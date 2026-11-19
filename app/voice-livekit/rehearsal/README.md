@@ -190,37 +190,39 @@ One call runs the WHOLE interview, OPENING to CLOSING, through the production ph
 (`R1Interview.run`): the opening (L-OPEN-HI and the plain agenda by default), the icebreaker and its
 exit, the brief, "ready" or the button, the role-play, the exit, the wrap-up and L-CLOSE.
 
-* CLOCK (`vloop.py`): a virtual-time event loop. The driver's silence windows and caps take no real
-  time (a 25-minute interview runs in about a second offline); a production model call (Christy, the
-  learner, the shadow judge, the end-intent classifier) takes its real seconds on the clock; a harness
-  call (the simulated candidate, the rubric judge) stands the clock still; its retry backoff sleeps
-  in real time (`vloop.real_sleep`), and each call's header records how its clock moved (`clock`:
-  watchdog trips, real and jumped seconds). S is the interview clock, R the role-play clock, both read
-  from the session's own phase machine.
+* CLOCK (`vloop.py`): a virtual-time event loop. The driver's silence windows and
+  caps take no real time (a 25-minute interview runs in about a second offline); a production model
+  call (the interviewer, the learner, the shadow judge, the end-intent classifier) takes its real
+  seconds on the clock; a harness call (the simulated candidate, the rubric judge) stands the clock
+  still; its retry backoff sleeps in real time (`vloop.real_sleep`), and each call's header records
+  how its clock moved (`clock`: watchdog trips, real and jumped seconds). S is the interview clock,
+  R the role-play clock, both read from the session's own phase machine.
 * SDK SIDE (`sim.py`): scripted lines play for their words at the voice's pace; a candidate turn is
   `user_state_changed`, the STT finals, the endpoint, `on_user_turn_completed`, the reply through
   `llm_node`; the "I'm ready" button is the server-sent `data_received` packet the API relays
   (`TestReadyButton`), pressed only while the page shows it (`awaiting` is `ready`; else a
-  `button_not_shown` event). Speech is scheduled as livekit-agents 1.6.4 does: one speech at a time in
-  creation order (a `say` made while a reply plays waits behind it), `interrupt()` cuts the playing
-  line (the transcript keeps the words played), and a turn that ends over an uninterruptible line gets
-  no reply. Live, the learner and Christy client uses the session's connection options (one retry
-  after 0.5 s) and its SDK `error` events reach the session as in production. Not emulated: barge-in,
-  VAD fragments, the acknowledgement hold, TTS audio.
+  `button_not_shown` event). Speech is scheduled as livekit-agents 1.6.4 does: one speech at a time
+  in creation order (a `say` made while a reply plays waits behind it), `interrupt()` cuts the
+  playing line (the transcript keeps the words played), and a turn that ends over an uninterruptible
+  line gets no reply. Live, the learner and interviewer client (one client) uses the session's
+  connection options (one retry after 0.5 s) and its SDK error events reach the session as in
+  production. Not emulated: barge-in, VAD fragments, the acknowledgement hold, TTS audio.
 * SEAMS (`seams.py`): every `*_runner` of `R1Interview` runs as in production, where each is on by
   default. Live, on its production client (`SEAM_CLIENTS`: the judge client for the shadow judge,
-  the end-intent classifier and the turn reader; Christy's client for the transition bridge); an
-  unmapped seam stops the sweep. Offline, a scripted stand-in (the end-intent classifier answers from
-  the turn's ground truth). The header's `seams` says which ran `live`, `scripted` or `absent`.
-* CANDIDATE (`candidate.py`): one person through the whole interview, phase-aware: a job candidate to
-  Christy (icebreaker answers, brief questions, "ready", wrap-up questions), the Program Advisor to the
-  learner (`advisor.py` behaviours), and out of role when Christy steps in (an end question, the offer
-  to wrap up). It decides from what it HEARD: by default Christy says hello and goes straight into the
-  agenda's first question, which the candidate answers; only with R1_OPENING_NO_HEARING_CHECK=0 does
-  she ask "Can you hear me okay?" first, and that sound check gets a short yes. Christy's in-role
-  questions are recognised from the line said, the offer to wrap up is taken only on spoken cues, and
-  a nervous silence lasts until Christy speaks again. A failed live advisor turn is played by the
-  scripted advisor of that level. Live, DeepSeek plays it; offline, scripted banks.
+  the end-intent classifier and the turn reader; the interviewer's client for the transition
+  bridge); an unmapped seam stops the sweep. Offline, a scripted stand-in (the end-intent classifier
+  answers from the turn's ground truth). The header's `seams` says which ran `live`, `scripted` or
+  `absent`.
+* CANDIDATE (`candidate.py`): one person through the whole interview, phase-aware: a job candidate
+  to the interviewer (icebreaker answers, brief questions, "ready", wrap-up questions), the Program
+  Advisor to the learner (`advisor.py` behaviours), and out of role when the interviewer steps in
+  (an end question, the offer to wrap up). It decides from what it HEARD: by default the interviewer
+  says hello and goes straight into the agenda's first question, which the candidate answers; only
+  with R1_OPENING_NO_HEARING_CHECK=0 does the interviewer ask "Can you hear me okay?" first, and
+  that sound check gets a short yes. The interviewer's in-role questions are recognised from the
+  line said, the offer to wrap up is taken only on spoken cues, and a nervous silence lasts until
+  the interviewer speaks again. A failed live advisor turn is played by the scripted advisor of that
+  level. Live, DeepSeek plays it; offline, scripted banks.
 * SCENARIOS (`scenarios.py`, `manual.py`): the synthetic edge scenarios (strong, average,
   terse-nervous, brief-repair, button-mid-brief, roleplay-question, icebreaker-skip, early-end,
   early-end-late, abuse-once, price-dodge, price-never, pushy-discounter, wrapup-question, wrapup-none,
@@ -233,15 +235,16 @@ exit, the brief, "ready" or the button, the role-play, the exit, the wrap-up and
   role-play move waits until R is within 15 s of when it was made), `manual-mix` samples the catalogue
   (its call id says `mix`; the header has the level it drew). Groups:
   `default` (all of them), `manual-replay`, `manual`, `synthetic`, `early`, `price`, `wrapup`.
-* CHECKS (`full_metrics.py`): phase order, the close, the icebreaker exit window, the role-play start
-  the way the scenario started it (no fallback to the button, the button only when shown), the
+* CHECKS (`full_metrics.py`): phase order, the close, the icebreaker exit window, the role-play
+  start the way the scenario started it (no fallback to the button, the button only when shown), the
   transition ceiling, no in-role exit before R 14:00 without agreement, every end request heard
   (asked, or an at-once exit the design allows; an ignored request also fails a time-cap end), the
-  abuse path (feature-detected), brief repair (Christy's scripted brief line again, or a shorter
-  one under 60 % of the brief), an icebreaker question asked again when the candidate asks for it,
-  the wrap-up answered, the hiring team named once,
-  Christy's repeats, one goodbye, no learner after the exit, dead air, no two bot lines at once. Optional M032 behaviours are feature-detected (`session_facts.start_by`, an abuse path, any
-  extra `*_runner` seam of `R1Interview`), so the same harness runs on main and on the M032 branch.
+  abuse path (feature-detected), brief repair (the interviewer's scripted brief line again, or a
+  shorter one under 60 % of the brief), an icebreaker question asked again when the candidate asks
+  for it, the wrap-up answered, the hiring team named once, the interviewer's repeats, one goodbye,
+  no learner after the exit, dead air, no two bot lines at once. Optional M032 behaviours are
+  feature-detected (`session_facts.start_by`, an abuse path, any extra `*_runner` seam of
+  `R1Interview`), so the same harness runs on main and on the M032 branch.
 
 Files: `calls/<id>.json` (rows in the export schema with `phase`, `speaker`, `voice`, `ai_voice`,
 `text`, the timing columns, S and R, the candidate's ground-truth `act` and the library `intent`; the
@@ -258,12 +261,12 @@ Harness switches (`rehearsal/flags.py`, default ON; `0` restores the previous be
 `REHEARSAL_KEEP_CONTROL_ACTS` (scored acts are never reworded), `REHEARSAL_TRANSITION_ACTS_V2` (the
 transition labels, the brief-line rule and the `icebreaker_repeat` check), `REHEARSAL_LEARNER_CLOCK`
 (window checks time the learner's line by its decision), `REHEARSAL_COMMIT_WINDOW`,
-`REHEARSAL_SPOKEN_LEAKS`, `REHEARSAL_PROBE_VOCAB_V2` and `REHEARSAL_CITED_MISFIRES` (diagnosis 2, above),
-`REHEARSAL_IB_REPEAT_INSISTED` (a repeat request that turns down, "no, I mean ...", the right question it
-just got also passes with the question before that one, as Christy's insisted-repeat line offers it,
-D2-IB1) and `REHEARSAL_SAME_TURN_FRAGMENTS` (a candidate row the session saved with no span while the
-candidate's turn was still being said is part of that turn, not the next one, when a check looks for
-the reply to it).
+`REHEARSAL_SPOKEN_LEAKS`, `REHEARSAL_PROBE_VOCAB_V2` and `REHEARSAL_CITED_MISFIRES` (diagnosis 2,
+above), `REHEARSAL_IB_REPEAT_INSISTED` (a repeat request that turns down, "no, I mean ...", the
+right question it just got also passes with the question before that one, as the interviewer's
+insisted-repeat line offers it, D2-IB1) and `REHEARSAL_SAME_TURN_FRAGMENTS` (a candidate row the
+session saved with no span while the candidate's turn was still being said is part of that turn, not
+the next one, when a check looks for the reply to it).
 
 Diagnosis 4 switches (all default ON; `0` restores the previous behaviour):
 `REHEARSAL_FLOW_DESIGN_RULES` (the flow judge reads the design rules fixed by policy and judges only
@@ -281,18 +284,19 @@ the timing of its spoken turn, and a tail said over the brief joins that turn's 
 
 Diagnosis 5 switches (all default ON; `0` restores the previous behaviour):
 `REHEARSAL_FLOW_AGENDA_RULES` (the design rules also say the agenda's "about thirty minutes" for the
-interview and "up to twenty" for the role-play are both right, and that Christy's one confirming ask on
-an end request, her wrap-up offer and her early-end note are policy; OFF sends the round-5 rubric),
-`REHEARSAL_FLOW_MIN_REPS` (the flow summary counts judged calls per scenario, and a live scenario judged
-on one call is a readiness reason: run `--calls` at twice the scenario count or more) and
-`REHEARSAL_NEXT_STEP_V2` ("pencil you in", "a weekend call", "a Tuesday or Friday call", "a quick
-evening session with a mentor" and "catch up over the phone" are next-step asks that earn a commitment;
-the qualifier is a closed list, so "a smart call", "another sales call", "your Monday meeting" and
-"every morning session is recorded" are not).
-`REHEARSAL_NEXT_STEP_PROCEED` (questions or offers to proceed count as next-step asks; OFF restores the previous vocabulary).
+interview and "up to twenty" for the role-play are both right, and that the interviewer's one
+confirming ask on an end request, the wrap-up offer and the early-end note are policy; OFF sends the
+round-5 rubric), `REHEARSAL_FLOW_MIN_REPS` (the flow summary counts judged calls per scenario, and a
+live scenario judged on one call is a readiness reason: run `--calls` at twice the scenario count or
+more) and `REHEARSAL_NEXT_STEP_V2` ("pencil you in", "a weekend call", "a Tuesday or Friday call",
+"a quick evening session with a mentor" and "catch up over the phone" are next-step asks that earn a
+commitment; the qualifier is a closed list, so "a smart call", "another sales call", "your Monday
+meeting" and "every morning session is recorded" are not). `REHEARSAL_NEXT_STEP_PROCEED` (questions
+or offers to proceed count as next-step asks; OFF restores the previous vocabulary).
 
 Two rounds scored by different rubrics are not comparable.  Judge saved records again, flow judge
-only (no candidate, Christy or learner call; the records are not written), under the current rubric:
+only (no candidate, interviewer or learner call; the records are not written), under the current
+rubric:
 
 ```
 python -m rehearsal.rejudge C:\tmp\m032-sim-runs\int-live-4b C:\tmp\m032-sim-runs\int-live-5 --out <dir> --budget-usd 1
@@ -314,41 +318,43 @@ python -m rehearsal --full --scenarios default+adapt --out <dir> --budget-usd 6 
 The owner's goal is a bot with excellent conversational flow that adapts to every kind of
 conversation while sticking to its objective. `rehearsal/adapt.py` adds fourteen named candidates
 (group `adapt`; `default+adapt` is `default` plus `adapt`, the same as `--scenarios default,adapt`;
-`default` and `all`, the 16 synthetic scenarios, are unchanged): `tangent`, `confused`,
-`rambler`, `one-worder`, `hinglish`, `rude-not-abusive`, `interrupter`, `off-script-advisor`,
+`default` and `all`, the 16 synthetic scenarios, are unchanged): `tangent`, `confused`, `rambler`,
+`one-worder`, `hinglish`, `rude-not-abusive`, `interrupter`, `off-script-advisor`,
 `manipulative-advisor`, `over-discounter`, `gives-up-midway`, `mid-roleplay-glitch`,
 `argues-with-christy` and `late-ready`. Each is phase-aware: offline the talk is scripted (answer
 banks, transforms of the scripted advisor's turns, word-for-word beats); live, DeepSeek plays the
-candidate with the behaviour in its system prompt to Christy and as an overlay on the advisor, and
-the beats are said word for word, so the behaviour always happens. Every candidate turn carries its
-ground-truth `act` (new: `tangent`, `confused_question`, `interrupt`, `off_script`, `pressure`,
-`discount_drop`, `glitch_check`, `glitch_lost`, `argue`) and `traits` (how it was said: `tangent`,
-`ramble`, `one_word`, `hinglish`, `rude`, `interrupt` ...); the header's `ground_truth.adapt` names
-the behaviour.
+candidate with the behaviour in its system prompt to the interviewer and as an overlay on the
+advisor, and the beats are said word for word, so the behaviour always happens. Every candidate turn
+carries its ground-truth `act` (new: `tangent`, `confused_question`, `interrupt`, `off_script`,
+`pressure`, `discount_drop`, `glitch_check`, `glitch_lost`, `argue`) and `traits` (how it was said:
+`tangent`, `ramble`, `one_word`, `hinglish`, `rude`, `interrupt` ...); the header's
+`ground_truth.adapt` names the behaviour.
 
 The interrupter cuts in while a generated bot reply is still playing (every third long learner
-reply, Christy's second icebreaker reply), and its voice cuts that reply as R1's voice barge-in
-does: once the voice has lasted the interruption `min_duration` (0.8 s, `r1_latency`; read at use)
-the line stops, keeping the words played until then (`SdkDriver.speak(barge_in=True)`). A line
-with less than that plus 0.4 s left is not cut in on (it would play to its end), and the advisor is
-fed the part of the learner line played before the cut. At the `R1_INTERRUPT_MIN_WORDS` rollback
-the voice cuts nothing and the committed turn does, as in production.
+reply, the interviewer's second icebreaker reply), and its voice cuts that reply as R1's voice
+barge-in does: once the voice has lasted the interruption `min_duration` (0.8 s, `r1_latency`; read
+at use) the line stops, keeping the words played until then (`SdkDriver.speak(barge_in=True)`). A
+line with less than that plus 0.4 s left is not cut in on (it would play to its end), and the
+advisor is fed the part of the learner line played before the cut. At the `R1_INTERRUPT_MIN_WORDS`
+rollback the voice cuts nothing and the committed turn does, as in production.
 
 New per-phase check `ready_taken`: every spoken "ready" in the transition starts the role-play (the
-learner picks up before the candidate speaks again). A "ready" Christy answers as a question, or
-ignores, fails.
+learner picks up before the candidate speaks again). A "ready" that the interviewer answers as a
+question or ignores fails.
 
 The flow judge (`rehearsal/flow_judge.py`, live only; offline it records `status: n/a`) reads the
-whole transcript, the scenario's behaviour and the call's facts, and scores the BOT on six axes,
-1 to 5: `christy_flow`, `learner_flow`, `adaptability`, `objective_kept`, `repetition`,
-`naturalness`, with evidence quotes that must be in a CHRISTY or LEARNER line (a quote from a
-candidate line or from no line is rejected, listed under `evidence_rejected`) and the worst moments
-(turn, speaker, why). Per-call scores go to `results.jsonl` (`flow`), the means, minimums, gates and
-worst moments to `scorecard.md` / `scorecard.json` (`flow`). Gates: naturalness mean >= 4.3,
-adaptability mean >= 4.3, objective_kept minimum >= 4, and no call below 3 on any axis. A failed
-gate or a call without a verdict keeps a live run from being ready, and `--strict` exits 5 on a
-failed flow gate and on a live judged run where a call has no verdict (a judge error) or no call was
-judged (`strict_failures`; offline `n/a` and `--no-judge` are not failures). The judge uses `--judge-model` (as the rubric judge); `--no-judge` turns both off.
+whole transcript, the scenario's behaviour and the call's facts, and scores the BOT on six axes, 1
+to 5: `christy_flow`, `learner_flow`, `adaptability`, `objective_kept`, `repetition`, `naturalness`,
+with evidence quotes that must be in an interviewer (DEX; CHRISTY with R1_INTERVIEWER_DEX=0) or
+LEARNER line (a quote from a candidate line or from no line is rejected, listed under
+`evidence_rejected`) and the worst moments (turn, speaker, why). Per-call scores go to
+`results.jsonl` (`flow`), the means, minimums, gates and worst moments to `scorecard.md` /
+`scorecard.json` (`flow`). Gates: naturalness mean >= 4.3, adaptability mean >= 4.3, objective_kept
+minimum >= 4, and no call below 3 on any axis. A failed gate or a call without a verdict keeps a
+live run from being ready, and `--strict` exits 5 on a failed flow gate and on a live judged run
+where a call has no verdict (a judge error) or no call was judged (`strict_failures`; offline `n/a`
+and `--no-judge` are not failures). The judge uses `--judge-model` (as the rubric judge);
+`--no-judge` turns both off.
 
 ## Not measured here
 
@@ -371,3 +377,6 @@ it snapshots the scripted learner for speculative calls. Use `--spec-reply on` o
 `off` to set the session flag, or `--spec-reply both` to compare real timing and
 timing-neutral adoption against OFF. The grid fails on timing-neutral transcript
 or decision drift. The default `env` leaves the process environment in control.
+
+The interviewer is Dex (Christy with `R1_INTERVIEWER_DEX=0`). Stored simulator records keep the
+voice label `christy` for the interviewer under either persona.

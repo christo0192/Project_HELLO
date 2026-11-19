@@ -46,6 +46,8 @@ HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
+import r1_script  # noqa: E402
+
 from r1_end_intent import (  # noqa: E402
     END_INTENT_LABELS,
     build_end_intent_messages,
@@ -65,11 +67,11 @@ FIXTURE = HERE / "tests" / "fixtures" / "r1_end_intent_labels.jsonl"
 CORPUS = HERE / "tests" / "fixtures" / "r1_advisor_corpus.jsonl"
 HELDOUT = HERE / "tests" / "fixtures" / "r1_advisor_heldout.jsonl"
 CONTEXTS = ("roleplay", "after_aside")
-# The interviewer's question as the candidate hears it (persona p1 v1), for the after-aside rows.
-ASIDE_QUESTION = (
-    "This is Christy, your interviewer. If you want to end the interview now, please say: end the "
-    "interview. Otherwise, just carry on with Meera Iyer."
-)
+
+
+def aside_question() -> str:
+    """Return the active interviewer's question for after-aside rows."""
+    return r1_script.line("L-ASIDE-END", lead_name="Meera Iyer")
 
 
 def load_rows(path: Path = FIXTURE) -> list[dict[str, Any]]:
@@ -239,7 +241,7 @@ async def _classify(
         row["text"],
         context=row["context"],
         learner_last="",
-        question=ASIDE_QUESTION if row["context"] == "after_aside" else "",
+        question=aside_question() if row["context"] == "after_aside" else "",
         seed="r1-end-intent-eval",
         turn=number,
     )

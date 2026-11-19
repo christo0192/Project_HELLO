@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import unittest.mock
 from pathlib import Path
 
@@ -31,7 +33,7 @@ HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from rehearsal import vloop
+from rehearsal import candidate, flow_judge, full, manual, persona, vloop
 
 
 def _transition_prefix_matches(said: list[str], planned: list[str], *, allow_drop: bool) -> bool:
@@ -809,6 +811,7 @@ class OfflineFullInterviewTests(unittest.TestCase):
                 self.assertIn(key, row)
         voices = {row["voice"] for row in record["rows"]}
         self.assertEqual(voices, {"christy", "learner", "candidate"})
+        self.assertIn("christy_repeats", record["phase_checks"]["checks"])
         self.assertTrue(record["admin_log"])
         self.assertIsNotNone(record["session_facts"])
         roleplay = [r for r in record["rows"] if r["phase"] == "roleplay" and r["r_sec"] is not None]
@@ -828,6 +831,7 @@ class OfflineFullInterviewTests(unittest.TestCase):
             body = (out / "calls" / f"{seed}.json").read_text(encoding="utf-8")
             self.assertNotIn(secret, body)
             self.assertEqual(json.loads(body)["header"]["scenario"], "early-end")
+            self.assertIn("christy", {row["voice"] for row in json.loads(body)["rows"]})
             lines = (out / "transcripts" / f"{seed}.txt").read_text(encoding="utf-8").splitlines()
             turn_lines = [line for line in lines if line.startswith("[S ")]
             self.assertEqual(len(turn_lines), len(record["rows"]) + len(record["events"]))
@@ -1016,7 +1020,7 @@ class CandidateSimTests(unittest.TestCase):
         import r1_script
         from rehearsal.candidate import is_icebreaker_question, is_sound_check
 
-        hello = "Hi Alex, I'm Christy, an AI interviewer from Interview Kickstart."
+        hello = "Hi Alex, I'm Dex, an AI interviewer from Interview Kickstart."
         for line in (hello, r1_script.line("L-OPEN-HI", first_name="Alex"),
                      r1_script.line("L-OPEN-HI", first_name="")):
             with self.subTest(line=line):
@@ -2547,8 +2551,6 @@ class LearnerClockTests(unittest.TestCase):
         self.assertGreater(seen, 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class AsideQuestionTests(unittest.TestCase):
@@ -2583,3 +2585,83 @@ class AsideQuestionTests(unittest.TestCase):
         rt = self._runtime()
         self.assertEqual(aside_question_of(rt, self._render("L-ASIDE-WRAP")), "wrap")
         self.assertEqual(aside_question_of(rt, self._render("L-ASIDE-END")), "end")
+
+
+class DexPersonaTests(unittest.TestCase):
+    RECORD = {
+        "header": {"scenario_title": "Christy test"},
+        "rows": [
+            {"voice": "christy", "text": "hello"},
+            {"voice": "learner", "text": "hi"},
+            {"voice": "candidate", "text": "yes"},
+        ],
+    }
+
+    def test_swap_name_keeps_case_and_identifier(self):
+        self.assertEqual(persona.swap_name("CHRISTY christy's christy_flow"), "DEX dex's christy_flow")
+
+    def test_render_swaps_library_move_by_default(self):
+        self.assertEqual(manual.render("Sorry Christy, can you repeat the question?", {}),
+                         "Sorry Dex, can you repeat the question?")
+
+    def test_render_keeps_name_with_flag_off(self):
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
+            self.assertEqual(manual.render("Sorry Christy, can you repeat the question?", {}),
+                             "Sorry Christy, can you repeat the question?")
+
+    def test_act_of_reads_raw_move(self):
+        self.assertEqual(manual.act_of("icebreaker", "asks Christy to repeat the question",
+                                       "Sorry Christy, can you repeat the question?"), "repeat_request")
+
+    def test_talker_prompt_uses_active_pronoun(self):
+        self.assertIn("with him", candidate.talker_system_prompt("strong", "Alex"))
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
+            self.assertIn("conversation with her.", candidate.talker_system_prompt("strong", "Alex"))
+
+    def test_tasks_and_aside_use_active_persona(self):
+        self.assertIn("Dex", candidate.icebreaker_task())
+        self.assertIn("his", candidate.thinking_task())
+        self.assertIn("Dex", candidate.wrapup_task())
+        self.assertIn("Dex", candidate.aside_note("hello"))
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
+            self.assertEqual(candidate.icebreaker_task(), "Answer Christy's last question, as yourself.")
+            self.assertEqual(candidate.thinking_task(),
+                             "You asked Christy for a moment to think. Now answer her earlier question, as yourself.")
+            self.assertEqual(candidate.wrapup_task(),
+                             "Christy asked whether you have any questions about the role or the next steps. "
+                             "Ask ONE real, short question (under 20 words).")
+            self.assertEqual(candidate.aside_note("hello"), "(Christy, the interviewer, stepped in and said: hello)")
+
+    def test_flow_messages_use_dex(self):
+        combined = " ".join(m["content"] for m in flow_judge.flow_messages(self.RECORD))
+        self.assertNotIn("christy", combined.replace("christy_flow", "").lower())
+        self.assertIn("he answers", combined)
+        self.assertIn("DEX|LEARNER", combined)
+
+    def test_stored_voice_renders_active_speaker(self):
+        self.assertEqual(flow_judge.judged_turns(self.RECORD)[0]["speaker"], "DEX")
+        self.assertIn("DEX", full.transcript_text(self.RECORD))
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
+            self.assertEqual(flow_judge.judged_turns(self.RECORD)[0]["speaker"], "CHRISTY")
+            self.assertIn("CHRISTY", full.transcript_text(self.RECORD))
+
+    def test_schema_is_original_with_flag_off(self):
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
+            messages = flow_judge.flow_messages({"rows": [{"voice": "learner"}]})
+            self.assertIn(flow_judge.SCHEMA_TEXT, messages[1]["content"])
+
+
+def setUpModule():
+    global _persona_environment
+    env = dict(os.environ)
+    env.pop("R1_INTERVIEWER_DEX", None)
+    _persona_environment = mock.patch.dict(os.environ, env, clear=True)
+    _persona_environment.start()
+
+
+def tearDownModule():
+    _persona_environment.stop()
+
+
+if __name__ == "__main__":
+    unittest.main()

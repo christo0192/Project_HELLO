@@ -1,11 +1,11 @@
 """The phase-aware candidate simulator of the full-interview tier.
 
-It plays ONE person through the whole interview.  In Christy's phases it is a job candidate: it
-answers the icebreaker, may ask about the brief or the role-play, says "ready" (or presses the
+It plays ONE person through the whole interview.  In the interviewer's phases it is a job
+candidate: it answers the icebreaker, may ask about the brief or the role-play, says "ready" (or presses the
 button), and answers the wrap-up.  In the role-play it is the Program Advisor: the advisor
 behaviours of ``rehearsal.advisor`` (live) or ``rehearsal.scripted_advisor`` (offline), with the
-scenario's role-play acts on top (``ScenarioAdvisor``).  When Christy steps into the role-play with a
-question (L-ASIDE-END, the offer to wrap up), the candidate answers her, out of role.
+scenario's role-play acts on top (``ScenarioAdvisor``).  When the interviewer steps into the
+role-play with a question (L-ASIDE-END, the offer to wrap up), the candidate answers out of role.
 
 What it hears is what was said aloud (``View.heard``: the bot's lines since its last turn, with the
 voice that spoke them); which role it is in follows the phase and what it heard (the learner
@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
-from rehearsal import flags
+from rehearsal import flags, persona
 from rehearsal.advisor import (
     AdvisorTurn,
     LLMAdvisor,
@@ -63,7 +63,13 @@ WRAP_DECLINE = Beat("wrap_decline", "No, let's keep going.")
 # (an open issue of the merge, left to the learner lane).
 HANGUP_ACCEPT = Beat("wrap_accept", "Yes, let's stop here.")
 WRAP_ACCEPT_FROM_R_SEC = 1080.0
-ASIDE_NOTE = "(Christy, the interviewer, stepped in and said: {text})"
+
+
+def aside_note(text: str) -> str:
+    """Describe an interviewer aside to the advisor."""
+    return persona.fill("({name}, the interviewer, stepped in and said: ") + text + ")"
+
+
 # A price reference: a price word or a figure.  The currency figure has no leading ``\b``: a space
 # or the start of the line before "$" is not a word boundary, so "\b\$9,000" never matched.
 _PRICE_REF = re.compile(
@@ -136,13 +142,12 @@ def asks_price(text: str | None) -> bool:
 
 
 def is_sound_check(text: str | None) -> bool:
-    """Christy asks whether the candidate can hear her (the M032 opening hello, and its retry)."""
+    """The interviewer asks if the candidate can hear them (the M032 hello and its retry)."""
     return bool(_SOUND_CHECK.search(text or ""))
 
 
 def is_icebreaker_question(text: str | None) -> bool:
-    """A Christy line that asks the candidate something about themselves: not a sound check, and
-    not a presence prompt after a silence."""
+    """An interviewer line asking about the candidate, excluding sound and presence checks."""
     value = text or ""
     if is_sound_check(value) or _PRESENCE_PROMPT.search(value):
         return False
@@ -252,11 +257,33 @@ def talker_system_prompt(style: str, name: str) -> str:
     return (
         f"You are {name}, a job candidate in a first-round interview for the Sales Program Advisor "
         "role at Interview Kickstart, an education company that sells career courses. The "
-        "interviewer, Christy, is an AI; this part of the interview is a conversation with her. "
-        f"{_STYLE_TEXT[style]} Speak as yourself, in plain spoken English, with no stage "
+        + persona.fill(
+            "interviewer, {name}, is an AI; this part of the interview is a conversation with {him}. "
+        )
+        + f"{_STYLE_TEXT[style]} Speak as yourself, in plain spoken English, with no stage "
         "directions and no lists. Never say you are an AI or that this is a simulation, and never "
         "invent a company name. Reply with ONE JSON object and nothing else: "
         '{"text": "<what you say aloud>"}.'
+    )
+
+
+def icebreaker_task() -> str:
+    """Return the icebreaker task for the active interviewer."""
+    return persona.fill("Answer {name}'s last question, as yourself.")
+
+
+def thinking_task() -> str:
+    """Return the thinking task for the active interviewer."""
+    return persona.fill(
+        "You asked {name} for a moment to think. Now answer {his} earlier question, as yourself."
+    )
+
+
+def wrapup_task() -> str:
+    """Return the wrap-up task for the active interviewer."""
+    return persona.fill(
+        "{name} asked whether you have any questions about the role or the next steps. Ask ONE "
+        "real, short question (under 20 words)."
     )
 
 
@@ -264,14 +291,6 @@ class LLMTalker:
     """Live free talk to Christy: one DeepSeek JSON call per answer (a harness call)."""
 
     offline = False
-    ICEBREAKER_TASK = "Answer Christy's last question, as yourself."
-    THINKING_TASK = (
-        "You asked Christy for a moment to think. Now answer her earlier question, as yourself."
-    )
-    WRAPUP_TASK = (
-        "Christy asked whether you have any questions about the role or the next steps. Ask ONE "
-        "real, short question (under 20 words)."
-    )
 
     def __init__(self, client: Any, model: str, style: str, name: str, *, temperature: float = 0.8) -> None:
         self.client, self.model, self.style, self.name = client, model, style, name
@@ -319,11 +338,11 @@ class LLMTalker:
         return text.strip()[:900]
 
     async def icebreaker_answer(self, thinking: bool = False) -> str:
-        text = await self._ask(self.THINKING_TASK if thinking else self.ICEBREAKER_TASK)
+        text = await self._ask(thinking_task() if thinking else icebreaker_task())
         return text or await self.fallback.icebreaker_answer(thinking)
 
     async def wrapup_question(self) -> str:
-        text = await self._ask(self.WRAPUP_TASK)
+        text = await self._ask(wrapup_task())
         return text or await self.fallback.wrapup_question()
 
 
@@ -854,7 +873,7 @@ class CandidateSim:
         else:
             learner_text = " ".join(learner) if learner else "..."
             if christy and not getattr(self.talker, "offline", True):
-                learner_text += " " + ASIDE_NOTE.format(text=" ".join(christy))
+                learner_text += " " + aside_note(" ".join(christy))
         self.exchanges += 1
         turn, act = await self.advisor.next_turn(learner_text, float(view.r_sec or 0.0), self.exchanges)
         text = turn.text if re.search(r"[A-Za-z0-9]", turn.text or "") else "Mm-hmm."

@@ -180,7 +180,7 @@ _add(
 _add(
     Scenario(
         "brief-repair",
-        "Asks to hear the brief again, checks Christy is there, asks for a shorter brief.",
+        "Asks to hear the brief again, checks the interviewer is there, asks for a shorter brief.",
         level="average",
         style="average",
         tags=("brief_repeat", "presence_check", "short_brief"),
@@ -207,7 +207,7 @@ _add(
 _add(
     Scenario(
         "roleplay-question",
-        "Asks Christy two questions about the role-play before saying ready.",
+        "Asks the interviewer two questions about the role-play before saying ready.",
         level="strong",
         style="strong",
         tags=("transition_questions",),
@@ -238,7 +238,7 @@ _add(
 _add(
     Scenario(
         "early-end",
-        "Tries to end the role-play early twice before 10:00: declines when Christy asks, then "
+        "Tries to end the role-play early twice before 10:00: declines when the interviewer asks, then "
         "agrees (an agreed stop before 10:00 leaves the attempt unscored).",
         level="strong",
         style="strong",

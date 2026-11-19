@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,7 +24,8 @@ HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from rehearsal import vloop
+from rehearsal import flow_judge, vloop
+from rehearsal import adapt, flags, persona
 
 ADAPT = (
     "tangent", "confused", "rambler", "one-worder", "hinglish", "rude-not-abusive", "interrupter",
@@ -555,7 +558,7 @@ def _verdict(**scores) -> str:
                 "naturalness": [{"turn": 3, "quote": "I missed it"}],
             },
             "worst_moments": [
-                {"turn": 3, "speaker": "CHRISTY", "why": "a bit abrupt"},
+                {"turn": 3, "speaker": "DEX", "why": "a bit abrupt"},
                 {"turn": 2, "speaker": "CANDIDATE", "why": "not a bot line"},
             ],
         }
@@ -582,7 +585,7 @@ class FlowJudgeSchemaTests(unittest.TestCase):
 
         verdict = validate_flow(parse_flow(_verdict()), _record(ROWS))
         kept = verdict["evidence"]["adaptability"]
-        self.assertEqual([(i["turn"], i["speaker"]) for i in kept], [(3, "CHRISTY"), (4, "LEARNER")])
+        self.assertEqual([(i["turn"], i["speaker"]) for i in kept], [(3, "DEX"), (4, "LEARNER")])
         self.assertTrue(kept[1]["turn_corrected"])  # "this is Meera" is turn 4, not 1
         reasons = {
             item["quote"]: item["rejected"] for item in verdict["evidence_rejected"] if item["axis"] != "worst_moments"
@@ -593,7 +596,7 @@ class FlowJudgeSchemaTests(unittest.TestCase):
         self.assertEqual([(item["turn"], item["rejected"]) for item in rejected_worst], [(2, "not_a_bot_turn")])
         self.assertEqual(len(verdict["worst_moments"]), 1)
         worst = verdict["worst_moments"][0]
-        self.assertEqual((worst["turn"], worst["speaker"], worst["phase"]), (3, "CHRISTY", "icebreaker"))
+        self.assertEqual((worst["turn"], worst["speaker"], worst["phase"]), (3, "DEX", "icebreaker"))
         self.assertIn("Back to your last role", worst["line"])
 
     def test_the_live_judge_is_asked_again_once_and_sees_the_behaviour(self) -> None:
@@ -849,7 +852,7 @@ class FlowDesignRulesTests(unittest.TestCase):
         # policy endings too; graded objections they leave unreached are no failure.
         system, _user = self._messages(_early_end_record())
         self.assertIn("or the request itself names the end", system)
-        self.assertIn("When Christy offers to wrap up and the candidate agrees, the role-play ends there", system)
+        self.assertIn("When Dex offers to wrap up and the candidate agrees, the role-play ends there", system)
         self.assertIn("After abuse from the candidate the learner hangs up", system)
         self.assertEqual(system.count("are no failure"), 3)
 
@@ -880,7 +883,7 @@ class FlowDesignRulesTests(unittest.TestCase):
 
         with _flow_switch(FLOW_DESIGN_RULES, "0"):
             system, user = self._messages(_early_end_record())
-        self.assertEqual(system, RUBRIC)
+        self.assertEqual(system, flow_judge.render_persona(RUBRIC))
         self.assertNotIn("Role-play ended by:", user)
         self.assertIn("role-play ended by: end_request", user)
 
@@ -995,7 +998,7 @@ class FlowRound5Tests(unittest.TestCase):
             "- The opening agenda says the whole interview takes about thirty minutes and the role-play up "
             "to twenty: both are correct.", system)
         self.assertIn(
-            "- Christy asks once to confirm an end request that does not name the end, and may offer to wrap "
+            "- Dex asks once to confirm an end request that does not name the end, and may offer to wrap "
             "up or note an early end; these asides are policy.", system)
         self.assertLess(system.index("DESIGN RULES"), system.index("thirty minutes"))
         self.assertLess(system.index("these asides are policy"), system.index("Score each axis"))
@@ -1005,14 +1008,14 @@ class FlowRound5Tests(unittest.TestCase):
         from rehearsal.flow_judge import RUBRIC_V2, flow_messages
 
         with _flow_switch(FLOW_AGENDA_RULES, "0"):
-            self.assertEqual(flow_messages(_early_end_record())[0]["content"], RUBRIC_V2)
+            self.assertEqual(flow_messages(_early_end_record())[0]["content"], flow_judge.render_persona(RUBRIC_V2))
 
     def test_the_design_rules_switch_off_still_sends_the_first_rubric(self) -> None:
         from rehearsal.flags import FLOW_DESIGN_RULES
         from rehearsal.flow_judge import RUBRIC, flow_messages
 
         with _flow_switch(FLOW_DESIGN_RULES, "0"):
-            self.assertEqual(flow_messages(_early_end_record())[0]["content"], RUBRIC)
+            self.assertEqual(flow_messages(_early_end_record())[0]["content"], flow_judge.render_persona(RUBRIC))
 
     @staticmethod
     def _judged(seed: str, scenario: str, **scores) -> dict:
@@ -1179,6 +1182,50 @@ class FlowRound5Tests(unittest.TestCase):
             self.assertFalse(saved["partial"])
             self.assertEqual(saved["runs"][0]["after_flow"][0]["status"], "error")
             self.assertTrue((out / "rejudge.md").exists())
+
+
+class DexAdaptPersonaTests(unittest.TestCase):
+    @staticmethod
+    def rendered_tasks():
+        return [persona.fill(task) for behaviour in adapt.BEHAVIOURS.values()
+                for task in behaviour.live_tasks.values()]
+
+    def test_live_tasks_use_dex_and_him(self):
+        rendered = self.rendered_tasks()
+        self.assertTrue(any("Dex's" in task for task in rendered))
+        self.assertTrue(any("Ask him" in task and "what he means" in task for task in rendered))
+
+    def test_live_tasks_use_original_persona_with_flag_off(self):
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
+            rendered = self.rendered_tasks()
+            self.assertTrue(any("Christy's" in task for task in rendered))
+            self.assertTrue(any("Ask her" in task and "what she means" in task for task in rendered))
+
+    def test_rubric_uses_dex_by_default(self):
+        self.assertNotRegex(flow_judge.rubric_text(), r"\b(?:Christy|CHRISTY|she)\b")
+
+    def test_rubrics_equal_constants_with_flag_off(self):
+        cases = (("0", "0", flow_judge.RUBRIC), ("1", "0", flow_judge.RUBRIC_V2),
+                 ("1", "1", flow_judge.RUBRIC_V3))
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
+            for design, agenda, expected in cases:
+                with self.subTest(design=design, agenda=agenda):
+                    with mock.patch.dict(os.environ, {flags.FLOW_DESIGN_RULES: design,
+                                                      flags.FLOW_AGENDA_RULES: agenda}):
+                        self.assertEqual(flow_judge.rubric_text(), expected)
+            self.assertIn("When Christy offers to wrap up", flow_judge.rubric_text())
+
+
+def setUpModule():
+    global _persona_environment
+    env = dict(os.environ)
+    env.pop("R1_INTERVIEWER_DEX", None)
+    _persona_environment = mock.patch.dict(os.environ, env, clear=True)
+    _persona_environment.start()
+
+
+def tearDownModule():
+    _persona_environment.stop()
 
 
 if __name__ == "__main__":
