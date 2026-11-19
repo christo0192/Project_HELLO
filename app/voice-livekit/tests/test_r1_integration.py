@@ -3569,7 +3569,9 @@ class TestWarmSayLines(unittest.IsolatedAsyncioTestCase):
         literals = set(re.findall(r"\bsay\(\s*['\"](L-[A-Z0-9-]+)['\"]", source))
         with mock.patch.dict(os.environ, {"R1_WARM_SAY_LINES": "1"}):
             missing = literals - set(rig.interview._warm_order())
-        self.assertEqual(missing, {"L-OPEN", "L-OPEN-HELLO", "L-MUTE"})
+        self.assertEqual(
+            missing, {"L-OPEN", "L-OPEN-HI", "L-OPEN-HELLO", "L-OPEN-HELLO-AGAIN", "L-MUTE"}
+        )
         with mock.patch.dict(os.environ, {"R1_MUTE_ASIDE_V2": "0"}):
             self.assertIn("L-MUTE", rig.interview._warm_order())
 
@@ -3756,10 +3758,11 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         # not warmed either; the re-asks and the steer are ``say`` lines and are.
         # M032 S6: the rotated start questions travel inside Christy's answers too, and Christy's
         # "Of course, take a moment." for a hold request is a reply, not a ``say`` line.
-        # M032 S7C: L-OPEN-HELLO is spoken first, like L-OPEN, before anything could be warm.
+        # M032 S7C: L-OPEN-HELLO is spoken first, before anything could be warm.
+        # Owner 2026-11-19: L-OPEN-HI carries the name and is spoken first too.
         unreachable = (
             "L-TIME-CUE", "L-NO-FEEDBACK", "L-FAQ-DEFER", "L-OPEN", "L-TRANSITION-ASK",
-            "L-TRANSITION-ASK-2", "L-TRANSITION-ASK-3", "L-IB-HOLD", "L-OPEN-HELLO",
+            "L-TRANSITION-ASK-2", "L-TRANSITION-ASK-3", "L-IB-HOLD", "L-OPEN-HELLO", "L-OPEN-HI",
         )
         for line_id in unreachable:
             self.assertNotIn(line_id, r1_session._WARM_ORDER)
@@ -3816,8 +3819,8 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         # diagnosis 3 eleven new lines; simulation diagnosis 4 four more (the exit-and-wrap-up
         # lines); diagnosis 5 the second
         # wrap-up offer (L-ASIDE-WRAP-AGAIN, R1_WRAP_OFFER_VARIANT); M033 T4 L-WRAP-MORE
-        # (R1_WARM_SAY_LINES).
-        self.assertEqual(len(specs), 56)
+        # (R1_WARM_SAY_LINES). The default opening drops three sound-check lines.
+        self.assertEqual(len(specs), 53)
         warmed = {spec.text for spec in specs}
         for line_id in unreachable:
             if line_id not in ("L-OPEN", "L-OPEN-HELLO"):
@@ -3847,16 +3850,16 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(pickup.text.startswith("Hello? Yes, this is "))
         # Revision 21's 22, M032 S7C's 7 (their flags are on), M032 S3's 5, simulation diagnosis
         # 3's 11 and simulation diagnosis 4's 4 exit-and-wrap-up lines (the learner lane), plus
-        # M033 T4's L-WRAP-MORE (R1_WARM_SAY_LINES).
-        self.assertEqual(len(off), 50)
+        # M033 T4's L-WRAP-MORE (R1_WARM_SAY_LINES), less three sound-check lines.
+        self.assertEqual(len(off), 47)
         self.assertFalse(
             {"L-TRANSITION-AGAIN", "L-TRANSITION-RECAP", "L-PRESENT", "L-PICKUP-BRIDGE"}
             & {spec.line_id for spec in off}
         )
         on = rig.interview._warm_specs(candidate_free=True)
-        # M032 S7C: the opening's agendas and the hello again lead the name-free group.
+        # The plain opening agenda leads the name-free group.
         self.assertEqual(
-            [spec.line_id for spec in on][4:8],
+            [spec.line_id for spec in on][1:5],
             ["L-TRANSITION-AGAIN", "L-TRANSITION-RECAP", "L-PRESENT", "L-TRANSITION-NUDGE"],
         )
         for spec in on:
@@ -3888,15 +3891,16 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
                 candidate_free=False
             )
         # M032 S6 adds four lines, M032 S7C seven, M032 S3 five, christy-ready the pause prompt,
-        # simulation diagnosis 3 eleven, simulation diagnosis 4 four, M033 T4 L-WRAP-MORE.
-        self.assertEqual(len(off), 55)
+        # simulation diagnosis 3 eleven, simulation diagnosis 4 four, M033 T4 L-WRAP-MORE;
+        # the default opening drops three sound-check lines.
+        self.assertEqual(len(off), 52)
         self.assertNotIn("L-TRANSITION-BRIDGED", {spec.line_id for spec in off})
         with _env(R1_TRANSITION_BRIDGE="1", R1_WRAP_OFFER_VARIANT="0"):
             free = rig.interview._warm_specs(candidate_free=True)
             named = rig.interview._warm_specs(candidate_free=False)
-        self.assertEqual(len(free) + len(named), 56)
-        # M032 S7C: after the opening's four lines, the first name-free line of the transition.
-        bridged = free[4]
+        self.assertEqual(len(free) + len(named), 53)
+        # After the plain opening agenda, the first name-free line of the transition.
+        bridged = free[1]
         self.assertEqual(bridged.line_id, "L-TRANSITION-BRIDGED")
         self.assertTrue(bridged.persist)
         self.assertNotIn("Asha", bridged.text)
@@ -3918,6 +3922,7 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
 
         off = {
             "R1_OPENING_SOUND_CHECK": "0", "R1_NO_AUDIO_LADDER": "0", "R1_MUTE_ASIDE_V2": "0",
+            "R1_OPENING_NO_HEARING_CHECK": "0",
             "R1_START_ASK_ONCE": "0",  # christy-ready's pause prompt is not S7C's
             "R1_WRAP_OFFER_VARIANT": "0",  # D5-ASIDE-WRAP2's line is not S7C's
         }
@@ -3939,9 +3944,16 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
                 now = ids()
                 self.assertEqual(set(now) - set(before), added)
                 self.assertEqual(set(before) - set(now), gone)
+        with _env(**{**off, "R1_OPENING_SOUND_CHECK": "1", "R1_OPENING_NO_HEARING_CHECK": "1"}):
+            self.assertEqual(set(ids()) - set(before), {"L-OPEN-AGENDA-PLAIN"})
         on = rig.interview._warm_specs(candidate_free=True)
+        self.assertEqual(on[0].line_id, "L-OPEN-AGENDA-PLAIN")
+        for line_id in ("L-OPEN-AGENDA", "L-OPEN-AGENDA-CONTINUE", "L-OPEN-HELLO-AGAIN"):
+            self.assertNotIn(line_id, [spec.line_id for spec in on])
+        with _env(R1_OPENING_NO_HEARING_CHECK="0"):
+            legacy_on = rig.interview._warm_specs(candidate_free=True)
         self.assertEqual(
-            [spec.line_id for spec in on][:4],
+            [spec.line_id for spec in legacy_on][:4],
             [
                 "L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-CONTINUE",
                 "L-OPEN-HELLO-AGAIN",

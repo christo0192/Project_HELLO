@@ -276,7 +276,8 @@ import r1_world
 # Revision 43: declined upgrade condition note.
 # Revision 44: render the upgrade condition note as a bullet.
 # 45: Keep the upgrade commitment in one sentence for scorer masking.
-PINNED_CONTENT_SHA256 = "0bb3cfbc252f33030caf018b91efb375a3159de3340df9e354c6ba04c826b601"
+# 46: L-OPEN-HI, the hello without the hearing question (R1_OPENING_NO_HEARING_CHECK).
+PINNED_CONTENT_SHA256 = "2b5f37945d8806c24847022353993f9fe4e6ea686672b0cccda3294ee711010d"
 
 CONTENT_MODULES = (
     "r1_text",

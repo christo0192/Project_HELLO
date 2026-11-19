@@ -4,7 +4,9 @@ The phone bot is scripted too; what makes it feel natural is the manners around 
 code chooses what each of Christy's icebreaker questions is FOR (``OBJECTIVES``) and the model only
 words it, after a few words of reaction to what the candidate just said.  L-OPEN already asks the
 first objective (background and sales work), so the cursor starts there; so does the opening's
-agenda (M032 S7C, ``R1_OPENING_SOUND_CHECK``), or it invites an early answer to carry on.
+agenda (M032 S7C, ``R1_OPENING_SOUND_CHECK``), or it invites an early answer to carry on. By
+default the hello has no hearing question and the plain agenda follows
+(``R1_OPENING_NO_HEARING_CHECK``).
 
 One decision per committed icebreaker answer (``IcebreakerPlan.next_job``), read by
 ``disposition``:

@@ -38,6 +38,7 @@ import r1_session
 from r1_guard import FALLBACK_REPLIES, FALLBACK_REPLY, StreamGuard
 from r1_prompts import ROLEPLAY_PHASE, select_context
 from r1_replies import Reply
+import r1_script
 from r1_script import LEARNER_FILLER_VARIANTS
 from r1_lines import INTERVIEWER_NAME, line, safe_first_name
 from r1_persistence import OUTCOME_DISPOSITIONS, R1TurnWriter
@@ -583,9 +584,10 @@ class R1TestCase(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         """M032 S7C (SWEEP-35): answer the hello's "Can you hear me okay?" as a candidate would.
 
-        A no-op with ``R1_OPENING_SOUND_CHECK`` off (L-OPEN is followed by the icebreaker at once).
+        A no-op when the sound check is off or the no-hearing-check opening is enabled.
         """
-        if not r1_session.opening_sound_check_enabled():
+        if (not r1_session.opening_sound_check_enabled()
+                or r1_session.opening_no_hearing_check_enabled()):
             return
         session = session or self.session
         await self.until(lambda: session.agent is not None)
@@ -604,6 +606,8 @@ class R1TestCase(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def opening_line_ids() -> tuple[str, ...]:
         """What the driver says before the icebreaker (M032 S7C: the hello, then the agenda)."""
+        if r1_session.opening_no_hearing_check_enabled():
+            return ("L-OPEN-HI", "L-OPEN-AGENDA-PLAIN")
         if r1_session.opening_sound_check_enabled():
             return ("L-OPEN-HELLO", "L-OPEN-AGENDA")
         return ("L-OPEN",)
@@ -3671,7 +3675,9 @@ class TestRunFlow(R1TestCase):
 
     async def test_the_icebreaker_prompt_waits_for_the_opening_to_finish_playing(self) -> None:
         self.session.playout_seconds = 0.15
-        with mock.patch.object(r1_session, "ICEBREAKER_PROMPT_SECONDS", 0.05):
+        with mock.patch.object(r1_session, "ICEBREAKER_PROMPT_SECONDS", 0.05), mock.patch.dict(
+            os.environ, {"R1_OPENING_NO_HEARING_CHECK": "0"}
+        ):
             task = asyncio.create_task(
                 run_r1_session(self.ctx, session_factory=self.session_factory)
             )
@@ -3681,9 +3687,26 @@ class TestRunFlow(R1TestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
         events = [item for item in self.order if not isinstance(item, str)]
-        open_end = events.index(("play_end", self.spoken_line(self.opening_line_ids()[-1])))
+        open_end = events.index(("play_end", self.spoken_line("L-OPEN-AGENDA")))
         prompt_start = events.index(("play_start", self.spoken_line("L-SIL-IB")))
         self.assertLess(open_end, prompt_start)
+
+    async def test_default_icebreaker_prompt_waits_for_the_opening_to_finish_playing(self) -> None:
+        self.session.playout_seconds = 0.15
+        with mock.patch.object(r1_session, "ICEBREAKER_PROMPT_SECONDS", 0.05):
+            task = asyncio.create_task(
+                run_r1_session(self.ctx, session_factory=self.session_factory)
+            )
+            await self.until(lambda: self.spoken_line("L-SIL-NOAUDIO") in self.session.spoken)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        events = [item for item in self.order if not isinstance(item, str)]
+        agenda = self.spoken_line(self.opening_line_ids()[-1])
+        self.assertLess(events.index(("play_end", agenda)),
+                        events.index(("play_start", self.spoken_line("L-SIL-NOAUDIO"))))
+        self.assertLess(events.index(("play_end", self.spoken_line("L-OPEN-HI"))),
+                        events.index(("play_start", agenda)))
 
     async def test_activation_failure_fails_closed_before_the_session_starts(self) -> None:
         self.writer.activate_ok = False
@@ -5762,7 +5785,7 @@ class TestWhatTheCandidateCanCut(R1TestCase):
         "L-SIL-RP2", "L-SIL-END", "L-MUTE", "L-REJOIN", "L-REJOIN-RP", "L-EXIT", "L-WRAP",
         "L-CLOSE", "L-SYSTEM-STOP",
         # M032 S7C: the sound check and its agendas, the never-heard ladder, the mute asides.
-        "L-OPEN-HELLO", "L-OPEN-HELLO-AGAIN", "L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN",
+        "L-OPEN-HI", "L-OPEN-HELLO", "L-OPEN-HELLO-AGAIN", "L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN",
         "L-OPEN-AGENDA-CONTINUE", "L-SIL-NOAUDIO", "L-SIL-END-NOAUDIO", "L-MUTE-RP", "L-MUTE-IV",
     )
 
@@ -11932,6 +11955,92 @@ class TestTheSoundCheckReader(unittest.TestCase):
         self.assertEqual(hits, [])
 
 
+class TestTheOpeningWithoutHearingCheck(R1TestCase):
+    """Owner 2026-11-19, R1_OPENING_NO_HEARING_CHECK: hello without the hearing question,
+    then the plain agenda at once. Synthetic text only."""
+
+    async def opening(self, *, playout=0.0):
+        ctx = FakeContext(self.order)
+        ctx.room.remote_participants["candidate"] = FakeParticipant("candidate")
+        session = FakeSession(log=self.order, playout_seconds=playout)
+        clock = Clock()
+        interview = R1Interview(ctx, {"first_name": "Arjun", "candidate_identity": "candidate"},
+                                session, self.writer, clock=clock)
+        task = asyncio.create_task(interview.run())
+        run = SimpleNamespace(interview=interview, session=session, clock=clock, task=task)
+        self.addCleanup(self.stop_opening, run)
+        await self.until(lambda: session.agent is not None)
+        return run
+
+    async def stop_opening(self, run):
+        if not run.task.done():
+            run.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await run.task
+
+    async def test_default_opening_reaches_icebreaker_without_input(self):
+        with mock.patch.dict(os.environ, {"R1_OPENING_SOUND_CHECK": "1",
+                                        "R1_OPENING_NO_HEARING_CHECK": "1",
+                                        "R1_BRIEF_WORDING_V2": "1", "R1_AGENDA_W3": "1"}):
+            with self.capture_logs() as logs:
+                run = await self.opening()
+                await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+            hello = run.interview.render_line("L-OPEN-HI")
+            agenda = run.interview.render_line("L-OPEN-AGENDA-PLAIN")
+            self.assertEqual(agenda, r1_script.LINES["L-OPEN-AGENDA-PLAIN-W3"])
+            self.assertEqual(run.session.spoken, [hello, agenda])
+            self.assertNotIn("?", hello)
+            self.assertEqual(run.session.generated, [])
+            self.assertFalse(any(row.get("error_type") == "r1_sound_check" for row in logs))
+            rows = [row for row in logs if row.get("error_type") == "r1_opening"]
+            self.assertEqual([row.get("error_category") for row in rows], ["no_hearing_check"])
+
+    async def test_greeting_over_hello_is_not_an_answer(self):
+        with mock.patch.dict(os.environ, {"R1_OPENING_NO_HEARING_CHECK": "1"}):
+            run = await self.opening(playout=0.2)
+            hello = run.interview.render_line("L-OPEN-HI")
+            await self.until(lambda: ("play_start", hello) in self.order)
+            run.session.emit("user_input_transcribed", final_event("Hi Christy"))
+            await self.settle()
+            with contextlib.suppress(r1_session.StopResponse):
+                await run.session.agent.on_user_turn_completed(
+                    None, SimpleNamespace(text_content="Hi Christy", id=f"msg_{next(_IDS)}"))
+            await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+            self.assertEqual(run.interview.machine.candidate_turns, 0)
+
+    async def test_sound_check_rollback_waits(self):
+        with mock.patch.dict(os.environ, {"R1_OPENING_NO_HEARING_CHECK": "0"}):
+            run = await self.opening()
+            await self.until(lambda: len(run.session.spoken) == 1)
+            self.assertEqual(run.session.spoken, [run.interview.render_line("L-OPEN-HELLO")])
+            await self.settle()
+            self.assertEqual(len(run.session.spoken), 1)
+
+    async def test_sound_check_off_uses_original_opening(self):
+        for value in ("0", "1"):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {
+                "R1_OPENING_SOUND_CHECK": "0", "R1_OPENING_NO_HEARING_CHECK": value
+            }):
+                run = await self.opening()
+                await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+                self.assertEqual(run.session.spoken, [run.interview.render_line("L-OPEN")])
+
+    async def test_base_agenda_when_brief_wording_off(self):
+        with mock.patch.dict(os.environ, {"R1_BRIEF_WORDING_V2": "0",
+                                        "R1_OPENING_NO_HEARING_CHECK": "1"}):
+            run = await self.opening()
+            await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+            self.assertEqual(run.session.spoken[1], r1_script.LINES["L-OPEN-AGENDA-PLAIN"])
+
+    def test_flag_defaults_and_rollbacks(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(r1_session.opening_no_hearing_check_enabled())
+        with mock.patch.dict(os.environ, {"R1_OPENING_NO_HEARING_CHECK": "0"}):
+            self.assertFalse(r1_session.opening_no_hearing_check_enabled())
+        with mock.patch.dict(os.environ, {"R1_OPENING_SOUND_CHECK": "0"}):
+            self.assertFalse(r1_session.opening_no_hearing_check_enabled())
+
+
 class TestTheOpeningSoundCheck(R1TestCase):
     """M032 S7C (SWEEP-35, ``R1_OPENING_SOUND_CHECK``, pattern P33).  L-OPEN was one 29 s block with
     no greeting exchange and no hearing check.  The driver says a short hello ("Can you hear me
@@ -11940,6 +12049,9 @@ class TestTheOpeningSoundCheck(R1TestCase):
 
     async def asyncSetUp(self) -> None:
         await super().asyncSetUp()
+        patcher = mock.patch.dict(os.environ, {"R1_OPENING_NO_HEARING_CHECK": "0"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         for name, value in (
             ("OPEN_CHECK_SILENCE_SECONDS", 0.2),
             ("OPEN_HELLO_FOLLOW_SECONDS", 0.6),

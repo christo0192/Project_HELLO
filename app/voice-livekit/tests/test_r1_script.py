@@ -284,6 +284,7 @@ class UnknownNameTests(unittest.TestCase):
         expected = {
             "L-OPEN": "Hi, I'm Christy, an AI interviewer from Interview Kickstart, and I'll",
             "L-OPEN-HELLO": "Hi, I'm Christy, an AI interviewer from Interview Kickstart. Can you",
+            "L-OPEN-HI": "Hi, I'm Christy, an AI interviewer from Interview Kickstart.",
             "L-TRANSITION": "Thank you. Next, let's do a sales role-play. I'll play",
             "L-TRANSITION-V20": (
                 "Thank you. We'll now move to the role-play. I'll play a prospective"
@@ -606,6 +607,17 @@ class OpeningSoundCheckLineTests(unittest.TestCase):
     shorter agenda.  Every text is word for word the spec's (owner and HR review, D-M032-4)."""
 
     AGENDAS = ("L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-CONTINUE")
+
+    def test_hello_without_hearing_check(self):
+        self.assertEqual(placeholders("L-OPEN-HI"), {"first_name"})
+        self.assertFalse(is_candidate_free("L-OPEN-HI"))
+        self.assertEqual(line("L-OPEN-HI", first_name="Arjun"),
+                         "Hi Arjun, I'm Christy, an AI interviewer from Interview Kickstart.")
+        self.assertEqual(line("L-OPEN-HI", first_name=""),
+                         "Hi, I'm Christy, an AI interviewer from Interview Kickstart.")
+        self.assertNotIn("?", LINES["L-OPEN-HI"])
+        self.assertNotIn("hear", LINES["L-OPEN-HI"].lower())
+        self.assertIn("AI interviewer", LINES["L-OPEN-HI"])
 
     def test_the_texts_word_for_word(self):
         self.assertEqual(

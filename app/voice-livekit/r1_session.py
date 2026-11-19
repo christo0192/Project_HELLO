@@ -786,7 +786,7 @@ _LIVE_PHASES = frozenset(
 # wrap-up loop, so _warm_order adds it while R1_WARM_SAY_LINES is on.
 _WARM_ORDER = (
     # M032 S7C (SWEEP-35): the agendas and the hello again come first: they play a few seconds into
-    # the interview.  The hello itself carries the name and is spoken at once, like L-OPEN.
+    # the interview. L-OPEN-HELLO and L-OPEN-HI carry the name and are spoken at once, like L-OPEN.
     "L-OPEN-AGENDA",
     "L-OPEN-AGENDA-PLAIN",
     "L-OPEN-AGENDA-CONTINUE",
@@ -1149,6 +1149,14 @@ def opening_sound_check_enabled() -> bool:
     with a sound check ("Can you hear me okay?"), then a shorter agenda.  Rollback: ``fly secrets
     set R1_OPENING_SOUND_CHECK=0 -a project-hello-voice`` (L-OPEN, exactly as before)."""
     return _env_switch(os.getenv("R1_OPENING_SOUND_CHECK"))
+
+
+def opening_no_hearing_check_enabled() -> bool:
+    """``R1_OPENING_NO_HEARING_CHECK`` (default on; owner 2026-11-19): with the sound check on,
+    the hello drops "Can you hear me okay?" (L-OPEN-HI) and the plain agenda follows at once:
+    no question, no wait, no reply reading. Rollback: ``fly secrets set
+    R1_OPENING_NO_HEARING_CHECK=0 -a project-hello-voice`` (today's sound check)."""
+    return opening_sound_check_enabled() and _env_switch(os.getenv("R1_OPENING_NO_HEARING_CHECK"))
 
 
 def mute_aside_v2_enabled() -> bool:
@@ -5148,6 +5156,8 @@ class R1Interview:
                 dropped.discard("L-PRESENT")  # M032 S6: said at a presence-check boundary too
         if not opening_sound_check_enabled():
             dropped |= _SOUND_CHECK_LINES
+        elif opening_no_hearing_check_enabled():
+            dropped |= _SOUND_CHECK_LINES - {"L-OPEN-AGENDA-PLAIN"}  # Only the plain agenda plays.
         if not no_audio_ladder_enabled():
             dropped |= _NO_AUDIO_LINES
         dropped |= {"L-MUTE"} if mute_aside_v2_enabled() else _MUTE_V2_LINES
@@ -10752,16 +10762,34 @@ class R1Interview:
         (``_sound_check``): a short hello that asks whether the candidate can hear Christy, their
         reply read in code, then one agenda.  The reply is no icebreaker answer
         (``_sound_check_open`` and ``_sound_check_rows``), and an early answer is counted once,
-        here.
+        here. With ``R1_OPENING_NO_HEARING_CHECK`` on, the hello and plain agenda play at once.
         """
         if not opening_sound_check_enabled():
             await self.say("L-OPEN")
             return None
+        if opening_no_hearing_check_enabled():
+            return await self._hello_then_agenda()
         self._sound_check_open = True
         try:
             return await self._sound_check()
         finally:
             self._sound_check_open = False
+
+    async def _hello_then_agenda(self) -> None:
+        """Say L-OPEN-HI and the plain agenda at once (``R1_OPENING_NO_HEARING_CHECK``).
+
+        Early answers are counted as on L-OPEN by ``_count_icebreaker_answer``; a never-heard
+        candidate is handled by the icebreaker's existing no-audio ladder.
+        """
+        await self.say("L-OPEN-HI")
+        _log.info(
+            "unknown_event",
+            error_type="r1_opening",
+            error_category="no_hearing_check",
+            schema="L-OPEN-AGENDA-PLAIN",
+        )
+        await self.say("L-OPEN-AGENDA-PLAIN")
+        return None
 
     def _take_queued_turns(self) -> list[str]:
         """The finals the driver has not read yet (said over the line that just played)."""

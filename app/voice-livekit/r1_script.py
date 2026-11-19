@@ -88,6 +88,8 @@ TRANSITION_QUIET_FALLBACK = "Fair enough."
 # ONE shorter agenda from this shared body.  The owner's durations are kept word for word ("about
 # thirty minutes", "up to twenty minutes"); the two filler durations are gone.  The agenda asks the
 # icebreaker plan's first objective, as L-OPEN did.
+# With R1_OPENING_NO_HEARING_CHECK on (default; owner 2026-11-19), L-OPEN-HI drops the hearing
+# question and the plain agenda follows at once.
 OPEN_HEARD = "Good, I can hear you. "
 OPEN_PLAIN = "Let's get started. "
 OPEN_AGENDA = (
@@ -143,6 +145,9 @@ LINES: dict[str, str] = {
     "L-OPEN-HELLO-AGAIN": (
         "Sorry about that. Please check your speaker or headphone volume. Can you hear me now?"
     ),
+    # Owner 2026-11-19 (R1_OPENING_NO_HEARING_CHECK): the hello without "Can you hear me okay?";
+    # spoken live (it carries the name), then L-OPEN-AGENDA-PLAIN.
+    "L-OPEN-HI": "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart.",
     "L-OPEN-AGENDA": OPEN_HEARD + OPEN_AGENDA + OPEN_FIRST_QUESTION,
     "L-OPEN-AGENDA-PLAIN": OPEN_PLAIN + OPEN_AGENDA + OPEN_FIRST_QUESTION,
     "L-OPEN-AGENDA-CONTINUE": OPEN_HEARD + OPEN_AGENDA + OPEN_CARRY_ON,

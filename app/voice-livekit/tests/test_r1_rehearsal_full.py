@@ -34,6 +34,34 @@ if str(HERE) not in sys.path:
 from rehearsal import vloop
 
 
+def _transition_prefix_matches(said: list[str], planned: list[str], *, allow_drop: bool) -> bool:
+    """Match the replay prefix, optionally skipping planned repeat requests."""
+    if not allow_drop:
+        return said[:len(planned)] == planned[:len(said)]
+    index = 0
+    for act in said:
+        while index < len(planned) and planned[index] == "repeat_request" and act != planned[index]:
+            index += 1
+        if index == len(planned):
+            return True  # Fallback turns may follow the replay.
+        if act != planned[index]:
+            return False
+        index += 1
+    return True  # The replay may run out before all planned moves are spoken.
+
+
+class TransitionPrefixTests(unittest.TestCase):
+    def test_only_repeat_requests_can_be_dropped(self) -> None:
+        planned = ["other", "repeat_request", "ready"]
+        self.assertTrue(_transition_prefix_matches(["other", "ready"], planned, allow_drop=True))
+        self.assertFalse(_transition_prefix_matches(["other", "ready"], planned, allow_drop=False))
+        self.assertFalse(_transition_prefix_matches(["ready"], planned, allow_drop=True))
+        self.assertFalse(_transition_prefix_matches(["ready", "other"], planned, allow_drop=True))
+        self.assertFalse(_transition_prefix_matches(["other", "wrong"], planned, allow_drop=True))
+        self.assertTrue(_transition_prefix_matches(["other"], planned, allow_drop=True))
+        self.assertTrue(_transition_prefix_matches(["other", "ready", "ready"], planned, allow_drop=True))
+
+
 # ------------------------------------------------------------------------------ virtual clock
 class VirtualLoopTests(unittest.TestCase):
     def test_a_long_sleep_takes_no_real_time_and_moves_the_loop_clock(self) -> None:
@@ -724,6 +752,7 @@ class OfflineFullInterviewTests(unittest.TestCase):
 
     def test_manual_replays_follow_their_moves_in_order(self) -> None:
         from rehearsal import manual
+        from rehearsal.flags import REPEAT_IF_UNANSWERED, on
         from rehearsal.scenarios import SCENARIOS
 
         for number in range(1, 11):
@@ -746,7 +775,12 @@ class OfflineFullInterviewTests(unittest.TestCase):
                     t["act"] for t in record["candidate_turns"] if t["phase"] == "transition" and t["role"] == "candidate"
                 ]
                 planned_transition = [m.act for m in moves if m.phase == "transition" and m.act != "ready_button"]
-                self.assertEqual(transition[: len(planned_transition)], planned_transition[: len(transition)])
+                self.assertTrue(
+                    _transition_prefix_matches(
+                        transition, planned_transition, allow_drop=on(REPEAT_IF_UNANSWERED)
+                    ),
+                    f"transition={transition}, planned={planned_transition}",
+                )
 
     def test_the_mix_samples_the_catalogue(self) -> None:
         from rehearsal import manual
