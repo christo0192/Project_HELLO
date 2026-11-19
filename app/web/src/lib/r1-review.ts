@@ -6,8 +6,9 @@
  * Staff-only. It sits beside `lib/r1.ts` on purpose, NOT in `lib/r1/` (the candidate side).
  *
  * Speakers. The worker stores the voice of an AI turn (`ai_voice`, 0136). An older turn has none, so
- * there the phase stands in for it: the learner speaks in the role-play, Christy everywhere else. That
- * is the scorer's own proxy (`r1SpeakerLabel`, API), and it can be wrong for a reply inside an aside.
+ * there the phase stands in for it: the learner speaks in the role-play, the interviewer (Dex)
+ * everywhere else. That is the scorer's own proxy (`r1SpeakerLabel`, API), and it can be wrong for
+ * a reply inside an aside.
  *
  * Talk. A bar needs a stored end that can be stood behind. A cut AI line's end is the latest its audio
  * can have stopped, so it can run late by the silence in that line (0136): it stays a tick, because
@@ -101,7 +102,9 @@ export const R1_PLAYBACK_RATES = [0.75, 1, 1.25, 1.5, 1.75, 2] as const;
 
 /* ── Speakers ─────────────────────────────────────────────────────── */
 
-export const R1_INTERVIEWER_LABEL = 'Christy (AI interviewer)';
+// The R1 interviewer is Dex (owner, 2026-11-19); ai_voice `interviewer` maps to this label.
+// Earlier transcripts retain the words spoken at the time and are shown verbatim, never rewritten.
+export const R1_INTERVIEWER_LABEL = 'Dex (AI interviewer)';
 
 /** "Priya Nair (AI learner)"; "AI learner" when the worker's log does not name her. */
 export function learnerLabel(name: string | null): string {

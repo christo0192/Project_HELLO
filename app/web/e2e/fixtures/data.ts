@@ -1613,7 +1613,7 @@ export const R1_REVIEW_SEEK_SEC = 70;
 const R1_ROLEPLAY_START_SEC = 300;
 
 const R1_REVIEW_LINES: ReadonlyArray<[number, 'bot' | 'candidate', R1ReviewTurn['phase'], string]> = [
-  [5, 'bot', 'opening', 'Hello Naveen, I am Christy, the AI interviewer for this round. Thank you for joining.'],
+  [5, 'bot', 'opening', 'Hello Naveen, I am Dex, the AI interviewer for this round. Thank you for joining.'],
   [24, 'candidate', 'opening', 'Thank you. Happy to be here.'],
   [32, 'bot', 'icebreaker', 'To start, tell me a little about the work you do today.'],
   [R1_REVIEW_SEEK_SEC, 'candidate', 'icebreaker', 'I look after inbound enquiries for an education company, and I enjoy working out what people really need.'],

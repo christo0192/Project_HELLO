@@ -122,7 +122,7 @@ function tablesFor(overrides: Partial<Tables> = {}): Tables {
       combined_key: 'r1/secret/key.mp4', combined_etag: 'SECRET-ETAG', upload_id: 'SECRET-UPLOAD',
     }],
     transcript_turns: [
-      { session_id: SESSION_1, turn_index: 0, speaker: 'bot', text: 'Hello, I am Christy.', turn_started_at_ms: 1_800_000_001_000, turn_ended_at_ms: 1_800_000_003_500, ai_voice: 'interviewer', ai_played_ms: 2400, is_gate: false, phase: 'opening', interrupted: false, source_item_id: 'SECRET-ITEM' },
+      { session_id: SESSION_1, turn_index: 0, speaker: 'bot', text: 'Hello, I am Dex.', turn_started_at_ms: 1_800_000_001_000, turn_ended_at_ms: 1_800_000_003_500, ai_voice: 'interviewer', ai_played_ms: 2400, is_gate: false, phase: 'opening', interrupted: false, source_item_id: 'SECRET-ITEM' },
       { session_id: SESSION_1, turn_index: 1, speaker: 'candidate', text: 'Tell me about your goals.', turn_started_at_ms: 1_800_000_005_000, turn_ended_at_ms: null, ai_voice: null, ai_played_ms: null, is_gate: false, phase: 'roleplay', interrupted: true, source_item_id: 'SECRET-ITEM' },
     ],
     assessments: [
@@ -270,7 +270,7 @@ describe('what the answer carries', () => {
     });
     expect(attempt.recording).toMatchObject({ state: 'ready', mode: 'single', has_video: true, started_at_ms: 1_800_000_000_000, duration_ms: 1_500_000 });
     expect(attempt.turns).toEqual([
-      { turn_index: 0, speaker: 'bot', text: 'Hello, I am Christy.', turn_started_at_ms: 1_800_000_001_000, turn_ended_at_ms: 1_800_000_003_500, ai_voice: 'interviewer', ai_played_ms: 2400, is_gate: false, phase: 'opening', interrupted: false },
+      { turn_index: 0, speaker: 'bot', text: 'Hello, I am Dex.', turn_started_at_ms: 1_800_000_001_000, turn_ended_at_ms: 1_800_000_003_500, ai_voice: 'interviewer', ai_played_ms: 2400, is_gate: false, phase: 'opening', interrupted: false },
       { turn_index: 1, speaker: 'candidate', text: 'Tell me about your goals.', turn_started_at_ms: 1_800_000_005_000, turn_ended_at_ms: null, ai_voice: null, ai_played_ms: null, is_gate: false, phase: 'roleplay', interrupted: true },
     ]);
   });
