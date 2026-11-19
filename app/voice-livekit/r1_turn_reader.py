@@ -85,6 +85,7 @@ __all__ = [
     "READER_LABELS",
     "READER_PHASES",
     "READER_PROMPT_VERSION",
+    "READER_PROMPT_REVISION_CHRISTY",
     "READER_SESSION_MAX_CALLS",
     "READER_SHADOW_MAX_BYTES",
     "READER_SHADOW_MAX_ROWS",
@@ -176,8 +177,9 @@ READER_SHADOW_MEMORY_ROWS = 400
 READER_SPECULATIVE_STARTS_PER_ROW = 3
 READER_SPECULATIVE_MAX_CALLS = 120
 READER_SESSION_MAX_CALLS = 200
-# Bump when READER_SYSTEM or a context line changes, so the owner's data names its prompt.
+# Bump the persona's own revision when its prompt or a context line changes.
 READER_PROMPT_REVISION = 3
+READER_PROMPT_REVISION_CHRISTY = 2
 
 READER_SYSTEM = (
     "You label ONE turn spoken by a job candidate in a recorded interview. The interviewer, "
@@ -254,8 +256,11 @@ def _prompt_sha() -> str:
 
 
 def reader_prompt_version() -> str:
-    """Follow R1_INTERVIEWER_DEX; 0 gives the Christy text."""
-    return f"r1-reader-v{READER_PROMPT_REVISION}+{_prompt_sha()[:12]}"
+    """Follow R1_INTERVIEWER_DEX; 0 gives the Christy label (revision 2) exactly as before."""
+    revision = (
+        READER_PROMPT_REVISION if interviewer_dex_enabled() else READER_PROMPT_REVISION_CHRISTY
+    )
+    return f"r1-reader-v{revision}+{_prompt_sha()[:12]}"
 
 
 READER_PROMPT_VERSION = reader_prompt_version()

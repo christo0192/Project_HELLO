@@ -7,6 +7,7 @@ It also covers Dex model prompts, agent instructions and voice defaults. No live
 r1_session falls back to Agent = object. Synthetic names only.
 """
 import itertools
+import json
 import os
 import string
 import unittest
@@ -151,9 +152,11 @@ class TestPersonaPrompts(unittest.TestCase):
                 "synthetic", phase="transition", seed="s", turn=1)
             self.assertNotIn("christy", str(reader_messages).casefold())
             self.assertEqual(r1_turn_reader.READER_PROMPT_REVISION, 3)
+            self.assertEqual(r1_turn_reader.READER_PROMPT_REVISION_CHRISTY, 2)
             self.assertTrue(r1_session.r1_agent_instructions().startswith("You are Dex."))
             explicit = r1_prompts.interviewer_prefix(name="Christy")
         with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}, clear=True):
+            self.assertTrue(r1_turn_reader.reader_prompt_version().startswith("r1-reader-v2+"))
             self.assertEqual(explicit, r1_prompts.interviewer_prefix())
             self.assertTrue(explicit.startswith("You are Christy, an AI interviewer"))
             self.assertEqual(r1_prompts.wrapup_note(), r1_prompts.WRAPUP_NOTE)
@@ -282,3 +285,37 @@ class TestInterviewerAddressDetectors(unittest.TestCase):
             self.assertFalse(tracker.is_short_wrap_yes("Yes desk"))
             self.assertFalse(tracker.is_bare_yes("Yes desk"))
             self.assertFalse(tracker.strictly_names_end("Please end the interview, desk."))
+
+
+class TestSessionVoiceMismatch(unittest.TestCase):
+    def test_session_warnings(self):
+        cases = [
+            ({}, True, "legacy_voice"),
+            ({"R1_INTERVIEWER_DEX": "0"}, True, None),
+            ({}, False, None),
+            ({"R1_TTS_INTERVIEWER_VOICE": "simran_en_customer"}, False, "voice_not_male"),
+        ]
+        for env, fallback, expected in cases:
+            with self.subTest(env=env, fallback=fallback), mock.patch.dict(
+                os.environ, env, clear=True
+            ):
+                lines = []
+
+                def build(voice_set, on_fallback=None):
+                    if fallback:
+                        return object()
+                    return type("FakeTTS", (), {"r1_voice_set": voice_set})()
+
+                def writer(raw):
+                    lines.append(json.loads(raw))
+
+                with mock.patch.object(r1_session._log, "_writer", writer):
+                    r1_session._build_session_tts(build)
+                warnings = [line for line in lines
+                            if line.get("error_type") == "r1_interviewer_voice_mismatch"]
+                self.assertEqual([line.get("error_category") for line in warnings],
+                                 [] if expected is None else [expected])
+                self.assertNotIn("simran_en_customer", json.dumps(warnings))
+                events = [(line.get("error_type"), line.get("error_category")) for line in lines]
+                if fallback:
+                    self.assertIn(("r1_tts_profile", "v3"), events)

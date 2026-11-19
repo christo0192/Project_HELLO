@@ -44,6 +44,9 @@ R1's two voices (owner decision 2026-10-30) are resolved here too, in pure code:
   (``bind_voice``): ``r1_sarvam.R1SarvamTTS.stream`` reads it, so concurrent speeches never
   cross voices and the session's TTS instance is never mutated.
 
+Under Dex the v3 rollback must be paired with ``R1_INTERVIEWER_DEX=0`` (v3 is female Simran);
+a mismatch is logged by r1_session as ``r1_interviewer_voice_mismatch``.
+
 This module logs nothing and imports no R1 module except the stdlib-only r1_script (the persona
 flag). ``r1_session`` supplies the callbacks and turns the voice set's ``notes`` into log lines.
 """
@@ -178,7 +181,17 @@ V4_SPEAKERS = frozenset(
     }
 )
 
+# Dex is male (owner 2026-11-19); an id missing here only logs a warning.
+V4_MALE_SPEAKERS = frozenset({
+    "deven_en_conversation", "dev_en_conversational", "dev_en_recovery",
+    "ashwin_en_sports", "ashwin_en_sports_energetic", "kalpit_en_edtech",
+    "nachiket_en_ads", "rohan_en_recovery", "rustom_en_suspense",
+    *(speaker for speaker in V4_SPEAKERS if speaker.startswith("shubh_en_")),
+})
+
 NOTE_PROFILE_UNKNOWN = "profile_unknown"
+NOTE_DEX_LEGACY_VOICE = "legacy_voice"
+NOTE_DEX_VOICE_NOT_MALE = "voice_not_male"
 
 
 def voice_role(voice: Any) -> str:
@@ -255,6 +268,8 @@ def r1_voice_set() -> R1VoiceSet:
     """R1's voices for this session, read from the environment (once per session).
 
     The v4 defaults follow ``R1_INTERVIEWER_DEX``.
+    Under Dex the v3 rollback must be paired with ``R1_INTERVIEWER_DEX=0`` (v3 is female
+    Simran); a mismatch is logged by r1_session as ``r1_interviewer_voice_mismatch``.
 
     ``R1_TTS_PROFILE`` unset, empty or ``v4`` is the v4 set; ``v3`` is the legacy set; any other
     value is the legacy set too, noted ``profile_unknown`` (an unknown value is most likely a
@@ -277,6 +292,22 @@ def r1_voice_set() -> R1VoiceSet:
         {"model": V4_MODEL, "speaker": learner, "pace": V4_PACE},
         tuple(notes),
     )
+
+
+def interviewer_voice_mismatch(voice_set: R1VoiceSet) -> str | None:
+    """The reason Dex (``R1_INTERVIEWER_DEX`` on) would speak a non-male voice, or None.
+
+    ``legacy_voice``: the v3 set (``R1_TTS_PROFILE=v3``, an unknown profile, or the v4 build
+    fallback); ``voice_not_male``: an interviewer override outside ``V4_MALE_SPEAKERS``.  The
+    voice is never changed here; the v3 rollback is paired with ``R1_INTERVIEWER_DEX=0``.
+    """
+    if not interviewer_dex_enabled():
+        return None
+    if voice_set.profile != PROFILE_V4:
+        return NOTE_DEX_LEGACY_VOICE
+    if voice_set.speaker(INTERVIEWER) not in V4_MALE_SPEAKERS:
+        return NOTE_DEX_VOICE_NOT_MALE
+    return None
 
 
 # Whose line the TTS of THIS task is speaking.  Set by ``r1_session`` at the top of its

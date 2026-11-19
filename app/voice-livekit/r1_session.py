@@ -386,6 +386,7 @@ from r1_tts import (
     bind_voice,
     flush_min_chars,
     flush_tts,
+    interviewer_voice_mismatch,
     legacy_voice_set,
     r1_voice_set,
 )
@@ -3428,7 +3429,7 @@ async def _default_session_factory(_ctx: Any, _context: dict[str, Any]) -> Any:
     line names the anchor and the minimum in use.
 
     The voices (owner decision 2026-10-30) are read ONCE here (``r1_voice_set``): v4 is one
-    ``R1SarvamTTS`` speaking Christy and the learner per speech, v3 (the rollback) is
+    ``R1SarvamTTS`` speaking the interviewer and the learner per speech, v3 (the rollback) is
     ``sarvam.TTS(**r1_tts_kwargs())`` exactly as before (``r1_sarvam.build_r1_tts``).  The STT
     model is R1's own switch (``r1_stt_model``): saaras:v4 unless it is set (saaras:v3 rollback).
     """
@@ -3496,6 +3497,14 @@ def _build_session_tts(build: Callable[..., Any]) -> Any:
     voice_set = getattr(tts, "r1_voice_set", None)
     if not isinstance(voice_set, R1VoiceSet):
         voice_set = legacy_voice_set()  # what a plain TTS speaks, and what the cache keys on
+    mismatch = interviewer_voice_mismatch(voice_set)
+    if mismatch is not None:
+        # Dex on, but a female or legacy voice (owner 2026-11-19: Dex is male); labels only.
+        _log.warn(
+            "unknown_event",
+            error_type="r1_interviewer_voice_mismatch",
+            error_category=mismatch,
+        )
     _log.info(
         "unknown_event",
         error_type="r1_tts_profile",

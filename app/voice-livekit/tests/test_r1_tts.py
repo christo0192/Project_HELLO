@@ -605,5 +605,32 @@ class TestBoundVoice(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await asyncio.create_task(speech()))
 
 
+class TestInterviewerVoiceMismatch(unittest.TestCase):
+    def test_male_speakers(self):
+        self.assertLessEqual(r1_tts.V4_MALE_SPEAKERS, r1_tts.V4_SPEAKERS)
+        self.assertIn(r1_tts.V4_DEFAULT_SPEAKERS[r1_tts.INTERVIEWER], r1_tts.V4_MALE_SPEAKERS)
+        self.assertNotIn("simran_en_customer", r1_tts.V4_MALE_SPEAKERS)
+        self.assertNotIn("zarina_en_conversation", r1_tts.V4_MALE_SPEAKERS)
+
+    def test_mismatches(self):
+        cases = [
+            ({}, False, None),
+            ({"R1_TTS_PROFILE": "v3"}, False, "legacy_voice"),
+            ({"R1_TTS_PROFILE": "unknown"}, False, "legacy_voice"),
+            ({}, True, "legacy_voice"),
+            ({"R1_TTS_INTERVIEWER_VOICE": "simran_en_customer"}, False, "voice_not_male"),
+            ({"R1_TTS_INTERVIEWER_VOICE": "shubh_en_narration"}, False, None),
+            ({"R1_INTERVIEWER_DEX": "0"}, False, None),
+            ({"R1_INTERVIEWER_DEX": "0", "R1_TTS_PROFILE": "v3"}, False, None),
+            ({"R1_INTERVIEWER_DEX": "0"}, True, None),
+        ]
+        for env, fallback, expected in cases:
+            with self.subTest(env=env, fallback=fallback), mock.patch.dict(
+                os.environ, env, clear=True
+            ):
+                voices = r1_tts.legacy_voice_set() if fallback else r1_tts.r1_voice_set()
+                self.assertEqual(r1_tts.interviewer_voice_mismatch(voices), expected)
+
+
 if __name__ == "__main__":
     unittest.main()

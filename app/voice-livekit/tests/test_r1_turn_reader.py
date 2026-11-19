@@ -503,10 +503,14 @@ class MessagesTests(unittest.TestCase):
     def test_the_prompt_version_is_pinned(self):
         # Changing the prompt changes what the owner's comparison means: bump the version on
         # purpose (r1_turn_reader.READER_PROMPT_REVISION) and update this pin.
-        self.assertEqual(READER_PROMPT_VERSION, "r1-reader-v3+" + r1_turn_reader._prompt_sha()[:12])
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                r1_turn_reader.reader_prompt_version(), "r1-reader-v3+" + PINNED_PROMPT_SHA
+            )
         self.assertEqual(r1_turn_reader._prompt_sha()[:12], PINNED_PROMPT_SHA)
         with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
             self.assertEqual(r1_turn_reader._prompt_sha()[:12], PINNED_PROMPT_SHA_CHRISTY)
+            self.assertEqual(r1_turn_reader.reader_prompt_version(), "r1-reader-v2+a015037dcc35")
 
 
 PINNED_PROMPT_SHA = "4381c2cb5af3"

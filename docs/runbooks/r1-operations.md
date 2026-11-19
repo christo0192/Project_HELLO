@@ -1506,7 +1506,8 @@ Switches (optional; timing of reads is noted for the M033 switches):
 | `R1_TTS_FLUSH_MIN_CHARS` | 60 | Early-flush length cap; `0` turns the early-flush `tts_node` off |
 | `R1_LINE_CACHE` | on | `off` speaks every scripted line live, as before PR-4c |
 | `R1_SYNTH_PER_MIN` | 5 | Background Sarvam syntheses started per minute (1-30); raise only after the Sarvam tier is confirmed (D13) |
-| `R1_TTS_PROFILE` | v4 | R1's voices, both at once (read once per session): `v4` is Bulbul v4 Flash (Christy `simran_en_customer`, the learner `zarina_en_conversation`), `v3` is the old voice (`SARVAM_TTS_MODEL` / `SARVAM_TTS_VOICE`) for both; any other value is v3. A Fly **secret** only. **Rollback: `fly secrets set R1_TTS_PROFILE=v3 -a project-hello-voice`** in a zero-live window. See "Voices: Bulbul v4 Flash" below |
+| `R1_TTS_PROFILE` | v4 | R1's voices, both at once (read once per session): `v4` is Bulbul v4 Flash (the interviewer Dex `deven_en_conversation`, or Christy `simran_en_customer` with `R1_INTERVIEWER_DEX=0`, the learner `zarina_en_conversation`), `v3` is the old voice (`SARVAM_TTS_MODEL` / `SARVAM_TTS_VOICE`) for both; any other value is v3. A Fly **secret** only. **Rollback: `fly secrets set R1_TTS_PROFILE=v3 R1_INTERVIEWER_DEX=0 -a project-hello-voice`** in a zero-live window. See "Voices: Bulbul v4 Flash" below |
+| `R1_INTERVIEWER_DEX` | 1 | Dex (male) in spoken lines, prompts and the default interviewer voice `deven_en_conversation`; 0 = Christy and `simran_en_customer` exactly as before. Rollback: `fly secrets set R1_INTERVIEWER_DEX=0 -a project-hello-voice` in a zero-live window |
 | `R1_TTS_INTERVIEWER_VOICE` / `R1_TTS_LEARNER_VOICE` | empty | v4 only: swap one voice for another id in `r1_tts.V4_SPEAKERS`; anything else is ignored with `r1_tts_setting_rejected`. Fly secrets only |
 | `R1_STT_MODEL` | empty (`saaras:v4`) | R1's STT model: `saaras:v4` (default) or `saaras:v3` (the rollback); anything else falls back to `SARVAM_STT_MODEL` with `r1_stt_setting_rejected` |
 
@@ -2944,25 +2945,35 @@ exactly today's construction, and both roles speak `SARVAM_TTS_VOICE` (`simran`)
   `interviewer_voice_rejected`, `learner_voice_rejected`), `r1_tts_profile_fallback` (the v4 TTS
   could not be built; THIS session runs on v3), `r1_tts_voice_unbound` (once per session: a speech
   R1 could not identify fell back to the phase rule; after an SDK bump this means the speech-handle
-  seam moved, and Christy's lines in role-play would come out in the learner's voice).
+  seam moved, and the interviewer's lines in role-play would come out in the learner's voice);
+* `r1_interviewer_voice_mismatch` (Dex is on but the session speaks a female or legacy voice:
+  `legacy_voice` = v3 profile or v4 build fallback, `voice_not_male` = an interviewer override
+  that is not a male id).
 
 **Rollback (no redeploy).** In a zero-live window (a secret change restarts running machines and
 cuts a live interview, as for `R1_RECORDING`):
 
 ```
-fly secrets set R1_TTS_PROFILE=v3 -a project-hello-voice
+fly secrets set R1_TTS_PROFILE=v3 R1_INTERVIEWER_DEX=0 -a project-hello-voice
 ```
 
-Fly restarts the running machines with the value, and stopped pool machines take it at their next
-start. Confirm the first new session logs `r1_tts_profile` `v3`. Undo (back to v4) with
-`fly secrets unset R1_TTS_PROFILE -a project-hello-voice`. An unknown value (a typo such as `V 3`)
-is v3 too, logged `profile_unknown`: the known-good voice wins.
+The v3 Simran voice is female, so turn Dex off with the v3 rollback. Fly restarts the running
+machines with the values, and stopped pool machines take them at their next start. Confirm the
+first new session logs `r1_tts_profile` `v3` and no `r1_interviewer_voice_mismatch`. Undo (back
+to v4 and Dex) with `fly secrets unset R1_TTS_PROFILE R1_INTERVIEWER_DEX -a project-hello-voice`.
+An unknown value (a typo such as `V 3`) is v3 too, logged `profile_unknown`: the known-good voice
+wins.
 
 **Swap one voice** (v4 only): `fly secrets set R1_TTS_LEARNER_VOICE=<id> -a project-hello-voice`
 (or `R1_TTS_INTERVIEWER_VOICE`). The id must be in `r1_tts.V4_SPEAKERS`, the English ids the live
 server listed for bulbul:v4-flash; anything else keeps the default and logs
-`learner_voice_rejected`. Adding an id is a code change on purpose: the plugin does not validate
+`learner_voice_rejected`. With Dex on, the interviewer id must also be in
+`r1_tts.V4_MALE_SPEAKERS`: a female id is still used, but logs `r1_interviewer_voice_mismatch`
+`voice_not_male`. Adding an id is a code change on purpose: the plugin does not validate
 v4 ids, and a wrong one is dead air on every line (an in-band 400, retried three times).
+
+**Pre-deploy check.** `fly secrets list -a project-hello-voice` (names only) must show no leftover
+`R1_TTS_INTERVIEWER_VOICE`.
 
 **Never split the model from the voice, and never point `SARVAM_TTS_MODEL` at bulbul:v4-flash.**
 Both half-flips fail badly on plugin 1.6.4: bulbul:v3 with a v4 id raises at session start, and
