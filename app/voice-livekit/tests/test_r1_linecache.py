@@ -507,6 +507,16 @@ class TestLineCacheWarm(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events.of("warm_done")[0][2]["count"], 2)
         self.assertEqual(cache.size, 2)
 
+    async def test_interviewer_personas_have_distinct_cache_keys(self) -> None:
+        import r1_script
+
+        cache, *_ = make_cache(FakeSynthesizer(), directory=self.directory)
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "1"}):
+            dex = r1_script.line("L-OPEN-HI", first_name="Asha")
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
+            christy = r1_script.line("L-OPEN-HI", first_name="Asha")
+        self.assertNotEqual(cache.key(dex), cache.key(christy))
+
     async def test_only_a_candidate_free_line_is_written_to_disk(self) -> None:
         cache, *_ = make_cache(FakeSynthesizer(), directory=self.directory)
         await cache.warm(self.SPECS)

@@ -29,6 +29,8 @@ import string
 from typing import Any
 
 INTERVIEWER_NAME = "Christy"
+# Owner 2026-11-19, R1_INTERVIEWER_DEX: Dex is a male interviewer.
+INTERVIEWER_NAME_DEX = "Dex"
 
 # M032 S6 (owner go of 2026-11-11, test fda9e9f6 #23-#31; SWEEP-30): ONE body for every brief, so
 # the first brief, the brief after Christy's own reaction (S5's bridge), the replay and the short
@@ -535,6 +537,13 @@ LINES: dict[str, str] = {
     "L-IB-HOLD": "Of course, take a moment. I'm here when you're ready.",
 }
 
+# Owner 2026-11-19, R1_INTERVIEWER_DEX: swap the name in each Christy line.
+# No line has an interviewer pronoun; placeholders remain unchanged.
+DEX_LINES: dict[str, str] = {
+    line_id: text.replace(INTERVIEWER_NAME, INTERVIEWER_NAME_DEX)
+    for line_id, text in LINES.items() if INTERVIEWER_NAME in text
+}
+
 # M032 S6: ``R1_TRANSITION_REPAIR=0`` (the rollback) speaks each of these lines as it was before
 # S6, under its old text's id.  ``active_line_id`` is the one place that choice is made: the
 # session's ``render_line`` and the role-play engine's coach aside both go through it, so the warm
@@ -627,6 +636,33 @@ def wrap_offer_variant_enabled() -> bool:
     R1_WRAP_OFFER_VARIANT=0 -a project-hello-voice`` (L-ASIDE-WRAP for every offer).
     """
     return (os.getenv("R1_WRAP_OFFER_VARIANT") or "1").strip().lower() not in _OFF_VALUES
+
+
+def interviewer_dex_enabled() -> bool:
+    """``R1_INTERVIEWER_DEX`` (default on; owner 2026-11-19): the R1 interviewer is Dex, a male
+    interviewer.  His name is spoken in every line that names the interviewer (``DEX_LINES``), and
+    the interviewer's voice and wording read the same flag.  Read at use.  Off gives back content
+    revision 46's Christy lines exactly.  Rollback:
+    ``fly secrets set R1_INTERVIEWER_DEX=0 -a project-hello-voice``.
+    """
+    return (os.getenv("R1_INTERVIEWER_DEX") or "1").strip().lower() not in _OFF_VALUES
+
+
+def interviewer_name() -> str:
+    """Return the active interviewer name."""
+    return INTERVIEWER_NAME_DEX if interviewer_dex_enabled() else INTERVIEWER_NAME
+
+
+def interviewer_pronouns() -> tuple[str, str, str]:
+    """Return subject, object and possessive pronouns for the active interviewer."""
+    return ("he", "him", "his") if interviewer_dex_enabled() else ("she", "her", "her")
+
+
+def persona_text(line_id: str) -> str:
+    """Return the active persona's text for a reviewed line."""
+    if interviewer_dex_enabled() and line_id in DEX_LINES:
+        return DEX_LINES[line_id]
+    return LINES[line_id]
 
 
 def agenda_w3_enabled() -> bool:
@@ -768,7 +804,7 @@ def spoken_first_name(text: object) -> str:
 def placeholders(line_id: str) -> frozenset[str]:
     """The placeholder names a line uses."""
     return frozenset(
-        field for _, field, _, _ in _FORMATTER.parse(LINES[line_id]) if field
+        field for _, field, _, _ in _FORMATTER.parse(persona_text(line_id)) if field
     )
 
 
@@ -784,6 +820,8 @@ CANDIDATE_FREE_LINES = tuple(line_id for line_id in LINES if is_candidate_free(l
 def line(line_id: str, **values: Any) -> str:
     """Render a reviewed line.  ``first_name`` is sanitised; unknown ids raise KeyError.
 
+    The active interviewer persona supplies the spoken name.
+
     An unknown first name (``known_first_name`` is "": empty, rejected, or the placeholder
     "there") is not spoken: the slot is deleted with its comma, so "Thank you, {first_name}.
     We'll" reads "Thank you. We'll" and "Are you still with me, {first_name}?" reads "Are you
@@ -792,7 +830,7 @@ def line(line_id: str, **values: Any) -> str:
     Persona placeholders must be supplied (``**persona.line_values``); a missing one is a
     programming error and raises KeyError rather than speaking a literal ``{lead_name}``.
     """
-    text = LINES[line_id]
+    text = persona_text(line_id)
     needed = placeholders(line_id)
     fields: dict[str, str] = {}
     if "first_name" in needed:

@@ -334,6 +334,8 @@ from r1_roleplay import (
 )
 from r1_script import (
     INTERVIEWER_NAME,
+    INTERVIEWER_NAME_DEX,
+    interviewer_dex_enabled,
     WORDING_LINES,
     active_line_id,
     brief_variety_enabled,
@@ -4120,7 +4122,7 @@ class R1Interview:
         name = spoken_first_name(text)
         if not name:
             return
-        taken = {INTERVIEWER_NAME.lower()}
+        taken = {INTERVIEWER_NAME.lower(), INTERVIEWER_NAME_DEX.lower()}
         with contextlib.suppress(Exception):
             variant = self.persona.variant
             taken |= {variant.first_name.lower(), variant.last_name.lower()}
@@ -4154,6 +4156,10 @@ class R1Interview:
     def _record_pins(self) -> None:
         """Log which persona and which pinned content this session plays (labels only)."""
         choice = self.persona_choice
+        _log.info(
+            "unknown_event", error_type="r1_interviewer_persona",
+            error_category="dex" if interviewer_dex_enabled() else "christy",
+        )
         _log.info(
             "unknown_event",
             error_type="r1_fidelity_persona",

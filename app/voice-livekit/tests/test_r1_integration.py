@@ -532,6 +532,16 @@ class TestPinsAreRecorded(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(label, r1_session.content_log_label(CONTENT_SHA256))
         self.assertEqual(label.replace(".", ""), CONTENT_SHA256[:12])
 
+    async def test_interviewer_persona_pin_tracks_flag(self) -> None:
+        rig = Rig()
+        for value, expected in ((None, "dex"), ("0", "christy")):
+            env = {} if value is None else {"R1_INTERVIEWER_DEX": value}
+            with mock.patch.dict(os.environ, env, clear=True), capture_r1_logs() as lines:
+                rig.interview._record_pins()
+            labels = [entry["error_category"] for entry in lines
+                      if entry["error_type"] == "r1_interviewer_persona"]
+            self.assertEqual(labels, [expected])
+
     def test_a_content_label_with_ten_digits_in_a_row_is_still_logged(self) -> None:
         # Revision 24's SHA starts with 12 digits: the logger drops 10+ digits in a row as a
         # possible phone number, so the label is split after its sixth character.

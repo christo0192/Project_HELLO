@@ -277,7 +277,8 @@ import r1_world
 # Revision 44: render the upgrade condition note as a bullet.
 # 45: Keep the upgrade commitment in one sentence for scorer masking.
 # 46: L-OPEN-HI, the hello without the hearing question (R1_OPENING_NO_HEARING_CHECK).
-PINNED_CONTENT_SHA256 = "2b5f37945d8806c24847022353993f9fe4e6ea686672b0cccda3294ee711010d"
+# 47: Dex, the male interviewer, in the spoken lines (R1_INTERVIEWER_DEX, DEX_LINES).
+PINNED_CONTENT_SHA256 = "f8d5a0ac8583211c7315829960a14d20fd84392fe82f015df0e8d72b01272501"
 
 CONTENT_MODULES = (
     "r1_text",

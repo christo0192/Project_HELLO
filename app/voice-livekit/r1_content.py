@@ -408,7 +408,9 @@ import r1_world
 # 45: Keep the upgrade commitment in one sentence for scorer masking.
 # 46: owner 2026-11-19 (R1_OPENING_NO_HEARING_CHECK): L-OPEN-HI, the hello without the hearing
 #    question. No other text changed.
-CONTENT_REVISION = 46
+# 47: owner 2026-11-19 (R1_INTERVIEWER_DEX): Dex, a male interviewer, replaces Christy in the
+#    spoken lines (r1_script.DEX_LINES); the Christy texts stay as the flag-off rollback.
+CONTENT_REVISION = 47
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -869,6 +871,9 @@ def manifest() -> dict[str, Any]:
         },
         "script": {
             "interviewer_name": r1_script.INTERVIEWER_NAME,
+            # Revision 47 (R1_INTERVIEWER_DEX).
+            "interviewer_name_dex": r1_script.INTERVIEWER_NAME_DEX,
+            "dex_lines": dict(r1_script.DEX_LINES),
             "exit_cue": r1_script.EXIT_CUE,
             "lines": dict(r1_script.LINES),
             # Revision 31 (D4-BRIEF2, D4-TRANS-PRESENT1, D4-TRANS-Q1).

@@ -40,7 +40,7 @@ from r1_prompts import ROLEPLAY_PHASE, select_context
 from r1_replies import Reply
 import r1_script
 from r1_script import LEARNER_FILLER_VARIANTS
-from r1_lines import INTERVIEWER_NAME, line, safe_first_name
+from r1_lines import line, safe_first_name
 from r1_persistence import OUTCOME_DISPOSITIONS, R1TurnWriter
 from r1_phases import (
     MAX_AGENT_RESIDENCY_SEC,
@@ -869,7 +869,8 @@ class TestPhaseAndConfiguration(unittest.TestCase):
 
     def test_lines_and_llm_configuration_fail_closed(self) -> None:
         self.assertEqual(safe_first_name("not/a/name"), "there")
-        self.assertIn(INTERVIEWER_NAME, line("L-OPEN", first_name="Asha"))
+        self.assertIn(r1_script.interviewer_name(), line("L-OPEN", first_name="Asha"))
+        self.assertIn("I'm Dex,", line("L-OPEN", first_name="Asha"))
         with self.assertRaises(r1_llm.R1LLMConfigurationError):
             r1_llm.r1_llm_config(
                 {"DEEPSEEK_API_KEY": "x", "R1_LLM_BASE_URL": "https://bad.example"}
@@ -3627,7 +3628,7 @@ class TestRunFlow(R1TestCase):
         text = self.spoken_line(exit_line)
         self.assertIn("let's pause the role-play here", text.lower())
         self.assertIn("do you have any questions for me about the role or the next steps?", text)
-        self.assertEqual(text.count("Christy"), 0 if exit_line == "L-EXIT-WRAP-ASIDE" else 1)
+        self.assertEqual(text.count("Dex"), 0 if exit_line == "L-EXIT-WRAP-ASIDE" else 1)
         phases = {row["text"]: row["phase"] for row in self.bot_rows()}
         self.assertEqual(phases[text], "roleplay_exit")
         return spoken
@@ -4575,7 +4576,7 @@ class TestUnknownAndSpokenFirstName(R1TestCase):
 
     async def test_the_placeholder_name_is_dropped_from_every_line(self) -> None:
         rendered = self.spoken_lines()
-        self.assertTrue(rendered["L-OPEN"].startswith("Hi, I'm Christy,"))
+        self.assertTrue(rendered["L-OPEN"].startswith("Hi, I'm Dex,"))
         self.assertTrue(rendered["L-TRANSITION"].startswith("Thank you. Next, let's do a sales"))
         self.assertIn("for your time today. The hiring team", rendered["L-CLOSE"])
         self.assertEqual(rendered["L-SIL-IB"], "Are you still with me?")
@@ -4640,10 +4641,15 @@ class TestUnknownAndSpokenFirstName(R1TestCase):
 
     async def test_a_name_that_belongs_to_the_learner_or_the_interviewer_is_not_adopted(self) -> None:
         variant = self.interview.persona.variant
-        for name in (variant.first_name, variant.last_name, "Christy"):
+        for name in (variant.first_name, variant.last_name, "Christy", "Dex"):
             with self.subTest(name=name):
                 await self.answer(f"Hello, my name is {name}.")
                 self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me?")
+
+    async def test_dex_introduction_is_not_adopted(self) -> None:
+        self.interview.machine.phase = R1Phase.OPENING
+        self.interview._learn_spoken_name("This is Dex.")
+        self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me?")
 
     async def test_the_guard_may_repeat_the_name_the_candidate_gave(self) -> None:
         from r1_guard import guard_text
@@ -12132,7 +12138,7 @@ class TestTheOpeningSoundCheck(R1TestCase):
         run = await self.opening()
         await self.hello_played(run)
         self.assertIn("AI interviewer", run.session.spoken[0])
-        self.assertTrue(run.session.spoken[0].startswith("Hi Asha, I'm Christy"))
+        self.assertTrue(run.session.spoken[0].startswith("Hi Asha, I'm Dex"))
         self.assertFalse(run.session.handles[0].allow_interruptions)
 
     async def test_a_hi_during_the_hello_waits_for_the_answer_to_the_question(self) -> None:
@@ -12283,7 +12289,7 @@ class TestTheOpeningSoundCheck(R1TestCase):
     async def test_a_name_said_in_the_reply_is_used_from_then_on(self) -> None:
         run = await self.opening(context={"first_name": "there", "candidate_identity": "candidate"})
         await self.hello_played(run)
-        self.assertTrue(run.session.spoken[0].startswith("Hi, I'm Christy"))
+        self.assertTrue(run.session.spoken[0].startswith("Hi, I'm Dex"))
         await self.reply(run, "Yes, hi, my name is Ravi.")
         await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
         self.assertEqual(run.interview._first_name(), "Ravi")
