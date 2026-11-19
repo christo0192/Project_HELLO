@@ -622,10 +622,13 @@ class TestLearnerContext(unittest.IsolatedAsyncioTestCase):
                             probe_first=True,
                             price_check=True,
                             timeline_v2=True,
+                            timeline_v3=True,
                         ),
                     )
                     self.assertIn(
-                        rendered.public_card_text(probe_first=True, timeline_v2=True), blob
+                        rendered.public_card_text(
+                            probe_first=True, timeline_v2=True, timeline_v3=True
+                        ), blob
                     )
                     # M032 S2P (D-M032-7): she knows no course figure; she asks the advisor.
                     self.assertNotIn("$9,000", blob)
@@ -682,6 +685,7 @@ class TestLearnerContext(unittest.IsolatedAsyncioTestCase):
                     probe_first=True,
                     price_check=True,
                     timeline_v2=True,
+                    timeline_v3=True,
                 ),
             },
         )
@@ -807,6 +811,8 @@ class TestInterviewerContext(unittest.IsolatedAsyncioTestCase):
 # ----------------------------------------------------------------- scheduler and tracker
 
 
+# These fixed-sequence scenarios exercise the full-chain rollback.
+@mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "0"})
 class TestOwedMoves(unittest.IsolatedAsyncioTestCase):
     async def test_at_most_one_move_is_raised_per_turn_and_no_script_is_handed_to_the_model(
         self,
@@ -853,6 +859,9 @@ class TestOwedMoves(unittest.IsolatedAsyncioTestCase):
         reply = "Honestly, I can find most of this free on YouTube, so why would I pay for it?"
         rig = Rig()
         await rig.start_roleplay()
+        theme = rig.engine.scheduler.theme_for("F3-PRIMARY")
+        if theme is not None:
+            reply = theme.variants[0]
         await rig.converse(OPENER, advance=20)
         await rig.converse("What do you do these days?", advance=120)
         spoken = await rig.converse(
@@ -1368,6 +1377,68 @@ class TestOutputGuardInEveryPhase(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(spoken, FALLBACK_REPLY)
 
+    async def test_restatement_trim_filters_stream_without_guard_hits(self) -> None:
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                rig = Rig()
+                rig.engine._restate_trim = enabled
+                rig.engine.scheduler.mark_commitment_resolved()
+                rig.engine._commitment_level = Level.MEDIUM
+                rig.engine._plan_restatement_heard = True
+                plan = rig.engine.plan_turn("What do you think?", 700)
+                self.assertIs(plan.mode, TurnMode.LLM_REPLY)
+                reply = Reply(phase="roleplay", candidate_text="What do you think?",
+                              plan=plan, r_sec=700)
+                text = "That sounds helpful. I will check with him."
+                spoken = await self.run_reply(rig, reply, text)
+                self.assertEqual("check with him" in spoken, not enabled)
+                self.assertIn("That sounds helpful", spoken)
+                self.assertFalse(rig.interview._guard_trips)
+                count = rig.engine.admin_log()["repetition"].get("restatements_trimmed", 0)
+                self.assertEqual(count, int(enabled))
+
+    async def test_restatement_stream_releases_non_plan_before_model_finishes(self) -> None:
+        rig = Rig()
+        rig.engine.scheduler.mark_commitment_resolved()
+        rig.engine._commitment_level = Level.MEDIUM
+        rig.engine._plan_restatement_heard = True
+        plan = rig.engine.plan_turn("What do you think?", 700)
+        rig.interview._last_reply = Reply(phase="roleplay", candidate_text="What do you think?",
+                                          plan=plan, r_sec=700)
+
+        class OrderedProvider(FakeProvider):
+            finished = False
+
+            async def _stream(self, text):
+                yield SimpleNamespace(delta=SimpleNamespace(content=text), usage=None)
+                self.finished = True
+
+        provider = OrderedProvider("That sounds helpful. I will check with him. Thanks again.")
+        stream = rig.interview.llm_node_stream(SimpleNamespace(items=[]), provider)
+        first = await anext(stream)
+        self.assertEqual(first, "That sounds helpful. ")
+        self.assertFalse(provider.finished)
+        rest = "".join([chunk async for chunk in stream])
+        self.assertEqual(first + rest, "That sounds helpful. Thanks again. ")
+        self.assertEqual(rig.engine.admin_log()["repetition"]["restatements_trimmed"], 1)
+
+    async def test_restatement_stream_keeps_all_plan_sentences(self) -> None:
+        rig = Rig()
+        rig.engine.scheduler.mark_commitment_resolved()
+        rig.engine._commitment_level = Level.MEDIUM
+        rig.engine._plan_restatement_heard = True
+        plan = rig.engine.plan_turn("What do you think?", 700)
+        reply = Reply(phase="roleplay", candidate_text="What do you think?", plan=plan, r_sec=700)
+        text = "I will check with him. Please email me."
+        class SentenceProvider(FakeProvider):
+            async def _stream(self, text):
+                yield SimpleNamespace(delta=SimpleNamespace(content=text), usage=None)
+
+        rig.interview._last_reply = reply
+        stream = rig.interview.llm_node_stream(SimpleNamespace(items=[]), SentenceProvider(text))
+        self.assertEqual("".join([chunk async for chunk in stream]).strip(), text)
+        self.assertNotIn("restatements_trimmed", rig.engine.admin_log()["repetition"])
+
     async def test_the_learner_goes_through_the_guard_too(self) -> None:
         rig = Rig()
         plan = rig.engine.plan_turn(OPENER, 20)
@@ -1595,6 +1666,9 @@ class TestTheScriptedVariantIsTheFallbackOfAnIntent(unittest.IsolatedAsyncioTest
 # ------------------------------------------------------------------------- commitment
 
 
+# M033 A6: an early ask meets money or the price question only when F1 is planned; these
+# scenarios pin a four-family plan so the seeded temperament cannot drop F1.
+@mock.patch("r1_roleplay.plan_families", new=lambda *_: ("F3", "F2", "F1", "F4"))
 class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
     CALL_ASK = "Shall I send you the enrolment link so you can enrol today?"
 
@@ -1646,9 +1720,14 @@ class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
         plan = rig.plan()
         self.assertIs(plan.mode, TurnMode.SAY_ONLY)
         self.assertIn("ask_in_window", ",".join(plan.reasons))
-        self.assertEqual(
-            spoken, commitment_line(plan.commitment_level, rig.persona.decision_maker)
-        )
+        self.assertEqual(spoken, plan.scripted_text)
+        if plan.commitment_level is Level.STRONG:
+            # M033 A8: the v1 line or a v2 form (with or without the plan details).
+            dm = rig.persona.decision_maker
+            self.assertIn(spoken, {
+                commitment_line(Level.STRONG, dm, strong_v2=v2, plan=named)
+                for v2 in (False, True) for named in (False, True)
+            })
         self.assertEqual(len(rig.provider.calls), calls)
         self.assertTrue(rig.engine.commitment_resolved)
         self.assertEqual(rig.engine.commitment_level, plan.commitment_level)
@@ -1764,6 +1843,8 @@ async def owners_close(rig: Rig) -> None:
             break
 
 
+# These fixed-sequence scenarios exercise the full-chain rollback.
+@mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "0"})
 class TestTheRoleplayEndsByConsent(unittest.IsolatedAsyncioTestCase):
     """M2 (owner and manager decisions of 2026-11-03): leaving the role-play is never abrupt.
 
@@ -2217,6 +2298,27 @@ class TestCoachAsideAlwaysReturns(unittest.IsolatedAsyncioTestCase):
 # ------------------------------------------------------------------- the fidelity record
 
 
+class TestPlannedFidelityRecord(unittest.IsolatedAsyncioTestCase):
+    async def test_planned_families_through_session(self):
+        with mock.patch.dict(os.environ, {"R1_TEMPERAMENT": "1", "R1_TEMPERAMENT_PLAN": "1"}):
+            with mock.patch("r1_roleplay.plan_families", return_value=("F2", "F4")):
+                rig = await fidelity_session()
+        self.assertIsNotNone(rig.interview.persona_choice.persona.temperament)
+        rig.interview._begin_exit()
+        rig.interview._queue_fidelity()
+        await rig.flush()
+        rows = rig.writer.admin_events
+        deliveries = [row for row in rows if row["event_type"] in (
+            "family_delivered", "push_delivered", "counter_delivered"
+        )]
+        self.assertEqual({row["family_id"] for row in deliveries}, {"F2", "F4"})
+        self.assertEqual(len(deliveries), 4)
+        facts = next(row for row in rows if row["event_type"] == "session_facts")
+        self.assertEqual(facts["payload"]["families_planned"], ["F2", "F4"])
+
+
+# These fixed-sequence scenarios exercise the full-chain rollback.
+@mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "0"})
 class TestFidelityRecord(unittest.IsolatedAsyncioTestCase):
     async def full_session(self) -> Rig:
         return await fidelity_session()
@@ -2347,6 +2449,24 @@ class TestFidelityRecord(unittest.IsolatedAsyncioTestCase):
         blob = json.dumps(rig.writer.admin_events).lower()
         for word in ("commitment", "strong", "medium", "weak", "grade"):
             self.assertNotIn(word, blob)
+
+    async def test_strong_gaps_are_logged_and_never_posted(self) -> None:
+        for flag in ("1", "0"):
+            with self.subTest(flag=flag), mock.patch.dict(
+                os.environ, {"R1_STRONG_EVIDENCE_V2": flag}
+            ):
+                rig = await self.full_session()
+                with capture_r1_logs() as lines:
+                    rig.interview._begin_exit()
+                    rig.interview._queue_fidelity()
+                    await rig.flush()
+                gaps = [e["error_category"] for e in lines
+                        if e["error_type"] == "r1_fidelity_strong_gap"]
+                if flag == "1":
+                    self.assertEqual(gaps, rig.engine.admin_log()["strong_gaps"] or ["none"])
+                else:
+                    self.assertEqual(gaps, [])
+                self.assertNotIn("strong_gaps", json.dumps(rig.writer.admin_events))
 
     async def test_the_session_logs_its_move_deliveries_as_they_happen(self) -> None:
         rig = Rig()
@@ -2556,6 +2676,8 @@ class TestAdminLogWriter(unittest.IsolatedAsyncioTestCase):
 # ------------------------------------------------------------------------ end to end
 
 
+# These fixed-sequence scenarios exercise the full-chain rollback.
+@mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "0"})
 class TestEndToEnd(R1TestCase):
     """A real session, PRE_JOIN to complete, with the persona's content live in the role-play."""
 
@@ -3949,6 +4071,8 @@ S3_MOVES = (
 )
 
 
+# These fixed-sequence scenarios exercise the full-chain rollback.
+@mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "0"})
 class TestEndingsThroughTheSession(unittest.IsolatedAsyncioTestCase):
     """M032 S3 through the real session: Christy's asides, the learner's line after them, and her
     hang-up before Christy (synthetic advisor turns)."""

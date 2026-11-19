@@ -214,3 +214,20 @@ describe('the pre-rename worker keys do NOT parse (the contract fails closed, ne
     expect(formatAdministrationLog(log)).toContain('NOT PROBED');
   });
 });
+
+describe('planned family worker contract', () => {
+  it('omits the property when the key is absent', () => {
+    const facts = parseR1AdministrationLog([row('session_facts', null, null, {})]).facts;
+    expect(facts).not.toHaveProperty('familiesPlanned');
+  });
+
+  it('parses a valid plan and rejects malformed plans', () => {
+    const parse = (plan: unknown) => parseR1AdministrationLog([
+      row('session_facts', null, null, { families_planned: plan }),
+    ]).facts?.familiesPlanned;
+    expect(parse(['F2', 'F4'])).toEqual(['F2', 'F4']);
+    for (const plan of [undefined, [], ['F2'], ['F9', 'F4'], ['F4', 'F4']]) {
+      expect(parse(plan)).toBeNull();
+    }
+  });
+});

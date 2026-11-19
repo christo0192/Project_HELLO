@@ -31,7 +31,7 @@
  *   time_cue           payload { roleplay_seconds: number }, the learner time cue (R about 1020).
  *   session_facts      once per session. payload { roleplay_seconds, talk_share_pct,
  *                      longest_monologue_seconds, barge_in_count, question_count,
- *                      interruption_count, first_audio_p95_ms }
+ *                      interruption_count, first_audio_p95_ms, families_planned? }
  */
 
 export interface R1AdminLogRow {
@@ -64,6 +64,7 @@ export interface R1DiscountEvent {
 }
 
 export interface R1SessionFacts {
+  readonly familiesPlanned?: readonly R1Family[] | null;
   readonly roleplaySeconds: number | null;
   readonly talkSharePct: number | null;
   readonly longestMonologueSeconds: number | null;
@@ -107,6 +108,13 @@ function boolOrNull(value: unknown): boolean | null {
 
 function isFamily(value: unknown): value is R1Family {
   return typeof value === 'string' && (R1_FAMILIES as readonly string[]).includes(value);
+}
+
+/** A planned family list: non-empty, distinct families, F4 included; anything else is null. */
+function familiesPlanned(value: unknown): readonly R1Family[] | null {
+  if (!Array.isArray(value) || value.length === 0 || !value.every(isFamily)) return null;
+  if (new Set(value).size !== value.length || !value.includes('F4')) return null;
+  return value;
 }
 
 /** The guard kinds the gate recognises; anything else is recorded as `other`. */
@@ -185,6 +193,10 @@ export function parseR1AdministrationLog(rows: readonly R1AdminLogRow[]): R1Admi
         break;
       case 'session_facts':
         facts = {
+          // M033 A6: absent means all four families (the property is then left out entirely).
+          ...('families_planned' in payload
+            ? { familiesPlanned: familiesPlanned(payload.families_planned) }
+            : {}),
           roleplaySeconds: finiteNonNegative(payload.roleplay_seconds),
           talkSharePct: finiteNonNegative(payload.talk_share_pct),
           longestMonologueSeconds: finiteNonNegative(payload.longest_monologue_seconds),

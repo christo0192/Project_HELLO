@@ -29,6 +29,7 @@ import r1_personas
 import r1_prompts
 import r1_scheduler
 import r1_script
+import r1_temperament
 import r1_text
 import r1_tracker
 import r1_world
@@ -389,7 +390,23 @@ import r1_world
 # 35: M032 integration 9 (the learner lane's 31 and the Christy lane's 33-34 merged onto
 #    revision 33): every text of both lanes in one manifest.  No text changed in the merge;
 #    CONTENT_REVISION = max(33, 31, 34) + 1.
-CONTENT_REVISION = 35
+# 36: M033 A4 (R1_COMMIT_UPGRADE): the STRONG upgrade line after a MEDIUM call commitment
+#    (r1_commitment.UPGRADE_LINE). No other text changed.
+# 37: M033 A5 (R1_TEMPERAMENT): the four learner temperaments (card line, decision-timing
+#    answer, stall rounds; r1_temperament). No other text changed.
+# 38: M033 A6 (R1_TEMPERAMENT_PLAN): family median minutes set objection plan order.
+# 39: M033 A7 (R1_TEMPERAMENT_THEMES): objection theme bank and each
+# temperament's top two themes per family.
+# 40: M033 A8 (R1_STRONG_EVIDENCE_V2): the v2 STRONG lines (no deposit) and the fee,
+#    payment plan and outcome readers.
+# 41: M033 A9 (R1_BUYING_SIGNALS): the three buying-signal specs and the
+#    per-temperament signal lists.
+# 42: M033 A10 (R1_MOVE_CONDITION, R1_PERSONA_TIMELINE_V3): the move-condition clauses
+#    and note, and the v3 card timeline and decider answer.
+# 43: PROOF-1 pins the declined upgrade condition note.
+# 44: render the declined upgrade condition as a bullet.
+# 45: Keep the upgrade commitment in one sentence for scorer masking.
+CONTENT_REVISION = 45
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -638,6 +655,18 @@ def _learner_followups(sample: r1_personas.RenderedPersona) -> dict[str, Any]:
     """M032 S7L (revision 25): the learner follow-ups' new texts, beside the ones they replace."""
     p = r1_prompts
     return {
+        "condition_clauses": {
+            clause.id: {"clause": clause.clause, "markers": clause.markers,
+                        "fallbacks": clause.fallbacks}
+            for clause in (*r1_negotiation.CONDITION_CLAUSES.values(),
+                           *r1_negotiation.CONDITION_FAMILY_CLAUSES.values())
+        },
+        "condition_met_note": p.CONDITION_MET_NOTE,
+        "timeline_answer_v3": r1_personas.TIMELINE_ANSWER_V3,
+        "decider_answer_v3": r1_personas.DECIDER_ANSWER_V3,
+        "learner_prefix_timeline_v3_sample": p.learner_prefix(
+            sample, offer_realism=True, probe_first=True, price_check=True, timeline_v3=True
+        ),
         # SWEEP-8: the card's timeline wording (latched per session) and a prefix rendered with it.
         "backstory_timeline_v2": dict(r1_personas.BACKSTORY_TIMELINE_V2),
         "success_answer_v2": r1_personas.SUCCESS_ANSWER_V2,
@@ -814,6 +843,28 @@ def manifest() -> dict[str, Any]:
         "revision": CONTENT_REVISION,
         "world": {"version": r1_world.WORLD_VERSION, "sha256": r1_world.WORLD_SHA256},
         "personas": {p.id: _persona_manifest(p) for p in r1_personas.PERSONAS},
+        "temperaments": {
+            "card_line_prefix": r1_temperament.CARD_LINE_PREFIX,
+            "default_signals": r1_temperament.DEFAULT_SIGNALS,
+            **{t.id: {
+                "label": t.label, "weight": t.weight, "count_weights": t.count_weights,
+                "family_weights": t.family_weights, "family_themes": t.family_themes,
+                "family_minutes": t.family_minutes, "theme_weights": t.theme_weights,
+                "signals": t.signals,
+                "f4_theme": t.f4_theme, "enrol_ceiling": t.enrol_ceiling.name,
+                "stall_rounds": t.stall_rounds, "key_criterion": t.key_criterion,
+                "card_line": t.card_line, "timeline_answer": t.timeline_answer,
+            } for t in r1_temperament.TEMPERAMENTS},
+        },
+        "objection_themes": {
+            f"{family}.{ident}": (
+                ident if r1_scheduler.DEFAULT_THEMES[family] == ident else {
+                    "family": theme.family, "id": theme.id, "label": theme.label,
+                    "brief": theme.brief, "worry": theme.worry, "variants": theme.variants,
+                    "markers": theme.markers,
+                }
+            ) for (family, ident), theme in r1_scheduler.OBJECTION_THEMES.items()
+        },
         "script": {
             "interviewer_name": r1_script.INTERVIEWER_NAME,
             "exit_cue": r1_script.EXIT_CUE,
@@ -940,6 +991,12 @@ def manifest() -> dict[str, Any]:
         },
         "commitment": {
             "lines": {level.name: text for level, text in r1_commitment.COMMITMENT_LINES.items()},
+            "upgrade_line": r1_commitment.UPGRADE_LINE,
+            "strong_line_v2": r1_commitment.STRONG_LINE_V2,
+            "strong_plan_line_v2": r1_commitment.STRONG_PLAN_LINE_V2,
+            "payment_plan_pattern": r1_tracker.PAYMENT_PLAN_PATTERN.pattern,
+            "payment_choice_pattern": r1_tracker.PAYMENT_CHOICE_PATTERN.pattern,
+            "outcome_pattern": r1_tracker.OUTCOME_PATTERN.pattern,
             "default_slot": r1_commitment.DEFAULT_SLOT,
             "moved_line": r1_commitment.MEDIUM_MOVED_LINE,
             "defer_line": r1_commitment.MEDIUM_DEFER_LINE,
@@ -1078,6 +1135,7 @@ def manifest() -> dict[str, Any]:
             "next_step_note": r1_prompts.NEXT_STEP_NOTE,
             "new_offer_note": r1_prompts.NEW_OFFER_NOTE,
             "resolved_note": r1_prompts.RESOLVED_NOTE,
+            "upgrade_condition_note": r1_prompts.UPGRADE_CONDITION_NOTE,
             "checkin_note": r1_prompts.CHECKIN_NOTE,
             "checkin_done_note": r1_prompts.CHECKIN_DONE_NOTE,
             "decider_said_note": r1_prompts.DECIDER_SAID_NOTE,

@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from r1_commitment import call_proposal_in
 from r1_script import active_line_id
 from r1_script import line as script_line
+from r1_temperament import CARD_LINE_PREFIX, Temperament, pick_temperament
 from r1_text import dollar_amounts, fold, is_question_like, split_sentences
 
 PERSONA_VERSION = 1
@@ -42,6 +43,9 @@ TOPIC_LABELS = {
     "H2": "what has held you back or not worked before",
     "H3": "your schedule, money or who else decides",
 }
+
+TIMELINE_ANSWER_V3 = "If it feels right I could decide quickly; otherwise I'd take a little time."
+DECIDER_ANSWER_V3 = "I usually talk big decisions over with my {decision_maker}."
 
 CONTACT_ANSWER = "You can use the email on my form."
 AVAILABILITY_ANSWER = "I'm not sure yet how many hours a week I could give it."
@@ -612,6 +616,7 @@ class RenderedPersona:
 
     persona: Persona
     variant: Variant
+    temperament: Temperament | None = None
 
     @property
     def id(self) -> str:
@@ -645,6 +650,10 @@ class RenderedPersona:
     def decider_answer(self) -> str:
         """The public answer to "who else is involved in your decision" (one person, all call)."""
         return f"I'd talk it over with my {self.persona.decision_maker} first."
+
+    @property
+    def decider_answer_v3(self) -> str:
+        return DECIDER_ANSWER_V3.format(decision_maker=self.decision_maker)
 
     @property
     def spoken_city(self) -> str:
@@ -707,7 +716,10 @@ class RenderedPersona:
             amount for _label, answer in self.work_answers for amount in dollar_amounts(answer)
         )
 
-    def public_card_text(self, *, probe_first: bool = False, timeline_v2: bool = False) -> str:
+    def public_card_text(
+        self, *, probe_first: bool = False, timeline_v2: bool = False,
+        timeline_v3: bool = False,
+    ) -> str:
         """Everything the learner prompt may say about the persona; no deep need.
 
         M032 S2P (D-M032-7, SWEEP-17; ``probe_first``, the engine's latched R1_PROBE_FIRST): the
@@ -736,13 +748,20 @@ class RenderedPersona:
                 "the advisor asks about you, and never recite it):"
             )
             parts.extend(f"- {fact}" for fact in backstory)
+        if self.temperament is not None:
+            parts.append(CARD_LINE_PREFIX + self.temperament.card_line)
         parts.append("Short answers, to give only when asked and never to expand on:")
         for topic in H_TOPICS:
             parts.append(f'- {TOPIC_LABELS[topic]}: "{self.surface(topic)}"')
         parts.append(f'- what you have studied so far: "{self.persona.prior_learning}"')
         for label, answer in public_answers(timeline_v2=timeline_v2):
+            if self.temperament is not None and label == "when you would decide on this course":
+                answer = self.temperament.timeline_answer
+            elif timeline_v3 and label == "when you would decide on this course":
+                answer = TIMELINE_ANSWER_V3
             parts.append(f'- {label}: "{answer}"')
-        parts.append(f'- who else is involved in your decision: "{self.decider_answer}"')
+        decider = self.decider_answer_v3 if timeline_v3 else self.decider_answer
+        parts.append(f'- who else is involved in your decision: "{decider}"')
         for label, answer in self.work_answers:
             parts.append(f'- {label}: "{answer}"')
         if self.work_answers:
@@ -814,6 +833,8 @@ def resolve_persona(
     variant: str = "default",
     seed: str = "",
     avoid_first_name: str = "",
+    temperament_on: bool = False,
+    temperament: str = "default",
 ) -> RenderedPersona:
     """Resolve the attempt's persona and one stable surface variant.
 
@@ -836,7 +857,10 @@ def resolve_persona(
             if candidate.first_name.lower() != avoid:
                 chosen = candidate
                 break
-    return RenderedPersona(persona, chosen)
+    selected = (pick_temperament(persona_id, seed,
+                                None if temperament == "default" else temperament)
+                if temperament_on else None)
+    return RenderedPersona(persona, chosen, selected)
 
 
 # ----------------------------------------------------------------------------------

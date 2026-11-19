@@ -189,7 +189,8 @@
         "VITE_CSP_MODE": { "requiredInProduction": true, "secret": false, "external": true },
         "VITE_CSP_REPORT_ENDPOINT": { "requiredInProduction": true, "secret": false, "external": true },
         "VITE_R1_RECORDINGS_ORIGIN": { "requiredInProduction": false, "secret": false, "external": true },
-        "VITE_CANDIDATE_WEBRTC_V2": { "requiredInProduction": false, "secret": false, "external": true }
+        "VITE_CANDIDATE_WEBRTC_V2": { "requiredInProduction": false, "secret": false, "external": true },
+        "VITE_R1_ENROL_GOAL": { "requiredInProduction": false, "secret": false, "external": true }
       }
     },
     "voice-livekit": {
@@ -282,6 +283,22 @@
         "R1_OFFER_READER_V2": { "requiredInProduction": false, "secret": false },
         "R1_COUNTER_V2": { "requiredInProduction": false, "secret": false },
         "R1_PRICE_CONFLICT": { "requiredInProduction": false, "secret": false },
+        "R1_INVENTED_OFFER_V2": { "requiredInProduction": false, "secret": false },
+        "R1_DISCOUNT_DISCIPLINE_V2": { "requiredInProduction": false, "secret": false },
+        "R1_CLOSE_WINDOW_EVIDENCE": { "requiredInProduction": false, "secret": false },
+        "R1_COMMIT_UPGRADE": { "requiredInProduction": false, "secret": false },
+        "R1_TEMPERAMENT": { "requiredInProduction": false, "secret": false },
+        "R1_TEMPERAMENT_PLAN": { "requiredInProduction": false, "secret": false },
+        "R1_TEMPERAMENT_THEMES": { "requiredInProduction": false, "secret": false },
+        "R1_STRONG_EVIDENCE_V2": { "requiredInProduction": false, "secret": false },
+        "R1_BUYING_SIGNALS": { "requiredInProduction": false, "secret": false },
+        "R1_UPGRADE_V2": { "requiredInProduction": false, "secret": false },
+        "R1_RESTATE_TRIM": { "requiredInProduction": false, "secret": false },
+        "R1_MOVE_CONDITION": { "requiredInProduction": false, "secret": false },
+        "R1_PERK_HISTORY": { "requiredInProduction": false, "secret": false },
+        "R1_DISCOUNT_READ_V3": { "requiredInProduction": false, "secret": false },
+        "R1_CONCESSION_CONDITION": { "requiredInProduction": false, "secret": false },
+        "R1_PERSONA_TIMELINE_V3": { "requiredInProduction": false, "secret": false },
         "R1_CLOSING_STATE": { "requiredInProduction": false, "secret": false },
         "R1_EARLY_CLOSE_ASIDE": { "requiredInProduction": false, "secret": false },
         "R1_ABUSE_HANGUP": { "requiredInProduction": false, "secret": false },

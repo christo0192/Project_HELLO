@@ -319,9 +319,23 @@ def offline_records() -> dict[str, dict]:
         factory = OfflineFullFactory(settings)
         specs = plan_full_specs(names, settings.learners)
 
+        import r1_roleplay
+
+        real_plan = r1_roleplay.plan_families
+
+        def plan_with_f1(temperament, seed):  # type: ignore[no-untyped-def]
+            planned = real_plan(temperament, seed)
+            return planned if "F1" in planned else ("F1", *planned)
+
         async def main() -> tuple[dict[str, dict], dict]:
             out = {}
             for spec in specs:
+                # M033 A6: the price scenarios test her price question, which only a plan with
+                # F1 asks; the other scenarios keep their seeded temperament plan.
+                if spec.scenario.startswith("price"):
+                    with unittest.mock.patch("r1_roleplay.plan_families", new=plan_with_f1):
+                        out[spec.scenario] = await run_full_call(spec, factory.make(spec))
+                    continue
                 out[spec.scenario] = await run_full_call(spec, factory.make(spec))
             again = await run_full_call(specs[names.index("strong")], factory.make(specs[names.index("strong")]))
             return out, again
@@ -474,6 +488,38 @@ class OfflineFullInterviewTests(unittest.TestCase):
                     )
                     self.assertEqual(record["outcome"], "complete")
 
+    def test_skilled_closer_answers_before_enrolment_ask(self) -> None:
+        from rehearsal.scripted_advisor import ScriptedAdvisor
+        from r1_commitment import AskKind, detect_ask
+
+        record = self.records["skilled-closer"]
+        self.assertIsNone(record["error"])
+        self.assertEqual(record["hard_fails"], [])
+        self.assertTrue(_check(record, "reached_closing")["ok"])
+        self.assertEqual(record["outcome"], "complete")
+        exchanges = record["exchanges"]
+        close = next(i for i, ex in enumerate(exchanges) if ex["advisor"]["intent"] == "close_ask")
+        self.assertGreaterEqual(exchanges[close]["r_sec"], 780)
+        self.assertEqual(detect_ask(exchanges[close]["advisor"]["text"]).kind, AskKind.ENROL)
+        raised = set()
+        answered = set()
+        for ex in exchanges[:close]:
+            advisor_turn = ex["advisor"]
+            if advisor_turn["intent"] in ("price", "discount", "answer_objection"):
+                answered.add(advisor_turn["topic"])
+            raised.update(k[:2] for k in ScriptedAdvisor._raised(ex["learner"]["spoken"]) if k.startswith("F"))
+        self.assertLessEqual(raised, answered)
+        committed = next(i for i, ex in enumerate(exchanges)
+                         if ScriptedAdvisor._closer_commitment(ex["learner"]["spoken"]))
+        self.assertNotIn("strong_blocked:decider_unresolved",
+                         exchanges[committed]["learner"]["plan"]["reasons"])
+        later = exchanges[committed + 1:]
+        self.assertFalse(any(ex["advisor"]["intent"] == "close_ask" for ex in later))
+        self.assertTrue(any(ex["advisor"]["intent"] in ("accept_callback", "farewell")
+                            for ex in later))
+        self.assertTrue(any(ex["advisor"]["intent"] == "farewell" for ex in later))
+        self.assertLess(record["roleplay_seconds"], 1000)
+
     def test_the_roleplay_starts_only_on_a_spoken_ready_or_the_button(self) -> None:
         for name, record in self.records.items():
             pickup = _rows(record, speaker="bot", voice="learner")
@@ -561,15 +607,18 @@ class OfflineFullInterviewTests(unittest.TestCase):
         if requests:
             self.assertGreaterEqual(requests[0]["r_sec"], 630.0 - REPLAY_HOLD_SLACK_SEC - 1.0)
             self.assertEqual(record["stop_reason"], "end_request")
+            self.assertGreaterEqual(record["roleplay_seconds"], 600.0)
         else:
             # M032 S3.4 (the learner lane, R1_ABUSE_HANGUP): the insult just before it ("Now get
             # lost, you idiot.") gets her hang-up, and the candidate's yes to Christy's question
             # ends the role-play before the request is reached.
             from rehearsal.full_metrics import abuse_supported
 
+            # The insult is not held to a real-session time, so faster turns (M033 PR-B latency)
+            # reach it sooner; the role-play then ends on the candidate's own yes to Christy.
             self.assertTrue(abuse_supported())
             self.assertTrue(_check(record, "abuse")["ok"], _check(record, "abuse"))
-        self.assertGreaterEqual(record["roleplay_seconds"], 600.0)
+            self.assertEqual(record["stop_reason"], "wrap_accepted")
 
     def test_no_two_bot_lines_ever_play_at_once(self) -> None:
         for name, record in self.records.items():
@@ -1776,6 +1825,29 @@ class PhaseCheckTests(unittest.TestCase):
         self.assertTrue(checks["end_consent"]["requests"][0]["answered_in_role"])
         self.assertFalse(checks["roleplay_end"]["ok"])
 
+    def test_an_early_farewell_passes_only_when_the_candidate_said_goodbye_in_role(self) -> None:
+        from rehearsal.full_metrics import _roleplay_end
+
+        def record(text: str) -> dict:
+            return {
+                "stop_reason": "farewell_exit",
+                "roleplay_seconds": 766.0,
+                "candidate_turns": [
+                    {"act": "advisor_turn", "phase": "roleplay", "text": "What day works for you?"},
+                    {"act": "advisor_turn", "phase": "roleplay", "text": text},
+                ],
+            }
+
+        closed = _roleplay_end(
+            record("Thank you, I'll send the email. Enjoy your evening, and we'll speak tomorrow."),
+            ["roleplay"],
+        )
+        self.assertTrue(closed["ok"])
+        self.assertTrue(closed["candidate_goodbye"])
+        cut = _roleplay_end(record("And what about the class sizes for the next cohort?"), ["roleplay"])
+        self.assertFalse(cut["ok"])
+        self.assertFalse(cut["candidate_goodbye"])
+
     def test_an_at_once_exit_needs_a_named_end_or_an_earlier_question(self) -> None:
         from rehearsal.full_metrics import phase_checks
 
@@ -2362,6 +2434,15 @@ class LearnerClockTests(unittest.TestCase):
         self.assertEqual(metrics.commitment_metrics([self._exchange(775.0, 787.0)], admin)["premature_commit_count"], 0)
         self.assertEqual(metrics.commitment_metrics([self._exchange(775.0, None)], admin)["premature_commit_count"], 1)
         self.assertEqual(metrics.commitment_metrics([self._exchange(700.0, 760.0)], admin)["premature_commit_count"], 1)
+
+    def test_evidence_window_changes_premature_count(self) -> None:
+        from rehearsal import metrics
+
+        admin = {"commitment": {"level": "MEDIUM"}, "close_window": {"open_r": 680}}
+        self.assertEqual(metrics.commitment_metrics(
+            [self._exchange(700, 700)], admin)["premature_commit_count"], 0)
+        self.assertEqual(metrics.commitment_metrics(
+            [self._exchange(670, 670)], admin)["premature_commit_count"], 1)
 
     def test_off_times_the_line_by_the_advisor_turn(self) -> None:
         from rehearsal import metrics

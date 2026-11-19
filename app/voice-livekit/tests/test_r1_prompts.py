@@ -104,6 +104,18 @@ class LearnerPrefixTests(unittest.TestCase):
             learner_prefix(resolve_persona("p1_career_switcher", variant="v2")),
         )
 
+    def test_temperament_prefix_contains_safe_card(self):
+        from r1_personas import deep_need_topics_in
+        from r1_temperament import TEMPERAMENTS
+
+        for item in TEMPERAMENTS:
+            persona = resolve_persona(P1.id, variant="v1", temperament_on=True,
+                                      temperament=item.id)
+            prefix = learner_prefix(persona, probe_first=True, timeline_v2=True)
+            self.assertIn(persona.public_card_text(probe_first=True, timeline_v2=True), prefix)
+            self.assertFalse(deep_need_topics_in(persona, prefix))
+            self.assertIn("Never state product facts", prefix)
+
     def test_it_never_contains_a_deep_need_a_marker_hit_or_another_persona(self):
         from r1_personas import deep_need_topics_in
 
@@ -381,6 +393,13 @@ class ReminderTests(unittest.TestCase):
         self.assertNotIn(FORCED_NOTE, calm)
         self.assertNotIn(FORCED_NOTE, turn_reminder(P1, r_sec=300))
         self.assertIn("Link it to what the advisor just said", FORCED_NOTE)
+
+    def test_upgrade_condition_note_is_a_bullet(self):
+        from r1_prompts import UPGRADE_CONDITION_NOTE
+
+        self.assertTrue(UPGRADE_CONDITION_NOTE.startswith("- "))
+        text = turn_reminder(P1, r_sec=100, notes=(UPGRADE_CONDITION_NOTE,))
+        self.assertIn(UPGRADE_CONDITION_NOTE, text)
 
     def test_an_intent_turn_keeps_the_disclosure_layers_and_the_other_notes(self):
         text = turn_reminder(

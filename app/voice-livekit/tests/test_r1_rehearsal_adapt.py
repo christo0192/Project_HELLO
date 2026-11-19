@@ -83,10 +83,9 @@ class AdaptRegistrationTests(unittest.TestCase):
         default = parse_scenarios("default")
         self.assertEqual(default, (*GROUPS["manual-replay"], manual.MIX, *SCENARIO_NAMES))
         self.assertFalse(set(default) & set(ADAPT))
-        # ``all`` keeps its meaning (the synthetic scenarios: a live sweep sized for it must not
-        # grow), and default plus adapt is a group of its own.
+        # ``all`` remains the synthetic scenarios, and default plus adapt is a group of its own.
         self.assertEqual(parse_scenarios("all"), SCENARIO_NAMES)
-        self.assertEqual(len(parse_scenarios("all")), 16)
+        self.assertEqual(len(parse_scenarios("all")), 17)
         self.assertEqual(parse_scenarios("default+adapt"), (*default, *ADAPT))
         self.assertEqual(parse_scenarios("default,adapt"), (*default, *ADAPT))
         self.assertEqual(parse_scenarios("Tangent,one-worder"), ("tangent", "one-worder"))

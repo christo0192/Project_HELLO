@@ -88,6 +88,7 @@ from r1_personas import (
     PERSONAS,
     PUBLIC_ANSWERS,
     SUCCESS_ANSWER_V2,
+    TIMELINE_ANSWER_V3,
     RenderedPersona,
 )
 from r1_scheduler import open_question_topics
@@ -2442,6 +2443,9 @@ def _price_accepted(sentence: str, ctx: GuardContext) -> bool:
     return any(
         not negated_before(folded, match.start())
         and _DOUBT_FRAME.search(clause_before(folded, match.start())) is None
+        and (os.getenv("R1_CONCESSION_CONDITION", "1").strip().lower()
+             in ("0", "off", "false", "no")
+             or _CONDITION_FRAME.search(clause_before(folded, match.start())) is None)
         for match in _PRICE_ACCEPTED.finditer(folded)
     )
 
@@ -2595,10 +2599,15 @@ def _is_card_answer(sentence: str, persona: RenderedPersona | None) -> bool:
 def _card_texts(persona: RenderedPersona) -> list[str]:
     # M032 SWEEP-8: both card wordings stay allowed, so a session on either release is clean.
     answers = [answer for _, answer in PUBLIC_ANSWERS]
+    if persona.temperament is not None:
+        answers.append(persona.temperament.timeline_answer)
     answers.append(SUCCESS_ANSWER_V2)
     answers.append(persona.persona.prior_learning)
     answers.extend(persona.surface(topic) for topic in H_TOPICS)
     answers.append(persona.decider_answer)
+    answers.append(persona.decider_answer_v3)
+    # M033 A10: both card wordings stay allowed for sessions on either release.
+    answers.append(TIMELINE_ANSWER_V3)
     answers.extend(answer for _label, answer in persona.work_answers)
     return answers
 
@@ -4180,6 +4189,17 @@ _DOUBT_FRAME = re.compile(
 )
 
 
+_CONDITION_FRAME = re.compile(
+    r"\b(?:(?:if|once|as long as|provided(?: that)?)\s+(?:i|we)\s+"
+    r"(?:know|knew|see|saw|can see|could see|am sure|'m sure|was sure|were sure|"
+    r"felt sure|feel sure|could be sure|believed|was convinced)"
+    r"|how\s+(?:would|do|can|could|will)\s+(?:i|we)\s+(?:know|tell|be sure)"
+    r"|(?:would|will|do|could)\s+(?:i|we)\s+(?:really\s+)?know"
+    r"|(?:if|once|as long as|provided(?: that)?)\s+i'm sure"
+    r"|i(?:'d| would) need to (?:know|see|feel))\b", re.IGNORECASE,
+)
+
+
 def has_concession(text: object) -> bool:
     """True when ``text`` expresses resolution, acceptance or "you've convinced me".
 
@@ -4197,6 +4217,9 @@ def has_concession(text: object) -> bool:
     return any(
         not negated_before(folded, match.start())
         and _DOUBT_FRAME.search(clause_before(folded, match.start())) is None
+        and (os.getenv("R1_CONCESSION_CONDITION", "1").strip().lower()
+             in ("0", "off", "false", "no")
+             or _CONDITION_FRAME.search(clause_before(folded, match.start())) is None)
         for match in (_CONCESSION_V2 if v2 else _CONCESSION).finditer(folded)
     )
 

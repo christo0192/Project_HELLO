@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import {
   discountLadderText,
   formatUsd,
+  r1ScenarioGoal,
   R1_SCENARIO_COPY,
   R1_SCENARIO_FACTS,
 } from './r1-scenario';
@@ -123,7 +124,10 @@ describe('what the card must never say', () => {
     expect(R1_SCENARIO_COPY.goal).toMatch(/^Your goal:/);
     expect(R1_SCENARIO_COPY.goal).toMatch(/understand their needs/);
     expect(R1_SCENARIO_COPY.goal).toMatch(/handle their concerns/);
-    expect(R1_SCENARIO_COPY.goal).toMatch(/agree a clear next step/);
+    // Enrolment is the goal and a next step the fallback, in one line (it fits a 1100x500 window).
+    expect(R1_SCENARIO_COPY.goal).toMatch(/help them enrol/);
+    expect(R1_SCENARIO_COPY.goal).toMatch(/or agree a next step/);
+    expect(R1_SCENARIO_COPY.goal.length).toBeLessThanOrEqual(100);
   });
 });
 
@@ -143,5 +147,18 @@ describe('formatting', () => {
     expect(discountLadderText([500, 1000])).toBe('$500 or $1,000');
     expect(discountLadderText([500])).toBe('$500');
     expect(discountLadderText([])).toBe('');
+  });
+});
+
+describe('scenario goal flag', () => {
+  const newGoal = 'Your goal: understand their needs, handle their concerns, and help them enrol or agree a next step.';
+  const oldGoal = 'Your goal: understand their needs, handle their concerns, and agree a clear next step.';
+
+  it.each([undefined, '', '1', 'true'])('uses the enrolment goal for %s', (flag) => {
+    expect(r1ScenarioGoal(flag)).toBe(newGoal);
+  });
+
+  it.each(['0', ' 0 '])('restores the previous goal for %s', (flag) => {
+    expect(r1ScenarioGoal(flag)).toBe(oldGoal);
   });
 });

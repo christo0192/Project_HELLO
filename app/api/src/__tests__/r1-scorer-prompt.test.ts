@@ -176,3 +176,17 @@ describe('R1 scorer prompt', () => {
     );
   });
 });
+
+describe('planned objection prompt', () => {
+  it('marks unplanned families as not to be scored', () => {
+    const log = parseR1AdministrationLog(cleanLogRows());
+    const planned = { ...log, facts: { ...log.facts!, familiesPlanned: ['F2', 'F4'] as const } };
+    const text = formatAdministrationLog(planned);
+    expect(text).toContain('- F1: not planned for this call (not raised; do not score it)');
+    expect(text).toContain('- F3: not planned for this call (not raised; do not score it)');
+    const note = '- Negotiation note: F1 was not planned, so the learner never anchored at $7,000 and never countered. Score Negotiation & discount discipline on how value is defended and on any discount the advisor offered; a missing anchor or counter is not a gap, and level 4 needs no counter.';
+    expect(text).toContain(note);
+    expect(formatAdministrationLog(log)).not.toContain(note);
+    expect(formatAdministrationLog({ ...planned, facts: { ...planned.facts, familiesPlanned: ['F1'] } })).not.toContain(note);
+  });
+});

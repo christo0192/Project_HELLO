@@ -315,6 +315,7 @@ from r1_prompts import (
     select_context,
 )
 from r1_roleplay import (
+    FLAG_TEMPERAMENT,
     IN_ROLE_ASIDE_REASONS,
     FLAG_WRAPUP_ANSWERS,
     FLAG_WRAPUP_DECLINE_V2,
@@ -4066,6 +4067,7 @@ class R1Interview:
                 self.context,
                 seed=self._seed(),
                 candidate_first_name=str(self.context.get("first_name") or ""),
+                temperament_on=flag_on(FLAG_TEMPERAMENT),
             )
         return self._choice
 
@@ -4851,6 +4853,11 @@ class R1Interview:
             turn_index=turn,
             option_count=len(commitment["asks"]),
         )
+        if "strong_gaps" in admin:
+            for label in admin["strong_gaps"] or ["none"]:
+                _log.info(
+                    "unknown_event", error_type="r1_fidelity_strong_gap", error_category=label
+                )
         for reason in admin["exclusion_reasons"]:
             _log.warn("unknown_event", error_type="r1_fidelity_excluded", error_category=reason)
         checks = admin["fidelity"]["checks"]
@@ -8438,6 +8445,9 @@ class R1Interview:
         last_sentence = ""  # the last sentence that reached it (M032 SWEEP-26)
         spoken: list[str] = []  # D5-TRANS1: what the reply said, for the bare-confirmation check
         recover = False
+        buffered: list[str] = []
+        trim = (reply.plan is not None and reply.plan.mode is TurnMode.LLM_REPLY
+                and self.engine.restatement_trim_applies())
         iterator: Any = None
         try:
             self._latency.mark("llm_start")
@@ -8451,17 +8461,32 @@ class R1Interview:
                 if text:
                     self._latency.mark("llm_first_token")
                     for sentence in guard.feed(text):
+                        if trim and self.engine.is_restatement(sentence):
+                            buffered.append(sentence)
+                            continue
                         spoke = True
                         last_sentence = sentence
                         spoken.append(sentence)
                         self._latency.mark("guard_release")
                         yield sentence + " "
             for sentence in guard.flush():
+                if trim and self.engine.is_restatement(sentence):
+                    buffered.append(sentence)
+                    continue
                 spoke = True
                 last_sentence = sentence
                 spoken.append(sentence)
                 self._latency.mark("guard_release")
                 yield sentence + " "
+            if buffered and spoke:
+                self.engine.note_restatements_trimmed(len(buffered))
+            elif buffered:
+                for sentence in buffered:
+                    spoke = True
+                    last_sentence = sentence
+                    spoken.append(sentence)
+                    self._latency.mark("guard_release")
+                    yield sentence + " "
             if spoke and reply.confirm_extra and is_bare_confirmation(" ".join(spoken)):
                 # D5-TRANS1: "That's right, yes." alone left their second question unanswered.
                 last_sentence = reply.confirm_extra

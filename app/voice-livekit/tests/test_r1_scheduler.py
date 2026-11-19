@@ -2427,5 +2427,301 @@ class MarkersV2Tests(unittest.TestCase):
                     self.assertTrue(wide.spoken_proves(state.spec.id, text))
 
 
+class CloseWindowEvidenceTests(unittest.TestCase):
+    def test_answer_opens_window_and_flag_restores_clock(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                s = OwedMoveScheduler("husband", evidence_window=enabled)
+                for state in s._states.values():
+                    if state.spec.family in sched.FAMILIES and state.spec.required:
+                        state.status = "delivered"
+                        state.delivered_turn = 1
+                s.turn = 1
+                s.observe_candidate_turn("Your husband can join tomorrow.", 680)
+                self.assertFalse(s.commit_permitted(680))
+                s.observe_candidate_turn("That makes sense.", 681)
+                self.assertEqual(s.commit_permitted(681), enabled)
+                self.assertTrue(s.commit_permitted(780))
+                self.assertEqual("close_window" in s.summary(), enabled)
+                if enabled:
+                    self.assertEqual(s.close_window_open_r, 681)
+                    self.assertEqual(s.close_window_reason, "evidence")
+
+    def test_floor_and_unanswered_push(self):
+        s = OwedMoveScheduler("husband", evidence_window=True)
+        for state in s._states.values():
+            if state.spec.family in sched.FAMILIES and state.spec.required:
+                state.status = "delivered"
+                state.delivered_turn = 1
+        s.turn = 1
+        s.observe_candidate_turn("Okay?", 540)
+        self.assertIsNone(s.f4_answered_turn)
+        self.assertFalse(s.commit_permitted(600))
+        s.observe_candidate_turn("Your husband can join tomorrow.", 599)
+        self.assertFalse(s.commit_permitted(599))
+        self.assertFalse(s.commit_permitted(600))
+        s.observe_candidate_turn("That makes sense.", 601)
+        self.assertTrue(s.commit_permitted(601))
+
+    def test_answer_readings_and_clock(self):
+        for text in (
+            "What do you think?", "Husband?", "We can make a careful plan together tomorrow."
+        ):
+            with self.subTest(text=text):
+                s = OwedMoveScheduler("husband", evidence_window=True)
+                for state in s._states.values():
+                    if state.spec.family in sched.FAMILIES and state.spec.required:
+                        state.status = "delivered"
+                        state.delivered_turn = 1
+                s.turn = 1
+                s.observe_candidate_turn(text, 680)
+                self.assertIsNotNone(s.f4_answered_turn)
+                self.assertFalse(s.commit_permitted(680))
+                s.observe_candidate_turn("That makes sense.", 681)
+                self.assertTrue(s.commit_permitted(681))
+        s = OwedMoveScheduler("husband", evidence_window=True)
+        for state in s._states.values():
+            if state.spec.family in sched.FAMILIES and state.spec.required:
+                state.status = "delivered"
+                state.delivered_turn = 1
+        s.turn = 1
+        s.observe_candidate_turn("Anything else?", 680)
+        self.assertIsNone(s.f4_answered_turn)
+        self.assertFalse(s.commit_permitted(779))
+        s.observe_candidate_turn("Okay?", 780)
+        self.assertEqual(s.close_window_reason, "clock")
+        self.assertFalse(s._hard_ready(s._states[COMMIT_STALL], 780))
+
+    def test_call_request_uses_topic_reading_if_it_matches(self):
+        text = "Can we hop on a call?"
+        s = OwedMoveScheduler("husband", evidence_window=True)
+        s._states[F4_PUSH].delivered_turn = 1
+        s.turn = 1
+        s.observe_candidate_turn(text, 680)
+        self.assertFalse(s._turn_answered)
+        self.assertEqual(s.f4_answered_turn is not None, "F4" in topics_in(text))
+
+    def test_forced_stall_still_waits_until_nineteen_minutes(self):
+        s = OwedMoveScheduler("husband", evidence_window=True)
+        state = s._states[COMMIT_STALL]
+        for item in s._states.values():
+            if item.spec.family in sched.FAMILIES and item.spec.required:
+                item.status = "delivered"
+        for r in (680, 780, 1139):
+            self.assertFalse(s._hard_ready(state, r))
+        self.assertTrue(s._hard_ready(state, 1140))
+
+
+class PlannedSchedulerTests(unittest.TestCase):
+    def test_planned_families_and_deadlines(self):
+        from r1_scheduler import OwedMoveScheduler
+
+        scheduler = OwedMoveScheduler("family", families=("F1", "F4"))
+        self.assertTrue(scheduler.family_complete("F2"))
+        self.assertTrue(scheduler.family_complete("F3"))
+        self.assertEqual(tuple(deadline for deadline, _ in scheduler.pacing_map), (810, 930))
+        self.assertEqual(scheduler.summary()["families_planned"], ["F1", "F4"])
+
+    def test_invalid_plans(self):
+        from r1_scheduler import OwedMoveScheduler
+
+        for plan in (("F4", "F1"), ("F1", "F1", "F4"), ("F4",), ("F9", "F4")):
+            with self.assertRaises(ValueError):
+                OwedMoveScheduler("family", families=plan)
+
+    def test_full_planned_runs(self):
+        for plan, expected, deadlines in (
+            (("F1", "F4"), [F1_ANCHOR, F1_COUNTER, F4_PRIMARY, F4_PUSH], (810, 930)),
+            (("F2", "F3", "F4"),
+             [F2_PRIMARY, F2_PUSH, F3_PRIMARY, F3_PUSH, F4_PRIMARY, F4_PUSH],
+             (640, 810, 930)),
+        ):
+            with self.subTest(plan=plan):
+                s = OwedMoveScheduler("family", families=plan)
+                seen = []
+                for index in range(30):
+                    r = 30 + index * 35
+                    move = turn(s, PITCH if index == 0 else NEUTRAL, r)
+                    if move is not None and move.family in sched.FAMILIES:
+                        seen.append(move.id)
+                    if s.all_families_complete:
+                        break
+                self.assertEqual(seen, expected)
+                self.assertEqual(tuple(deadline for deadline, _ in s.pacing_map), deadlines)
+                self.assertFalse(s.graded_moves_owed(r))
+                self.assertTrue(s.all_families_complete)
+                summary = s.summary(final=True)
+                self.assertFalse(any(reason.startswith("family_missing")
+                                     for reason in summary["exclusion_reasons"]))
+                for family in set(sched.FAMILIES) - set(plan):
+                    self.assertFalse(summary["families"][family]["planned"])
+                    self.assertFalse(summary["families"][family]["delivered"])
+                    self.assertTrue(all(move["status"] == "skipped" for move in summary["moves"]
+                                        if move["family"] == family))
+
+    def test_early_redirect_forces_first_primary(self):
+        for plan, expected in ((("F2", "F4"), F2_PRIMARY), (None, F3_PRIMARY)):
+            scheduler = OwedMoveScheduler("family", families=plan)
+            scheduler.observe_candidate_turn("Hello there", 60)
+            self.assertEqual(scheduler.next_forced_peek(60).id, expected)
+            self.assertEqual(scheduler._force_next(60).id, expected)
+
+    def test_f4_waits_for_previous_second_move_and_f1_counter(self):
+        scheduler = OwedMoveScheduler("family", families=("F1", "F2", "F4"))
+        for move in (F1_ANCHOR, F1_COUNTER, F2_PRIMARY, F2_PUSH):
+            scheduler.observe_candidate_turn(NEUTRAL, 500)
+            scheduler.confirm_delivered(move, 500)
+        state = scheduler._state(F4_PRIMARY)
+        self.assertFalse(scheduler._hard_ready(state, 500))
+        scheduler.observe_candidate_turn(NEUTRAL, 510)
+        self.assertTrue(scheduler._hard_ready(state, 510))
+
+    def test_commit_stall_keeps_its_clock_gate(self):
+        scheduler = OwedMoveScheduler("family", families=("F1", "F4"))
+        for move in (F1_ANCHOR, F1_COUNTER, F4_PRIMARY, F4_PUSH):
+            scheduler.observe_candidate_turn(NEUTRAL, 900)
+            scheduler.confirm_delivered(move, 900)
+        state = scheduler._state(COMMIT_STALL)
+        self.assertFalse(scheduler._hard_ready(state, sched.COMMIT_STALL_R_SEC - 1))
+        self.assertTrue(scheduler._hard_ready(state, sched.COMMIT_STALL_R_SEC))
+
+    def test_no_plan_keeps_pacing_and_summary_contract(self):
+        from r1_roleplay import _PACING_MAP
+
+        scheduler = OwedMoveScheduler("family")
+        self.assertEqual(scheduler.pacing_map, _PACING_MAP)
+        self.assertNotIn("families_planned", scheduler.summary())
+        self.assertTrue(all("planned" not in value
+                            for value in scheduler.summary()["families"].values()))
+
+    def test_pending_moves_follow_planned_order(self):
+        scheduler = OwedMoveScheduler("family", families=("F2", "F3", "F4"))
+        self.assertEqual(scheduler.required_pending(), (
+            F2_PRIMARY, F2_PUSH, F3_PRIMARY, F3_PUSH, F4_PRIMARY, F4_PUSH,
+        ))
+
+
+class ObjectionThemeTests(unittest.TestCase):
+    def test_variants_do_not_cross_families(self):
+        for (family, ident), theme in sched.OBJECTION_THEMES.items():
+            if ident == sched.DEFAULT_THEMES[family]:
+                continue
+            for variant in theme.variants:
+                self.assertTrue(sched.markers_match(theme.markers, variant), (ident, variant))
+                for spec in sched.PLAN:
+                    if spec.family not in sched.FAMILIES or spec.family == family:
+                        continue
+                    for person in ("husband", "father"):
+                        for markers in (spec.markers,
+                                        sched.widened_markers(spec.id, spec.markers)):
+                            filled = tuple(tuple(sched._fill(p, person, regex=True) for p in group)
+                                           for group in markers)
+                            if filled:
+                                self.assertFalse(sched.markers_match(filled, variant),
+                                                 (ident, spec.id, variant))
+                for (other_family, other_id), other in sched.OBJECTION_THEMES.items():
+                    if other_family != family:
+                        self.assertFalse(sched.markers_match(other.markers, variant),
+                                         (ident, other_id, variant))
+
+    def test_synthetic_paraphrases_do_not_cross_families(self):
+        examples = {
+            ("F3", "pays_off"): ("Will this really pay off for me?",
+                                 "Could I end up ahead after all that effort?"),
+            ("F3", "confirm_fit"): ("Would this suit someone with my background?",
+                                    "Is this a good fit for me?"),
+            ("F3", "format_pace"): ("How is this taught to people like me?",
+                                    "I worry it might move too fast for me."),
+            ("F3", "trust"): ("I've been burned before, so can I believe this?",
+                              "What can I rely on when promises sound so big?"),
+            ("F2", "unavailable_now"): ("Currently I have too much going on.",
+                                       "At the moment taking on something new is tough."),
+            ("F1", "cannot_afford"): ("My finances are limited these days.",
+                                      "I can't manage the budget right now."),
+            ("F4", "no_need"): ("There's no hurry; it can wait.",
+                                "Things are okay as things are."),
+            ("F4", "family_approval"): ("This choice is up to us together at home.",
+                                       "I can't decide this step by myself."),
+        }
+        for (family, ident), texts in examples.items():
+            for text in texts:
+                self.assertTrue(sched.markers_match(sched.OBJECTION_THEMES[(family, ident)].markers,
+                                                    text), (ident, text))
+                for spec in sched.PLAN:
+                    if spec.family not in sched.FAMILIES or spec.family == family:
+                        continue
+                    for person in ("husband", "father"):
+                        for markers in (spec.markers, sched.widened_markers(spec.id, spec.markers)):
+                            filled = tuple(tuple(sched._fill(p, person, regex=True) for p in group)
+                                           for group in markers)
+                            if filled:
+                                self.assertFalse(sched.markers_match(filled, text),
+                                                 (ident, spec.id, text))
+                for (other_family, other_id), other in sched.OBJECTION_THEMES.items():
+                    if other_family != family:
+                        self.assertFalse(sched.markers_match(other.markers, text),
+                                         (ident, other_id, text))
+
+    def test_theme_only_answers(self):
+        for text in ("Read the reviews.", "See testimonials.", "We are transparent.",
+                     "We are honest.", "Our track record is available.",
+                     "Hear from real learners.", "Hear from real students.",
+                     "Hear from real people.", "The pace is flexible.",
+                     "Go at your own pace.", "We go step by step.",
+                     "It is hands-on.", "There is practice.", "You can ask questions."):
+            self.assertTrue(sched.worry_answered("F3", text, themed=True), text)
+            if "learners" not in text and "students" not in text:
+                self.assertFalse(sched.worry_answered("F3", text), text)
+
+    def test_nondefault_text_has_no_course_facts(self):
+        import re
+        forbidden = re.compile(
+            r"\b(?:months?|weeks?|hours?|live|recorded|weekends?|evenings?|cohorts?|"
+            r"batch|certificate|curriculum|mentors?|placement|refund|guarantee|discount|"
+            r"youtube|coursera|udemy)\b", re.I
+        )
+        for (family, ident), theme in sched.OBJECTION_THEMES.items():
+            if ident == sched.DEFAULT_THEMES[family]:
+                continue
+            for text in (theme.label, theme.brief, theme.worry, *theme.variants):
+                self.assertIsNone(re.search(r"[0-9$]", text), (ident, text))
+                self.assertIsNone(forbidden.search(text), (ident, text))
+                self.assertIsNone(sched.COURSE_LENGTH_FIGURE.search(text), (ident, text))
+
+    def test_new_worries_can_be_answered(self):
+        for family, text in (("F3", "Here is evidence of outcomes."),
+                             ("F3", "Your background is a good fit."),
+                             ("F2", "You can start later or pause.")):
+            self.assertTrue(sched.worry_answered(family, text, themed=True))
+
+        self.assertFalse(sched.worry_answered("F3", "Your background is a good fit."))
+
+    def test_anchor_reason_preserves_anchor_and_counter(self):
+        plain = OwedMoveScheduler("father")
+        themed = OwedMoveScheduler("father", themes={"F1": "cannot_afford"})
+        for variant in themed._state(sched.F1_ANCHOR).variants:
+            self.assertTrue(sched.markers_match(plain._state(sched.F1_ANCHOR).markers, variant))
+        self.assertEqual(plain._state(sched.F1_COUNTER), themed._state(sched.F1_COUNTER))
+
+    def test_theme_states_and_defaults(self):
+        plain = OwedMoveScheduler("father")
+        defaults = OwedMoveScheduler("father", themes=sched.DEFAULT_THEMES)
+        self.assertEqual(plain._states, defaults._states)
+        self.assertEqual(plain.summary(), defaults.summary())
+        themed = OwedMoveScheduler("father", themes={"F3": "pays_off"})
+        theme = sched.OBJECTION_THEMES[("F3", "pays_off")]
+        self.assertEqual(themed.theme_for(F3_PRIMARY), theme)
+        self.assertEqual(themed._state(F3_PRIMARY).brief, theme.brief)
+        self.assertEqual(themed._state(F3_PRIMARY).markers, theme.markers)
+        self.assertTrue(themed.spoken_proves(F3_PRIMARY, theme.variants[0]))
+        for variant in theme.variants:
+            self.assertTrue(sched.markers_match(theme.markers, variant))
+        self.assertEqual(plain._state(F3_PUSH), themed._state(F3_PUSH))
+        with self.assertRaises(ValueError):
+            OwedMoveScheduler("father", themes={"F3": "unknown"})
+        with self.assertRaises(ValueError):
+            OwedMoveScheduler("father", themes={"F9": "unknown"})
+
+
 if __name__ == "__main__":
     unittest.main()

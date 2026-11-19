@@ -1,6 +1,7 @@
 """Unit tests for ``r1_commitment``: asks, levels, grading and the scripted lines."""
 from __future__ import annotations
 
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -1548,6 +1549,127 @@ class RefusedCallReaderTests(unittest.TestCase):
                 classify_learner_commitment("I'm not ready to set up a call just yet."),
                 Level.MEDIUM,
             )
+
+
+class CloseEvidenceFloorTests(unittest.TestCase):
+    def test_floor_matches_api_gate(self):
+        from pathlib import Path
+        from r1_commitment import COMMIT_EVIDENCE_FLOOR_R_SEC, commitment_permitted
+
+        self.assertEqual(COMMIT_EVIDENCE_FLOOR_R_SEC, 600)
+        self.assertFalse(commitment_permitted(599, True, evidence=True))
+        self.assertTrue(commitment_permitted(600, True, evidence=True))
+        gate = Path(__file__).resolve().parents[2] / "api/src/lib/r1/gate.ts"
+        if gate.is_file():
+            self.assertIn("MIN_ROLEPLAY_SECONDS: 600", gate.read_text(encoding="utf-8"))
+
+
+class CommitUpgradeLineTests(unittest.TestCase):
+    def test_upgrade_line_is_scripted_strong_and_masked(self):
+        import r1_commitment as c
+
+        self.assertEqual(c.UPGRADE_LINE, "Actually, I don't want to wait, so send me the "
+                         "enrolment link and I'll get started today.")
+        self.assertTrue(c.is_commitment_line(c.UPGRADE_LINE, "husband"))
+        self.assertEqual(c.mask_for_scorer(c.UPGRADE_LINE, "husband"), c.MASK_PLACEHOLDER)
+        self.assertEqual(c.classify_learner_commitment(c.UPGRADE_LINE), c.Level.STRONG)
+        self.assertIsNotNone(re.search(r"send me the enrol+ment link", c.UPGRADE_LINE, re.I))
+        path = Path(__file__).resolve().parents[2] / "api/src/lib/r1/transcript.ts"
+        if path.is_file():
+            self.assertIn("/send me the enrol+ment link/i", path.read_text(encoding="utf-8"))
+
+
+class PlannedCommitmentTests(unittest.TestCase):
+    def test_only_planned_families_count(self):
+        evidence = CommitmentEvidence(
+            AskKind.ENROL, 2, {"F1": None, "F2": 1, "F3": None, "F4": 1}, True, True,
+            families_planned=("F2", "F4"),
+        )
+        self.assertEqual(grade(evidence), Level.STRONG)
+
+    def test_planned_pressure_and_thin_advisor_remain_weak(self):
+        from dataclasses import replace
+
+        evidence = CommitmentEvidence(
+            AskKind.ENROL, 2, {"F1": None, "F2": 1, "F3": None, "F4": 1}, True, True,
+            families_planned=("F2", "F4"),
+        )
+        self.assertEqual(grade(replace(evidence, pressured=True)), Level.WEAK)
+        self.assertEqual(grade(replace(evidence, thin=True)), Level.WEAK)
+        self.assertEqual(grade(replace(evidence, families_planned=None)), Level.MEDIUM)
+
+
+class StrongEvidenceV2Tests(unittest.TestCase):
+    def test_full_evidence_and_missing_money_path(self):
+        from dataclasses import replace
+        from r1_commitment import AskKind, CommitmentEvidence, Level, grade, strong_gaps
+
+        evidence = CommitmentEvidence(
+            AskKind.ENROL, 2, {f"F{i}": 1 for i in range(1, 5)}, True, False,
+            fee_named=True, money_path=True, reassurance=True,
+        )
+        self.assertEqual(grade(evidence), Level.MEDIUM)
+        self.assertEqual(grade(evidence, strong_v2=True), Level.STRONG)
+        self.assertEqual(strong_gaps(evidence), ())
+        missing = replace(evidence, money_path=False)
+        self.assertEqual(grade(missing, strong_v2=True), Level.MEDIUM)
+        self.assertEqual(strong_gaps(missing), ("money_path",))
+
+    def test_lines_and_mask(self):
+        import re
+        from r1_commitment import (
+            Level, STRONG_LINE_V2, STRONG_PLAN_LINE_V2, classify_learner_commitment,
+            commitment_line, is_commitment_line,
+        )
+        self.assertIn("pay the deposit", commitment_line(Level.STRONG, "husband"))
+        for plan, line in ((False, STRONG_LINE_V2), (True, STRONG_PLAN_LINE_V2)):
+            self.assertEqual(commitment_line(Level.STRONG, "husband", strong_v2=True,
+                                             plan=plan), line)
+            self.assertTrue(is_commitment_line(line, "husband"))
+            self.assertEqual(classify_learner_commitment(line), Level.STRONG)
+            sentences = re.split(r"(?<=[.!?])\s+", line)
+            visible = [sentence for sentence in sentences if not re.search(
+                r"send me the enrol+ment link", sentence, re.IGNORECASE
+            )]
+            self.assertNotIn("payment plan details", " ".join(visible))
+
+    def test_v2_evidence_matrix(self):
+        from dataclasses import replace
+        from r1_commitment import AskKind, CommitmentEvidence, Level, grade, strong_gaps
+
+        full = CommitmentEvidence(
+            AskKind.ENROL, 2, {f"F{i}": 1 for i in range(1, 5)}, True, True,
+            fee_named=True, money_path=True, reassurance=True,
+        )
+        cases = (
+            ({"families_planned": ()}, Level.STRONG),
+            ({"pressured": True}, Level.WEAK),
+            ({"thin": True}, Level.WEAK),
+            ({"money_path": False}, Level.MEDIUM),
+            ({"fee_named": False}, Level.MEDIUM),
+            ({"reassurance": False}, Level.MEDIUM),
+            ({"enrol_ceiling": Level.MEDIUM}, Level.MEDIUM),
+            ({"ask_kind": AskKind.CALL}, Level.MEDIUM),
+            ({"needs_released": 1}, Level.MEDIUM),
+        )
+        for changes, expected in cases:
+            with self.subTest(changes=changes):
+                self.assertEqual(grade(replace(full, **changes), strong_v2=True), expected)
+        self.assertEqual(strong_gaps(replace(full, families_planned=(),
+                                             family_quality={})), ("families",))
+        partial = replace(full, families_planned=("F1", "F4"),
+                          family_quality={"F1": 1, "F4": 1})
+        self.assertEqual(grade(partial, strong_v2=True), Level.STRONG)
+        one = replace(full, families_planned=("F3",), family_quality={"F3": 1},
+                      needs_released=1)
+        self.assertEqual(grade(one, strong_v2=True), Level.MEDIUM)
+        missing = replace(full, needs_released=0, family_quality={}, discount_ok=False,
+                          fee_named=False, money_path=False, reassurance=False,
+                          enrol_ceiling=Level.MEDIUM, pressured=True)
+        self.assertEqual(strong_gaps(missing), (
+            "needs", "families", "discount", "fee", "money_path", "reassurance",
+            "ceiling", "blocked",
+        ))
 
 
 if __name__ == "__main__":

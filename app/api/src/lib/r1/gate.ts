@@ -112,7 +112,8 @@ export function evaluateR1Gate(input: R1GateInput): R1GateResult {
   // Every family delivered exactly as the deck defines it (F2-F4 primary and push; F1 anchor and
   // the counter below), and no delivery slipped. An F1 `push` row, if one ever arrives, is not a
   // deck move and is neither required nor judged.
-  for (const family of R1_FAMILIES) {
+  const planned = log.facts?.familiesPlanned ?? null;
+  for (const family of planned ?? R1_FAMILIES) {
     const entry = log.families[family];
     const hasPush = R1_FAMILIES_WITH_PUSH.has(family);
     if (entry.primary === null) failures.push(`family_missing:${family.toLowerCase()}`);
@@ -126,12 +127,15 @@ export function evaluateR1Gate(input: R1GateInput): R1GateResult {
       }
     }
   }
-  if (log.counter === null) {
-    failures.push('counter_missing');
-  } else if (log.counter.slipSeconds === null) {
-    failures.push('counter_slip_unknown');
-  } else if (log.counter.slipSeconds > R1_GATE_LIMITS.MAX_FAMILY_SLIP_SECONDS) {
-    failures.push('counter_slip');
+  const f1Planned = planned === null || planned.includes('F1');
+  if (f1Planned) {
+    if (log.counter === null) {
+      failures.push('counter_missing');
+    } else if (log.counter.slipSeconds === null) {
+      failures.push('counter_slip_unknown');
+    } else if (log.counter.slipSeconds > R1_GATE_LIMITS.MAX_FAMILY_SLIP_SECONDS) {
+      failures.push('counter_slip');
+    }
   }
 
   // A deep need must be probed BEFORE it is revealed. A reveal row without a turn index is
@@ -206,7 +210,7 @@ export function describeAdministrationQuality(
   input: R1GateInput,
   result: R1GateResult,
 ): R1AdministrationQuality {
-  const delivered = R1_FAMILIES.filter((family) => {
+  const delivered = (input.log.facts?.familiesPlanned ?? R1_FAMILIES).filter((family) => {
     const entry = input.log.families[family];
     // F1's second move is the counter; the others' is the push.
     const second = R1_FAMILIES_WITH_PUSH.has(family) ? entry.push : input.log.counter;

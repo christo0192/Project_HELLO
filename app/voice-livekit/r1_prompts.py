@@ -149,6 +149,11 @@ STRETCH_USED_NOTE = (
 TEMPLATE_USED_NOTE = (
     "- You have already asked what a call or a next step would involve: do not ask that again."
 )
+UPGRADE_CONDITION_NOTE = (
+    "- Keep the existing next step. Kindly say you are not ready yet, then say in your "
+    "own words the one thing that would move you:"
+)
+
 RESOLVED_NOTE = (
     "- You have already told the advisor where you stand on the next step. Do not repeat it, "
     "change it or add to it: react briefly to what they just said and let them wrap up."
@@ -556,6 +561,12 @@ VERDICT_USED_NOTE = (
 NOT_ANSWERED_NOTE = (
     "- The advisor has not really answered the worry you raised last. Do not open by calling their "
     "reply reasonable, good, fair or helpful: respond to what they actually said."
+)
+# M033 A10 (R1_MOVE_CONDITION): acknowledge a condition the advisor has met.
+CONDITION_MET_NOTE = (
+    "- What the advisor just said answers the thing you said would help you decide. You may say so "
+    "once, in a few words of your own (for example: Okay, that makes sense.), then respond to "
+    "what he said."
 )
 # S2 item 7 (RCA critic, fda9e9f6 #34-#37): after the coach aside the aside turn is not in her
 # context, so to the model the advisor answered her greeting with "Okay, sure." and she greeted
@@ -1437,6 +1448,7 @@ def learner_prefix(
     probe_first: bool = False,
     price_check: bool = False,
     timeline_v2: bool = False,
+    timeline_v3: bool = False,
 ) -> str:
     """The learner's system prefix: behaviour rules plus the persona's public card.
 
@@ -1484,7 +1496,9 @@ def learner_prefix(
         + "Do not volunteer worries, deadlines, money details or personal circumstances "
         "beyond your card. Share the extra detail a system note allows, and only then.\n"
         + CARD_MARKER
-        + persona.public_card_text(probe_first=probe_first, timeline_v2=timeline_v2)
+        + persona.public_card_text(
+            probe_first=probe_first, timeline_v2=timeline_v2, timeline_v3=timeline_v3
+        )
     )
 
 

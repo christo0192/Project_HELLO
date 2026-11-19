@@ -292,6 +292,7 @@ class RunResult:
     late: list[str] = field(default_factory=list)
     excluded: list[str] = field(default_factory=list)
     forced: int = 0
+    families_planned: tuple[str, ...] | None = None
     last_r: float | None = None
     cue_r: float | None = None
     holds: int = 0
@@ -315,6 +316,8 @@ class RunResult:
             "late": list(self.late),
             "excluded": list(self.excluded),
             "forced": self.forced,
+            "families_planned": self.families_planned,
+            "forced_share": self.forced / (2 * len(self.families_planned or (1, 2, 3, 4))),
             "last_r": self.last_r,
             "cue_r": self.cue_r,
             "holds": self.holds,
@@ -510,13 +513,17 @@ def run_one(
     *,
     seed: str = "grid",
     step: tuple[float, float] | None = None,
+    temperament: str | None = None,
 ) -> RunResult:
     """One role-play: ``pattern``'s advisor at ``pace`` seconds an exchange until R = 19:10.
 
     ``step`` (slow pace, from R): the exchanges from that R on take the slow pace (a STEP row).
     """
     advisor = PATTERNS[pattern]
-    persona = resolve_persona("p1_career_switcher", variant="v1")
+    persona = resolve_persona(
+        "p1_career_switcher", variant="v1", temperament_on=temperament is not None,
+        temperament=temperament,
+    )
     engine = RolePlayEngine(persona, candidate_first_name="Alex", seed=f"{seed}:{pattern}:{pace}")
     learner = _Learner(
         engine,
@@ -524,6 +531,7 @@ def run_one(
         says_not_today=pattern in NOT_TODAY_PATTERNS,
     )
     result = RunResult(pattern, pace, step)
+    result.families_planned = engine.scheduler.families_planned
     cut_moves: set[str] = set()
     line_of: dict[str, int] = {}  # the heard learner line that delivered each graded move
     r = START_R_SEC
@@ -572,6 +580,8 @@ def run_one(
     result.cue_r = summary["time_cue_delivered_sec"]
     late: set[str] = set()
     for family, info in summary["families"].items():
+        if info.get("planned") is False:
+            continue
         lateness = info["max_lateness_sec"]
         if not info["delivered"] or (lateness is not None and lateness > 0):
             late.add(family)
@@ -600,12 +610,13 @@ def run_grid(
     *,
     patterns: tuple[str, ...] | None = None,
     paces: tuple[float, ...] = PACES,
+    temperament: str | None = None,
 ) -> list[RunResult]:
     """Every pattern at every pace, with ``env`` (flag values) set for the duration (the
     ``EXTRA_PATTERNS`` only when named in ``patterns``)."""
     names = patterns or tuple(name for name in PATTERNS if name not in EXTRA_PATTERNS)
     with mock.patch.dict(os.environ, env or {}):
-        return [run_one(name, pace) for name in names for pace in paces]
+        return [run_one(name, pace, temperament=temperament) for name in names for pace in paces]
 
 
 def run_steps(
@@ -675,6 +686,9 @@ def totals(results: list[RunResult]) -> dict[str, Any]:
         "late_runs": sum(1 for item in results if item.late),
         "excluded_runs": sum(1 for item in results if item.excluded),
         "forced_moves": sum(item.forced for item in results),
+        "forced_share": (sum(item.forced for item in results) / sum(
+            2 * len(item.families_planned or (1, 2, 3, 4)) for item in results
+        )) if results else 0.0,
         "mean_last_r": round(sum(last) / len(last), 1) if last else None,
         "cue_missing": sum(1 for item in results if item.cue_r is None),
         "pushes_without_reaction_fast": len(pushes_without_reaction(results)),
@@ -796,6 +810,8 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="the adaptability flags off, then on (gated patterns and the tangent advisor)",
     )
+    parser.add_argument("--temperament", choices=("deep_evaluator", "price_negotiator",
+                                                    "steady_enquirer", "time_blocked"))
     parser.add_argument("--json", help="write the results to this file")
     args = parser.parse_args(argv)
     out: dict[str, Any] = {}
@@ -808,7 +824,7 @@ def main(argv: list[str] | None = None) -> int:
     settings = (("off", flags("0")), ("on", flags("1"))) if args.compare else (("env", None),)
     grids: dict[str, list[RunResult]] = {}
     for label, env in settings:
-        results = run_grid(env)
+        results = run_grid(env, temperament=args.temperament)
         grids[label] = results
         print(f"== flags {label}")
         print(table(results))

@@ -268,7 +268,15 @@ import r1_world
 # Revision 35 (ninth merge of the M032 lanes): the learner lane's 31 and the Christy lane's
 # 33-34 on top of revision 33; no text changed in the merge.  CONTENT_REVISION =
 # max(33, 31, 34) + 1.
-PINNED_CONTENT_SHA256 = "d6069be2c1ef130b23934a4c7c1a8bee85560916b9ea80a7528f6605f458d31b"
+# 36: M033 A4 pins the STRONG upgrade line.
+# 37: M033 A5 learner temperaments.
+# 40: M033 A8 v2 STRONG lines and evidence readers.
+# Revision 41: buying-signal questions and temperament priorities.
+# Revision 42: move conditions and the v3 persona card.
+# Revision 43: declined upgrade condition note.
+# Revision 44: render the upgrade condition note as a bullet.
+# 45: Keep the upgrade commitment in one sentence for scorer masking.
+PINNED_CONTENT_SHA256 = "0bb3cfbc252f33030caf018b91efb375a3159de3340df9e354c6ba04c826b601"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -529,6 +537,7 @@ class PinTests(unittest.TestCase):
             ("offer_on_table_note", r1_prompts.OFFER_ON_TABLE_NOTE),
             ("new_offer_note", r1_prompts.NEW_OFFER_NOTE),
             ("resolved_note", r1_prompts.RESOLVED_NOTE),
+            ("upgrade_condition_note", r1_prompts.UPGRADE_CONDITION_NOTE),
             ("checkin_note", r1_prompts.CHECKIN_NOTE),
             ("checkin_done_note", r1_prompts.CHECKIN_DONE_NOTE),
             ("email_again_note", r1_prompts.EMAIL_AGAIN_NOTE),
@@ -1106,6 +1115,12 @@ class FinalReviewRoundOnePinTests(unittest.TestCase):
             self.assertNotEqual(r1_content.content_sha256(), base, "STRONG line")
         finally:
             r1_commitment.COMMITMENT_LINES[r1_commitment.Level.STRONG] = line
+        upgrade_line = r1_commitment.UPGRADE_LINE
+        try:
+            r1_commitment.UPGRADE_LINE = upgrade_line + " "
+            self.assertNotEqual(r1_content.content_sha256(), base, "upgrade line")
+        finally:
+            r1_commitment.UPGRADE_LINE = upgrade_line
         self.assertEqual(r1_content.content_sha256(), base)
 
 

@@ -77,7 +77,19 @@ export function formatAdministrationLog(log: R1AdministrationLog): string {
     lines.push(`- ${need.need}: ${probed}, revealed at ${turnLabel(need.revealedTurn)}`);
   }
   lines.push('Objections the worker delivered (turn, slip in seconds from the scheduled moment):');
+  const planned = log.facts?.familiesPlanned;
   for (const family of R1_FAMILIES) {
+    if (planned != null && !planned.includes(family)) {
+      lines.push(`- ${family}: not planned for this call (not raised; do not score it)`);
+      if (family === 'F1') {
+        lines.push(
+          '- Negotiation note: F1 was not planned, so the learner never anchored at $7,000 and never ' +
+          'countered. Score Negotiation & discount discipline on how value is defended and on any discount ' +
+          'the advisor offered; a missing anchor or counter is not a gap, and level 4 needs no counter.',
+        );
+      }
+      continue;
+    }
     const entry = log.families[family];
     if (family === 'F1') {
       // F1 is the $7,000 anchor and the counter after the advisor's first answer. It has no push.

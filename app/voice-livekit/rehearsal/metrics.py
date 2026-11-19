@@ -989,19 +989,24 @@ def commitment_metrics(
         plan = _learner(ex).get("plan") or {}
         if plan.get("resolves") and plan.get("commitment_level") and _spoke_commitment(ex):
             commit_exchange = index
-            break
+            if not commitment.get("upgraded"):
+                break
     earned: bool | None = None
     if level in ("MEDIUM", "STRONG") and commit_exchange is not None:
         window = range(max(0, commit_exchange - 2), commit_exchange + 1)
         earned = any(advisor_asked_next_step(_advisor(exchanges[i])) for i in window)
     premature = 0
+    opening = (admin.get("close_window") or {}).get("open_r")
+    threshold = opening if type(opening) is int else COMMIT_PERMITTED_R_SEC
     for ex in exchanges:
         plan = _learner(ex).get("plan") or {}
         if plan.get("commitment_level") in ("MEDIUM", "STRONG") and _spoke_commitment(ex):
-            if _learner_r(ex) < COMMIT_PERMITTED_R_SEC:
+            if _learner_r(ex) < threshold:
                 premature += 1
     return {
         "commitment_level": level,
+        **({"commitment_upgraded": bool(commitment["upgraded"])}
+           if "upgraded" in commitment else {}),
         "commitment_resolved": bool(commitment.get("resolved")),
         "commitment_exchange": None if commit_exchange is None else commit_exchange + 1,
         "commitment_earned": earned,
@@ -1020,6 +1025,7 @@ _NEXT_STEP = re.compile(
     r"payment link|enrol+ment link|get you started|move forward|next step)\b",
     re.IGNORECASE,
 )
+_NEXT_STEP_PROCEED = re.compile(r"\bproceed(?:ing)?\b", re.IGNORECASE)
 # D5-HF-UNEARNED2 (``REHEARSAL_NEXT_STEP_V2``): more ways to ask for the next step.  "Shall I pencil
 # you in for a weekend slot?" and "shall I pencil in a weekend call with your husband?" earned a
 # commitment that the words above missed.  D5R-NS2-WILDCARD: the qualifier is a closed list (a free
@@ -1079,6 +1085,8 @@ def advisor_asked_next_step(advisor: Mapping[str, Any]) -> bool:
     for sentence in split_sentences(str(advisor.get("text") or "")):
         named = _NEXT_STEP.search(sentence) is not None or (
             flags.on(flags.NEXT_STEP_V2) and _next_step_v2(sentence)
+        ) or (
+            flags.on(flags.NEXT_STEP_PROCEED) and _NEXT_STEP_PROCEED.search(sentence) is not None
         )
         if named and ("?" in sentence or _OFFERING_VOICE.search(sentence) is not None):
             return True
@@ -1192,6 +1200,9 @@ def schedule_metrics(admin: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "families_delivered": delivered,
         "families_delivered_count": len(delivered),
+        **({"families_planned": schedule["families_planned"],
+            "families_planned_count": len(schedule["families_planned"])}
+           if "families_planned" in schedule else {}),
         "max_slip_sec_by_family": slips,
         "max_slip_sec": max(known) if known else None,
         "exclusion_reasons": list(schedule.get("exclusion_reasons") or []),
@@ -1415,6 +1426,14 @@ def commitment_spoken_leaks(
         cap = Level.WEAK
         if recorded is not None and isinstance(recorded_turn, (int, float)) and recorded_turn < roleplay_turn:
             cap = max(cap, recorded)
+        if commitment.get("upgraded"):
+            for earlier in exchanges:
+                if not isinstance(earlier.get("n"), int) or earlier["n"] >= roleplay_turn:
+                    continue
+                prior_plan = _learner(earlier).get("plan") or {}
+                prior_level = _level_named(prior_plan.get("commitment_level"))
+                if prior_level is not None and _spoke_commitment(earlier):
+                    cap = max(cap, prior_level)
         plan = _learner(ex).get("plan") or {}
         scripted = _level_named(plan.get("commitment_level"))
         if plan.get("delivered_commitment") and scripted is not None:

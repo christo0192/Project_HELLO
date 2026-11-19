@@ -25,9 +25,11 @@ constants moved by): each turn lands in the window it landed in on the day.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
@@ -51,6 +53,17 @@ WEAK = stall_line("")
 FIXTURE = replay.load_fixture()
 # The owner's call is a 14:00 role-play; the engine runs a 20:00 one (see the module docstring).
 STRETCH = replay.stretch_14_to_20
+# M033 A6: the owner's call raised all four families, so the replay keeps the full chain (a
+# temperament plan could drop families the recorded advisor answered).
+_FULL_CHAIN = mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "0"})
+
+
+def setUpModule() -> None:
+    _FULL_CHAIN.start()
+
+
+def tearDownModule() -> None:
+    _FULL_CHAIN.stop()
 
 
 class OwnerSessionCalibrationTests(unittest.TestCase):
@@ -370,3 +383,36 @@ class NegativeControlTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CommitmentUpgradeMetricsTests(unittest.TestCase):
+    def test_upgrade_summary_is_conditional(self):
+        from rehearsal.metrics import commitment_metrics
+
+        result = commitment_metrics([], {"commitment": {"level": "STRONG", "upgraded": True}})
+        self.assertEqual(result["commitment_level"], "STRONG")
+        self.assertTrue(result["commitment_upgraded"])
+        self.assertNotIn("commitment_upgraded", commitment_metrics([], {"commitment": {}}))
+
+    def test_upgrade_is_not_a_repeat_of_booking(self):
+        from rehearsal.metrics import repeat_metrics
+        from r1_commitment import Level, UPGRADE_LINE, commitment_line
+
+        metrics = repeat_metrics([commitment_line(Level.MEDIUM, "husband"), UPGRADE_LINE])
+        self.assertEqual(metrics["near_repeat_count"], 0)
+        self.assertEqual(metrics["exact_repeat_extra"], 0)
+
+    def test_medium_cap_before_later_upgrade_is_retained(self):
+        from rehearsal.metrics import commitment_spoken_leaks
+
+        admin = {
+            "turn_map": [{"roleplay_turn": 2, "transcript_turn": 4}],
+            "commitment": {"level": "STRONG", "turn": 3, "upgraded": True},
+        }
+        exchanges = [
+            {"n": 1, "learner": {"plan": {"commitment_level": "MEDIUM",
+                                          "delivered_commitment": True}}},
+            {"n": 2, "learner": {"spoken": "Let's book a call with my husband."}},
+        ]
+        trips = [{"category": "commitment", "turn_index": 4}]
+        self.assertEqual(commitment_spoken_leaks(admin, trips, exchanges), [])

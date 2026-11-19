@@ -52,12 +52,14 @@ from __future__ import annotations
 
 import functools
 import re
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 
 from r1_commitment import (
     COMMIT_PERMITTED_R_SEC,
     COMMIT_STALL_R_SEC,
     commitment_line,
+    commitment_permitted,
     detect_ask,
     Level,
 )
@@ -720,6 +722,123 @@ CURIOSITY_LABELS_V2: dict[str, tuple[str, ...]] = {
 }
 REQUIRED_MOVES = tuple(spec.id for spec in PLAN if spec.required)
 SPEC_BY_ID = {spec.id: spec for spec in PLAN}
+
+
+@dataclass(frozen=True)
+class ObjectionTheme:
+    """Family, id, label, objectives and fallbacks; defaults use moves, markers prove delivery."""
+
+    family: str
+    id: str
+    label: str
+    brief: str
+    worry: str
+    variants: tuple[str, ...]
+    markers: tuple[tuple[str, ...], ...]
+
+
+DEFAULT_THEMES = {"F3": "alternatives", "F2": "schedule", "F1": "fee_high", "F4": "wants_time"}
+_THEME_MOVES = {"F3": F3_PRIMARY, "F2": F2_PRIMARY, "F1": F1_ANCHOR, "F4": F4_PRIMARY}
+OBJECTION_THEMES: dict[tuple[str, str], ObjectionTheme] = {}
+for _family, _id in DEFAULT_THEMES.items():
+    _spec = SPEC_BY_ID[_THEME_MOVES[_family]]
+    OBJECTION_THEMES[(_family, _id)] = ObjectionTheme(
+        _family, _id, _id, _spec.brief, _spec.worry,
+        (_spec.line, *_spec.variants), _spec.markers,
+    )
+
+del _family, _id, _spec
+
+
+def _theme(
+    family: str, ident: str, label: str, brief: str, worry: str,
+    variants: tuple[str, ...], markers: tuple[tuple[str, ...], ...],
+) -> None:
+    OBJECTION_THEMES[(family, ident)] = ObjectionTheme(
+        family, ident, label, brief, worry, variants, markers,
+    )
+
+
+_theme("F3", "pays_off", "doubts it will pay off",
+       "you are not sure all the money and effort would really pay off for you in the end, and "
+       "you ask how you could tell it would be worth it",
+       "you doubt the money and effort would really pay off for you; what you want to know is "
+       "how you could tell it would be worth it for you",
+       ("I guess my worry is whether it would actually pay off for me in the end.",
+        "How would I know all that effort would really be worth it for me?"),
+       ((r"\b(?:pay(?:s|ing)? off|payoff|worth (?:it|the|all)|be worth|return on|"
+         r"make (?:it|that|the money) back|get (?:my money|it) back|end up (?:better|ahead)|"
+         r"(?:actually|really) (?:help|work out|be useful))\b",),))
+_theme("F3", "confirm_fit", "needs to confirm fit",
+       "before anything else you want to be sure this is really right for someone with your "
+       "background and what you are aiming for, and you ask how you could tell",
+       "you are not sure yet that this is right for someone with your background and aims; "
+       "what you want to know is how you could tell before going further",
+       ("Before anything else, I'd want to be sure this is right for someone with my background.",
+        "How do I know this is really the right thing for someone like me?"),
+       ((r"\b(?:right (?:thing )?for (?:someone|people|me)|suit(?:s|ed|able)?|"
+         r"someone like me|people like me|(?:my|a) background|background like mine|cut out for|"
+         r"(?:good|right) (?:match|fit) for me|where i(?:'m| am) (?:at|coming from))\b",),))
+_theme("F3", "format_pace", "format or pace",
+       "you worry that the way it is taught, and how fast it moves, might not suit how you "
+       "learn best, and you ask how it actually works",
+       "you worry the teaching style or speed might not suit how you learn; what you want to "
+       "know is how it actually works for someone like you",
+       ("I'm a bit worried the way it's taught might not suit how I learn.",
+        "What if it moves too fast for the way I pick things up?"),
+       ((r"\b(?:taught|teach(?:es|ing)?|how i learn|learn best|the way i (?:learn|pick)|"
+         r"pick (?:things|stuff) up|too (?:fast|quick|slow)|(?:the|its|that) pace|"
+         r"mov(?:e|es|ing) (?:fast|quick|too))\b",),))
+_theme("F3", "trust", "trust",
+       "you have been let down before by courses that promised a lot, so you are wary of taking "
+       "what you are told at face value, and you ask what you could actually rely on",
+       "you have been let down by big promises before and you are wary; what you want to know "
+       "is what you could actually rely on",
+       ("I've been let down by courses that promised a lot, so I'm a little wary.",
+        "Honestly, a lot of these programs promise the world, so how do I know what's real?"),
+       ((r"\b(?:let down|burn(?:ed|t)|wary|skeptic\w*|sceptic\w*|promis\w*|face value|"
+         r"what's real|too good to be true|trust\w*|believe|legit\w*|rely on)\b",),))
+_theme("F2", "unavailable_now", "unavailable right now",
+       "right now is a bad moment for you to take on anything new, because a lot is already on "
+       "your plate at the moment, and you are not sure about starting now",
+       "a lot is already on your plate at the moment, so you are not sure now is the moment to "
+       "start anything new; what you want to know is whether starting now even makes sense",
+       ("Honestly, right now is a really bad moment for me to take on anything new.",
+        "I've got a lot on my plate at the moment, so starting something now is hard."),
+       ((r"\b(?:right now|at the moment|currently|these days|this (?:point|stage|period)|"
+         r"(?:start|starting|begin|beginning) (?:something |anything )?now|on my plate|"
+         r"a lot going on)\b",),
+        (r"\b(?:bad (?:moment|time|timing)|take on|anything new|something new|start\w*|"
+         r"begin\w*|plate|going on|hard|tough|swamped|overwhelm\w*|too much)\b",)))
+_theme("F1", "cannot_afford", "can't afford it right now",
+       "money is tight for you right now, so it is about what you can manage at the moment, "
+       "not about whether it is worth it",
+       "money is tight for you at the moment; what matters is what you could actually manage",
+       ("Money's really tight for me right now.",
+        "Honestly, my budget is stretched thin at the moment."),
+       ((r"\b(?:money|budget|afford\w*|finances|savings|cash)\b",),
+        (r"\b(?:tight|stretched|thin|limited|right now|at the moment|these days|can't|cannot)\b",)))
+_theme("F4", "no_need", "no current need",
+       "you are in no hurry: things are okay for you as they are, so you do not feel you need "
+       "this right away",
+       "things are okay for you as they are, so you do not feel any need to act right away",
+       ("Honestly, I'm not in a rush; things are okay for me as they are.",
+        "I don't really feel like I need this right away, to be honest."),
+       ((r"\b(?:no (?:rush|hurry)|not in (?:a|any) (?:rush|hurry)|no urgency|not urgent|"
+         r"(?:need|needing) (?:this|it) (?:right away|right now|yet|now|today)|"
+         r"(?:okay|ok|fine) (?:for me )?as (?:they|it|things) (?:are|is|stand)|"
+         r"as things are|can wait)\b",),))
+_theme("F4", "family_approval", "needs family approval",
+       "a step this big is something your household decides together, not you alone, so you "
+       "cannot say yes on your own today; do not name anyone and do not say you will talk to "
+       "anyone",
+       "a step this big is decided together at home, not by you alone",
+       ("A step this big is something we decide together at home, not just me.",
+        "This isn't really a decision I can make on my own."),
+       ((r"\b(?:together|at home|household|on my own|by myself|alone|not just me|"
+         r"(?:just|only|all) up to me|only me)\b",),
+        (r"\b(?:decid\w*|decision|step|call|say yes|choice)\b",)))
+
 _ORDER = {spec.id: index for index, spec in enumerate(PLAN)}
 
 # Simulation diagnosis 1 (U1, U2; flag R1_MARKERS_V2, latched per session by the engine): more
@@ -1508,12 +1627,18 @@ _WORRY_ANSWER: dict[str, tuple[re.Pattern[str], ...]] = {
 }
 
 
-def worry_answered(family: str | None, text: object) -> bool:
+def worry_answered(family: str | None, text: object, *, themed: bool = False) -> bool:
     """The advisor's turn took up the worry of ``family`` (F2 or F3; any other: True)."""
     patterns = _WORRY_ANSWER.get(family or "")
     if patterns is None:
         return True
     lowered = fold(text).lower()
+    if themed and family == "F3" and re.search(
+        r"\b(?:background|suit\w*|fit|goals?|proof|evidence|reviews?|testimonials?|"
+        r"transparen\w*|honest\w*|track record|real (?:learners|students|people)|pace|"
+        r"at your own pace|step by step|hands-on|practice|questions)\b", lowered
+    ):
+        return True
     return any(pattern.search(lowered) for pattern in patterns)
 
 
@@ -2220,11 +2345,31 @@ class _MoveState:
 class OwedMoveScheduler:
     """Per-session schedule of the learner's owed moves (see the module docstring)."""
 
-    def __init__(self, decision_maker: str, *, markers_v2: bool = False) -> None:
+    def __init__(
+        self, decision_maker: str, *, markers_v2: bool = False, evidence_window: bool = False,
+        families: tuple[str, ...] | None = None,
+        themes: Mapping[str, str] | None = None,
+    ) -> None:
         """``markers_v2``: R1_MARKERS_V2 (simulation diagnosis 1), the wider delivery markers."""
+        if families is not None and (
+            not 2 <= len(families) <= 4 or len(set(families)) != len(families)
+            or families[-1] != "F4" or not set(families) <= set(FAMILIES)
+        ):
+            raise ValueError("invalid family plan")
+        if themes is not None and any(key not in OBJECTION_THEMES for key in themes.items()):
+            raise ValueError("invalid objection theme")
+        self.objection_themes = None if themes is None else dict(themes)
+        self.families_planned = families
+        deadlines = dict(zip(families or (), (430, 640, 810, 930)[-len(families or ()):]))
         self.decision_maker = decision_maker
+        self.evidence_window = evidence_window
+        self.f4_answered_turn: int | None = None
+        self.close_window_open_r: int | None = None
+        self.close_window_reason: str | None = None
         self._states: dict[str, _MoveState] = {}
         for spec in PLAN:
+            if spec.family in deadlines and spec.required:
+                spec = replace(spec, deadline_sec=deadlines[spec.family])
             if spec.id == COMMIT_STALL:
                 text = commitment_line(Level.WEAK, decision_maker)
             else:
@@ -2242,6 +2387,26 @@ class OwedMoveScheduler:
                 if spec.variants
                 else (),
             )
+        for family, ident in (self.objection_themes or {}).items():
+            theme = self.theme_for(_THEME_MOVES[family])
+            if theme is None:
+                continue
+            state = self._states[_THEME_MOVES[family]]
+            if family == "F1":
+                state.brief += "; the reason it matters: " + theme.brief
+                state.variants = tuple(
+                    f"{theme.variants[i % len(theme.variants)]} {variant}"
+                    for i, variant in enumerate(state.variants)
+                )
+            else:
+                state.text = theme.variants[0]
+                state.brief = theme.brief
+                state.markers = theme.markers
+                state.variants = theme.variants
+        if families is not None:
+            for state in self._states.values():
+                if state.spec.family in FAMILIES and state.spec.family not in families:
+                    state.status = "skipped"
         self.turn = 0
         self.last_r: float | None = None
         self._gaps: list[float] = []
@@ -2263,6 +2428,26 @@ class OwedMoveScheduler:
         # M032 SWEEP-20: (move id, issued, forced_when_issued, enabled_sec) before the last
         # redirect.
         self._redirect_undo: tuple[str, int, bool, float | None] | None = None
+
+    def theme_for(self, move_id: str) -> ObjectionTheme | None:
+        """Return the applied non-default theme for this move, if any."""
+        for family, ident in (self.objection_themes or {}).items():
+            if _THEME_MOVES[family] == move_id and ident != DEFAULT_THEMES[family]:
+                return OBJECTION_THEMES[(family, ident)]
+        return None
+
+    @property
+    def pacing_map(self) -> tuple[tuple[int, tuple[str, ...]], ...]:
+        """Each owed family's deadline and required moves, in this session's order (M033 A6:
+        the planned families only, at their re-slotted deadlines; the full chain without a plan)."""
+        return tuple(
+            (
+                max(self._states[s.id].spec.deadline_sec or 0 for s in PLAN
+                    if s.family == family and s.required),
+                tuple(s.id for s in PLAN if s.family == family and s.required),
+            )
+            for family in (self.families_planned or FAMILIES)
+        )
 
     # ------------------------------------------------------------------ observation
     @property
@@ -2298,6 +2483,13 @@ class OwedMoveScheduler:
         for family in topics:
             self._topic_turn[family] = self.turn
         self._turn_answered = answers_substantively(text)
+        push_turn = self._states[F4_PUSH].delivered_turn
+        if (
+            self.f4_answered_turn is None and push_turn is not None and push_turn < self.turn
+            and ("F4" in topics or tail_theme_hit(F4_PUSH, text, self.decision_maker)
+                 or self._turn_answered)
+        ):
+            self.f4_answered_turn = self.turn
         if pitch and self.pitch_turn is None:
             self.pitch_turn = self.turn
         if price and self.price_quoted_turn is None:
@@ -2320,6 +2512,12 @@ class OwedMoveScheduler:
         # other than an owed move (a stall, a reveal, a free reply), so slip is never
         # understated.
         self._refresh_enabled(r_sec)
+        if (
+            self.evidence_window and self.close_window_open_r is None
+            and self.commit_permitted(r_sec)
+        ):
+            self.close_window_open_r = int(r_sec)
+            self.close_window_reason = "evidence" if r_sec < COMMIT_PERMITTED_R_SEC else "clock"
         return TurnSignals(
             turn=self.turn,
             pitch=pitch,
@@ -2358,7 +2556,7 @@ class OwedMoveScheduler:
     def family_complete(self, family: str) -> bool:
         """True when every required component of ``family`` has been delivered."""
         return all(
-            self._delivered(spec.id)
+            self._states[spec.id].status in ("delivered", "skipped")
             for spec in PLAN
             if spec.family == family and spec.required
         )
@@ -2399,15 +2597,21 @@ class OwedMoveScheduler:
         for spec in PLAN:
             if spec.family not in FAMILIES or not spec.required:
                 continue
-            if self._delivered(spec.id):
+            state = self._states[spec.id]
+            if state.status in ("delivered", "skipped"):
                 continue
+            spec = state.spec
             if spec.deadline_sec is None or r_sec <= spec.deadline_sec + SLIP_LIMIT_SEC:
                 return True
         return False
 
     def commit_permitted(self, r_sec: float) -> bool:
-        """The close window: all four families done and R >= 13:00."""
-        return self.all_families_complete and r_sec >= COMMIT_PERMITTED_R_SEC
+        """The close window opens on the clock or on completed and answered evidence."""
+        return commitment_permitted(
+            r_sec, self.all_families_complete,
+            evidence=(self.evidence_window and self.f4_answered_turn is not None
+                      and self.f4_answered_turn < self.turn),
+        )
 
     def mark_commitment_resolved(self) -> None:
         """Record that a grade-level commitment line (or the 19:00 stall) was spoken."""
@@ -2454,6 +2658,21 @@ class OwedMoveScheduler:
         if state.spec.role == "primary" and not self._primary_gate(family):
             return False
         since = self._since
+        if self.families_planned is not None and state.spec.role == "primary":
+            index = self.families_planned.index(family)
+            price = move_id == F1_ANCHOR and self.price_quoted_turn is not None
+            if index == 0:
+                return price or self.pitch_turn is not None or r_sec >= F3_FALLBACK_OPEN_SEC
+            previous = self.families_planned[index - 1]
+            second = {"F1": F1_COUNTER, "F2": F2_PUSH, "F3": F3_PUSH}[previous]
+            if family == "F4":
+                return (
+                    all(self.family_complete(f) for f in self.families_planned[:-1])
+                    and (since(second) or 0) >= 1
+                    and (previous == "F1" or "F1" not in self.families_planned
+                         or (since(F1_COUNTER) or 0) >= 1)
+                )
+            return price or (self.family_complete(previous) and (since(second) or 0) >= 1)
         if move_id == F3_PRIMARY:
             return self.pitch_turn is not None or r_sec >= F3_FALLBACK_OPEN_SEC
         if move_id == F3_PUSH:
@@ -2488,6 +2707,10 @@ class OwedMoveScheduler:
                 and self.open_family is None
             )
         return False
+
+    def turns_since_objection(self) -> int:
+        """Learner turns since the last objection."""
+        return self._since_objection()
 
     def _since_objection(self) -> int:
         """Learner turns since the last objection of any family (since the start if none)."""
@@ -2575,7 +2798,13 @@ class OwedMoveScheduler:
         candidate monologue cannot hide a late first learner turn.
         """
         move_id = state.spec.id
-        if move_id == F3_PRIMARY and self.pitch_turn is None:
+        first_primary = (
+            self.families_planned is not None and state.spec.role == "primary"
+            and state.spec.family == self.families_planned[0]
+        )
+        if (move_id == F3_PRIMARY or first_primary) and self.pitch_turn is None:
+            if move_id == F1_ANCHOR and self.price_quoted_turn is not None:
+                return r_sec
             return min(r_sec, float(F3_FALLBACK_OPEN_SEC))
         if move_id == TIME_CUE:
             return min(r_sec, float(TIME_CUE_SEC))
@@ -2758,7 +2987,11 @@ class OwedMoveScheduler:
         family on top of an unanswered push.
         """
         open_family = self.open_family
-        for spec in PLAN:
+        ordered = (
+            tuple(s for family in self.families_planned for s in PLAN if s.family == family)
+            if self.families_planned is not None else PLAN
+        )
+        for spec in ordered:
             if spec.id in (COMMIT_STALL, TIME_CUE):
                 continue
             if open_family is not None and spec.family != open_family:
@@ -2777,10 +3010,15 @@ class OwedMoveScheduler:
 
     def required_pending(self) -> tuple[str, ...]:
         """M032 SWEEP-24: the required graded moves not yet delivered, in plan order (pure)."""
+        ordered = (
+            tuple(s for family in self.families_planned for s in PLAN if s.family == family)
+            if self.families_planned is not None else PLAN
+        )
         return tuple(
             spec.id
-            for spec in PLAN
-            if spec.required and spec.family in FAMILIES and not self._delivered(spec.id)
+            for spec in ordered
+            if spec.required and spec.family in FAMILIES
+            and self._states[spec.id].status not in ("delivered", "skipped")
         )
 
     def next_forced_peek(self, r_sec: float) -> OwedMove | None:
@@ -2790,7 +3028,11 @@ class OwedMoveScheduler:
         the reading time of the ``OwedMove`` returned.
         """
         open_family = self.open_family
-        for spec in PLAN:
+        ordered = (
+            tuple(s for family in self.families_planned for s in PLAN if s.family == family)
+            if self.families_planned is not None else PLAN
+        )
+        for spec in ordered:
             if spec.id in (COMMIT_STALL, TIME_CUE):
                 continue
             if open_family is not None and spec.family != open_family:
@@ -2863,6 +3105,7 @@ class OwedMoveScheduler:
         moves = []
         for spec in PLAN:
             state = self._states[spec.id]
+            spec = state.spec
             delivery = state.delivery
             moves.append(
                 {
@@ -2893,16 +3136,19 @@ class OwedMoveScheduler:
             complete = self.family_complete(family)
             max_slip = max(slips) if slips else None
             families[family] = {
-                "delivered": complete,
+                "delivered": complete and (self.families_planned is None
+                                           or family in self.families_planned),
                 "max_slip_sec": _round(max_slip),
                 "max_lateness_sec": _round(max(late)) if late else None,
             }
+            if self.families_planned is not None:
+                families[family]["planned"] = family in self.families_planned
             if max_slip is not None and max_slip > SLIP_LIMIT_SEC:
                 reasons.append(f"family_slip:{family}")
             if final and not complete:
                 reasons.append(f"family_missing:{family}")
         cue = self._states[TIME_CUE]
-        return {
+        result = {
             "plan_version": PLAN_VERSION,
             "moves": moves,
             "families": families,
@@ -2911,6 +3157,15 @@ class OwedMoveScheduler:
             "excluded_from_auto_status": bool(reasons),
             "exclusion_reasons": reasons,
         }
+        if self.families_planned is not None:
+            result["families_planned"] = list(self.families_planned)
+        if self.evidence_window:
+            result["close_window"] = {
+                "open_r": self.close_window_open_r,
+                "reason": self.close_window_reason,
+                "f4_answered_turn": self.f4_answered_turn,
+            }
+        return result
 
 
 def _round(value: float | None) -> float | None:

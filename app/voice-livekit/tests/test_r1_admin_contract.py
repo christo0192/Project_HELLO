@@ -52,6 +52,11 @@ if str(HERE) not in sys.path:
 import r1_guard
 from r1_phases import R1Phase
 from r1_replies import (
+    CLOSE_WINDOW_FACT_KEYS,
+    PLAN_FACT_KEYS,
+    TEMPERAMENT_FACT_KEYS,
+    THEME_FACT_KEYS,
+    SIGNAL_FACT_KEYS,
     EXTRA_FACT_KEYS,
     GUARD_KINDS,
     READER_FACT_KEYS,
@@ -111,6 +116,7 @@ API_PAYLOAD_KEYS = {
             "question_count",
             "interruption_count",
             "first_audio_p95_ms",
+            "families_planned",
         }
     ),
 }
@@ -192,7 +198,13 @@ def parse_like_api(rows):
             if time_cue is None:
                 time_cue = finite_non_negative(payload.get("roleplay_seconds"))
         elif event_type == "session_facts":
+            plan = payload.get("families_planned")
+            if (not isinstance(plan, list) or not plan or "F4" not in plan
+                    or any(item not in API_FAMILIES for item in plan)
+                    or len(set(plan)) != len(plan)):
+                plan = None
             facts = {
+                "families_planned": plan,
                 "roleplay_seconds": finite_non_negative(payload.get("roleplay_seconds")),
                 **{
                     key: finite_non_negative(payload.get(key))
@@ -220,7 +232,8 @@ def gate_like_api(log):
         failures.append("roleplay_duration_unknown")
     elif roleplay < MIN_ROLEPLAY_SECONDS:
         failures.append("roleplay_too_short")
-    for family in API_FAMILIES:
+    planned = (log["facts"] or {}).get("families_planned") or API_FAMILIES
+    for family in planned:
         entry, name = log["families"][family], family.lower()
         has_push = family in API_FAMILIES_WITH_PUSH
         if entry["primary"] is None:
@@ -234,12 +247,13 @@ def gate_like_api(log):
                 failures.append(f"family_slip_unknown:{name}")
             elif delivery["slip_seconds"] > MAX_FAMILY_SLIP_SECONDS:
                 failures.append(f"family_slip:{name}")
-    if log["counter"] is None:
-        failures.append("counter_missing")
-    elif log["counter"]["slip_seconds"] is None:
-        failures.append("counter_slip_unknown")
-    elif log["counter"]["slip_seconds"] > MAX_FAMILY_SLIP_SECONDS:
-        failures.append("counter_slip")
+    if "F1" in planned:
+        if log["counter"] is None:
+            failures.append("counter_missing")
+        elif log["counter"]["slip_seconds"] is None:
+            failures.append("counter_slip_unknown")
+        elif log["counter"]["slip_seconds"] > MAX_FAMILY_SLIP_SECONDS:
+            failures.append("counter_slip")
     if any(need["revealed_turn"] is None for need in log["needs"]):
         failures.append("need_reveal_turn_unknown")
     if any(
@@ -289,7 +303,7 @@ class TestWorkerRowsAgainstTheApiParser(unittest.IsolatedAsyncioTestCase):
     async def test_every_row_carries_every_key_the_parser_reads(self):
         _, rows = await self.session_rows()
         for row in rows:
-            expected = API_PAYLOAD_KEYS[row["event_type"]]
+            expected = API_PAYLOAD_KEYS[row["event_type"]] - set(PLAN_FACT_KEYS)
             with self.subTest(event_type=row["event_type"], turn=row["turn_index"]):
                 self.assertLessEqual(expected, set(row["payload"]), row)
 
@@ -310,12 +324,14 @@ class TestWorkerRowsAgainstTheApiParser(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(need["probed_turn"])
             self.assertLessEqual(need["probed_turn"], need["revealed_turn"])
         # Objections: every delivery has a slip (not "slip not reported").
-        for family in API_FAMILIES:
+        planned = log["facts"]["families_planned"] or API_FAMILIES
+        for family in planned:
             self.assertIsNotNone(log["families"][family]["primary"], family)
             self.assertIsNotNone(log["families"][family]["primary"]["slip_seconds"], family)
-        for family in API_FAMILIES_WITH_PUSH:
+        for family in set(planned) & set(API_FAMILIES_WITH_PUSH):
             self.assertIsNotNone(log["families"][family]["push"]["slip_seconds"], family)
-        self.assertIsNotNone(log["counter"]["slip_seconds"])
+        if "F1" in planned:
+            self.assertIsNotNone(log["counter"]["slip_seconds"])
         # Discounts: an amount (not "amount not reported").
         self.assertTrue(log["discounts"])
         for discount in log["discounts"]:
@@ -347,21 +363,22 @@ class TestWorkerRowsAgainstTheApiParser(unittest.IsolatedAsyncioTestCase):
             for row in rows
             if row["event_type"] in ("family_delivered", "push_delivered", "counter_delivered")
         }
+        planned = parse_like_api(rows)["facts"]["families_planned"] or API_FAMILIES
         self.assertEqual(
             families,
-            {("family_delivered", f) for f in API_FAMILIES}
-            | {("push_delivered", f) for f in ("F2", "F3", "F4")}
-            | {("counter_delivered", "F1")},
+            {("family_delivered", f) for f in planned}
+            | {("push_delivered", f) for f in planned if f in API_FAMILIES_WITH_PUSH}
+            | ({("counter_delivered", "F1")} if "F1" in planned else set()),
         )
         moves = {row["payload"].get("move_id") for row in rows} - {None}
-        self.assertTrue({"F3-PRIMARY", "F2-PRIMARY", "F1-ANCHOR", "F4-PRIMARY"} <= moves)
+        self.assertIn("F4-PRIMARY", moves)
         self.assertNotIn("Q-A", moves)
         blob = json.dumps(rows)
         for private in ("intents", "fallback_appended", "handed_to_model", "curiosity", "brief"):
             self.assertNotIn(private, blob)
         # The engine still logs it for the rehearsal metrics.
         intents = rig.engine.admin_log()["intents"]
-        self.assertGreaterEqual(sum(intents["handed_to_model"].values()), 8)
+        self.assertGreaterEqual(sum(intents["handed_to_model"].values()), 2 * len(planned))
 
     async def test_the_negotiation_memory_is_logged_but_never_posted(self):
         """R1-Q: offers, callbacks, reasons and the slot stay in the worker's own log."""
@@ -479,11 +496,19 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         payload = facts[0]["payload"]
         # The worker-only counts (M032 SWEEP-1) are stored with the row and never parsed, and so
         # are the repairs' labels and counts (M032 S6), under names the parser never reads.
-        worker_only = set(SESSION_FACT_WORKER_KEYS) | set(EXTRA_FACT_KEYS)
+        worker_only = (
+            set(SESSION_FACT_WORKER_KEYS) | set(EXTRA_FACT_KEYS) | set(CLOSE_WINDOW_FACT_KEYS)
+            | set(TEMPERAMENT_FACT_KEYS) | set(THEME_FACT_KEYS) | set(SIGNAL_FACT_KEYS)
+        )
         self.assertEqual(set(payload) - {"pins"} - worker_only, API_PAYLOAD_KEYS["session_facts"])
-        self.assertEqual(set(SESSION_FACT_KEYS), API_PAYLOAD_KEYS["session_facts"])
+        self.assertEqual(set(SESSION_FACT_KEYS) | set(PLAN_FACT_KEYS),
+                         API_PAYLOAD_KEYS["session_facts"])
         self.assertEqual(set(SESSION_FACT_WORKER_KEYS) & API_PAYLOAD_KEYS["session_facts"], set())
         self.assertEqual(set(EXTRA_FACT_KEYS) & API_PAYLOAD_KEYS["session_facts"], set())
+        self.assertEqual(set(CLOSE_WINDOW_FACT_KEYS) & API_PAYLOAD_KEYS["session_facts"], set())
+        if API_ADMIN_LOG.is_file():
+            for key in CLOSE_WINDOW_FACT_KEYS:
+                self.assertNotIn(key, API_ADMIN_LOG.read_text(encoding="utf-8"))
         for key in SESSION_FACT_KEYS:
             value = payload[key]
             self.assertTrue(
@@ -501,6 +526,65 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(payload["first_audio_p95_ms"], 0)
         self.assertEqual(facts[0]["turn_index"], None)
         self.assertEqual(facts[0]["family_id"], None)
+
+    def test_temperament_worker_fact_is_optional(self):
+        plain = session_facts_event(None, {}, roleplay_seconds=700)["payload"]
+        admin = {"temperament": {"id": "deep_evaluator", "stall_rounds": 1,
+                                 "enrol_ceiling": "STRONG"}}
+        payload = session_facts_event(admin, {}, roleplay_seconds=700)["payload"]
+        self.assertEqual(set(payload) - set(plain), set(TEMPERAMENT_FACT_KEYS))
+        self.assertEqual(payload["temperament"], "deep_evaluator")
+        self.assertFalse(set(TEMPERAMENT_FACT_KEYS) & API_PAYLOAD_KEYS["session_facts"])
+
+    def test_theme_worker_fact_is_optional(self):
+        plain = session_facts_event(None, {}, roleplay_seconds=700)["payload"]
+        themes = {"F3": "pays_off", "F4": "wants_time"}
+        present = session_facts_event({"objection_themes": themes}, {},
+                                      roleplay_seconds=700)["payload"]
+        self.assertNotIn("objection_themes", plain)
+        self.assertEqual(present["objection_themes"], themes)
+        self.assertFalse(set(THEME_FACT_KEYS) & API_PAYLOAD_KEYS["session_facts"])
+
+    def test_buying_signals_worker_fact_is_optional(self):
+        plain = session_facts_event(None, {}, roleplay_seconds=700)["payload"]
+        signals = [{"id": "N-SIG-PLAN", "turn": 12}]
+        present = session_facts_event({"buying_signals": signals}, {},
+                                      roleplay_seconds=700)["payload"]
+        self.assertNotIn("buying_signals", plain)
+        self.assertEqual(present["buying_signals"], signals)
+        self.assertFalse(set(SIGNAL_FACT_KEYS) & API_PAYLOAD_KEYS["session_facts"])
+
+    def test_move_conditions_worker_fact_is_optional(self):
+        plain = session_facts_event(None, {}, roleplay_seconds=700)["payload"]
+        conditions = [{"id": "money_path", "turn": 12, "named": True}]
+        present = session_facts_event({"move_conditions": conditions}, {},
+                                      roleplay_seconds=700)["payload"]
+        self.assertNotIn("move_conditions", plain)
+        self.assertEqual(present["move_conditions"], conditions)
+
+    def test_strong_gaps_are_never_session_facts(self):
+        for admin in (None, {"strong_gaps": []}, {"strong_gaps": ["fee"]}):
+            with self.subTest(admin=admin):
+                payload = session_facts_event(admin, {}, roleplay_seconds=700)["payload"]
+                self.assertNotIn("strong_gaps", payload)
+
+    def test_choose_persona_temperament_flag(self):
+        from r1_replies import choose_persona
+        for context in ({}, {"attempt": {"persona_id": "p1_career_switcher"}}):
+            self.assertIsNone(choose_persona(context, seed="s").persona.temperament)
+            self.assertIsNotNone(choose_persona(context, seed="s", temperament_on=True)
+                                 .persona.temperament)
+
+    def test_close_window_worker_facts_are_optional(self):
+        plain = session_facts_event(None, {}, roleplay_seconds=700)
+        admin = {"close_window": {"open_r": 680, "reason": "evidence"}}
+        row = session_facts_event(admin, {}, roleplay_seconds=700)
+        payload = row["payload"]
+        self.assertEqual(set(payload) - set(plain["payload"]), set(CLOSE_WINDOW_FACT_KEYS))
+        self.assertEqual(payload["close_window_open_r"], 680)
+        self.assertEqual(payload["close_window_reason"], "evidence")
+        self.assertEqual({k: v for k, v in payload.items() if k not in CLOSE_WINDOW_FACT_KEYS},
+                         plain["payload"])
 
     def test_the_turn_readers_record_rides_along_unread_by_the_api(self):
         # M032 S4: the shadow record is worker-only.  It sits in the same row, the parser reads
@@ -554,7 +638,9 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         (facts,) = [e for e in posted(rig.writer.admin_events) if e["event_type"] == "session_facts"]
         # The learner lane's worker-only counts (M032 SWEEP-1) ride along whatever these flags say.
         self.assertEqual(
-            set(facts["payload"]) - {"pins"} - set(SESSION_FACT_WORKER_KEYS),
+            set(facts["payload"]) - {"pins"} - set(SESSION_FACT_WORKER_KEYS)
+            - set(CLOSE_WINDOW_FACT_KEYS) - set(TEMPERAMENT_FACT_KEYS) - set(THEME_FACT_KEYS)
+            - set(SIGNAL_FACT_KEYS),
             API_PAYLOAD_KEYS["session_facts"],
         )
 
@@ -994,6 +1080,31 @@ class TestPlanReasonsAreLoggedForProduction(unittest.IsolatedAsyncioTestCase):
         blob = " ".join(labels)
         self.assertNotIn("data science", blob.lower())
         del rig
+
+
+class PlannedFactsTests(unittest.TestCase):
+    def test_plan_is_optional_in_session_facts(self):
+        from r1_replies import session_facts_event
+
+        absent = session_facts_event({}, {}, roleplay_seconds=600)["payload"]
+        present = session_facts_event(
+            {"families_planned": ["F2", "F4"]}, {}, roleplay_seconds=600
+        )["payload"]
+        self.assertNotIn("families_planned", absent)
+        self.assertEqual(present["families_planned"], ["F2", "F4"])
+
+    def test_skipped_families_never_post_deliveries(self):
+        from r1_replies import fidelity_events
+        from r1_scheduler import OwedMoveScheduler
+
+        scheduler = OwedMoveScheduler("family", families=("F2", "F4"))
+        for move in ("F2-PRIMARY", "F2-PUSH", "F4-PRIMARY", "F4-PUSH"):
+            scheduler.observe_candidate_turn("Synthetic answer", 500)
+            scheduler.confirm_delivered(move, 500)
+        admin = {"schedule": scheduler.summary(), "tracker": {}}
+        rows = fidelity_events(admin, {})
+        self.assertEqual({row["family_id"] for row in rows}, {"F2", "F4"})
+        self.assertFalse(any(row["family_id"] in ("F1", "F3") for row in rows))
 
 
 if __name__ == "__main__":

@@ -1384,6 +1384,13 @@ class StateTests(unittest.TestCase):
         state.note_reason_voiced(neg.REASON_TIMING, 9)
         self.assertEqual(state.voiced[neg.REASON_TIMING], 1)  # the first time stands
 
+    def test_custom_stall_limit(self):
+        one = neg.Negotiation("husband", max_stall_rounds=1)
+        default = neg.Negotiation("husband")
+        one.stall_rounds = default.stall_rounds = 1
+        self.assertFalse(one.can_stall())
+        self.assertTrue(default.can_stall())
+
     def test_stall_rounds_are_capped(self):
         state = self.state()
         self.assertTrue(state.can_stall())
@@ -3533,5 +3540,112 @@ class LowOfferAndAnchorSituationTests(unittest.TestCase):
         self.assertNotIn("good to know", neg.anchor_after_offer(6000).brief)
 
 
+class BuyingSignalSpecTests(unittest.TestCase):
+    def test_signal_questions_and_stall_separation(self):
+        for signal_id in neg.SIGNAL_IDS:
+            spec = neg.SPEC_BY_ID[signal_id]
+            self.assertEqual((spec.kind, spec.reason, len(spec.variants)),
+                             (neg.KIND_SIGNAL, None, 3))
+            for line in spec.variants:
+                self.assertTrue(line.endswith("?"))
+                self.assertNotRegex(line, r"\d")
+                self.assertTrue(markers_match(neg.filled_markers(spec.markers, "partner"), line))
+                self.assertIs(classify_learner_commitment(line), Level.NONE)
+                self.assertFalse(has_concession(line))
+            for stall_id in (neg.N_MONEY, neg.N_TIMING, neg.N_DECISION_MAKER):
+                for line in neg.SPEC_BY_ID[stall_id].variants:
+                    self.assertFalse(markers_match(spec.markers, line))
+
+    def test_temperament_priorities(self):
+        from r1_temperament import DEFAULT_SIGNALS, TEMPERAMENT_BY_ID
+
+        expected = {
+            "deep_evaluator": (neg.N_SIG_FORMAT, neg.N_SIG_PLAN),
+            "price_negotiator": (neg.N_SIG_PLAN, neg.N_SIG_DISCOUNT),
+            "steady_enquirer": (neg.N_SIG_FORMAT,),
+            "time_blocked": (),
+        }
+        self.assertEqual(DEFAULT_SIGNALS, (neg.N_SIG_PLAN,))
+        for key, signals in expected.items():
+            self.assertEqual(TEMPERAMENT_BY_ID[key].signals, signals)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+class MoveConditionContractTests(unittest.TestCase):
+    def test_conditions_match_their_own_text_and_not_each_other(self):
+        clauses = list(neg.CONDITION_CLAUSES.values()) + list(
+            neg.CONDITION_FAMILY_CLAUSES.values()
+        )
+        for clause in clauses:
+            markers = neg.filled_markers(clause.markers, "husband")
+            for text in (clause.clause, *clause.fallbacks):
+                text = neg.fill_decision_maker(text, "husband")
+                self.assertTrue(markers_match(markers, text), (clause.id, text))
+                self.assertNotRegex(text, r"\d")
+                self.assertEqual(classify_learner_commitment(text), Level.NONE)
+                self.assertFalse(has_concession(text))
+                for other in clauses:
+                    if other.id != clause.id:
+                        self.assertFalse(markers_match(
+                            neg.filled_markers(other.markers, "husband"), text
+                        ), (clause.id, other.id, text))
+
+    def test_condition_is_recorded_only_when_spoken(self):
+        memory = Negotiation("husband")
+        self.assertFalse(memory.note_condition("money_path", "I need to think.", 1))
+        self.assertTrue(memory.note_condition(
+            "money_path", "Honestly, it would help if I knew how the payment could work for me.", 2
+        ))
+        self.assertEqual(memory.condition_named, [{"id": "money_path", "turn": 2}])
+
+    def test_v3_habitual_decider_is_not_decider_first(self):
+        for v3 in (False, True):
+            memory = Negotiation("husband", timeline_v3=v3)
+            self.assertEqual(
+                memory._says_decider_first("I usually talk big decisions over with my husband."),
+                not v3,
+            )
+            self.assertTrue(memory._says_decider_first("I need to talk to my husband first."))
+            for text in (
+                "I usually talk big decisions over with my husband, so I'd want to "
+                "talk to my husband about this.",
+                "I usually talk things over with my husband, and I'll talk to my husband tonight.",
+            ):
+                self.assertTrue(memory._says_decider_first(text))
+
+    def test_paraphrased_conditions_and_stalls(self):
+        samples = {
+            "money_path": "If I knew I could manage the payments.",
+            "decider": "If I could explain it to my husband.",
+            "reassurance": "How did others like me work out after?",
+            "needs": "If it felt right for my situation.",
+            "work": "Once work is less busy.",
+            "families:F1": "If the fee is doable.",
+            "families:F2": "How would it work with my week?",
+            "families:F3": "If I knew it would be worth it.",
+        }
+        clauses = (*neg.CONDITION_CLAUSES.values(), *neg.CONDITION_FAMILY_CLAUSES.values())
+        for clause in clauses:
+            markers = neg.filled_markers(clause.markers, "husband")
+            self.assertTrue(markers_match(markers, samples[clause.id]), clause.id)
+            for stall in (neg.N_MONEY, neg.N_TIMING, neg.N_DECISION_MAKER):
+                for text in neg.SPEC_BY_ID[stall].variants:
+                    self.assertFalse(markers_match(markers, text), (clause.id, text))
+            self.assertEqual(len(clause.fallbacks), 3)
+
+    def test_condition_text_has_no_persona_need(self):
+        clauses = (*neg.CONDITION_CLAUSES.values(), *neg.CONDITION_FAMILY_CLAUSES.values())
+        for persona in PERSONAS:
+            rendered = resolve_persona(persona.id, variant="v1")
+            for clause in clauses:
+                for text in (clause.clause, *clause.fallbacks):
+                    text = neg.fill_decision_maker(text, rendered.decision_maker)
+                    for topic in ("H1", "H2", "H3"):
+                        for marker in rendered.markers(topic):
+                            self.assertIsNone(marker.search(text), (persona.id, clause.id, text))
+                    self.assertFalse(
+                        deep_need_topics_in(rendered, text), (persona.id, clause.id, text)
+                    )
+        self.assertNotIn("condition_named", Negotiation("husband").log())

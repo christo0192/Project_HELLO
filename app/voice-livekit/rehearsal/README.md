@@ -288,6 +288,7 @@ on one call is a readiness reason: run `--calls` at twice the scenario count or 
 evening session with a mentor" and "catch up over the phone" are next-step asks that earn a commitment;
 the qualifier is a closed list, so "a smart call", "another sales call", "your Monday meeting" and
 "every morning session is recorded" are not).
+`REHEARSAL_NEXT_STEP_PROCEED` (questions or offers to proceed count as next-step asks; OFF restores the previous vocabulary).
 
 Two rounds scored by different rubrics are not comparable.  Judge saved records again, flow judge
 only (no candidate, Christy or learner call; the records are not written), under the current rubric:
@@ -357,6 +358,12 @@ and the live UI.
 
 `call.py` imports `Rig` from `tests/test_r1_integration.py`; if PR-B or PR-4c changes that rig, fix it
 there first. The DeepSeek price constants in `llm.py` are estimates (S0-B), not the price list.
+
+The `skilled-closer` scenario uses the explicit `closer` advisor level with discovery,
+concern handling and an enrolment ask. Calibration to real move rates and scorecard
+enrolment metrics are follow-up work.
+
+`REHEARSAL_CLOSER_REASSURANCE=0` restores the previous closer guidance.
 
 The full-interview harness injects the streaming `spec_reply_runner` seam. Offline,
 it snapshots the scripted learner for speculative calls. Use `--spec-reply on` or

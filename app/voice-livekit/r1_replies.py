@@ -106,6 +106,12 @@ SESSION_FACT_KEYS = (
 # the same row for the owner's comparison.  Worker-only: the API stores it with the payload and its
 # parser reads none of it, so no gate or score can depend on it.  Labels and counts only.
 READER_FACT_KEYS = ("reader_shadow", "reader_agreement")
+# M033 A3 (R1_CLOSE_WINDOW_EVIDENCE): when and why the close window opened (int seconds and
+# "clock" / "evidence"), only when the engine logs it.  Worker-only: the API parser reads
+# neither, so no gate or score depends on them.
+CLOSE_WINDOW_FACT_KEYS = ("close_window_open_r", "close_window_reason")
+# Worker-only: the API parser reads none of it; no gate or score depends on it.
+TEMPERAMENT_FACT_KEYS = ("temperament",)
 # Worker-only ``session_facts`` keys (M032 S1 and SWEEP-1): the API stores them with the row and
 # does not parse them, so they never touch the gate or the score.  ``learner_timing`` carries the
 # learner's timing holds as counts only (no text), so the owner's next test shows how often each
@@ -310,7 +316,8 @@ def pick_persona_id(seed: str) -> str:
 
 
 def choose_persona(
-    context: Mapping[str, Any], *, seed: str, candidate_first_name: str = ""
+    context: Mapping[str, Any], *, seed: str, candidate_first_name: str = "",
+    temperament_on: bool = False
 ) -> PersonaChoice:
     """Pick the persona card: the attempt's own when valid, else a pick seeded by the session."""
     seed = seed or DEFAULT_SEED
@@ -324,10 +331,12 @@ def choose_persona(
                 variant=variant if isinstance(variant, str) and variant else "default",
                 seed=seed,
                 avoid_first_name=candidate_first_name,
+                temperament_on=temperament_on,
             )
             return PersonaChoice(rendered, SOURCE_ATTEMPT, seed)
     rendered = resolve_persona(
-        pick_persona_id(seed), variant="default", seed=seed, avoid_first_name=candidate_first_name
+        pick_persona_id(seed), variant="default", seed=seed, avoid_first_name=candidate_first_name,
+        temperament_on=temperament_on
     )
     return PersonaChoice(rendered, SOURCE_SEED, seed)
 
@@ -419,6 +428,7 @@ def llm_messages(
                 probe_first=reply.plan.probe_first,
                 price_check=reply.plan.price_check,
                 timeline_v2=reply.plan.timeline_v2,
+                timeline_v3=reply.plan.timeline_v3,
             ),
             select_context(ordered, ROLEPLAY_PHASE),
             reply.candidate_text,
@@ -579,6 +589,15 @@ EXTRA_FACT_KEYS = (
 )
 
 
+# The API parser (admin-log.ts) reads this plan; absent means all four families.
+PLAN_FACT_KEYS = ("families_planned",)
+# Worker-only observation; the API parser does not use this for grading.
+THEME_FACT_KEYS = ("objection_themes",)
+# Worker-only observation; the API parser does not use this for grading.
+SIGNAL_FACT_KEYS = ("buying_signals",)
+CONDITION_FACT_KEYS = ("move_conditions",)
+
+
 def session_facts_event(
     admin: Mapping[str, Any] | None,
     pins: Mapping[str, Any],
@@ -617,6 +636,15 @@ def session_facts_event(
         "interruption_count": None,
         "first_audio_p95_ms": _measured(first_audio_p95_ms),
     }
+    close = (admin or {}).get("close_window")
+    close_facts = (
+        {"close_window_open_r": close.get("open_r"), "close_window_reason": close.get("reason")}
+        if isinstance(close, Mapping) else {}
+    )
+    temperament = (admin or {}).get("temperament")
+    temperament_facts = (
+        {"temperament": temperament["id"]} if isinstance(temperament, Mapping) else {}
+    )
     shadow = {key: reader[key] for key in READER_FACT_KEYS if key in (reader or {})}
     added = {key: extra[key] for key in EXTRA_FACT_KEYS if key in (extra or {})}
     return {
@@ -632,6 +660,12 @@ def session_facts_event(
             "learner_endings": _learner_endings(admin),
             "learner_followups": _learner_followups(admin),
             "wrapup": _wrapup_counts(wrapup),
+            **close_facts,
+            **temperament_facts,
+            **{key: admin[key] for key in PLAN_FACT_KEYS if key in (admin or {})},
+            **{key: admin[key] for key in THEME_FACT_KEYS if key in (admin or {})},
+            **{key: admin[key] for key in SIGNAL_FACT_KEYS if key in (admin or {})},
+            **{key: admin[key] for key in CONDITION_FACT_KEYS if key in (admin or {})},
             **shadow,
             **added,
         },

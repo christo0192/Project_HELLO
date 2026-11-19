@@ -296,7 +296,8 @@ def _families_line(record: Mapping[str, Any]) -> str:
     delivered = (record.get("metrics") or {}).get("families_delivered")
     if delivered is None:
         return "Graded objection families delivered before the end: unknown."
-    missing = [family for family in FAMILY_IDS if family not in delivered]
+    planned = (record.get("metrics") or {}).get("families_planned", FAMILY_IDS)
+    missing = [family for family in planned if family not in delivered]
     return (
         f"Graded objection families delivered before the end: {', '.join(delivered) or 'none'}; "
         f"not reached: {', '.join(missing) or 'none'}."

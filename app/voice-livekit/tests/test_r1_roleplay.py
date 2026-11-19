@@ -389,7 +389,8 @@ def cooperative_script():
 
 def strong_script():
     """The cooperative script whose last turn also answers the learner's decider stall."""
-    return [*cooperative_script()[:-1], HANDLE_DECIDER]
+    return [*cooperative_script()[:-1], HANDLE_DECIDER +
+            " The $9,000 fee has a payment plan. Our alumni moved into data roles."]
 
 
 def run_cooperative(period=72.5, eng=None, ask_at=None, script=None):
@@ -1219,7 +1220,12 @@ class AskTests(unittest.TestCase):
         plan = session.say(ASK, r)
         self.assertEqual(plan.mode, TurnMode.SAY_ONLY)
         self.assertEqual(plan.commitment_level, Level.STRONG)
-        self.assertEqual(plan.scripted_text, commitment_line(Level.STRONG, "husband"))
+        # M033 A8: the v2 plan line, or the v1 line when R1_STRONG_EVIDENCE_V2 is off.
+        from r1_roleplay import FLAG_STRONG_EVIDENCE_V2, flag_on
+        v2 = flag_on(FLAG_STRONG_EVIDENCE_V2)
+        self.assertEqual(plan.scripted_text, commitment_line(
+            Level.STRONG, "husband", strong_v2=v2, plan=v2
+        ))
         self.assertTrue(plan.resolves_commitment)
         self.assertTrue(eng.commitment_resolved)
         self.assertEqual(eng.commitment_level, Level.STRONG)
@@ -1265,6 +1271,33 @@ class AskTests(unittest.TestCase):
         self.assertEqual(handled.commitment_level, Level.MEDIUM)
         self.assertIn("ask_in_window:grade_medium", handled.reasons)
         self.assertTrue(handled.resolves_commitment)
+
+    def test_temperament_limits_stalls_and_is_logged(self):
+        persona = resolve_persona(P1.id, variant="v1", temperament_on=True,
+                                  temperament="deep_evaluator")
+        eng = engine(persona)
+        self.assertEqual(eng.admin_log()["temperament"], {
+            "id": "deep_evaluator", "stall_rounds": 1, "enrol_ceiling": "STRONG"})
+        self.assertNotIn("temperament", engine().admin_log())
+        eng.negotiation.stall_rounds = 1
+        self.assertFalse(eng.negotiation.can_stall())
+        default = engine()
+        default.negotiation.stall_rounds = 1
+        self.assertTrue(default.negotiation.can_stall())
+        self.assertEqual(eng.admin_log()["negotiation"]["stall_rounds"], 1)
+
+    def test_temperament_resolves_weak_after_one_stall(self):
+        persona = resolve_persona(P1.id, variant="v1", temperament_on=True,
+                                  temperament="deep_evaluator")
+        for current, expected in ((persona, Level.WEAK), (P1, None)):
+            session, r = run_cooperative(72.5, eng=engine(current))
+            session.eng.negotiation.stall_rounds = 1
+            plan = session.say(ASK, r)
+            self.assertEqual(plan.commitment_level, expected)
+            if expected is Level.WEAK:
+                self.assertTrue(plan.resolves_commitment)
+            else:
+                self.assertEqual(plan.mode, TurnMode.INTENT)
 
     def test_the_stall_reason_rounds_are_capped_at_two(self):
         eng = engine()
@@ -5024,7 +5057,7 @@ class SituationNotesThroughTheEngineTests(unittest.TestCase):
                 s = Session(engine(rendered))
                 s.say(OPENER, 20)
                 plan = s.say("Is anyone else involved in the decision?", 60)
-                note = DECIDER_ASKED_NOTE.format(answer=rendered.decider_answer)
+                note = DECIDER_ASKED_NOTE.format(answer=rendered.decider_answer_v3)
                 self.assertIn(note, plan.reminder)
                 self.assertIn(rendered.decision_maker, note)
 
@@ -9491,7 +9524,8 @@ class ProbeFirstCardAndPrefixTests(unittest.TestCase):
         offer_realism = eng._offer_realism
         self.assertEqual(
             eng.learner_prefix_text(),
-            P2.learner_prefix(P1, offer_realism=offer_realism, timeline_v2=eng._timeline_v2),
+            P2.learner_prefix(P1, offer_realism=offer_realism, timeline_v2=eng._timeline_v2,
+                              timeline_v3=eng._timeline_v3),
         )
         self.assertIn("You know only that it is around $9,000 and about 6 months.", P1.public_card_text())
         self.assertIn(P2.PREFIX_COURSE_SENTENCE, eng.learner_prefix_text())
@@ -9511,6 +9545,7 @@ class ProbeFirstCardAndPrefixTests(unittest.TestCase):
             probe_first=plan.probe_first,
             price_check=plan.price_check,
             timeline_v2=plan.timeline_v2,
+            timeline_v3=plan.timeline_v3,
         )
         self.assertEqual(rebuilt, before)
 
@@ -11690,7 +11725,8 @@ class PersonaTimelineLatchTests(unittest.TestCase):
     def test_flag_off_builds_the_card_of_the_release_before(self):
         from r1_prompts import learner_prefix
 
-        with mock.patch.dict(r1_roleplay.os.environ, {"R1_PERSONA_TIMELINE_V2": "0"}):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_PERSONA_TIMELINE_V2": "0",
+                                                     "R1_PERSONA_TIMELINE_V3": "0"}):
             eng = engine()
         self.assertFalse(eng.plan_turn(OPENER, 20).timeline_v2)
         self.assertEqual(
@@ -13856,7 +13892,8 @@ class EarlyCloseByeReviewTests(unittest.TestCase):
     BYE = "Okay, thank you so much for your time, take care, bye."
 
     def early_close(self):
-        s = Session(engine())
+        with mock.patch.dict(os.environ, {"R1_CLOSE_WINDOW_EVIDENCE": "0"}):
+            s = Session(engine())
         s.say(OPENER, 20)
         deliver(s.eng, *ALL_MOVES, r=200)
         s.reply = "Sure, that works for me."
@@ -13883,7 +13920,7 @@ class EarlyCloseByeReviewTests(unittest.TestCase):
         self.assertFalse(s.eng.exit_farewell)
 
     def test_flag_off_is_the_release_before(self):
-        with d3_flags(R1_FAREWELL_EXIT_V2="0"):
+        with d3_flags(R1_FAREWELL_EXIT_V2="0", R1_CLOSE_WINDOW_EVIDENCE="0"):
             s = Session(engine())
             s.say(OPENER, 20)
             deliver(s.eng, *ALL_MOVES, r=200)
@@ -13893,8 +13930,6 @@ class EarlyCloseByeReviewTests(unittest.TestCase):
             s.say("Yes, let's stop the role-play there.", 710)
             self.assertIsNone(s.eng.exit_bye)
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 # ------------------------------------------------------------------------------------------------
@@ -14888,7 +14923,8 @@ class D5PostByeQuietTests(unittest.TestCase):
     """D5-LRN-POSTBYE1 (R1_POST_BYE_QUIET)."""
 
     def bye_session(self):
-        s = done_session()
+        with mock.patch.dict(os.environ, {"R1_CLOSE_WINDOW_EVIDENCE": "0"}):
+            s = done_session()
         # Christy's two early-close asks were answered "carry on" already: a close is held.
         s.eng._wrap_offers.extend(
             {"trigger": r1_roleplay.TRIGGER_EARLY_CLOSE, "answer": "no", "r_sec": 0.0}
@@ -15124,6 +15160,918 @@ class D5RPostByeTests(unittest.TestCase):
         s = D5PostByeQuietTests.bye_session(D5PostByeQuietTests())
         s.say("Yeah, totally get it.", 790)
         self.assertTrue(s.eng._bye_heard)
+
+
+class DiscountDisciplineV2IntegrationTests(unittest.TestCase):
+    def test_flag_latches_tracker_rule(self):
+        for value in ("0", "1"):
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ, {"R1_DISCOUNT_DISCIPLINE_V2": value}),
+            ):
+                eng = engine(seed="discipline-v2")
+                session = Session(eng)
+                session.say("Our curriculum covers python and sql with weekly mentor feedback.", 20)
+                session.say("If you go with the payment plan, I can do $1,500 off.", 60)
+                session.say("So with the $1,500 off it comes to $7,500.", 100)
+                self.assertEqual(len(eng.tracker.discount_log), 2)
+                expected = value == "1"
+                self.assertEqual(eng.tracker.discount_ok, expected)
+                self.assertEqual(eng.tracker.commitment_evidence(None).discount_ok, expected)
+                rule = eng.admin_log()["tracker"]["discounts"]["rule"]
+                self.assertEqual(rule, "first_offer" if expected else "every_mention")
+
+
+class InventedOfferV2IntegrationTests(unittest.TestCase):
+    def test_flag_latches_tracker_and_prompt(self):
+        for value in ("0", "1"):
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ, {"R1_INVENTED_OFFER_V2": value}),
+            ):
+                eng = engine(seed="invented-v2")
+                session = Session(eng)
+                session.say("Unlike a free course on YouTube, you get a mentor every week.", 20.0)
+                expected = value == "0"
+                self.assertEqual(eng.tracker.invented_offer, expected)
+                self.assertEqual(eng.tracker.commitment_evidence(None).pressured, expected)
+                system = eng.judge_messages("hello", "hello")[0]["content"]
+                self.assertEqual("invented_offer is true only when" in system, not expected)
+
+
+class CloseWindowEvidenceIntegrationTests(unittest.TestCase):
+    def test_answer_and_ask_same_turn_waits_for_judge(self):
+        for value in ("0", "1"):
+            with self.subTest(value=value), mock.patch.dict(
+                os.environ, {"R1_CLOSE_WINDOW_EVIDENCE": value}
+            ):
+                session, _ = run_cooperative(25, script=strong_script() + [HANDLE_DECIDER] * 11)
+                session.eng.scheduler.f4_answered_turn = None
+                plan = session.eng.plan_turn(
+                    "Your husband can join the call. Shall I send you the enrolment link?", 660
+                )
+                self.assertIsNotNone(session.eng.scheduler.f4_answered_turn)
+                self.assertIn("ask_before_close_window", plan.reasons)
+                self.assertFalse(any(x.startswith("ask_in_window:") for x in plan.reasons))
+                self.assertIsNone(plan.commitment_level)
+
+    def test_early_graded_ask_and_goodbye_with_rollback(self):
+        for value in ("0", "1"):
+            with self.subTest(value=value), mock.patch.dict(
+                os.environ, {"R1_CLOSE_WINDOW_EVIDENCE": value}
+            ):
+                script = strong_script() + [HANDLE_DECIDER] * 11
+                session, _ = run_cooperative(25, script=script)
+                session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+                plan = session.say("Shall I send you the enrolment link?", 700)
+                log = session.eng.admin_log()
+                if value == "1":
+                    self.assertIn("ask_in_window:grade_strong", plan.reasons)
+                    self.assertTrue(session.eng.commitment_resolved)
+                    self.assertEqual(log["close_window"]["reason"], "evidence")
+                    self.assertLessEqual(log["close_window"]["open_r"], 700)
+                    bye = session.say("Goodbye, thank you.", 750)
+                    self.assertEqual(bye.mode, TurnMode.EXIT)
+                    self.assertEqual(session.eng.scheduler.close_attempts, 1)
+                    self.assertIsNone(session.eng.admin_log()["early_close"]["end_request"])
+                    self.assertNotIn("early_close:offer", bye.reasons)
+                else:
+                    self.assertTrue(any(reason in plan.reasons for reason in (
+                        "ask_before_close_window", "ask_yields_to_owed_move")))
+                    self.assertIsNone(plan.commitment_level)
+                    self.assertNotIn("close_window", log)
+
+
+class CommitUpgradeTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ, {"R1_UPGRADE_V2": "0"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    BOOK = "Shall we set up a call with your husband on Thursday at 7 PM?"
+    ENROL = "Would you like to go ahead and enrol today? I can send you the enrolment link."
+
+    def booked(self, flag="1", handle=True):
+        with mock.patch.dict(os.environ, {"R1_COMMIT_UPGRADE": flag}):
+            session, r = run_cooperative(65, eng=engine(), script=strong_script())
+        session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+        first = session.say(self.BOOK, r)
+        self.assertEqual(first.commitment_level, Level.MEDIUM)
+        self.assertTrue(session.spoken[-1])
+        if handle:
+            commitment_turn = session.eng.turn
+            session.say(HANDLE_DECIDER, r + 5)
+            self.assertGreater(session.eng.negotiation.decider_handled_turn, commitment_turn)
+        return session, r + 10
+
+    def test_upgrade_and_single_attempt(self):
+        from r1_commitment import UPGRADE_LINE
+
+        s, r = self.booked()
+        plan = s.say(self.ENROL, r)
+        self.assertEqual(plan.commitment_level, Level.STRONG, plan.reasons)
+        self.assertIn("commitment_upgraded", plan.reasons)
+        self.assertEqual(s.spoken[-1], UPGRADE_LINE)
+        self.assertEqual(s.eng.admin_log()["commitment"].get("violations", 0), 0)
+        self.assertEqual(s.eng._violations, 0)
+        self.assertEqual(s.eng.commitment_level, Level.STRONG)
+        self.assertEqual(s.eng.negotiation.level, Level.STRONG)
+        log = s.eng.admin_log()["commitment"]
+        self.assertEqual((log["first_level"], log["upgraded"], log["upgrade_tried"],
+                          log["level"]), ("MEDIUM", True, True, "STRONG"))
+        later = s.say(ASK, r + 5)
+        self.assertIn("commitment_on_record", later.reasons)
+        self.assertFalse(later.scripted_text)
+
+    def test_unresolved_decider_spends_attempt(self):
+        s, r = self.booked(handle=False)
+        plan = s.say(self.ENROL, r)
+        self.assertIn("commitment_on_record", plan.reasons)
+        self.assertIn("upgrade_declined:decider_unresolved", plan.reasons)
+        self.assertEqual(s.eng.commitment_level, Level.MEDIUM)
+        s.say(HANDLE_DECIDER, r + 5)
+        later = s.say(self.ENROL, r + 10)
+        self.assertIn("commitment_on_record", later.reasons)
+        self.assertFalse(any(x.startswith("upgrade_declined:") for x in later.reasons))
+
+    def test_enrol_turn_handles_decider(self):
+        from r1_commitment import UPGRADE_LINE
+
+        s, r = self.booked(handle=False)
+        commitment_turn = s.eng.turn
+        plan = s.say(
+            "Your husband can still join Thursday, and if you would rather not wait, "
+            "would you like to enrol today? I can send you the enrolment link.", r,
+        )
+        self.assertGreater(s.eng.negotiation.decider_handled_turn, commitment_turn)
+        self.assertEqual(plan.commitment_level, Level.STRONG, plan.reasons)
+        self.assertIn("commitment_upgraded", plan.reasons)
+        self.assertEqual(s.spoken[-1], UPGRADE_LINE)
+
+    def test_flag_off(self):
+        s, r = self.booked(flag="0")
+        plan = s.say(ASK, r)
+        self.assertIn("commitment_on_record", plan.reasons)
+        self.assertFalse(any(x.startswith("upgrade_declined:") for x in plan.reasons))
+        for key in ("first_level", "upgraded", "upgrade_tried"):
+            self.assertNotIn(key, s.eng.admin_log()["commitment"])
+
+    def test_grade_below_strong_is_declined_once(self):
+        from dataclasses import replace
+
+        for field in ("pressured", "thin"):
+            with self.subTest(field=field):
+                s, r = self.booked()
+                original = s.eng._evidence
+                with mock.patch.object(
+                    s.eng, "_evidence", side_effect=lambda kind: replace(
+                        original(kind), **{field: True}
+                    )
+                ):
+                    plan = s.say(ASK, r)
+                self.assertTrue(any(x.startswith("upgrade_declined:grade_")
+                                    for x in plan.reasons), plan.reasons)
+                later = s.say(ASK, r + 5)
+                self.assertFalse(any(x.startswith("upgrade_declined:") for x in later.reasons))
+
+    def test_cut_upgrade_is_revoiced_without_spending_attempt(self):
+        from r1_commitment import UPGRADE_LINE
+
+        s, r = self.booked()
+        before = len(s.eng._upgrade_attempt_turns)
+        plan = s.eng.plan_turn(ASK, r)
+        self.assertIn("commitment_upgraded", plan.reasons)
+        s.eng.record_spoken(plan, "Actually, I don't want", r_sec=r, interrupted=True)
+        self.assertEqual(len(s.eng._upgrade_attempt_turns), before)
+        self.assertFalse(s.eng._upgrade_tried)
+        later = s.eng.plan_turn("Okay.", r + 5)
+        self.assertEqual(later.mode, TurnMode.SAY_ONLY)
+        self.assertEqual(later.scripted_text, UPGRADE_LINE)
+        self.assertIn("commitment_revoiced", later.reasons)
+        self.assertIn("commitment_upgraded", later.reasons)
+        s.eng.record_spoken(later, UPGRADE_LINE, r_sec=r + 5)
+        self.assertEqual(s.eng.commitment_level, Level.STRONG)
+
+    def test_time_limit_and_strong_first(self):
+        s, r = self.booked()
+        plan = s.say(ASK, 1140)
+        self.assertIn("commitment_on_record", plan.reasons)
+        self.assertFalse(s.eng.admin_log()["commitment"]["upgrade_tried"])
+        with mock.patch.dict(os.environ, {"R1_COMMIT_UPGRADE": "1"}):
+            s, r = run_cooperative(65, eng=engine(), script=strong_script())
+        s.eng.apply_judge(GOOD_JUDGE, s.eng.turn)
+        first = s.say(ASK, r)
+        self.assertEqual(first.commitment_level, Level.STRONG)
+        later = s.say(ASK, r + 5)
+        self.assertIn("commitment_on_record", later.reasons)
+        self.assertFalse(s.eng.admin_log()["commitment"]["upgrade_tried"])
+
+    def test_free_confirmation_passes_guard_after_upgrade(self):
+        s, r = self.booked()
+        s.say(ASK, r)
+        plan = s.eng.plan_turn("What happens next?", r + 5)
+        result = s.eng.sanitize_reply(plan, "Great, I'll look out for the link.")
+        self.assertIn("look out for the link", result.text)
+        self.assertFalse(any(hit.rule == "commitment" for hit in result.hits))
+
+    def test_medium_enrol_does_not_qualify(self):
+        with mock.patch.dict(os.environ, {"R1_COMMIT_UPGRADE": "1"}):
+            s, r = run_cooperative(65, eng=engine())
+        s.say(ASK, r)
+        first = s.say(
+            "We have a payment plan with monthly instalments. Shall I send you the enrolment link?",
+            r + 10,
+        )
+        self.assertEqual(first.commitment_level, Level.MEDIUM, first.reasons)
+        later = s.say(ASK, r + 15)
+        self.assertIn("commitment_on_record", later.reasons)
+        self.assertFalse(s.eng.admin_log()["commitment"]["upgrade_tried"])
+
+    def test_blockers_decline_upgrade(self):
+        for field, label in (("call_declined_turn", "call_declined"),
+                             ("wait_said_turn", "learner_waiting")):
+            with self.subTest(label=label):
+                s, r = self.booked()
+                setattr(s.eng.negotiation, field, s.eng.turn)
+                plan = s.say(ASK, r)
+                self.assertIn("upgrade_declined:" + label, plan.reasons)
+                self.assertEqual(s.eng.commitment_level, Level.MEDIUM)
+
+
+class TemperamentPlanEngineTests(unittest.TestCase):
+    def test_plan_and_rollback(self):
+        from r1_personas import resolve_persona
+        from r1_temperament import plan_families
+
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament="steady_enquirer")
+        with mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "1"}):
+            engine = r1_roleplay.RolePlayEngine(persona, seed="plan-test")
+            self.assertEqual(engine.scheduler.families_planned,
+                             plan_families(persona.temperament, engine.seed))
+            self.assertEqual(engine.admin_log()["families_planned"],
+                             list(engine.scheduler.families_planned))
+        with mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "0"}):
+            engine = r1_roleplay.RolePlayEngine(persona, seed="plan-test")
+            self.assertIsNone(engine.scheduler.families_planned)
+            self.assertNotIn("families_planned", engine.admin_log())
+
+    def test_last_point_does_not_wait_for_unplanned_f1(self):
+        from r1_personas import resolve_persona
+        from r1_scheduler import F2_PRIMARY, F2_PUSH, F4_PRIMARY
+
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament="steady_enquirer")
+        with mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "1",
+                                         "R1_LAST_POINT_V2": "0"}):
+            engine = r1_roleplay.RolePlayEngine(persona, seed="test")
+            engine.scheduler = r1_roleplay.OwedMoveScheduler("family", families=("F2", "F4"))
+            for move in (F2_PRIMARY, F2_PUSH, F4_PRIMARY):
+                engine.scheduler.observe_candidate_turn("Synthetic answer", 850)
+                engine.scheduler.confirm_delivered(move, 850)
+            with mock.patch.object(engine, "_last_point_plan", return_value="last"):
+                self.assertEqual(engine._late_end_request(None, r_sec=850, by_model=False), "last")
+
+    def test_price_offers_are_still_read_without_f1(self):
+        from r1_personas import resolve_persona
+
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament="steady_enquirer")
+        engine = r1_roleplay.RolePlayEngine(persona, seed="test")
+        engine.scheduler = r1_roleplay.OwedMoveScheduler("family", families=("F2", "F4"))
+        session = Session(engine)
+        session.say("Our curriculum covers python and sql with weekly mentor feedback.", 20)
+        session.say("If you use the payment plan, I can do $1,500 off.", 60)
+        self.assertEqual(len(engine.tracker.discount_log), 1)
+        self.assertIsNotNone(engine.negotiation.best_offer_usd)
+        self.assertTrue(engine.fidelity()["checks"]["f1_counter_delivered"])
+
+    def test_price_first_does_not_wait_for_an_unplanned_anchor(self):
+        from r1_personas import resolve_persona
+
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament="steady_enquirer")
+        engine = r1_roleplay.RolePlayEngine(persona, seed="test")
+        engine.scheduler = r1_roleplay.OwedMoveScheduler("family", families=("F2", "F4"))
+        engine._probe_first = True
+        with mock.patch.object(engine.negotiation, "next_reason",
+                               return_value=r1_roleplay.REASON_MONEY):
+            self.assertFalse(engine._price_first_due())
+
+    def test_money_stall_is_not_raised_when_f1_is_unplanned(self):
+        from r1_personas import resolve_persona
+
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament="steady_enquirer")
+        engine = r1_roleplay.RolePlayEngine(persona, seed="test")
+        engine.scheduler = r1_roleplay.OwedMoveScheduler("family", families=("F2", "F4"))
+        self.assertIn(r1_roleplay.REASON_MONEY, engine._stall_skip())
+
+
+class TemperamentThemeEngineTests(unittest.TestCase):
+    def test_pick_and_rollback(self):
+        from r1_temperament import pick_themes
+        from r1_scheduler import FAMILIES
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament="deep_evaluator")
+        for plan_flag in ("0", "1"):
+            with mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": plan_flag,
+                                              "R1_TEMPERAMENT_THEMES": "1"}):
+                eng = r1_roleplay.RolePlayEngine(persona, seed="theme-test")
+                families = eng.scheduler.families_planned or FAMILIES
+                self.assertEqual(eng.scheduler.objection_themes,
+                                 dict(pick_themes(persona.temperament, eng.seed, families)))
+                self.assertEqual(eng.admin_log()["objection_themes"],
+                                 eng.scheduler.objection_themes)
+            with mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": plan_flag,
+                                              "R1_TEMPERAMENT_THEMES": "0"}):
+                eng = r1_roleplay.RolePlayEngine(persona, seed="theme-test")
+                self.assertIsNone(eng.scheduler.objection_themes)
+                self.assertNotIn("objection_themes", eng.admin_log())
+
+    def test_decider_said_suppresses_themed_f4_last_point(self):
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament="deep_evaluator")
+        engine = r1_roleplay.RolePlayEngine(persona, seed="theme-test")
+        for theme in ("no_need", "family_approval"):
+            engine.scheduler = r1_scheduler.OwedMoveScheduler(
+                persona.decision_maker, themes={"F4": theme})
+            engine._decider_said_turn = 1
+            self.assertFalse(engine._last_point_worth(r1_scheduler.F4_PRIMARY))
+            engine._decider_said_turn = None
+            engine._stall_themes["decider"] = 1
+            self.assertFalse(engine._last_point_worth(r1_scheduler.F4_PRIMARY))
+            engine._stall_themes["decider"] = 0
+
+    def test_disabled_themes_restore_scheduler_and_intents(self):
+        from r1_scheduler import F1_ANCHOR, F2_PRIMARY, F3_PRIMARY, F4_PRIMARY
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament="deep_evaluator")
+        for plan_flag in ("0", "1"):
+            for probe in ("0", "1"):
+                for voice in ("0", "1"):
+                    flags = {"R1_TEMPERAMENT": "1", "R1_TEMPERAMENT_PLAN": plan_flag,
+                             "R1_TEMPERAMENT_THEMES": "0", "R1_PROBE_FIRST": probe,
+                             "R1_LEARNER_VOICE_V2": voice}
+                    with mock.patch.dict(os.environ, flags):
+                        engine = r1_roleplay.RolePlayEngine(persona, seed="rollback")
+                        reference = r1_roleplay.RolePlayEngine(persona, seed="rollback")
+                        reference.scheduler = r1_scheduler.OwedMoveScheduler(
+                            persona.decision_maker, markers_v2=engine._markers_v2,
+                            evidence_window=engine._close_evidence,
+                            families=engine.scheduler.families_planned,
+                        )
+                        self.assertEqual(engine.scheduler._states, reference.scheduler._states)
+                        for move_id in (F3_PRIMARY, F2_PRIMARY, F4_PRIMARY, F1_ANCHOR):
+                            intents = []
+                            for current in (engine, reference):
+                                move = current.scheduler._owed(
+                                    current.scheduler._state(move_id), 800.0, False)
+                                plan = current._intent_plan(
+                                    move, [], redirect=False, first_probes=(),
+                                    reveal_topics=(), monologue=None)
+                                intents.append(plan.intent)
+                            self.assertEqual(*intents)
+
+    def test_themed_intents_override_family_wording(self):
+        from r1_scheduler import F1_ANCHOR, F2_PRIMARY, F3_PRIMARY, F4_PRIMARY
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament="deep_evaluator")
+        for probe in ("0", "1"):
+            for voice in ("0", "1"):
+                with mock.patch.dict(os.environ, {"R1_PROBE_FIRST": probe,
+                                                  "R1_LEARNER_VOICE_V2": voice}):
+                    eng = r1_roleplay.RolePlayEngine(persona, seed="theme-test")
+                    eng.scheduler = r1_scheduler.OwedMoveScheduler(
+                        persona.decision_maker, themes={
+                            "F3": "pays_off",
+                            "F2": "unavailable_now",
+                            "F4": "no_need",
+                            "F1": "cannot_afford",
+                        })
+                    for move_id in (F3_PRIMARY, F2_PRIMARY, F4_PRIMARY, F1_ANCHOR):
+                        state = eng.scheduler._state(move_id)
+                        move = eng.scheduler._owed(state, 800.0, False)
+                        plan = eng._intent_plan(move, [], redirect=False, first_probes=(),
+                                                reveal_topics=(), monologue=None)
+                        theme = eng.scheduler.theme_for(move_id)
+                        self.assertIn(theme.brief if voice == "0" or move_id == F1_ANCHOR
+                                      else theme.worry, plan.intent.brief)
+                        if move_id == F1_ANCHOR:
+                            self.assertTrue(all("$7,000" in x for x in plan.intent.fallbacks))
+                        else:
+                            self.assertTrue(set(plan.intent.fallbacks) <= set(theme.variants))
+
+
+class StrongEvidenceV2IntegrationTests(unittest.TestCase):
+    def test_plan_and_flag_rollback(self):
+        from r1_commitment import STRONG_PLAN_LINE_V2
+
+        for flag in ("0", "1"):
+            with self.subTest(flag=flag), mock.patch.dict(
+                os.environ, {"R1_STRONG_EVIDENCE_V2": flag}
+            ):
+                session, r = run_cooperative(72.5, script=strong_script())
+                session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+                plan = session.say(ASK, r)
+                self.assertEqual(plan.commitment_level, Level.STRONG)
+                if flag == "1":
+                    self.assertEqual(plan.scripted_text, STRONG_PLAN_LINE_V2)
+                    self.assertIn("strong_gaps:none", plan.reasons)
+                    self.assertEqual(session.eng.admin_log()["strong_gaps"], [])
+                else:
+                    self.assertEqual(plan.scripted_text, commitment_line(Level.STRONG, "husband"))
+                    self.assertFalse(any(x.startswith("strong_gaps:") for x in plan.reasons))
+                    self.assertNotIn("strong_gaps", session.eng.admin_log())
+
+    def test_discount_and_missing_money_path(self):
+        from r1_commitment import STRONG_LINE_V2
+
+        for discount in (True, False):
+            with self.subTest(discount=discount), mock.patch.dict(
+                os.environ, {"R1_STRONG_EVIDENCE_V2": "1"}
+            ):
+                script = strong_script()
+                script = [PRICE_ONLY if text == PRICE_TALK else text for text in script]
+                script[-1] = HANDLE_DECIDER + " Our alumni moved into data roles."
+                if not discount:
+                    script = ["I understand the concern about the fee." if text == ANSWER else text
+                              for text in script]
+                session, r = run_cooperative(72.5, script=script)
+                session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+                plan = session.say(ASK, r)
+                if discount:
+                    self.assertEqual(plan.commitment_level, Level.STRONG, plan.reasons)
+                    self.assertEqual(plan.scripted_text, STRONG_LINE_V2)
+                    self.assertIn("strong_gaps:none", plan.reasons)
+                else:
+                    self.assertEqual(plan.commitment_level, Level.MEDIUM, plan.reasons)
+                    self.assertIn("strong_gaps:money_path", plan.reasons)
+
+    def test_time_blocked_ceiling(self):
+        from dataclasses import replace
+        from r1_temperament import TEMPERAMENTS
+
+        temperament = next(item for item in TEMPERAMENTS if item.id == "time_blocked")
+        with mock.patch.dict(os.environ, {"R1_TEMPERAMENT_PLAN": "0",
+                                         "R1_TEMPERAMENT_THEMES": "0",
+                                         "R1_STRONG_EVIDENCE_V2": "1"}):
+            session, r = run_cooperative(
+                72.5, eng=engine(persona=replace(P1, temperament=temperament)),
+                script=strong_script(),
+            )
+            session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+            plan = session.say(ASK, r)
+            self.assertEqual(plan.commitment_level, Level.MEDIUM, plan.reasons)
+            self.assertIn("ceiling", session.eng.admin_log()["strong_gaps"])
+
+
+class BuyingSignalEngineTests(unittest.TestCase):
+    def make_engine(self, temperament="price_negotiator", flag="1"):
+        from r1_tracker import NeedState
+
+        persona = resolve_persona("p1_career_switcher", variant="v1", temperament_on=True,
+                                  temperament=temperament)
+        with mock.patch.dict(os.environ, {"R1_BUYING_SIGNALS": flag}):
+            eng = RolePlayEngine(persona, seed="signals")
+        eng.scheduler = r1_scheduler.OwedMoveScheduler(persona.decision_maker,
+                                                        families=("F1", "F3", "F4"))
+        eng.turn = 12
+        eng.scheduler.turn = 12
+        next(iter(eng.tracker.gate._records.values())).state = NeedState.REVEALED
+        eng.tracker.family_quality.update({"F1": 1, "F3": 1})
+        return eng
+
+    def due(self, eng, when=420, **kwargs):
+        return eng._signal_due(when, quiet=kwargs.get("quiet", False),
+                               responding=kwargs.get("responding", False),
+                               occupied=kwargs.get("occupied", False))
+
+    def test_priorities_windows_spacing_and_limit(self):
+        eng = self.make_engine()
+        self.assertEqual(self.due(eng), "N-SIG-PLAN")
+        for when in (359, 1080):
+            self.assertIsNone(self.due(eng, when))
+        eng._buying_signals_log.append({"id": "N-SIG-PLAN", "turn": 8})
+        self.assertIsNone(self.due(eng, 659))
+        self.assertEqual(self.due(eng, 660), "N-SIG-DISCOUNT")
+        eng.tracker.discount_log.append({})
+        self.assertIsNone(self.due(eng, 660))
+        eng.tracker.discount_log.clear()
+        eng._buying_signals_log.append({"id": "N-SIG-DISCOUNT", "turn": 9})
+        self.assertIsNone(self.due(eng, 700))
+        self.assertEqual(self.due(self.make_engine("deep_evaluator")), "N-SIG-FORMAT")
+        self.assertIsNone(self.due(self.make_engine("time_blocked")))
+        self.assertIsNone(self.due(self.make_engine(flag="0")))
+
+    def test_blockers(self):
+        eng = self.make_engine()
+        for field in ("quiet", "responding", "occupied"):
+            self.assertIsNone(self.due(eng, **{field: True}))
+        eng.tracker.family_quality["F1"] = None
+        self.assertIsNone(self.due(eng))
+        eng.tracker.family_quality["F1"] = 1
+        eng.scheduler.note_objection(turn=eng.scheduler.turn)
+        self.assertIsNone(self.due(eng))
+        eng.scheduler._last_objection_turn = None
+        eng._pending_ask = AskKind.ENROL
+        self.assertIsNone(self.due(eng))
+        eng._pending_ask = None
+        eng._commitment_level = Level.MEDIUM
+        self.assertIsNone(self.due(eng))
+
+    def test_free_reply_plans_and_records_signal(self):
+        eng = self.make_engine()
+        session = Session(eng)
+        plan = None
+        for i in range(8):
+            before = eng.scheduler._last_objection_turn
+            plan = session.say("The learning support helps you grow in your career.", 420 + i * 30)
+            if plan.negotiation_id == "N-SIG-PLAN":
+                break
+        self.assertEqual(plan.mode, TurnMode.INTENT)
+        self.assertEqual(plan.negotiation_id, "N-SIG-PLAN")
+        self.assertIn("buying_signal:N-SIG-PLAN", plan.reasons)
+        self.assertEqual(set(plan.intent.fallbacks),
+                         set(r1_roleplay.SPEC_BY_ID["N-SIG-PLAN"].variants))
+        self.assertEqual(eng.admin_log()["buying_signals"],
+                         [{"id": "N-SIG-PLAN", "turn": plan.turn}])
+        self.assertEqual(eng.scheduler._last_objection_turn, before)
+        self.assertFalse(eng.negotiation.voiced)
+        self.assertFalse(eng.negotiation.question_used)
+
+    def test_disabled_engines_match_and_do_not_log(self):
+        first = Session(self.make_engine(flag="0"))
+        second = Session(self.make_engine(flag="0"))
+        for i in range(8):
+            text = "The learning support helps you grow in your career."
+            left = first.say(text, 420 + i * 30)
+            right = second.say(text, 420 + i * 30)
+            self.assertEqual(left, right)
+            self.assertFalse(any(reason.startswith("buying_signal:") for reason in left.reasons))
+        self.assertNotIn("buying_signals", first.eng.admin_log())
+
+    def test_advisor_discount_suppresses_discount_question(self):
+        eng = self.make_engine()
+        eng._buying_signals_log.append({"id": "N-SIG-PLAN", "turn": 4})
+        eng.tracker.observe_candidate_turn("If you pay upfront, I can offer $1000 off.", 10)
+        self.assertTrue(eng.tracker.discount_log)
+        self.assertIsNone(self.due(eng, 660))
+
+    def test_no_need_or_open_family_blocks_signal(self):
+        from r1_tracker import NeedState
+
+        eng = self.make_engine()
+        record = next(iter(eng.tracker.gate._records.values()))
+        record.state = NeedState.UNPROBED
+        self.assertIsNone(self.due(eng))
+        record.state = NeedState.REVEALED
+        eng.scheduler.observe_candidate_turn("The fee is clear.", 420)
+        eng.scheduler.confirm_delivered(F1_ANCHOR, 420)
+        self.assertIsNotNone(eng.scheduler.open_family)
+        self.assertIsNone(self.due(eng))
+
+    def test_signal_does_not_voice_stall_or_consume_objection_spacing(self):
+        eng = self.make_engine()
+        before = eng.scheduler._last_objection_turn
+        spec = r1_roleplay.SPEC_BY_ID["N-SIG-PLAN"]
+        eng.negotiation.note_spoken(spec.id, spec.variants[0], eng.turn)
+        self.assertFalse(eng.negotiation.voiced)
+        self.assertFalse(eng.negotiation.question_used)
+        self.assertEqual(eng.scheduler._last_objection_turn, before)
+        self.assertNotIn("buying_signals", eng.admin_log())
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class MoveConditionEngineTests(unittest.TestCase):
+    def test_unrepairable_gaps_do_not_offer_condition(self):
+        eng = BuyingSignalEngineTests().make_engine()
+        evidence = eng._evidence(AskKind.ENROL)
+        with mock.patch.object(r1_roleplay, "strong_gaps", return_value={"discount", "money_path"}):
+            self.assertIsNone(eng._select_move_condition(evidence))
+        with mock.patch.object(r1_roleplay, "strong_gaps", return_value={"money_path"}):
+            self.assertEqual(eng._select_move_condition(evidence).id, "money_path")
+
+    def test_planning_limit_and_named_log(self):
+        eng = BuyingSignalEngineTests().make_engine()
+        eng._move_condition = True
+        eng.tracker.family_quality.clear()
+        evidence = eng._evidence(AskKind.ENROL)
+        for index in range(3):
+            eng.turn += 1
+            plan = eng._spec_plan(r1_roleplay.SPEC_BY_ID["N-MONEY"], [],
+                                  first_probes=(), reveal_topics=(), monologue=None)
+            plan = eng._add_move_condition(plan, evidence)
+            found = [reason for reason in plan.reasons if reason.startswith("move_condition:")]
+            self.assertEqual(bool(found), index < 2)
+            if found:
+                clause_id = found[0].split(":", 1)[1]
+                if index == 0:
+                    self.assertEqual(clause_id, "money_path")
+                self.assertTrue(eng.negotiation.note_condition(
+                    clause_id, plan.intent.fallback, plan.turn))
+        log = eng.admin_log()["move_conditions"]
+        self.assertEqual(len({entry["id"] for entry in log}), 2)
+        self.assertTrue(all(entry["named"] for entry in log))
+        eng._move_condition = False
+        self.assertNotIn("move_conditions", eng.admin_log())
+
+    def test_time_blocked_selects_work(self):
+        eng = BuyingSignalEngineTests().make_engine("time_blocked")
+        plan = eng._spec_plan(r1_roleplay.SPEC_BY_ID["N-MONEY"], [],
+                              first_probes=(), reveal_topics=(), monologue=None)
+        plan = eng._add_move_condition(plan, eng._evidence(AskKind.ENROL))
+        self.assertIn("move_condition:work", plan.reasons)
+
+    def test_acknowledges_named_money_path_once(self):
+        eng = BuyingSignalEngineTests().make_engine()
+        eng._move_condition = True
+        eng.negotiation.note_condition(
+            "money_path", "If I knew how the payment could work for me.", 2)
+        eng.turn = 3
+        eng._notes = []
+        eng._condition_ack_note()
+        self.assertNotIn(r1_roleplay.CONDITION_MET_NOTE, eng._notes)
+        eng.tracker.payment_plan_named = True
+        eng._condition_ack_note()
+        self.assertIn(r1_roleplay.CONDITION_MET_NOTE, eng._notes)
+        eng._notes = []
+        eng._condition_ack_note()
+        self.assertNotIn(r1_roleplay.CONDITION_MET_NOTE, eng._notes)
+
+    def test_in_window_stall_and_rollback(self):
+        for flag in ("0", "1"):
+            with self.subTest(flag=flag), mock.patch.dict(
+                os.environ, {"R1_MOVE_CONDITION": flag}
+            ):
+                session, r = run_cooperative(72.5)
+                session.eng.tracker.payment_plan_named = False
+                session.eng.tracker.discount_log.clear()
+                plan = session.say(ASK, r)
+                conditions = [reason for reason in plan.reasons
+                              if reason.startswith("move_condition:")]
+                self.assertEqual(bool(conditions), flag == "1", plan.reasons)
+                if conditions:
+                    self.assertIn("Then say, in your own words", plan.intent.brief)
+                    self.assertIn("move_conditions", session.eng.admin_log())
+                else:
+                    self.assertNotIn("move_conditions", session.eng.admin_log())
+
+    def test_pre_window_ask_has_no_condition(self):
+        session = Session(engine())
+        session.say(OPENER, 20)
+        plan = session.say(ASK, 30)
+        self.assertFalse(any(reason.startswith("move_condition:") for reason in plan.reasons))
+        self.assertNotIn("move_conditions", session.eng.admin_log())
+
+    def test_pressured_stall_does_not_name_a_condition(self):
+        session, r = run_cooperative(72.5)
+        session.eng.tracker.invented_offer = True
+        plan = session.say(ASK, r)
+        self.assertIn("advisor_pressured", plan.reasons)
+        self.assertFalse(any(reason.startswith("move_condition:") for reason in plan.reasons))
+
+    def test_v3_is_latched_for_card_and_negotiation(self):
+        with mock.patch.dict(os.environ, {"R1_PERSONA_TIMELINE_V3": "0"}):
+            old = engine()
+        with mock.patch.dict(os.environ, {"R1_PERSONA_TIMELINE_V3": "1"}):
+            new = engine()
+            self.assertFalse(old.plan_turn(OPENER, 20).timeline_v3)
+        with mock.patch.dict(os.environ, {"R1_PERSONA_TIMELINE_V3": "0"}):
+            self.assertTrue(new.plan_turn(OPENER, 20).timeline_v3)
+        sentence = "I usually talk big decisions over with my husband."
+        self.assertTrue(old.negotiation._says_decider_first(sentence))
+        self.assertFalse(new.negotiation._says_decider_first(sentence))
+
+    def test_disabled_engines_have_identical_stalls(self):
+        with mock.patch.dict(os.environ, {"R1_MOVE_CONDITION": "0"}):
+            left, left_r = run_cooperative(72.5)
+            right, right_r = run_cooperative(72.5)
+        for offset in (0, 50):
+            first = left.say(ASK, left_r + offset)
+            second = right.say(ASK, right_r + offset)
+            self.assertEqual(first.reasons, second.reasons)
+            self.assertEqual(first.intent, second.intent)
+        self.assertNotIn("move_conditions", left.eng.admin_log())
+
+    def test_two_real_weak_stalls_choose_distinct_conditions(self):
+        session, r = run_cooperative(72.5)
+        eng = session.eng
+        eng.negotiation.voiced.clear()
+        eng.negotiation.voicings.clear()
+        eng.negotiation.stall_rounds = 0
+        eng.tracker.payment_plan_named = False
+        eng.tracker.discount_log.clear()
+        ids = []
+        for offset in (0, 50, 100):
+            plan = session.say(ASK, r + offset)
+            ids.extend(reason for reason in plan.reasons
+                       if reason.startswith("move_condition:"))
+        self.assertEqual(len(ids), 2)
+        self.assertEqual(len(set(ids)), 2)
+
+    def test_met_condition_suppresses_unanswered_worry_only_for_that_turn(self):
+        for met in (False, True):
+            with self.subTest(met=met):
+                session = Session(engine(), reply="I see.")
+                session.say(OPENER, 20)
+                session.say(PITCH, 40)
+                eng = session.eng
+                eng._move_condition = True
+                if met:
+                    eng.negotiation.note_condition(
+                        "money_path", "If I knew how the payment could work for me.", eng.turn)
+                eng._worry_family = "F2"
+                reply = session.say("The discount depends on the payment plan you choose.", 60)
+                self.assertEqual(P2.CONDITION_MET_NOTE in (reply.reminder or ""), met)
+                self.assertEqual(P2.NOT_ANSWERED_NOTE in (reply.reminder or ""), not met)
+                eng._worry_family = "F2"
+                later = session.say("The payment plan is available monthly.", 100)
+                self.assertIn(P2.NOT_ANSWERED_NOTE, later.reminder or "")
+
+    def test_money_condition_acknowledged_on_later_advisor_turn(self):
+        session, r = run_cooperative(72.5)
+        eng = session.eng
+        eng.tracker.payment_plan_named = False
+        eng.tracker.discount_log.clear()
+        plan = session.say(ASK, r)
+        self.assertIn("move_condition:money_path", plan.reasons)
+        self.assertTrue(eng.admin_log()["move_conditions"][0]["named"])
+        reply = session.say("The discount depends on the payment plan you choose.", r + 50)
+        self.assertIn(r1_roleplay.CONDITION_MET_NOTE, reply.reminder or "")
+        again = session.say("What else are you considering?", r + 100)
+        self.assertNotIn(r1_roleplay.CONDITION_MET_NOTE, again.reminder or "")
+
+
+class ProofUpgradeV2Tests(unittest.TestCase):
+    BOOK = CommitUpgradeTests.BOOK
+    ENROL = CommitUpgradeTests.ENROL
+    booked = CommitUpgradeTests.booked
+    def test_unresolved_decider_names_condition(self):
+        s, r = self.booked(handle=False)
+        s.say("I understand your concern.", r)
+        plan = s.say(self.ENROL, r + 5)
+        self.assertIn("upgrade_declined:decider_unresolved", plan.reasons)
+        self.assertIn("if I knew what to tell my husband about it", plan.reminder)
+
+    def test_next_turn_does_not_spend_attempt(self):
+        s, r = self.booked(handle=False)
+        plan = s.say(self.ENROL, r)
+        self.assertFalse(any(x.startswith("upgrade_declined:") for x in plan.reasons))
+        self.assertFalse(s.eng._upgrade_tried)
+
+    def test_second_attempt_and_limit(self):
+        s, r = self.booked(handle=False)
+        s.say("I understand your concern.", r)
+        first = s.say(self.ENROL, r + 5)
+        self.assertTrue(any(x.startswith("upgrade_declined:") for x in first.reasons))
+        second = s.say(self.ENROL, r + 10)
+        self.assertTrue(any(x.startswith("upgrade_declined:") for x in second.reasons))
+        third = s.say(self.ENROL, r + 15)
+        self.assertFalse(any(x.startswith("upgrade_declined:") for x in third.reasons))
+
+    def test_trim_only_after_prior_plan(self):
+        s, r = self.booked()
+        s.eng._plan_restatement_heard = True
+        text = "That helps. I'll get back to you."
+        self.assertEqual(s.eng.trim_restatement(text), "That helps.")
+        self.assertEqual(s.eng.trim_restatement("I'll get back to you."),
+                         "I'll get back to you.")
+        self.assertEqual(s.eng.admin_log()["repetition"]["restatements_trimmed"], 1)
+
+    def test_enrol_medium_reassurance_and_second_attempt(self):
+        from dataclasses import replace
+        from r1_prompts import UPGRADE_CONDITION_NOTE, RESOLVED_NOTE
+
+        s, r = run_cooperative(65, eng=engine(), script=strong_script())
+        s.eng.apply_judge(GOOD_JUDGE, s.eng.turn)
+        original = s.eng._evidence
+
+        def missing(kind):
+            evidence = original(kind)
+            return replace(evidence, needs_released=2, reassurance=False, money_path=True,
+                           fee_named=True, discount_ok=True, enrol_ceiling=Level.STRONG,
+                           family_quality={f: 1 for f in (evidence.families_planned or
+                                                          ("F1", "F2", "F3", "F4"))})
+        with mock.patch.object(s.eng, "_evidence", side_effect=missing):
+            initial = s.say(self.ENROL, r)
+            self.assertEqual(initial.commitment_level, Level.MEDIUM)
+            s.say(HANDLE_DECIDER, r + 5)
+            first = s.say(self.ENROL, r + 10)
+        self.assertIn(UPGRADE_CONDITION_NOTE, first.reminder)
+        self.assertNotIn(RESOLVED_NOTE, first.reminder)
+        self.assertEqual(s.eng._condition_planned[-1]["id"], "reassurance")
+        with mock.patch.object(s.eng, "_evidence",
+                               side_effect=lambda kind: replace(missing(kind), reassurance=True)):
+            second = s.say(self.ENROL, r + 15)
+        self.assertEqual(second.commitment_level, Level.STRONG, second.reasons)
+
+    def test_declines_pressure_thin_and_ceiling_without_coaching(self):
+        from dataclasses import replace
+        from r1_prompts import RESOLVED_NOTE, UPGRADE_CONDITION_NOTE
+
+        for field, value in (("pressured", True), ("thin", True),
+                             ("enrol_ceiling", Level.MEDIUM)):
+            with self.subTest(field=field):
+                s, r = self.booked()
+                original = s.eng._evidence
+                with mock.patch.object(s.eng, "_evidence",
+                                       side_effect=lambda kind: replace(original(kind),
+                                                                       **{field: value})):
+                    plan = s.say(self.ENROL, r)
+                self.assertNotEqual(plan.commitment_level, Level.STRONG)
+                if field != "enrol_ceiling":
+                    self.assertIn(RESOLVED_NOTE, plan.reminder)
+                    self.assertNotIn(UPGRADE_CONDITION_NOTE, plan.reminder)
+
+    def test_trim_flag_off_and_single_sentence(self):
+        s, r = self.booked()
+        s.eng._plan_restatement_heard = True
+        s.eng._restate_trim = False
+        text = "That is helpful. Please email me."
+        self.assertEqual(s.eng.trim_restatement(text), text)
+        self.assertNotIn("restatements_trimmed", s.eng.admin_log()["repetition"])
+
+    def test_heard_plan_and_guarded_reply(self):
+        s, r = self.booked()
+        s.eng._plan_restatement_heard = False
+        plan = s.eng.plan_turn("How does that sound?", r)
+        s.eng.record_spoken(plan, "I will talk it over with my husband.", r_sec=r)
+        self.assertTrue(s.eng._plan_restatement_heard)
+        plan = s.eng.plan_turn("What else?", r + 5)
+        before = s.eng.ledger.summary()
+        result = s.eng.sanitize_reply(plan, "That sounds helpful. I will check with him.")
+        self.assertEqual(result.text, "That sounds helpful.")
+        self.assertEqual(before, s.eng.ledger.summary())
+
+    def test_used_reassurance_is_not_coached_twice(self):
+        from dataclasses import replace
+        from r1_prompts import UPGRADE_CONDITION_NOTE
+
+        s, r = self.booked()
+        original = s.eng._evidence
+        def missing(kind):
+            evidence = original(kind)
+            return replace(evidence, needs_released=2, reassurance=False, money_path=True,
+                           fee_named=True, discount_ok=True, enrol_ceiling=Level.STRONG,
+                           family_quality={f: 1 for f in (evidence.families_planned or
+                                                          ("F1", "F2", "F3", "F4"))})
+        with mock.patch.object(s.eng, "_evidence", side_effect=missing):
+            first = s.say(self.ENROL, r)
+            second = s.say(self.ENROL, r + 5)
+        self.assertIn(UPGRADE_CONDITION_NOTE, first.reminder)
+        self.assertNotIn(UPGRADE_CONDITION_NOTE, second.reminder)
+        self.assertEqual(len(s.eng._condition_planned), 1)
+
+    def test_note_has_no_digits_commitment_or_concession(self):
+        from r1_commitment import classify_learner_commitment
+        from r1_guard import has_concession
+        from r1_prompts import UPGRADE_CONDITION_NOTE
+
+        self.assertNotRegex(UPGRADE_CONDITION_NOTE, r"\d")
+        self.assertEqual(classify_learner_commitment(UPGRADE_CONDITION_NOTE), Level.NONE)
+        self.assertFalse(has_concession(UPGRADE_CONDITION_NOTE))
+
+    def test_restatement_flags_are_latched(self):
+        with mock.patch.dict(os.environ, {"R1_RESTATE_TRIM": "0", "R1_UPGRADE_V2": "0"}):
+            eng = engine()
+        with mock.patch.dict(os.environ, {"R1_RESTATE_TRIM": "1", "R1_UPGRADE_V2": "1"}):
+            self.assertFalse(eng._restate_trim)
+            self.assertFalse(eng._upgrade_v2)
+
+    def test_v2_off_preserves_single_call_attempt_and_resolved_note(self):
+        from r1_prompts import RESOLVED_NOTE, UPGRADE_CONDITION_NOTE
+
+        with mock.patch.dict(os.environ, {"R1_UPGRADE_V2": "0"}):
+            s, r = self.booked(handle=False)
+        first = s.say(self.ENROL, r)
+        self.assertIn("upgrade_declined:decider_unresolved", first.reasons)
+        self.assertIn(RESOLVED_NOTE, first.reminder)
+        self.assertNotIn(UPGRADE_CONDITION_NOTE, first.reminder)
+        later = s.say(self.ENROL, r + 5)
+        self.assertFalse(any(x.startswith("upgrade_declined:") for x in later.reasons))
+        with mock.patch.dict(os.environ, {"R1_UPGRADE_V2": "0"}):
+            s, r = self.booked()
+        s.eng._commitment_ask_kind = AskKind.ENROL
+        plan = s.say(self.ENROL, r)
+        self.assertFalse(s.eng._upgrade_tried)
+        self.assertIn(RESOLVED_NOTE, plan.reminder)
+
+
+class DiscountSignalReviewTests(unittest.TestCase):
+    def test_heard_signal_conditions_next_answer_only_when_enabled(self):
+        for flag in ("1", "0"):
+            with self.subTest(flag=flag):
+                eng = BuyingSignalEngineTests().make_engine(flag=flag)
+                session = Session(eng)
+                plan = session.say("Our mentors support you.", 420)
+                signal = dataclasses.replace(plan, negotiation_id="N-SIG-DISCOUNT")
+                eng.record_spoken(signal, "If I decide soon, can you help with the price?")
+                session.say("Yes, I can do $1,500 off for you.", 450)
+                self.assertEqual(eng.tracker.discount_log[-1]["conditional"], flag == "1")
 
 
 class SpeculativeCopyTest(unittest.TestCase):

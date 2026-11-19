@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from rehearsal import HARNESS_VERSION
-from rehearsal.advisor import ADVISOR_LEVELS
+from rehearsal.advisor import ADVISOR_LEVELS, KNOWN_LEVELS
 from rehearsal.call import DEFAULT_CANDIDATE_NAMES, CallDeps, CallSpec, git_sha, run_call
 from rehearsal.llm import (
     KEY_NAME,
@@ -65,7 +65,12 @@ from r1_personas import PERSONA_IDS
 
 EXIT_OK, EXIT_ERROR, EXIT_NO_KEY, EXIT_NO_BALANCE, EXIT_BUDGET, EXIT_STRICT = 0, 1, 2, 3, 4, 5
 ABORT_REASONS = frozenset({"insufficient_balance", "budget_exceeded"})
-LEVEL_ALIASES = {"pushy-discounter": "pushy", "short-answers": "terse", "short": "terse"}
+LEVEL_ALIASES = {
+    "skilled-closer": "closer",
+    "pushy-discounter": "pushy",
+    "short-answers": "terse",
+    "short": "terse",
+}
 VARIANTS = ("v1", "v2", "v3")
 MATRICES = {
     "smoke": {"calls": 4, "levels": ("strong",)},
@@ -103,8 +108,8 @@ def parse_levels(text: str) -> tuple[str, ...]:
         if token == "all":
             return ADVISOR_LEVELS
         token = LEVEL_ALIASES.get(token, token)
-        if token not in ADVISOR_LEVELS:
-            raise ValueError(f"unknown advisor level {token!r}; use {', '.join(ADVISOR_LEVELS)}")
+        if token not in KNOWN_LEVELS:
+            raise ValueError(f"unknown advisor level {token!r}; use {', '.join(KNOWN_LEVELS)}")
         if token not in levels:
             levels.append(token)
     if not levels:

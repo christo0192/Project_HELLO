@@ -327,6 +327,32 @@ class ScheduleAndGuardMetricTests(unittest.TestCase):
         self.assertAlmostEqual(found["intent_fallback_rate"], 0.25)
         self.assertEqual(found["deadline_forced_moves"], ["F4-PUSH"])
 
+    def test_schedule_metrics_reports_planned_and_delivered_separately(self) -> None:
+        schedule = {
+            "families_planned": ["F2", "F4"],
+            "families": {
+                "F1": {"planned": False, "delivered": False},
+                "F2": {"planned": True, "delivered": True},
+                "F4": {"planned": True, "delivered": False},
+            },
+        }
+        found = metrics.schedule_metrics({"schedule": schedule})
+        self.assertEqual(found["families_planned"], ["F2", "F4"])
+        self.assertEqual(found["families_planned_count"], 2)
+        self.assertEqual(found["families_delivered"], ["F2"])
+
+    def test_families_3plus_rate_counts_a_fully_delivered_short_plan(self) -> None:
+        from rehearsal import scorecard
+
+        def record(delivered: int, planned: int | None) -> dict:
+            metrics = {"roleplay_seconds": 900, "families_delivered_count": delivered}
+            if planned is not None:
+                metrics["families_planned_count"] = planned
+            return {"metrics": metrics}
+
+        group = scorecard.aggregate_group([record(2, 2), record(2, None), record(3, 4)])
+        self.assertAlmostEqual(group["families_3plus_rate"], 2 / 3)
+
     def test_commitment_hits_after_the_commitment_are_counted(self) -> None:
         admin = {
             "guard": {"hits": 2, "leak_hits": 2, "by_category": {"commitment": 2}, "flagged": False},
@@ -1100,11 +1126,215 @@ class ScriptedStandInTests(unittest.TestCase):
                 with self.subTest(topic=topic, line=line):
                     self.assertTrue(detect_followup(line))
 
+    def test_closer_scenario_and_safe_banks(self) -> None:
+        from rehearsal.scenarios import SCENARIOS, SCENARIO_NAMES, GROUPS, parse_scenarios
+        from r1_world import claims_guarantee, deck_conflicts
+        from r1_commitment import detect_ask, AskKind
+
+        self.assertIn("skilled-closer", SCENARIO_NAMES)
+        self.assertEqual(parse_scenarios("closer"), GROUPS["closer"])
+        self.assertEqual(SCENARIOS["skilled-closer"].level, "closer")
+        self.assertNotIn("closer", advisor.ADVISOR_LEVELS)
+        self.assertIn("closer", advisor.KNOWN_LEVELS)
+        self.assertEqual(run.parse_levels("all"), advisor.ADVISOR_LEVELS)
+        self.assertEqual(run.parse_levels("skilled-closer"), ("closer",))
+        banks = list(sa.ANSWER_CLOSER.values()) + [sa.MONEY_PATH_CLOSER, sa.REASSURE_CLOSER,
+            sa.CLOSE_CLOSER, sa.DECIDE_CLOSER, sa.ACCEPT_ENROL_CLOSER,
+            sa.PITCH_CLOSER, sa.CALLBACK_CLOSER, sa.EARLY_STALL_CLOSER,
+            sa.TOTAL_PRICE_CLOSER, *sa.QUESTION_CLOSER.values()]
+        for line in (line for bank in banks for line in bank):
+            self.assertLessEqual(metrics._dollar_figures(line), {9000, 8500, 7500, 500, 1000, 1500})
+            self.assertFalse(claims_guarantee(line), line)
+            self.assertFalse(deck_conflicts(line), line)
+            self.assertNotRegex(line.lower(), r"webinar|refund|instal|monthly|per month|tonight|midnight|today only|\bends\b|\bseats?\b")
+        for line in sa.CLOSE_CLOSER:
+            self.assertEqual(detect_ask(line).kind, AskKind.ENROL)
+        self.assertIsNotNone(advisor.LLMAdvisor(None, "test", "closer"))
+        prompt = advisor.advisor_system_prompt("closer").lower()
+        for phrase in ("enrol", "enrolment link", "payment plan details", "webinar", "guarantee"):
+            self.assertIn(phrase, prompt)
+
+    def test_closer_answers_then_closes_and_accepts(self) -> None:
+        async def run_closer():
+            a = sa.ScriptedAdvisor("closer", "synthetic")
+            inputs = [(None, 10), ("What is the price? I saw 7000.", 100),
+                      ("My schedule is packed.", 200), ("I need to talk to my husband.", 300)]
+            inputs += [("Okay.", 350 + n * 45) for n in range(14)]
+            turns = []
+            for i, (text, clock) in enumerate(inputs):
+                turns.append(await a.next_turn(text, clock, i))
+                if turns[-1].intent == "close_ask":
+                    break
+            turns.append(await a.next_turn("I'm not ready; the schedule is packed.", 810, 30))
+            turns.append(await a.next_turn("Okay.", 820, 31))
+            turns.append(await a.next_turn("Okay.", 825, 32))
+            turns.append(await a.next_turn("Okay.", 830, 32))
+            turns.append(await a.next_turn("Okay, let's do it. Send me the enrolment link and the payment plan details, and I'll get started today.", 835, 33))
+            turns.append(await a.next_turn("Okay.", 850, 34))
+            return [turn.as_dict() for turn in turns]
+        turns = asyncio.run(run_closer())
+        self.assertEqual(turns, asyncio.run(run_closer()))
+        self.assertEqual([t["topic"] for t in turns[1:4]], ["F1", "F2", "F4"])
+        close = next(i for i, t in enumerate(turns) if t["intent"] == "close_ask")
+        self.assertIn("decide", turns[close + 1]["text"].lower())
+        self.assertEqual(turns[close + 2]["topic"], "F2")
+        self.assertEqual(turns[close + 3]["intent"], "close_ask")
+        self.assertIn("payment plan details", turns[-2]["text"])
+        self.assertEqual(turns[-1]["intent"], "farewell")
+
+    def test_closer_commitments_questions_and_retry(self) -> None:
+        from r1_commitment import STRONG_PLAN_LINE_V2, WEAK_CALL_LINE
+        from r1_text import negated_before, normalize
+        from r1_tracker import OUTCOME_PATTERN
+        from r1_world import claims_guarantee
+
+        line = sa.REASSURE_CLOSER[0]
+        folded = normalize(line.split(".", 1)[1])
+        self.assertTrue(any(not negated_before(folded, m.start())
+                            for m in OUTCOME_PATTERN.finditer(folded)))
+        self.assertFalse(claims_guarantee(line))
+        from r1_tracker import CoverageTracker
+        from tests.test_r1_tracker import PERSONA
+
+        tracker = CoverageTracker(PERSONA, discipline_v2=True)
+        tracker.observe_candidate_turn(sa.ANSWER_CLOSER["F1b"][0])
+        self.assertEqual([item["usd"] for item in tracker.discount_log], [500])
+        self.assertTrue(tracker.discount_ok)
+
+        async def exercise():
+            a = sa.ScriptedAdvisor("closer", "test")
+            await a.next_turn(None, 1, 1)
+            a._close_asked = 1
+            a._closer_waiting = True
+            call = await a.next_turn(
+                "Let me check with my husband first, and then let's book a call, so we can decide.",
+                820, 2)
+            before = await a.next_turn("Talk to you then.", 839, 3)
+            bye = await a.next_turn("Looking forward to it.", 840, 4)
+            results = []
+            for text in (STRONG_PLAN_LINE_V2, WEAK_CALL_LINE.format(decision_maker="partner")):
+                b = sa.ScriptedAdvisor("closer", "test")
+                await b.next_turn(None, 1, 1)
+                results.append(await b.next_turn(text, 800, 2))
+            c = sa.ScriptedAdvisor("closer", "test")
+            await c.next_turn(None, 1, 1)
+            c._close_asked = 1
+            c._closer_waiting = True
+            stall = await c.next_turn("I am not sure yet.", 800, 2)
+            retry = await c.next_turn("Okay.", 810, 3)
+            return call, before, bye, results, stall, retry
+        call, before, bye, results, stall, retry = asyncio.run(exercise())
+        self.assertEqual(call.intent, "accept_callback")
+        self.assertNotEqual(before.intent, "close_ask")
+        self.assertEqual(bye.intent, "farewell")
+        self.assertIn("payment plan details", results[0].text)
+        self.assertIn("email", results[1].text.lower())
+        self.assertIn("decide", stall.text.lower())
+        self.assertEqual(retry.intent, "close_ask")
+
+    def test_closer_decider_clarification_and_early_stall(self) -> None:
+        from r1_commitment import detect_ask
+        from r1_negotiation import reasons_handled_in, REASON_DECISION_MAKER
+
+        for dm in ("husband", "wife", "partner", "parents"):
+            line = sa.ANSWER_CLOSER["F4dm"][0].format(dm=dm)
+            self.assertIn(REASON_DECISION_MAKER, reasons_handled_in(line, "husband"))
+            self.assertIsNone(detect_ask(line))
+
+        async def exercise():
+            a = sa.ScriptedAdvisor("closer", "test")
+            await a.next_turn(None, 1, 0)
+            early = await a.next_turn("I don't think I can decide today.", 100, 1)
+            price = await a.next_turn("What is the fee?", 120, 2)
+            total = await a.next_turn("Is $1,000 what I'd pay in total?", 140, 3)
+            a._close_asked = 1
+            a._closer_waiting = True
+            dm = await a.next_turn("I must consult my wife first.", 800, 4)
+            return early, price, total, dm
+        early, price, total, dm = asyncio.run(exercise())
+        self.assertIn("no rush", early.text)
+        self.assertIn("ready to decide", early.text)
+        self.assertEqual((total.intent, total.topic), ("price", "F1"))
+        for figure in ("$9,000", "$7,500", "$8,500"):
+            self.assertIn(figure, total.text)
+        self.assertIn("wife", dm.text)
+        self.assertIn("explain", dm.text)
+        for phrase in ("So it would be $1,000?", "Is that the total?"):
+            self.assertEqual(sa.ScriptedAdvisor._closer_question(phrase), "total")
+        for phrase, key in (
+            ("How does paying for it work, and is there a way to split it up?", "money"),
+            ("What is the pace of the sessions like for someone with a full-time job?", "week"),
+        ):
+            self.assertEqual(sa.ScriptedAdvisor._closer_question(phrase), key)
+
+    def test_closer_never_says_the_same_line_twice_running(self) -> None:
+        async def exercise():
+            a = sa.ScriptedAdvisor("closer", "test")
+            await a.next_turn(None, 1, 0)
+            first = await a.next_turn("Who else is usually in the program, people like me?", 100, 1)
+            again = await a.next_turn("Sorry, who else is in the program, people like me?", 120, 2)
+            return first, again
+
+        first, again = asyncio.run(exercise())
+        self.assertNotEqual(first.text, again.text)
+        if again.text.endswith(first.text):
+            self.assertEqual(again.text, "Just to be clear: " + first.text)
+
+    def test_closer_handles_latest_decider_before_any_enrol_ask(self) -> None:
+        async def exercise():
+            a = sa.ScriptedAdvisor("closer", "test")
+            await a.next_turn(None, 1, 0)
+            a._discovery = len(a._DISCOVERY)
+            a._pitched = 1
+            a._closer_money = a._closer_reassured = True
+            first = await a.next_turn("My partner wonders about the curriculum?", 910, 1)
+            second = await a.next_turn("Okay.", 920, 2)
+            third = await a.next_turn("Okay.", 930, 3)
+            return first, second, third
+        turns = asyncio.run(exercise())
+        close = next(i for i, turn in enumerate(turns) if turn.intent == "close_ask")
+        self.assertTrue(any("explain" in turn.text and "partner" in turn.text
+                            for turn in turns[:close]))
+
+    def test_closer_answers_questions_and_price_pushes(self) -> None:
+        async def run_lines(lines):
+            a = sa.ScriptedAdvisor("closer", "test")
+            turns = [await a.next_turn(None, 1, 0)]
+            for i, line in enumerate(lines):
+                turns.append(await a.next_turn(line, 100 + i * 20, i + 1))
+            return turns
+        cases = {
+            "What does a typical week look like?": "flexible",
+            "Can payment be spread out over time or all at once?": "payment plan details",
+            "What would be the first thing I'd do?": "Python",
+            "Who else is usually in the program, people like me?": "career switchers",
+            "What kind of people usually get the most out of it?": "career switchers",
+            "Who usually gets the most out of it?": "career switchers",
+            "Is it for someone like me?": "career switchers",
+            "How do you help people along the way?": "mentorship",
+            "How do people usually feel halfway through?": "alumni",
+        }
+        for question, expected in cases.items():
+            with self.subTest(question=question):
+                self.assertIn(expected.lower(), asyncio.run(run_lines([question]))[-1].text.lower())
+        turns = asyncio.run(run_lines(["What is the fee?", "Any flexibility?",
+                                        "Any flexibility?"]))
+        self.assertIn("$9,000", turns[1].text)
+        self.assertIn("$500", turns[-2].text)
+        self.assertNotRegex(turns[-1].text, r"\$[0-9]")
+        turns = asyncio.run(run_lines(["Okay."] * 15 + ["Any flexibility?"] * 15))
+        self.assertTrue(all(a.text != b.text for a, b in zip(turns, turns[1:])))
+        self.assertFalse(any(t.intent == "close_ask" for t in turns))
+
     def test_the_scripted_advisor_states_only_deck_figures_except_the_pushy_one(self) -> None:
         allowed = {PRICE_USD, 7000, 8500, 8000, 7500, 500, 1000, 1500, *NET_PRICES_USD}
         banks = [sa.GREET, *sa.PROBES.values(), *sa.FOLLOWUPS.values(), sa.PITCH, sa.VALUE, sa.URGENCY,
                  sa.CLOSE_STRONG, sa.CLOSE_AVERAGE, sa.WEAK_PITCHES, sa.WEAK_DISCOUNT]
         banks += list(sa.ANSWER_STRONG.values()) + list(sa.ANSWER_AVERAGE.values())
+        banks += list(sa.ANSWER_CLOSER.values()) + [sa.MONEY_PATH_CLOSER, sa.REASSURE_CLOSER,
+                 sa.CLOSE_CLOSER, sa.DECIDE_CLOSER, sa.ACCEPT_ENROL_CLOSER,
+            sa.PITCH_CLOSER, sa.CALLBACK_CLOSER, sa.EARLY_STALL_CLOSER,
+            sa.TOTAL_PRICE_CLOSER, *sa.QUESTION_CLOSER.values()]
         for bank in banks:
             for line in bank:
                 with self.subTest(line=line):
@@ -2275,6 +2505,43 @@ class IterationTwoHarnessTests(unittest.TestCase):
             self.assertFalse(metrics.advisor_asked_next_step({"intent": "other", "text": text}))
         self.assertTrue(metrics.advisor_asked_next_step({"intent": "other", "text": text}))
 
+    def test_proceed_asks_earn_a_commitment(self) -> None:
+        admin = {"commitment": {"level": "MEDIUM", "resolved": True}}
+        plan = {"resolves": True, "commitment_level": "MEDIUM", "delivered_commitment": True}
+        for text in (
+            "Let's proceed.",
+            "Shall we proceed?",
+            "Can we proceed with the enrolment?",
+            "I can proceed with your registration.",
+            "Would you be comfortable proceeding?",
+            "We have discussed your goals. The schedule fits your needs. "
+            "So if the reduced fee works for you, let's proceed, because the batch closes soon.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(metrics.advisor_asked_next_step({"intent": "discount", "text": text}))
+                exchanges = [
+                    exchange(1, 800, text, "discount"),
+                    exchange(2, 820, "Great.", "other", spoken="Okay, let's do that.", plan=plan),
+                ]
+                found = metrics.commitment_metrics(exchanges, admin)
+                self.assertTrue(found["commitment_earned"])
+                self.assertNotIn("unearned_commitment", metrics.hard_fails(found))
+
+    def test_proceed_facts_are_not_asks(self) -> None:
+        for text in (
+            "The batch will proceed next week.",
+            "Most students proceed to the advanced track later.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(metrics.advisor_asked_next_step({"intent": "discount", "text": text}))
+
+    def test_proceed_flag_off_restores_previous_result(self) -> None:
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"REHEARSAL_NEXT_STEP_PROCEED": "0"}):
+            self.assertFalse(metrics.advisor_asked_next_step({"intent": "discount", "text": "Let's proceed."}))
+
     def test_the_advisor_tag_alone_is_still_enough(self) -> None:
         self.assertTrue(metrics.advisor_asked_next_step({"intent": "close_ask", "text": "Okay."}))
         self.assertFalse(metrics.advisor_asked_next_step({"intent": "pitch", "text": "Okay."}))
@@ -2841,6 +3108,16 @@ class FinalReviewRoundOneHarnessTests(unittest.TestCase):
         self.assertEqual(first["unprompted_dump_count"], 1)  # only the first telling is a dump
 
 
+class PlannedBunchingGridTests(unittest.TestCase):
+    def test_unplanned_families_are_not_late(self) -> None:
+        from rehearsal import bunching_grid
+
+        with mock.patch("r1_roleplay.plan_families", return_value=("F2", "F4")):
+            result = bunching_grid.run_one("cooperative", 40, temperament="steady_enquirer")
+        self.assertEqual(result.families_planned, ("F2", "F4"))
+        self.assertFalse({"F1", "F3"} & set(result.late))
+
+
 class BunchingGridTests(unittest.TestCase):
     """M032 S1 item 8: the bunching grid (advisor patterns x 20-65 s an exchange) with the S1 flags
     off and on.  With them on no gated run may turn late or excluded, use the forced path more than
@@ -3144,6 +3421,12 @@ class DiagnosisTwoHarnessTests(unittest.TestCase):
         ])
         self.assertEqual(group["commitment_excluded_reasons"], {"ended_before_window": 1})
         self.assertAlmostEqual(group["medium_or_better_rate"], 1.0)
+
+    def test_evidence_window_counts_early_call(self) -> None:
+        record = {"admin_log": {"close_window": {"open_r": 680}}}
+        m = {"commitment_level": None, "roleplay_seconds": 700}
+        self.assertIsNone(scorecard.commitment_exclusion(record, m))
+        self.assertEqual(scorecard.commitment_exclusion({}, m), "ended_before_window")
 
     def test_the_abuse_hang_up_is_read_from_the_admin_log_too(self) -> None:
         group = scorecard.aggregate_group([
@@ -3830,3 +4113,17 @@ class SpecReplySeamTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProofOneCloserTests(unittest.TestCase):
+    def test_closer_reassurance_flag(self):
+        from unittest import mock
+        from rehearsal import advisor
+        with mock.patch.dict("os.environ", {"REHEARSAL_CLOSER_REASSURANCE": "1"}):
+            prompt = advisor.advisor_system_prompt("closer").lower()
+        self.assertIn("track record of alumni success", prompt)
+        self.assertIn("success stories", prompt)
+        self.assertIn("callback before 13:00", prompt)
+        with mock.patch.dict("os.environ", {"REHEARSAL_CLOSER_REASSURANCE": "0"}):
+            old = advisor.advisor_system_prompt("closer").lower()
+        self.assertNotIn("callback before 13:00", old)

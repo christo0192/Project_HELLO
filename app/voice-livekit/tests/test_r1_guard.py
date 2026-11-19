@@ -424,6 +424,13 @@ class LearnerLengthAndAckTests(unittest.TestCase):
         self.assertFalse(guard_text("Around $900 a month.", context).clean)
         self.assertFalse(guard_text("My schedule is packed on weekends.", context).clean)
 
+    def test_temperament_timing_answers_pass_as_card_answers(self):
+        from r1_temperament import TEMPERAMENTS
+        for item in TEMPERAMENTS:
+            persona = resolve_persona(PERSONA.id, temperament_on=True, temperament=item.id)
+            result = guard_text(item.timeline_answer, ctx(mode="ack", persona=persona))
+            self.assertTrue(result.clean, (item.id, result.hits))
+
     def test_the_deflection_line_is_no_longer_a_whitelisted_card_answer(self):
         """R1-Q: the catch-all deflection left the card, so it is not a card answer either."""
         from r1_guard import _card_texts
@@ -4323,6 +4330,47 @@ class TestSelfDeflectionAfterNoQuestion(unittest.TestCase):
             interviewer_fallback="What draws you to this role?",
         )
         self.assertNotIn("hiring team", guard_text(self.REPLY, context).text)
+
+
+class ObjectionThemeGuardTests(unittest.TestCase):
+    def test_theme_variants_are_guard_safe(self):
+        import r1_scheduler as scheduler
+        for (family, ident), theme in scheduler.OBJECTION_THEMES.items():
+            if ident != scheduler.DEFAULT_THEMES[family]:
+                for variant in theme.variants:
+                    self.assertTrue(guard_text(variant, ctx()).clean, (ident, variant))
+        anchor = scheduler.OwedMoveScheduler("father", themes={"F1": "cannot_afford"})
+        for variant in anchor._state(scheduler.F1_ANCHOR).variants:
+            result = guard_text(variant, ctx(allowed_extra=frozenset({7000, 9000})))
+            self.assertTrue(result.clean, variant)
+
+
+class ConditionAcknowledgementTests(unittest.TestCase):
+    def test_short_acknowledgements_are_guard_clean(self):
+        for text in ("That helps.", "Okay, that makes sense."):
+            result = guard_text(text, ctx())
+            self.assertEqual(result.text, text)
+            self.assertFalse(result.hits)
+
+
+class ProofOneConcessionTests(unittest.TestCase):
+    def test_conditions_and_questions_are_not_concessions(self):
+        for text in (
+            "I can make time if I know it is worth it.",
+            "How would I know it is worth it for me?",
+            "I can proceed if I'm sure it is worth it.",
+            "I would need to see it is worth it.",
+        ):
+            self.assertFalse(has_concession(text), text)
+        for text in ("I know it is worth it.", "You have convinced me.",
+                     "That settles it."):
+            self.assertTrue(has_concession(text), text)
+
+    def test_condition_flag_off(self):
+        from unittest.mock import patch
+
+        with patch.dict("os.environ", {"R1_CONCESSION_CONDITION": "0"}):
+            self.assertTrue(has_concession("I can make time if I know it is worth it."))
 
 
 class EarlyReleaseTests(unittest.TestCase):

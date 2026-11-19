@@ -344,7 +344,7 @@ GATES: tuple[tuple[str, str, str, str, Mapping[str, float], str], ...] = (
     ),
 )
 
-LEVELS_ORDER = ("strong", "average", "weak", "pushy", "terse")
+LEVELS_ORDER = ("strong", "average", "weak", "pushy", "terse", "closer")
 
 
 def _rate(numerator: float, denominator: float) -> float | None:
@@ -376,7 +376,9 @@ def commitment_exclusion(record: Mapping[str, Any], m: Mapping[str, Any]) -> str
     if m.get("commitment_level") is not None:
         return None
     seconds = m.get("roleplay_seconds")
-    if isinstance(seconds, (int, float)) and seconds >= COMMIT_PERMITTED_R_SEC:
+    opening = ((record.get("admin_log") or {}).get("close_window") or {}).get("open_r")
+    threshold = opening if type(opening) is int else COMMIT_PERMITTED_R_SEC
+    if isinstance(seconds, (int, float)) and seconds >= threshold:
         return None
     if m.get("stop_reason") == "end_request":
         return "end_request"
@@ -475,7 +477,13 @@ def aggregate_group(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "hard_fail_reasons": dict(reasons),
         "calls_reaching_close_window": len(closing),
         "families_3plus_rate": _rate(
-            sum(1 for m in closing if (m.get("families_delivered_count") or 0) >= 3), len(closing)
+            # M033 A6: a planned call raises 2-4 families; it needs min(3, planned) of them.
+            sum(
+                1 for m in closing
+                if (m.get("families_delivered_count") or 0)
+                >= min(3, m.get("families_planned_count") or 4)
+            ),
+            len(closing),
         ),
         "objections_in_context_rate": _rate(in_ctx, objections),
         "judge_calls": len(judged),

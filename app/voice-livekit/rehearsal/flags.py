@@ -64,11 +64,15 @@ Each one guards a fix to the simulator or its checks, so OFF restores the previo
   meeting" or one the candidate already has), a named session only "for you", with a mentor or "put you
   down for" (D5R-NS2-WILDCARD: "a smart call", "another sales call" and "every morning session" are no
   asks), and "catch up over a call / the phone".
+* ``REHEARSAL_CLOSER_REASSURANCE``: coach the closer on honest outcome evidence.
+* ``REHEARSAL_NEXT_STEP_PROCEED``: a question or offer to proceed counts as a next-step ask;
+  OFF restores the previous vocabulary.
 """
 from __future__ import annotations
 
 import os
 
+CLOSER_REASSURANCE = "REHEARSAL_CLOSER_REASSURANCE"
 KEEP_CONTROL_ACTS = "REHEARSAL_KEEP_CONTROL_ACTS"
 TRANSITION_ACTS_V2 = "REHEARSAL_TRANSITION_ACTS_V2"
 LEARNER_CLOCK = "REHEARSAL_LEARNER_CLOCK"
@@ -89,6 +93,7 @@ BACKCHANNEL_GAP = "REHEARSAL_BACKCHANNEL_GAP"
 FLOW_AGENDA_RULES = "REHEARSAL_FLOW_AGENDA_RULES"
 FLOW_MIN_REPS = "REHEARSAL_FLOW_MIN_REPS"
 NEXT_STEP_V2 = "REHEARSAL_NEXT_STEP_V2"
+NEXT_STEP_PROCEED = "REHEARSAL_NEXT_STEP_PROCEED"
 
 _OFF = frozenset({"0", "false", "off", "no"})
 
@@ -102,6 +107,7 @@ __all__ = [
     "ADVISOR_FAREWELL_LOOP",
     "BACKCHANNEL_GAP",
     "CITED_MISFIRES",
+    "CLOSER_REASSURANCE",
     "COMMIT_WINDOW",
     "CONTINUED_ROWS",
     "DIG_RELEASED",
@@ -113,6 +119,7 @@ __all__ = [
     "KEEP_CONTROL_ACTS",
     "LEARNER_CLOCK",
     "NEXT_STEP_V2",
+    "NEXT_STEP_PROCEED",
     "OPEN_INVITE",
     "PROBE_VOCAB_V2",
     "REPEAT_IF_UNANSWERED",
