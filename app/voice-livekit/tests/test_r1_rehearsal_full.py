@@ -1012,6 +1012,52 @@ class CandidateSimTests(unittest.TestCase):
         second = asyncio.run(sim.next_action(_view("icebreaker", [agenda])))
         self.assertEqual((second.act, second.text), ("icebreaker_answer", "answer 1"))
 
+    def test_the_hello_without_a_hearing_question_is_no_sound_check(self) -> None:
+        import r1_script
+        from rehearsal.candidate import is_icebreaker_question, is_sound_check
+
+        hello = "Hi Alex, I'm Christy, an AI interviewer from Interview Kickstart."
+        for line in (hello, r1_script.line("L-OPEN-HI", first_name="Alex"),
+                     r1_script.line("L-OPEN-HI", first_name="")):
+            with self.subTest(line=line):
+                self.assertFalse(is_sound_check(line))
+                self.assertFalse(is_icebreaker_question(line))
+
+    def test_the_plain_agenda_is_an_icebreaker_question(self) -> None:
+        import r1_script
+        from rehearsal.candidate import is_icebreaker_question, is_sound_check
+
+        agenda = (
+            "Let's get started. The whole interview takes about thirty minutes: a few minutes to get to "
+            "know you, a sales role-play of up to twenty minutes, then time for your questions. To start, "
+            "tell me a bit about yourself and the sales or customer-facing work you've done."
+        )
+        self.assertTrue(is_icebreaker_question(agenda))
+        self.assertFalse(is_sound_check(agenda))
+        for line_id in ("L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-PLAIN-W2", "L-OPEN-AGENDA-PLAIN-W3"):
+            with self.subTest(line_id=line_id):
+                line = r1_script.line(line_id)
+                self.assertTrue(is_icebreaker_question(line))
+                self.assertFalse(is_sound_check(line))
+
+    def test_the_default_opening_gets_an_icebreaker_answer_not_a_yes(self) -> None:
+        hello = _span("bot", "interviewer", "Hi Alex, I'm Christy, an AI interviewer from Interview Kickstart.",
+                      0.0, 4.0)
+        agenda = _span(
+            "bot", "interviewer",
+            "Let's get started. The whole interview takes about thirty minutes: a few minutes to get to "
+            "know you, a sales role-play of up to twenty minutes, then time for your questions. To start, "
+            "tell me a bit about yourself and the sales or customer-facing work you've done.",
+            4.0, 20.0,
+        )
+        talker = _CountingTalker()
+        sim = _sim(talker=talker)
+        action = asyncio.run(sim.next_action(_view("opening", [hello, agenda])))
+        self.assertEqual((action.kind, action.act, action.text), ("speak", "icebreaker_answer", "answer 1"))
+        self.assertNotEqual(action.act, "sound_check_answer")
+        self.assertEqual(talker.answers, 1)
+        self.assertEqual(len(sim._ib_questions), 1)
+
     def test_the_nervous_silence_counts_questions_not_lines(self) -> None:
         sim = _sim("terse-nervous")
         hello = _span("bot", "interviewer", "Hi Alex. Can you hear me okay?", 0.0, 3.0)

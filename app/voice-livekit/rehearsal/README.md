@@ -187,8 +187,8 @@ python -m rehearsal --full --scenarios manual-M01 --out <dir> --budget-usd 0.50 
 ```
 
 One call runs the WHOLE interview, OPENING to CLOSING, through the production phase driver
-(`R1Interview.run`): L-OPEN, the icebreaker and its exit, the brief, "ready" or the button, the
-role-play, the exit, the wrap-up and L-CLOSE.
+(`R1Interview.run`): the opening (L-OPEN-HI and the plain agenda by default), the icebreaker and its
+exit, the brief, "ready" or the button, the role-play, the exit, the wrap-up and L-CLOSE.
 
 * CLOCK (`vloop.py`): a virtual-time event loop. The driver's silence windows and caps take no real
   time (a 25-minute interview runs in about a second offline); a production model call (Christy, the
@@ -215,11 +215,12 @@ role-play, the exit, the wrap-up and L-CLOSE.
 * CANDIDATE (`candidate.py`): one person through the whole interview, phase-aware: a job candidate to
   Christy (icebreaker answers, brief questions, "ready", wrap-up questions), the Program Advisor to the
   learner (`advisor.py` behaviours), and out of role when Christy steps in (an end question, the offer
-  to wrap up). It decides from what it HEARD: a sound check ("Can you hear me okay?") gets a short
-  yes, Christy's in-role questions are recognised from the line said, the offer to wrap up is taken
-  only on spoken cues, and a nervous silence lasts until Christy speaks again. A failed live advisor
-  turn is played by the scripted advisor of that level. Live, DeepSeek plays it; offline, scripted
-  banks.
+  to wrap up). It decides from what it HEARD: by default Christy says hello and goes straight into the
+  agenda's first question, which the candidate answers; only with R1_OPENING_NO_HEARING_CHECK=0 does
+  she ask "Can you hear me okay?" first, and that sound check gets a short yes. Christy's in-role
+  questions are recognised from the line said, the offer to wrap up is taken only on spoken cues, and
+  a nervous silence lasts until Christy speaks again. A failed live advisor turn is played by the
+  scripted advisor of that level. Live, DeepSeek plays it; offline, scripted banks.
 * SCENARIOS (`scenarios.py`, `manual.py`): the synthetic edge scenarios (strong, average,
   terse-nervous, brief-repair, button-mid-brief, roleplay-question, icebreaker-skip, early-end,
   early-end-late, abuse-once, price-dodge, price-never, pushy-discounter, wrapup-question, wrapup-none,
