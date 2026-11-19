@@ -31,9 +31,7 @@ prosody per call and a two-letter first fragment sounds choppy.
 R1's two voices (owner decision 2026-10-30) are resolved here too, in pure code:
 
 * ``R1_TTS_PROFILE`` picks a WHOLE voice set, atomically.  ``v4`` (the default) is Bulbul v4
-  Flash with Christy and the learner both ``zarina_en_conversation`` by default (owner
-  2026-11-19). Christy was ``simran_en_customer`` until then; ``R1_TTS_INTERVIEWER_VOICE``
-  restores it.
+  Flash with Christy as ``simran_en_customer`` and the learner as ``zarina_en_conversation``;
   ``v3`` is exactly today's voice (``r1_tts_kwargs``, the browser screener's Simran) for both.
   A model and a speaker are never set apart, because each half-applied flip fails badly on
   plugin 1.6.4 (measured live 2026-10-29): bulbul:v3 with a v4 id raises ``ValueError`` when
@@ -105,11 +103,9 @@ PROFILE_DEFAULT = PROFILE_V4
 V4_MODEL = "bulbul:v4-flash"
 V4_PACE = 1.0  # v4 accepts 0.5-2.0; R1 speaks at the v3 voice's pace
 V4_DEFAULT_SPEAKERS: Mapping[str, str] = {
-    INTERVIEWER: "zarina_en_conversation",  # Owner 2026-11-19: same voice as the learner
+    INTERVIEWER: "simran_en_customer",  # "Simran - A confident and low female voice"
     LEARNER: "zarina_en_conversation",  # "Zarina - A deep, full and flowing female voice"
 }
-# Christy until 2026-11-19; the rollback value of R1_TTS_INTERVIEWER_VOICE
-V4_PREVIOUS_INTERVIEWER_SPEAKER = "simran_en_customer"
 # Every English id the live server listed for bulbul:v4-flash on 2026-10-29 (the list came back
 # inside a 400 and was cut short after ``simran_en_sales``), plus the server-listed ids the
 # smoke test named beyond that cut.  ``simran`` (the v3 short name) is NOT here: v4 rejects it.
@@ -218,7 +214,7 @@ class R1VoiceSet:
 
     @property
     def distinct(self) -> bool:
-        """False for one shared voice: v3, or v4 with equal speakers (default since 2026-11-19)."""
+        """True when the two roles really are two voices (v4), False when they share one (v3)."""
         return self.interviewer != self.learner
 
 
@@ -250,10 +246,8 @@ def r1_voice_set() -> R1VoiceSet:
     value is the legacy set too, noted ``profile_unknown`` (an unknown value is most likely a
     typo made during a rollback, so the known-good voice wins).  The overrides
     ``R1_TTS_INTERVIEWER_VOICE`` and ``R1_TTS_LEARNER_VOICE`` apply in v4 only, and v4 ignores
-    ``SARVAM_TTS_*`` (those stay the browser screener's voice). Both v4 roles default to
-    ``zarina_en_conversation`` (owner 2026-11-19); ``R1_TTS_INTERVIEWER_VOICE=simran_en_customer``
-    restores Christy's previous voice. v4 sends no temperature (the plugin never sends one for a
-    non-v3 model) and keeps the plugin's en-IN and 22050 Hz.
+    ``SARVAM_TTS_*`` (those stay the browser screener's voice).  v4 sends no temperature (the
+    plugin never sends one for a non-v3 model) and keeps the plugin's en-IN and 22050 Hz.
     """
     profile = (os.getenv("R1_TTS_PROFILE") or "").strip().lower()
     if profile == PROFILE_V3:

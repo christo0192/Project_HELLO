@@ -1,9 +1,8 @@
 """R1's Sarvam providers: the voiced TTS, the TTS build with its fallback, and the STT model.
 
-R1 (and only R1) speaks with Bulbul v4 Flash: Christy and the learner both default to
-``zarina_en_conversation`` since 2026-11-19 (Christy was ``simran_en_customer`` from 2026-10-30,
-restored by ``R1_TTS_INTERVIEWER_VOICE=simran_en_customer``), behind the ``R1_TTS_PROFILE`` flip
-back to today's voice (``v3``).  R1's STT is Saaras v4 by default, with
+Owner decision 2026-10-30: R1 (and only R1) speaks with Bulbul v4 Flash, Christy as
+``simran_en_customer`` and the role-play learner as ``zarina_en_conversation``, behind the
+``R1_TTS_PROFILE`` flip back to today's voice (``v3``).  R1's STT is Saaras v4 by default, with
 ``R1_STT_MODEL=saaras:v3`` the rollback (verified live 2026-10-30 on the production account).
 
 The transport is the pinned plugin (livekit-plugins-sarvam 1.6.4), unchanged.  The live smoke

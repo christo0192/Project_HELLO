@@ -144,7 +144,7 @@ class TestBuildR1Tts(EnvCase):
         self.assertEqual(tts.label, "r1_sarvam.R1SarvamTTS")
         self.assertEqual(tts.model, "bulbul:v4-flash")
         self.assertEqual(tts.provider, "Sarvam")
-        self.assertEqual(tts._opts.speaker, "zarina_en_conversation")
+        self.assertEqual(tts._opts.speaker, "simran_en_customer")
         self.assertEqual(tts._opts.pace, 1.0)
         self.assertEqual(str(tts._opts.target_language_code), "en-IN")
         self.assertEqual((tts.sample_rate, tts.num_channels), (22050, 1))
@@ -213,10 +213,6 @@ class TestVoicedStreams(unittest.IsolatedAsyncioTestCase):
         return stream
 
     async def test_each_stream_speaks_the_voice_bound_in_its_task(self) -> None:
-        os.environ["R1_TTS_INTERVIEWER_VOICE"] = "simran_en_customer"
-        await self.tts.aclose()
-        self.tts = r1_sarvam.build_r1_tts(r1_tts.r1_voice_set())
-
         async def speech(voice):
             if voice is not None:
                 r1_tts.bind_voice(voice)
@@ -232,9 +228,6 @@ class TestVoicedStreams(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(stream._opts.model, "bulbul:v4-flash")
 
     async def test_two_speeches_in_flight_never_mix_voices(self) -> None:
-        os.environ["R1_TTS_INTERVIEWER_VOICE"] = "simran_en_customer"
-        await self.tts.aclose()
-        self.tts = r1_sarvam.build_r1_tts(r1_tts.r1_voice_set())
         both_first = asyncio.Event()
         ready = []
 
@@ -255,20 +248,6 @@ class TestVoicedStreams(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(learner, ["zarina_en_conversation"] * 2)
         self.assertEqual(interviewer, ["simran_en_customer"] * 2)
         self.assertEqual(self.tts._opts.speaker, "simran_en_customer")
-
-    async def test_default_streams_all_speak_zarina(self) -> None:
-        async def speech(voice):
-            if voice is not None:
-                r1_tts.bind_voice(voice)
-            stream = self.open()
-            return stream._opts.speaker, stream._opts.model
-
-        for voice in ("interviewer", "learner", None):
-            self.assertEqual(
-                await asyncio.create_task(speech(voice)),
-                ("zarina_en_conversation", "bulbul:v4-flash"),
-            )
-        self.assertEqual(self.tts._opts.speaker, "zarina_en_conversation")
 
     async def test_an_override_voice_is_what_the_stream_speaks(self) -> None:
         os.environ["R1_TTS_LEARNER_VOICE"] = "neha_en_customer"

@@ -630,8 +630,7 @@ def build_line_cache(
     cache is only built from the session TTS's own ``sample_rate`` and ``num_channels``.  The
     voices are the session TTS's own too (``r1_voice_set`` on an ``R1SarvamTTS``); any other
     TTS is the legacy v3 set.  ``synthesizer_factory(kwargs)`` is called once per DISTINCT
-    voice kwargs: once under v3 and default v4 (both roles zarina since 2026-11-19),
-    twice when the v4 speakers differ.
+    voice: once under v3 (today's single synthesizer, shared by both roles), twice under v4.
     """
     if not line_cache_enabled():
         return None
