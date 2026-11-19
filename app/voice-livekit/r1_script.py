@@ -32,6 +32,16 @@ INTERVIEWER_NAME = "Christy"
 # Owner 2026-11-19, R1_INTERVIEWER_DEX: Dex is a male interviewer.
 INTERVIEWER_NAME_DEX = "Dex"
 
+# Owner 2026-11-19 (R1_INTERVIEWER_DEX): names candidates may call the interviewer,
+# as speech-to-text spells them; detectors accept all of them whatever the flag.
+INTERVIEWER_ADDRESS_NAMES = (
+    "christy", "christie", "christi", "kristy", "kristie", "cristy",
+    "dex", "decks", "dax", "deks",
+)
+INTERVIEWER_ADDRESS_ALT = "|".join(sorted(INTERVIEWER_ADDRESS_NAMES, key=len, reverse=True))
+# "desk" is an address only in name-only turns ("Desk?", "Hello desk?"), never a filler.
+INTERVIEWER_NAME_ONLY_EXTRA = ("desk",)
+
 # M032 S6 (owner go of 2026-11-11, test fda9e9f6 #23-#31; SWEEP-30): ONE body for every brief, so
 # the first brief, the brief after Christy's own reaction (S5's bridge), the replay and the short
 # recap can never drift apart.  ``BRIEF_GOAL`` is the goal clause the recap reuses word for word.
@@ -754,7 +764,7 @@ def known_first_name(value: object) -> str:
 # ("this is Salesforce" mid-answer is not one), each after an optional greeting.  The name must
 # start with a capital letter as the speech-to-text wrote it ("my name is not on it" and "this is
 # great" are not names) and is letters only.
-_HELLO = r"hi|hello|hey|christy|good (?:morning|afternoon|evening)"
+_HELLO = r"hi|hello|hey|" + INTERVIEWER_ADDRESS_ALT + r"|good (?:morning|afternoon|evening)"
 _FILLER = r"yeah|yes|yep|so|um|uh|well|okay|ok|sure|alright"
 _NAME_TAIL = r"\s+([A-Z][A-Za-z]{1,23})(?![A-Za-z0-9'-])"
 _SPOKEN_NAME = (
@@ -773,7 +783,7 @@ _NOT_A_NAME = frozenset(
         "interesting", "important", "awesome", "amazing", "yes", "no", "sir", "madam", "maam",
         "my", "our", "your", "his", "her", "it", "its", "in", "on", "at", "to", "for", "with",
         "what", "why", "how", "when", "who", "which", "where", "that", "this", "there", "here",
-        "christy", "interviewer", "interview", "kickstart",
+        *INTERVIEWER_ADDRESS_NAMES, "interviewer", "interview", "kickstart",
     }
 )
 SPOKEN_NAME_MIN_LETTERS = 2

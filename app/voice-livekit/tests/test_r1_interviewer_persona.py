@@ -12,7 +12,12 @@ import string
 import unittest
 from unittest import mock
 
+import r1_guard
+import r1_icebreaker as ice
+import r1_negotiation as negotiation
 import r1_script
+import r1_tracker as tracker
+from r1_personas import resolve_persona
 import r1_lines
 import r1_content
 import r1_end_intent
@@ -183,3 +188,97 @@ class TestPersonaPrompts(unittest.TestCase):
             before = r1_tts.r1_voice_set()
             os.environ["R1_INTERVIEWER_DEX"] = "0"
             self.assertEqual(r1_tts.r1_voice_set(), before)
+
+
+class TestInterviewerAddressDetectors(unittest.TestCase):
+    def persona_states(self):
+        """Yield once with R1_INTERVIEWER_DEX unset and once with it 0 (the env is restored)."""
+        for flag in (None, "0"):
+            closed = True
+            with self.subTest(flag=flag), mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("R1_INTERVIEWER_DEX", None)
+                if flag is not None:
+                    os.environ["R1_INTERVIEWER_DEX"] = flag
+                yield
+                closed = False
+            if closed:
+                return  # a failing caller closed the generator; subTest swallowed GeneratorExit
+
+    def test_vocabulary(self):
+        for _ in self.persona_states():
+            names = r1_script.INTERVIEWER_ADDRESS_NAMES
+            expected = "christy christie christi kristy kristie cristy dex decks dax deks".split()
+            self.assertTrue(set(expected) <= set(names))
+            self.assertNotIn("desk", names)
+            self.assertRegex(r1_script.INTERVIEWER_ADDRESS_ALT, r"^[a-z|]+$")
+
+    def test_name_only_and_lead_in(self):
+        for _ in self.persona_states():
+            texts = ("Dex?", "Hello Dex.", "Decks?", "Desk?", "Hello desk?", "Hey, Dax?",
+                     "Christy?", "Christie.")
+            for text in texts:
+                with self.subTest(text=text):
+                    self.assertTrue(r1_session.is_name_only(text))
+            self.assertTrue(r1_session.is_lead_in_only("Christy, so."))
+            self.assertTrue(r1_session.is_lead_in_only("Dex, so."))
+
+    def test_icebreaker_repair_and_sound_check(self):
+        for _ in self.persona_states():
+            for name in ("Dex", "Decks", "Christy"):
+                with self.subTest(name=name):
+                    view = r1_session._ib_repair_view(f"{name}, are you there?")
+                    self.assertTrue(r1_session.is_repair_turn(view))
+                    view = r1_session._ib_repair_view(f"Sorry {name}, can you repeat the question?")
+                    self.assertTrue(r1_session.is_repeat_request(view))
+            for name in ("Dex", "Christy"):
+                self.assertEqual(r1_session.sound_check_reading(f"Hello {name}?"),
+                                 r1_session.SOUND_HEARD)
+            self.assertEqual(r1_session.sound_check_reading("Sorry Dex, I can't hear you"),
+                             r1_session.SOUND_CANT_HEAR)
+
+    def test_tracker_end_and_yes_readers(self):
+        for _ in self.persona_states():
+            for name in ("Dex", "Christy"):
+                self.assertTrue(tracker.strictly_names_end(f"Please end the interview, {name}."))
+                self.assertTrue(tracker.is_short_wrap_yes(f"Yes {name}."))
+                self.assertTrue(tracker.is_bare_yes(f"Yes {name}"))
+            self.assertTrue(tracker.strictly_names_end("Dex end the interview"))
+            self.assertTrue(tracker.confirms_end(
+                "Sorry Decks, yes, please end the interview, I need to go."))
+
+    def test_session_consent_brief_refusal_and_affirmation(self):
+        for _ in self.persona_states():
+            for name in ("Dex", "Christy"):
+                self.assertTrue(r1_session.is_no_questions(f"No, thank you, {name}."))
+                self.assertTrue(r1_session.is_affirmation_only(f"Yes {name}, one more."))
+                self.assertTrue(r1_session.is_transition_consent(f"Okay {name}, I'm ready."))
+                self.assertTrue(r1_session.is_brief_request(
+                    f"{name}, can you go over the role-play again?"))
+
+    def test_spoken_name(self):
+        for _ in self.persona_states():
+            self.assertEqual(r1_script.spoken_first_name("Hi Dex, myself Ravi"), "Ravi")
+            for name in ("Dex", "Decks", "Christy"):
+                self.assertFalse(r1_script.spoken_first_name(f"This is {name}"))
+
+    def test_guard_icebreaker_ask_and_negotiation(self):
+        for _ in self.persona_states():
+            for name in ("Dex", "Christy"):
+                self.assertTrue(ice.asks_christy(f"{name}, what do you mean?"))
+                self.assertIsNone(negotiation._named_sellers(f"{name} said 5000"))
+                self.assertIsNotNone(r1_guard._LEARNER_META.search(f"{name} told me to call you"))
+            ctx = r1_guard.GuardContext(
+                phase="roleplay", persona=resolve_persona("p1_career_switcher", variant="v1"))
+            hits = r1_guard.check_sentence("Dex told me to call you.", ctx)
+            self.assertIn("meta", {hit.category for hit in hits})
+            for word in ("index", "Dexter"):
+                self.assertIsNone(r1_guard._LEARNER_META.search(word))
+
+    def test_desk_negatives(self):
+        for _ in self.persona_states():
+            self.assertFalse(r1_session.is_name_only("I had a desk job in sales"))
+            view = r1_session._ib_repair_view("I had a desk job in sales")
+            self.assertFalse(r1_session.is_repair_turn(view))
+            self.assertFalse(tracker.is_short_wrap_yes("Yes desk"))
+            self.assertFalse(tracker.is_bare_yes("Yes desk"))
+            self.assertFalse(tracker.strictly_names_end("Please end the interview, desk."))

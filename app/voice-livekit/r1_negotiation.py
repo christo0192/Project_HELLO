@@ -48,6 +48,7 @@ from r1_commitment import (
     describes_programme,
 )
 from r1_scheduler import has_refusal, is_close_attempt, markers_match
+from r1_script import INTERVIEWER_ADDRESS_NAMES
 from r1_text import (
     COUNT_NOUN_AFTER,
     canonical_amounts,
@@ -2773,7 +2774,7 @@ _KNOWN_SELLERS = (
 _CAPITALISED = re.compile(r"(?<![\w'])([A-Z][a-zA-Z]+)(?:'s|\u2019s)?\b")
 # Capitalised words that are never a seller: the speaker, the learner, the interviewer, our own
 # brand, the course's subjects, employers named in a pitch, calendar words and contractions.
-_NOT_A_SELLER = frozenset(
+_NOT_A_SELLER = frozenset(INTERVIEWER_ADDRESS_NAMES) | frozenset(
     "i i'm i'll i'd i've it it's that that's this there there's here here's what what's who "
     "who's how let let's today today's tonight tonight's we you your our okay ok so and but "
     "yes yeah no sure well also then now see look please hi hello thanks thank sorry actually "

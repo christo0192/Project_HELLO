@@ -333,6 +333,9 @@ from r1_roleplay import (
     flag_on,
 )
 from r1_script import (
+    INTERVIEWER_ADDRESS_ALT,
+    INTERVIEWER_ADDRESS_NAMES,
+    INTERVIEWER_NAME_ONLY_EXTRA,
     INTERVIEWER_NAME,
     INTERVIEWER_NAME_DEX,
     interviewer_name,
@@ -721,10 +724,11 @@ _SOFT_CLOSE_RE = re.compile(
     r"understood|perfect|cool|noted|great)\b"
 )
 _AFFIRMATIONS = frozenset({"yes", "yeah", "yep", "yup", "sure"})
-# The interviewer's name as the STT spells it (owner test 8f5bfefc: "Christy, so.", "Christie.").
+# The interviewer's names (Dex, and Christy for candidates who still use it) as STT spells them.
 _INTERVIEWER_NAMES = frozenset(
-    {INTERVIEWER_NAME.lower(), "christy", "christie", "christi", "kristy", "kristie", "cristy"}
+    {INTERVIEWER_NAME.lower(), INTERVIEWER_NAME_DEX.lower(), *INTERVIEWER_ADDRESS_NAMES}
 )
+_NAME_ONLY_NAMES = _INTERVIEWER_NAMES | frozenset(INTERVIEWER_NAME_ONLY_EXTRA)
 # Courtesy and filler: the ONLY words allowed next to a refusal.  This is an allowlist on
 # purpose.  A list of question words can never be complete ("any feedback for me", "the
 # salary range", "please share my feedback" open with no question word), and the two ways
@@ -1426,21 +1430,21 @@ def is_lead_in_only(text: str) -> bool:
     )
 
 
-# What a candidate says to get the interviewer's attention, around her name ("Christie.", "Hey,
-# Christy?"): it asks nothing by itself.
+# What a candidate says to get the interviewer's attention, around the interviewer's name
+# ("Christie.", "Hey, Christy?"): it asks nothing by itself.
 _CALLING_WORDS = frozenset({"hey", "hi", "hello", "um", "uh", "hmm", "oh", "so", "and"})
 
 
 def is_name_only(text: str) -> bool:
-    """A wrap-up turn that only calls the interviewer by name ("Christie.", "Christy?").
+    """A wrap-up turn that only calls the interviewer by name ("Christie.", "Christy?", "Dex?").
 
     It is not a question of its own, so it does not count toward ``WRAPUP_QUESTION_LIMIT``; the
     model still replies to it, and that reply answers the question it follows (owner test
     8f5bfefc: "Christie." was the candidate asking again after the answer never came).
     """
     words = fold_speech(text).split()
-    return any(word in _INTERVIEWER_NAMES for word in words) and all(
-        word in _INTERVIEWER_NAMES or word in _CALLING_WORDS for word in words
+    return any(word in _NAME_ONLY_NAMES for word in words) and all(
+        word in _NAME_ONLY_NAMES or word in _CALLING_WORDS for word in words
     )
 
 
@@ -1871,7 +1875,8 @@ _NEG_AUX = (
 )
 # Words a reply may open with before what it says ("Sorry, not audible.", "Yes, but it's low.").
 _SOUND_CHECK_LEAD = (
-    r"(?:(?:yes|yeah|okay|ok|um|uh|hmm|sorry|but|well|actually|so|hi|hello|christy|sir|ma'am|maam|"
+    r"(?:(?:yes|yeah|okay|ok|um|uh|hmm|sorry|but|well|actually|so|hi|hello|"
+    + INTERVIEWER_ADDRESS_ALT + r"|sir|ma'am|maam|"
     r"mam|madam) )*"
 )
 # What may follow "hear" in a complaint: Christy ("you", "your voice", "the audio"), nothing at all
@@ -1879,7 +1884,8 @@ _SOUND_CHECK_LEAD = (
 # the customer" is not one.
 _HEAR_OBJECT = (
     r"(?: (?:you|anything|a thing|much|what you)\b|"
-    r" (?:your|the) (?:voice|audio|sound)\b|$| (?=(?:properly|clearly|well|at all|now|christy|"
+    r" (?:your|the) (?:voice|audio|sound)\b|$| (?=(?:properly|clearly|well|at all|now|"
+    + INTERVIEWER_ADDRESS_ALT + r"|"
     r"sir|ma'am|maam|madam|sorry|please)\b))"
 )
 # How much: "a bit low", "little low", "very low", "slightly muffled".
@@ -1929,7 +1935,7 @@ _SOUND_CHECK_SHORT_RE = re.compile(
     r"there(?:'s| is) (?:an |some |a lot of |a bit of )?(?:echo|noise|static|lag|delay|"
     r"disturbance)|"
     r"(?:a (?:little )?bit |a little |little )?louder(?: please)?|volume up(?: please)?"
-    r")(?: (?:sorry|please|sir|ma'am|maam|mam|madam|christy))?$"
+    r")(?: (?:sorry|please|sir|ma'am|maam|mam|madam|" + INTERVIEWER_ADDRESS_ALT + r"))?$"
 )
 # Review of S7C: what an early answer tells about the candidate.  First person with a work or
 # study verb ("I have been working in", "I handled", "we sell", "I started my career", "I did my
@@ -1986,7 +1992,7 @@ def sound_check_reading(text: str, *, after_question: bool = True) -> str:
     if after_question and _has_question_mark(text):
         if view and is_repair_turn(view) and _STILL_THERE_RE.search(view) is not None:
             return SOUND_CANT_HEAR  # "Hello? Are you there?"
-        named = any(word in _INTERVIEWER_NAMES for word in words)  # "Hello Christy?" heard her
+        named = any(word in _NAME_ONLY_NAMES for word in words)  # "Hello Christy?" or "Hello Dex?"
         if not named and (
             all(word in _HELLO_ONLY_WORDS for word in words)
             or all(word in _SOUND_QUERY_WORDS for word in words)
@@ -2047,7 +2053,8 @@ _BRIEF_REQUEST_RE = re.compile(
 # "Come again?", "Pardon?", "Once again?", "Sorry, one more time.": a request only as the whole
 # (short) utterance, so "I got promoted once again last year" is none.
 _BRIEF_SHORT_RE = re.compile(
-    r"^(?:(?:sorry|pardon|um|uh|hmm|okay|ok|please|ma'am|madam|sir|christy|can you|could you|"
+    r"^(?:(?:sorry|pardon|um|uh|hmm|okay|ok|please|ma'am|madam|sir|"
+    + INTERVIEWER_ADDRESS_ALT + r"|can you|could you|"
     r"say it|say that) )*(?:come again|once again|one more time|again|pardon|pardon me)"
     r"(?: please)?$"
 )
@@ -2413,7 +2420,8 @@ _IB_QUESTION_ASK_RE = re.compile(
     r"\b(?:"
     r"(?:can|could|would|will) you (?:please |just |kindly )?(?:repeat|ask|say|read|tell)|"
     r"(?:please|just) (?:repeat|ask|say|read)|"
-    r"^(?:(?:okay|ok|so|sorry|um|uh|hmm|wait|actually|christy|ma'am|maam|madam|sir) )*repeat|"
+    r"^(?:(?:okay|ok|so|sorry|um|uh|hmm|wait|actually|"
+    + INTERVIEWER_ADDRESS_ALT + r"|ma'am|maam|madam|sir) )*repeat|"
     r"repeat (?:it|that|this|your|the)|"
     r"(?:ask|say|tell|read|give)(?: me| us)?(?: it| that| this| the question| your question|"
     r" (?:the|that|your) \w+ question)? (?:again|once more|one more time)|"
@@ -2433,7 +2441,8 @@ _IB_QUESTION_ASK_RE = re.compile(
 # one", "The other one", "That's not the one I meant").  A bare "No," or "I mean," opens many an
 # answer ("No, not really, I never tracked that."), so neither is enough on its own.
 _IB_INSIST_RE = re.compile(
-    r"^(?:(?:um|uh|oh|sorry|wait|actually|christy|ma'am|maam|madam|sir|no|nope) )*"
+    r"^(?:(?:um|uh|oh|sorry|wait|actually|"
+    + INTERVIEWER_ADDRESS_ALT + r"|ma'am|maam|madam|sir|no|nope) )*"
     r"(?:no (?:i mean|i meant)|nope (?:i mean|i meant)|"
     r"(?:no )?not (?:that|this)(?: one| question)|"
     r"(?:no )?(?:the|that) other (?:one|question)|"
@@ -2453,7 +2462,8 @@ _IB_INSIST_REF_WORDS = frozenset(
 _IB_INSIST_WORDS = _IB_INSIST_REF_WORDS | frozenset(
     {"the", "that", "this", "your", "very", "you", "asked", "had", "were", "asking", "me", "us",
      "i", "mean", "meant", "no", "not", "nope", "it", "is", "it's", "its", "that's", "thats",
-     "wrong", "please", "sorry", "um", "uh", "oh", "wait", "actually", "christy", "ma'am", "maam",
+     "wrong", "please", "sorry", "um", "uh", "oh", "wait", "actually", *INTERVIEWER_ADDRESS_NAMES,
+     "ma'am", "maam",
      "madam", "sir", "go", "back", "to", "and", "ask", "repeat", "say", "read", "put", "again",
      "once", "more", "time", "from", "just"}
 )
@@ -2627,7 +2637,8 @@ _GO_OVER_YOU_RE = re.compile(
 _GO_OVER_FOR_ME_RE = re.compile(r"\b(?:for (?:me|us)|please)\b")
 _IMPERATIVE_FILLER = frozenset(
     {"okay", "ok", "so", "just", "sorry", "um", "uh", "hmm", "yeah", "yes", "alright", "right",
-     "then", "and", "well", "actually", "christy", "ma'am", "maam", "madam", "sir", "please",
+     "then", "and", "well", "actually", *INTERVIEWER_ADDRESS_NAMES,
+     "ma'am", "maam", "madam", "sir", "please",
      "also", "now", "quickly", "briefly", "hang", "on", "wait", "again", "once", "more"}
 )
 
@@ -2927,7 +2938,7 @@ _PERMISSION_RE = re.compile(
 _PERMISSION_FILLER = frozenset(
     {
         "so", "um", "uh", "well", "okay", "ok", "alright", "yes", "yeah", "sure", "actually",
-        "just", "also", "please", "sorry", "christy", "christie", "ma'am", "madam", "sir",
+        "just", "also", "please", "sorry", *INTERVIEWER_ADDRESS_NAMES, "ma'am", "madam", "sir",
         "a", "an", "one", "two", "three", "few", "couple", "of", "some", "any", "more", "other",
         "another", "quick", "small", "little", "question", "questions", "first", "before", "we",
         "start", "begin", "get", "started", "the", "this", "that", "it", "role", "play",
@@ -3041,7 +3052,7 @@ _CONSENT_FILLER = frozenset(
         "lets", "let", "us", "the", "this", "that", "it", "role", "play", "roleplay", "with",
         "from", "my", "side", "for", "fine", "good", "great", "perfect", "cool", "absolutely",
         "definitely", "really", "fully", "totally", "quite", "pretty", "set", "and", "just",
-        "go", "ahead", "christy", "ma'am", "madam", "sir", "oh", "ah", "hmm", "is",
+        "go", "ahead", *INTERVIEWER_ADDRESS_NAMES, "ma'am", "madam", "sir", "oh", "ah", "hmm", "is",
         # Repair (round 2): a Hindi-English yes ("Haan, let's start.", "Ji, ready.").
         "haan", "han", "haa", "haanji", "ji", "achha", "acha", "accha",
     }
@@ -3054,7 +3065,8 @@ _SHORT_YES_RE = re.compile(
 )
 _SHORT_YES_FILLER = frozenset(
     {"please", "so", "um", "uh", "well", "then", "thanks", "thank", "you", "oh", "ah", "hmm",
-     "sounds", "good", "great", "cool", "perfect", "right", "christy", "ma'am", "madam", "sir"}
+     "sounds", "good", "great", "cool", "perfect", "right", *INTERVIEWER_ADDRESS_NAMES,
+     "ma'am", "madam", "sir"}
 )
 
 
@@ -3124,7 +3136,7 @@ _READY_LEAD_WORDS = frozenset(
         "uh", "well", "right", "fine", "good", "great", "perfect", "cool", "and", "oh", "ah",
         "hmm", "totally", "fully", "absolutely", "definitely", "really", "haan", "han", "haa",
         "haanji", "ji", "achha", "acha", "accha", "hai", "theek", "thik", "chalo", "bas",
-        "thanks", "christy", "ma'am", "madam", "sir",
+        "thanks", *INTERVIEWER_ADDRESS_NAMES, "ma'am", "madam", "sir",
     }
 )
 # A readiness the turn takes back, puts off or makes depend on something, or a turn that still asks
@@ -3168,7 +3180,8 @@ _ANSWERED_QUESTIONS_RE = re.compile(
 # "are you ready", "can you say it again").  A wh-word inside a statement ("I see how it works")
 # asks nothing.
 _WIDE_ASK_START_RE = re.compile(
-    r"^(?:(?:so|and|but|okay|ok|um|uh|well|sorry|yes|yeah|haan|then|christy) )*"
+    r"^(?:(?:so|and|but|okay|ok|um|uh|well|sorry|yes|yeah|haan|then|"
+    + INTERVIEWER_ADDRESS_ALT + r") )*"
     r"(?:what|what's|whats|how|how's|when|where|why|who|whom|whose|which|whether|"
     r"(?:am|is|are|do|does|did|will|would|have|has|was|were|can|could|should|shall|may) "
     r"(?:i|we|you|she|he|it|there|they|"
