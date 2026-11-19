@@ -4044,7 +4044,14 @@ class TestWrapupAndReadyDriveTheDriver(R1TestCase):
     async def test_agent_instructions_follow_persona(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertTrue(r1_session.r1_agent_instructions().startswith("You are Dex."))
-            self.assertIn("You are Dex.", R1Agent(self.interview).instructions)
+            if r1_session.Agent is not object:
+                self.assertIn("You are Dex.", R1Agent(self.interview).instructions)
+            else:
+                with mock.patch.object(
+                    r1_session, "r1_agent_instructions", wraps=r1_session.r1_agent_instructions
+                ) as instructions:
+                    R1Agent(self.interview)
+                instructions.assert_called_once_with()
         with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}, clear=True):
             self.assertTrue(r1_session.r1_agent_instructions().startswith("You are Christy."))
 
