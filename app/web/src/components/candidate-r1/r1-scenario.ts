@@ -35,8 +35,7 @@ export function discountLadderText(discounts: readonly number[] = R1_SCENARIO_FA
 }
 
 export const R1_GOAL_ENROL =
-  'Your goal: understand their needs, handle their concerns, and help them decide to enrol. '
-  + 'If they are not ready today, agree a clear next step.';
+  'Your goal: understand their needs, handle their concerns, and help them enrol or agree a next step.';
 export const R1_GOAL_NEXT_STEP =
   'Your goal: understand their needs, handle their concerns, and agree a clear next step.';
 

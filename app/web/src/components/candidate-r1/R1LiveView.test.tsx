@@ -102,7 +102,7 @@ describe('scenario card', () => {
     renderLive({ leadVisible: true, phase: 'transition' });
     const card = screen.getByRole('region', { name: 'Your role-play' });
     expect(card).toHaveTextContent('understand their needs');
-    expect(card).toHaveTextContent('agree a clear next step');
+    expect(card).toHaveTextContent('help them enrol or agree a next step');
     expect(card).toHaveTextContent('stays in character');
   });
 

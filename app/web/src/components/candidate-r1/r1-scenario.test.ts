@@ -124,8 +124,10 @@ describe('what the card must never say', () => {
     expect(R1_SCENARIO_COPY.goal).toMatch(/^Your goal:/);
     expect(R1_SCENARIO_COPY.goal).toMatch(/understand their needs/);
     expect(R1_SCENARIO_COPY.goal).toMatch(/handle their concerns/);
-    expect(R1_SCENARIO_COPY.goal).toMatch(/decide to enrol/);
-    expect(R1_SCENARIO_COPY.goal).toMatch(/agree a clear next step/);
+    // Enrolment is the goal and a next step the fallback, in one line (it fits a 1100x500 window).
+    expect(R1_SCENARIO_COPY.goal).toMatch(/help them enrol/);
+    expect(R1_SCENARIO_COPY.goal).toMatch(/or agree a next step/);
+    expect(R1_SCENARIO_COPY.goal.length).toBeLessThanOrEqual(100);
   });
 });
 
@@ -149,8 +151,7 @@ describe('formatting', () => {
 });
 
 describe('scenario goal flag', () => {
-  const newGoal = 'Your goal: understand their needs, handle their concerns, and help them decide to enrol. '
-    + 'If they are not ready today, agree a clear next step.';
+  const newGoal = 'Your goal: understand their needs, handle their concerns, and help them enrol or agree a next step.';
   const oldGoal = 'Your goal: understand their needs, handle their concerns, and agree a clear next step.';
 
   it.each([undefined, '', '1', 'true'])('uses the enrolment goal for %s', (flag) => {
