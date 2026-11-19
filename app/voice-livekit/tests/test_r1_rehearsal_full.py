@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import unittest.mock
 from pathlib import Path
 
@@ -31,7 +33,35 @@ HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from rehearsal import vloop
+from rehearsal import candidate, flow_judge, full, manual, persona, vloop
+
+
+def _transition_prefix_matches(said: list[str], planned: list[str], *, allow_drop: bool) -> bool:
+    """Match the replay prefix, optionally skipping planned repeat requests."""
+    if not allow_drop:
+        return said[:len(planned)] == planned[:len(said)]
+    index = 0
+    for act in said:
+        while index < len(planned) and planned[index] == "repeat_request" and act != planned[index]:
+            index += 1
+        if index == len(planned):
+            return True  # Fallback turns may follow the replay.
+        if act != planned[index]:
+            return False
+        index += 1
+    return True  # The replay may run out before all planned moves are spoken.
+
+
+class TransitionPrefixTests(unittest.TestCase):
+    def test_only_repeat_requests_can_be_dropped(self) -> None:
+        planned = ["other", "repeat_request", "ready"]
+        self.assertTrue(_transition_prefix_matches(["other", "ready"], planned, allow_drop=True))
+        self.assertFalse(_transition_prefix_matches(["other", "ready"], planned, allow_drop=False))
+        self.assertFalse(_transition_prefix_matches(["ready"], planned, allow_drop=True))
+        self.assertFalse(_transition_prefix_matches(["ready", "other"], planned, allow_drop=True))
+        self.assertFalse(_transition_prefix_matches(["other", "wrong"], planned, allow_drop=True))
+        self.assertTrue(_transition_prefix_matches(["other"], planned, allow_drop=True))
+        self.assertTrue(_transition_prefix_matches(["other", "ready", "ready"], planned, allow_drop=True))
 
 
 # ------------------------------------------------------------------------------ virtual clock
@@ -724,6 +754,7 @@ class OfflineFullInterviewTests(unittest.TestCase):
 
     def test_manual_replays_follow_their_moves_in_order(self) -> None:
         from rehearsal import manual
+        from rehearsal.flags import REPEAT_IF_UNANSWERED, on
         from rehearsal.scenarios import SCENARIOS
 
         for number in range(1, 11):
@@ -746,7 +777,12 @@ class OfflineFullInterviewTests(unittest.TestCase):
                     t["act"] for t in record["candidate_turns"] if t["phase"] == "transition" and t["role"] == "candidate"
                 ]
                 planned_transition = [m.act for m in moves if m.phase == "transition" and m.act != "ready_button"]
-                self.assertEqual(transition[: len(planned_transition)], planned_transition[: len(transition)])
+                self.assertTrue(
+                    _transition_prefix_matches(
+                        transition, planned_transition, allow_drop=on(REPEAT_IF_UNANSWERED)
+                    ),
+                    f"transition={transition}, planned={planned_transition}",
+                )
 
     def test_the_mix_samples_the_catalogue(self) -> None:
         from rehearsal import manual
@@ -775,6 +811,7 @@ class OfflineFullInterviewTests(unittest.TestCase):
                 self.assertIn(key, row)
         voices = {row["voice"] for row in record["rows"]}
         self.assertEqual(voices, {"christy", "learner", "candidate"})
+        self.assertIn("christy_repeats", record["phase_checks"]["checks"])
         self.assertTrue(record["admin_log"])
         self.assertIsNotNone(record["session_facts"])
         roleplay = [r for r in record["rows"] if r["phase"] == "roleplay" and r["r_sec"] is not None]
@@ -794,6 +831,7 @@ class OfflineFullInterviewTests(unittest.TestCase):
             body = (out / "calls" / f"{seed}.json").read_text(encoding="utf-8")
             self.assertNotIn(secret, body)
             self.assertEqual(json.loads(body)["header"]["scenario"], "early-end")
+            self.assertIn("christy", {row["voice"] for row in json.loads(body)["rows"]})
             lines = (out / "transcripts" / f"{seed}.txt").read_text(encoding="utf-8").splitlines()
             turn_lines = [line for line in lines if line.startswith("[S ")]
             self.assertEqual(len(turn_lines), len(record["rows"]) + len(record["events"]))
@@ -977,6 +1015,52 @@ class CandidateSimTests(unittest.TestCase):
         agenda = _span("bot", "interviewer", "Good, I can hear you. So, to begin, tell me about yourself.", 6.0, 12.0)
         second = asyncio.run(sim.next_action(_view("icebreaker", [agenda])))
         self.assertEqual((second.act, second.text), ("icebreaker_answer", "answer 1"))
+
+    def test_the_hello_without_a_hearing_question_is_no_sound_check(self) -> None:
+        import r1_script
+        from rehearsal.candidate import is_icebreaker_question, is_sound_check
+
+        hello = "Hi Alex, I'm Dex, an AI interviewer from Interview Kickstart."
+        for line in (hello, r1_script.line("L-OPEN-HI", first_name="Alex"),
+                     r1_script.line("L-OPEN-HI", first_name="")):
+            with self.subTest(line=line):
+                self.assertFalse(is_sound_check(line))
+                self.assertFalse(is_icebreaker_question(line))
+
+    def test_the_plain_agenda_is_an_icebreaker_question(self) -> None:
+        import r1_script
+        from rehearsal.candidate import is_icebreaker_question, is_sound_check
+
+        agenda = (
+            "Let's get started. The whole interview takes about thirty minutes: a few minutes to get to "
+            "know you, a sales role-play of up to twenty minutes, then time for your questions. To start, "
+            "tell me a bit about yourself and the sales or customer-facing work you've done."
+        )
+        self.assertTrue(is_icebreaker_question(agenda))
+        self.assertFalse(is_sound_check(agenda))
+        for line_id in ("L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-PLAIN-W2", "L-OPEN-AGENDA-PLAIN-W3"):
+            with self.subTest(line_id=line_id):
+                line = r1_script.line(line_id)
+                self.assertTrue(is_icebreaker_question(line))
+                self.assertFalse(is_sound_check(line))
+
+    def test_the_default_opening_gets_an_icebreaker_answer_not_a_yes(self) -> None:
+        hello = _span("bot", "interviewer", "Hi Alex, I'm Christy, an AI interviewer from Interview Kickstart.",
+                      0.0, 4.0)
+        agenda = _span(
+            "bot", "interviewer",
+            "Let's get started. The whole interview takes about thirty minutes: a few minutes to get to "
+            "know you, a sales role-play of up to twenty minutes, then time for your questions. To start, "
+            "tell me a bit about yourself and the sales or customer-facing work you've done.",
+            4.0, 20.0,
+        )
+        talker = _CountingTalker()
+        sim = _sim(talker=talker)
+        action = asyncio.run(sim.next_action(_view("opening", [hello, agenda])))
+        self.assertEqual((action.kind, action.act, action.text), ("speak", "icebreaker_answer", "answer 1"))
+        self.assertNotEqual(action.act, "sound_check_answer")
+        self.assertEqual(talker.answers, 1)
+        self.assertEqual(len(sim._ib_questions), 1)
 
     def test_the_nervous_silence_counts_questions_not_lines(self) -> None:
         sim = _sim("terse-nervous")
@@ -2467,8 +2551,6 @@ class LearnerClockTests(unittest.TestCase):
         self.assertGreater(seen, 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class AsideQuestionTests(unittest.TestCase):
@@ -2503,3 +2585,83 @@ class AsideQuestionTests(unittest.TestCase):
         rt = self._runtime()
         self.assertEqual(aside_question_of(rt, self._render("L-ASIDE-WRAP")), "wrap")
         self.assertEqual(aside_question_of(rt, self._render("L-ASIDE-END")), "end")
+
+
+class DexPersonaTests(unittest.TestCase):
+    RECORD = {
+        "header": {"scenario_title": "Christy test"},
+        "rows": [
+            {"voice": "christy", "text": "hello"},
+            {"voice": "learner", "text": "hi"},
+            {"voice": "candidate", "text": "yes"},
+        ],
+    }
+
+    def test_swap_name_keeps_case_and_identifier(self):
+        self.assertEqual(persona.swap_name("CHRISTY christy's christy_flow"), "DEX dex's christy_flow")
+
+    def test_render_swaps_library_move_by_default(self):
+        self.assertEqual(manual.render("Sorry Christy, can you repeat the question?", {}),
+                         "Sorry Dex, can you repeat the question?")
+
+    def test_render_keeps_name_with_flag_off(self):
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
+            self.assertEqual(manual.render("Sorry Christy, can you repeat the question?", {}),
+                             "Sorry Christy, can you repeat the question?")
+
+    def test_act_of_reads_raw_move(self):
+        self.assertEqual(manual.act_of("icebreaker", "asks Christy to repeat the question",
+                                       "Sorry Christy, can you repeat the question?"), "repeat_request")
+
+    def test_talker_prompt_uses_active_pronoun(self):
+        self.assertIn("with him", candidate.talker_system_prompt("strong", "Alex"))
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
+            self.assertIn("conversation with her.", candidate.talker_system_prompt("strong", "Alex"))
+
+    def test_tasks_and_aside_use_active_persona(self):
+        self.assertIn("Dex", candidate.icebreaker_task())
+        self.assertIn("his", candidate.thinking_task())
+        self.assertIn("Dex", candidate.wrapup_task())
+        self.assertIn("Dex", candidate.aside_note("hello"))
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
+            self.assertEqual(candidate.icebreaker_task(), "Answer Christy's last question, as yourself.")
+            self.assertEqual(candidate.thinking_task(),
+                             "You asked Christy for a moment to think. Now answer her earlier question, as yourself.")
+            self.assertEqual(candidate.wrapup_task(),
+                             "Christy asked whether you have any questions about the role or the next steps. "
+                             "Ask ONE real, short question (under 20 words).")
+            self.assertEqual(candidate.aside_note("hello"), "(Christy, the interviewer, stepped in and said: hello)")
+
+    def test_flow_messages_use_dex(self):
+        combined = " ".join(m["content"] for m in flow_judge.flow_messages(self.RECORD))
+        self.assertNotIn("christy", combined.replace("christy_flow", "").lower())
+        self.assertIn("he answers", combined)
+        self.assertIn("DEX|LEARNER", combined)
+
+    def test_stored_voice_renders_active_speaker(self):
+        self.assertEqual(flow_judge.judged_turns(self.RECORD)[0]["speaker"], "DEX")
+        self.assertIn("DEX", full.transcript_text(self.RECORD))
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
+            self.assertEqual(flow_judge.judged_turns(self.RECORD)[0]["speaker"], "CHRISTY")
+            self.assertIn("CHRISTY", full.transcript_text(self.RECORD))
+
+    def test_schema_is_original_with_flag_off(self):
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
+            messages = flow_judge.flow_messages({"rows": [{"voice": "learner"}]})
+            self.assertIn(flow_judge.SCHEMA_TEXT, messages[1]["content"])
+
+
+def setUpModule():
+    global _persona_environment
+    env = dict(os.environ)
+    env.pop("R1_INTERVIEWER_DEX", None)
+    _persona_environment = mock.patch.dict(os.environ, env, clear=True)
+    _persona_environment.start()
+
+
+def tearDownModule():
+    _persona_environment.stop()
+
+
+if __name__ == "__main__":
+    unittest.main()

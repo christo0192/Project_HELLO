@@ -2166,7 +2166,7 @@ class TestR1VoicesOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
             if line.get("error_type") == "r1_tts_voice"
         }
         self.assertEqual(
-            voices, {"interviewer": "simran_en_customer", "learner": "zarina_en_conversation"}
+            voices, {"interviewer": "deven_en_conversation", "learner": "zarina_en_conversation"}
         )
         profile = next(line for line in lines if line.get("error_type") == "r1_tts_profile")
         self.assertEqual(profile.get("model"), "bulbul:v4-flash")
@@ -2203,6 +2203,7 @@ class TestR1VoicesOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tts.model, "bulbul:v3")
         events = [(line.get("error_type"), line.get("error_category")) for line in lines]
         self.assertIn(("r1_tts_profile_fallback", "ValueError"), events)
+        self.assertIn(("r1_interviewer_voice_mismatch", "legacy_voice"), events)
         self.assertIn(("r1_tts_profile", "v3"), events)  # what the session really speaks
         await tts.aclose()
 

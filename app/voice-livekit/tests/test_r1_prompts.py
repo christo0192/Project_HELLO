@@ -19,11 +19,10 @@ from r1_prompts import (
     CHECKIN_DONE_NOTE,
     CHECKIN_NOTE,
     EMAIL_OFFER_NOTE,
-    INTERVIEWER_NAME,
     NEXT_STEP_PROPOSED_NOTE,
     REACT_HOW_IT_LANDS,
     REACTION_ONLY_NOTE,
-    WRAPUP_NOTE,
+    wrapup_note,
     assemble_messages,
     control_prose,
     interviewer_prefix,
@@ -81,7 +80,7 @@ class InterviewerPrefixTests(unittest.TestCase):
             self.assertNotIn(word.lower(), lowered, word)
 
     def test_it_carries_the_deck_faq_and_the_deflection_and_prohibitions(self):
-        self.assertIn(INTERVIEWER_NAME, self.PREFIX)
+        self.assertIn("Dex", self.PREFIX)
         self.assertIn("10:00 PM to 8 AM IST", self.PREFIX)
         self.assertIn("3:30 AM to 8 AM IST", self.PREFIX)
         self.assertIn("That's a good question for the hiring team", self.PREFIX)
@@ -732,7 +731,7 @@ class ContextFilterTests(unittest.TestCase):
 
     def test_a_wrapup_call_sees_only_wrapup_turns_plus_the_ended_note(self):
         messages = select_context(self.ITEMS, "wrapup")
-        self.assertEqual(messages[0], {"role": "system", "content": WRAPUP_NOTE})
+        self.assertEqual(messages[0], {"role": "system", "content": wrapup_note()})
         joined = " ".join(m["content"] for m in messages)
         self.assertIn("What is the shift?", joined)
         for leak in ("Meera", "SaaS", "Just exploring"):
@@ -1310,8 +1309,11 @@ class InterviewerVoiceTests(unittest.TestCase):
         import os
         from unittest import mock
 
-        self.assertEqual(_sha(interviewer_prefix(voice=False)), PRE_M032_INTERVIEWER_PREFIX_SHA256)
-        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_VOICE": "0"}):
+        self.assertEqual(
+            _sha(interviewer_prefix(voice=False, name="Christy")),
+            PRE_M032_INTERVIEWER_PREFIX_SHA256,
+        )
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_VOICE": "0", "R1_INTERVIEWER_DEX": "0"}):
             self.assertEqual(_sha(interviewer_prefix()), PRE_M032_INTERVIEWER_PREFIX_SHA256)
         with mock.patch.dict(os.environ, {"R1_INTERVIEWER_VOICE": "1"}):
             self.assertEqual(interviewer_prefix(), interviewer_prefix(voice=True))

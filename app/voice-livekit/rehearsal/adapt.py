@@ -36,6 +36,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
+from rehearsal import persona
 from rehearsal.advisor import AdvisorTurn
 from rehearsal.scenarios import (
     GROUPS,
@@ -266,7 +267,7 @@ _behaviour(Behaviour(
     "You are easily distracted: every few turns, drift to something unrelated (cricket, traffic, "
     "the weather, food, a neighbour) for a sentence or two, then come back to the call.",
     icebreaker=TANGENT_ICEBREAKER,
-    live_tasks={"tangent": "Start answering Christy's last question, then drift to an unrelated topic "
+    live_tasks={"tangent": "Start answering {name}'s last question, then drift to an unrelated topic "
                 "(cricket, traffic, food, the weather) for a sentence or two, then come back briefly."},
 ))
 _behaviour(Behaviour(
@@ -276,8 +277,8 @@ _behaviour(Behaviour(
     "You are unsure how this role-play works: now and then you ask what you are supposed to do or "
     "say, then carry on with the call.",
     icebreaker=CONFUSED_ICEBREAKER,
-    live_tasks={"confused_question": "You did not understand Christy's last question. Ask her, in "
-                "under 20 words, what she means; do not answer it yet."},
+    live_tasks={"confused_question": "You did not understand {name}'s last question. Ask {him}, in "
+                "under 20 words, what {he} means; do not answer it yet."},
 ))
 _behaviour(Behaviour(
     "rambler", "ramble",
@@ -532,7 +533,7 @@ def adapt_scenarios() -> list[Scenario]:
         ),
         Scenario(
             "one-worder",
-            "Answers in one or two words everywhere: to Christy, in the role-play and at the end.",
+            "Answers in one or two words everywhere: to the interviewer, in the role-play and at the end.",
             level="terse", style="one_word", tags=(ADAPT_TAG, "one_word"), adapt="one_word",
             transition=(_b("ready", "Ready.", "one_word"),),
             ready_fallbacks=("Ready.",),
@@ -629,7 +630,7 @@ def adapt_scenarios() -> list[Scenario]:
         ),
         Scenario(
             "gives-up-midway",
-            "Wants to stop the role-play at R 6:00 and again at R 12:00; carries on when Christy asks.",
+            "Wants to stop the role-play at R 6:00 and again at R 12:00; carries on when the interviewer asks.",
             level="average", style="average", tags=(ADAPT_TAG, "gives_up", "early_end", "end_decline"),
             adapt="gives_up",
             transition=(READY,),
@@ -657,7 +658,7 @@ def adapt_scenarios() -> list[Scenario]:
         ),
         Scenario(
             "argues-with-christy",
-            "Disputes the brief and the rules with Christy, then plays along.",
+            "Disputes the brief and the rules with the interviewer, then plays along.",
             level="average", style="average", tags=(ADAPT_TAG, "argue"), adapt="argue",
             transition=(
                 _b("argue", "Hold on, that doesn't make sense to me. Why would a real advisor spend "
@@ -769,7 +770,7 @@ class AdaptTalker:
         if self.offline:
             return text or await self.base.icebreaker_answer(thinking)
         task = self.behaviour.live_tasks.get(act)
-        said = await self.base._ask(task) if task else None
+        said = await self.base._ask(persona.fill(task)) if task else None
         if said is None:
             said = await self.base.icebreaker_answer(thinking)
         if self.behaviour.live_transform is not None:

@@ -65,6 +65,7 @@ from r1_negotiation import (
 )
 from r1_personas import asks_about_learner
 from r1_scheduler import EARLY_CLOSE_BEFORE_SEC, answered_topics, is_close_attempt
+from r1_script import interviewer_dex_enabled
 from r1_text import normalize
 from r1_tracker import (
     detect_end_request,
@@ -84,12 +85,18 @@ __all__ = [
     "READER_LABELS",
     "READER_PHASES",
     "READER_PROMPT_VERSION",
+    "READER_PROMPT_REVISION_CHRISTY",
     "READER_SESSION_MAX_CALLS",
     "READER_SHADOW_MAX_BYTES",
     "READER_SHADOW_MAX_ROWS",
     "READER_SPECULATIVE_MAX_CALLS",
     "READER_SPECULATIVE_STARTS_PER_ROW",
     "READER_SYSTEM",
+    "READER_SYSTEM_DEX",
+    "TRANSITION_CONTEXT_DEX",
+    "reader_system",
+    "transition_context",
+    "reader_prompt_version",
     "REGEX_DETECTORS",
     "ReaderReading",
     "ReaderShadowLog",
@@ -170,8 +177,9 @@ READER_SHADOW_MEMORY_ROWS = 400
 READER_SPECULATIVE_STARTS_PER_ROW = 3
 READER_SPECULATIVE_MAX_CALLS = 120
 READER_SESSION_MAX_CALLS = 200
-# Bump when READER_SYSTEM or a context line changes, so the owner's data names its prompt.
-READER_PROMPT_REVISION = 2
+# Bump the persona's own revision when its prompt or a context line changes.
+READER_PROMPT_REVISION = 3
+READER_PROMPT_REVISION_CHRISTY = 2
 
 READER_SYSTEM = (
     "You label ONE turn spoken by a job candidate in a recorded interview. The interviewer, "
@@ -218,11 +226,28 @@ TRANSITION_CONTEXT = (
 )
 
 
+READER_SYSTEM_DEX = READER_SYSTEM.replace("Christy", "Dex")
+TRANSITION_CONTEXT_DEX = (
+    "Phase: before the role-play. Dex is briefing the candidate; the learner has not "
+    "spoken yet."
+)
+
+
+def reader_system() -> str:
+    """Follow R1_INTERVIEWER_DEX; 0 gives the Christy text."""
+    return READER_SYSTEM_DEX if interviewer_dex_enabled() else READER_SYSTEM
+
+
+def transition_context() -> str:
+    """Follow R1_INTERVIEWER_DEX; 0 gives the Christy text."""
+    return TRANSITION_CONTEXT_DEX if interviewer_dex_enabled() else TRANSITION_CONTEXT
+
+
 def _prompt_sha() -> str:
     manifest = {
-        "system": READER_SYSTEM,
+        "system": reader_system(),
         "roleplay_context": ROLEPLAY_CONTEXT,
-        "transition_context": TRANSITION_CONTEXT,
+        "transition_context": transition_context(),
         "labels": list(READER_LABELS),
         "answered": list(ANSWERED_VALUES),
     }
@@ -230,7 +255,15 @@ def _prompt_sha() -> str:
     return hashlib.sha256(blob.encode("ascii")).hexdigest()
 
 
-READER_PROMPT_VERSION = f"r1-reader-v{READER_PROMPT_REVISION}+{_prompt_sha()[:12]}"
+def reader_prompt_version() -> str:
+    """Follow R1_INTERVIEWER_DEX; 0 gives the Christy label (revision 2) exactly as before."""
+    revision = (
+        READER_PROMPT_REVISION if interviewer_dex_enabled() else READER_PROMPT_REVISION_CHRISTY
+    )
+    return f"r1-reader-v{revision}+{_prompt_sha()[:12]}"
+
+
+READER_PROMPT_VERSION = reader_prompt_version()
 
 
 # ------------------------------------------------------------------ today's detectors
@@ -400,9 +433,9 @@ def build_reader_messages(
     spoken), anything else shows her last line.  No candidate text is put in the system message.
     """
     sentinel = sentinel_for(f"{seed}:reader", turn)
-    system = READER_SYSTEM.replace("{sentinel}", sentinel)
+    system = reader_system().replace("{sentinel}", sentinel)
     if phase == "transition":
-        lead = TRANSITION_CONTEXT
+        lead = transition_context()
     else:
         lead = ROLEPLAY_CONTEXT.replace(
             "{learner_last}",
@@ -934,7 +967,7 @@ class ReaderShadowLog:
         total = self._turns + len(self._pending)
         summary: dict[str, Any] = {
             "mode": MODE_SHADOW,
-            "prompt": READER_PROMPT_VERSION,
+            "prompt": reader_prompt_version(),
             "turns": total,
             "status": status,
             "labels": labels,

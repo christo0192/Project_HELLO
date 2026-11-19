@@ -29,6 +29,18 @@ import string
 from typing import Any
 
 INTERVIEWER_NAME = "Christy"
+# Owner 2026-11-19, R1_INTERVIEWER_DEX: Dex is a male interviewer.
+INTERVIEWER_NAME_DEX = "Dex"
+
+# Owner 2026-11-19 (R1_INTERVIEWER_DEX): names candidates may call the interviewer,
+# as speech-to-text spells them; detectors accept all of them whatever the flag.
+INTERVIEWER_ADDRESS_NAMES = (
+    "christy", "christie", "christi", "kristy", "kristie", "cristy",
+    "dex", "decks", "dax", "deks",
+)
+INTERVIEWER_ADDRESS_ALT = "|".join(sorted(INTERVIEWER_ADDRESS_NAMES, key=len, reverse=True))
+# "desk" is an address only in name-only turns ("Desk?", "Hello desk?"), never a filler.
+INTERVIEWER_NAME_ONLY_EXTRA = ("desk",)
 
 # M032 S6 (owner go of 2026-11-11, test fda9e9f6 #23-#31; SWEEP-30): ONE body for every brief, so
 # the first brief, the brief after Christy's own reaction (S5's bridge), the replay and the short
@@ -88,6 +100,8 @@ TRANSITION_QUIET_FALLBACK = "Fair enough."
 # ONE shorter agenda from this shared body.  The owner's durations are kept word for word ("about
 # thirty minutes", "up to twenty minutes"); the two filler durations are gone.  The agenda asks the
 # icebreaker plan's first objective, as L-OPEN did.
+# With R1_OPENING_NO_HEARING_CHECK on (default; owner 2026-11-19), L-OPEN-HI drops the hearing
+# question and the plain agenda follows at once.
 OPEN_HEARD = "Good, I can hear you. "
 OPEN_PLAIN = "Let's get started. "
 OPEN_AGENDA = (
@@ -143,6 +157,9 @@ LINES: dict[str, str] = {
     "L-OPEN-HELLO-AGAIN": (
         "Sorry about that. Please check your speaker or headphone volume. Can you hear me now?"
     ),
+    # Owner 2026-11-19 (R1_OPENING_NO_HEARING_CHECK): the hello without "Can you hear me okay?";
+    # spoken live (it carries the name), then L-OPEN-AGENDA-PLAIN.
+    "L-OPEN-HI": "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart.",
     "L-OPEN-AGENDA": OPEN_HEARD + OPEN_AGENDA + OPEN_FIRST_QUESTION,
     "L-OPEN-AGENDA-PLAIN": OPEN_PLAIN + OPEN_AGENDA + OPEN_FIRST_QUESTION,
     "L-OPEN-AGENDA-CONTINUE": OPEN_HEARD + OPEN_AGENDA + OPEN_CARRY_ON,
@@ -530,6 +547,13 @@ LINES: dict[str, str] = {
     "L-IB-HOLD": "Of course, take a moment. I'm here when you're ready.",
 }
 
+# Owner 2026-11-19, R1_INTERVIEWER_DEX: swap the name in each Christy line.
+# No line has an interviewer pronoun; placeholders remain unchanged.
+DEX_LINES: dict[str, str] = {
+    line_id: text.replace(INTERVIEWER_NAME, INTERVIEWER_NAME_DEX)
+    for line_id, text in LINES.items() if INTERVIEWER_NAME in text
+}
+
 # M032 S6: ``R1_TRANSITION_REPAIR=0`` (the rollback) speaks each of these lines as it was before
 # S6, under its old text's id.  ``active_line_id`` is the one place that choice is made: the
 # session's ``render_line`` and the role-play engine's coach aside both go through it, so the warm
@@ -624,6 +648,33 @@ def wrap_offer_variant_enabled() -> bool:
     return (os.getenv("R1_WRAP_OFFER_VARIANT") or "1").strip().lower() not in _OFF_VALUES
 
 
+def interviewer_dex_enabled() -> bool:
+    """``R1_INTERVIEWER_DEX`` (default on; owner 2026-11-19): the R1 interviewer is Dex, a male
+    interviewer.  His name is spoken in every line that names the interviewer (``DEX_LINES``), and
+    the interviewer's voice and wording read the same flag.  Read at use.  Off gives back content
+    revision 46's Christy lines exactly.  Rollback:
+    ``fly secrets set R1_INTERVIEWER_DEX=0 -a project-hello-voice``.
+    """
+    return (os.getenv("R1_INTERVIEWER_DEX") or "1").strip().lower() not in _OFF_VALUES
+
+
+def interviewer_name() -> str:
+    """Return the active interviewer name."""
+    return INTERVIEWER_NAME_DEX if interviewer_dex_enabled() else INTERVIEWER_NAME
+
+
+def interviewer_pronouns() -> tuple[str, str, str]:
+    """Return subject, object and possessive pronouns for the active interviewer."""
+    return ("he", "him", "his") if interviewer_dex_enabled() else ("she", "her", "her")
+
+
+def persona_text(line_id: str) -> str:
+    """Return the active persona's text for a reviewed line."""
+    if interviewer_dex_enabled() and line_id in DEX_LINES:
+        return DEX_LINES[line_id]
+    return LINES[line_id]
+
+
 def agenda_w3_enabled() -> bool:
     """``R1_AGENDA_W3`` (default on, only with ``R1_BRIEF_WORDING_V2``; M032 diagnosis 5,
     D5-AGENDA1): the opening agenda says the parts make up the whole in one sentence ("The whole
@@ -713,7 +764,7 @@ def known_first_name(value: object) -> str:
 # ("this is Salesforce" mid-answer is not one), each after an optional greeting.  The name must
 # start with a capital letter as the speech-to-text wrote it ("my name is not on it" and "this is
 # great" are not names) and is letters only.
-_HELLO = r"hi|hello|hey|christy|good (?:morning|afternoon|evening)"
+_HELLO = r"hi|hello|hey|" + INTERVIEWER_ADDRESS_ALT + r"|good (?:morning|afternoon|evening)"
 _FILLER = r"yeah|yes|yep|so|um|uh|well|okay|ok|sure|alright"
 _NAME_TAIL = r"\s+([A-Z][A-Za-z]{1,23})(?![A-Za-z0-9'-])"
 _SPOKEN_NAME = (
@@ -732,7 +783,7 @@ _NOT_A_NAME = frozenset(
         "interesting", "important", "awesome", "amazing", "yes", "no", "sir", "madam", "maam",
         "my", "our", "your", "his", "her", "it", "its", "in", "on", "at", "to", "for", "with",
         "what", "why", "how", "when", "who", "which", "where", "that", "this", "there", "here",
-        "christy", "interviewer", "interview", "kickstart",
+        *INTERVIEWER_ADDRESS_NAMES, "interviewer", "interview", "kickstart",
     }
 )
 SPOKEN_NAME_MIN_LETTERS = 2
@@ -763,7 +814,7 @@ def spoken_first_name(text: object) -> str:
 def placeholders(line_id: str) -> frozenset[str]:
     """The placeholder names a line uses."""
     return frozenset(
-        field for _, field, _, _ in _FORMATTER.parse(LINES[line_id]) if field
+        field for _, field, _, _ in _FORMATTER.parse(persona_text(line_id)) if field
     )
 
 
@@ -779,6 +830,8 @@ CANDIDATE_FREE_LINES = tuple(line_id for line_id in LINES if is_candidate_free(l
 def line(line_id: str, **values: Any) -> str:
     """Render a reviewed line.  ``first_name`` is sanitised; unknown ids raise KeyError.
 
+    The active interviewer persona supplies the spoken name.
+
     An unknown first name (``known_first_name`` is "": empty, rejected, or the placeholder
     "there") is not spoken: the slot is deleted with its comma, so "Thank you, {first_name}.
     We'll" reads "Thank you. We'll" and "Are you still with me, {first_name}?" reads "Are you
@@ -787,7 +840,7 @@ def line(line_id: str, **values: Any) -> str:
     Persona placeholders must be supplied (``**persona.line_values``); a missing one is a
     programming error and raises KeyError rather than speaking a literal ``{lead_name}``.
     """
-    text = LINES[line_id]
+    text = persona_text(line_id)
     needed = placeholders(line_id)
     fields: dict[str, str] = {}
     if "first_name" in needed:

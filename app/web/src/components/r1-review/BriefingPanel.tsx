@@ -29,12 +29,12 @@ function Block({ title, children }: { title: string; children: ReactNode }) {
 }
 
 const PHASES: ReadonlyArray<{ name: string; detail: string }> = [
-  { name: 'Opening', detail: 'Christy (AI interviewer) introduces the interview.' },
+  { name: 'Opening', detail: 'Dex (AI interviewer) introduces the interview.' },
   { name: 'Icebreaker', detail: 'A short conversation about the candidate, over by 4:30 into the interview.' },
-  { name: 'Transition', detail: 'Christy sets up the role-play and takes questions. It starts only when the candidate is ready.' },
-  { name: 'Role-play', detail: 'The candidate is the Program Advisor; the AI learner is the prospective student. It runs up to 20:00 on its own clock, which stops during an aside. From 14:00 Christy may offer to wrap up.' },
-  { name: 'Wrap-up', detail: 'Christy asks whether the candidate has questions about the role or the next steps.' },
-  { name: 'Closing', detail: 'Christy closes the interview.' },
+  { name: 'Transition', detail: 'Dex sets up the role-play and takes questions. It starts only when the candidate is ready.' },
+  { name: 'Role-play', detail: 'The candidate is the Program Advisor; the AI learner is the prospective student. It runs up to 20:00 on its own clock, which stops during an aside. From 14:00 Dex may offer to wrap up.' },
+  { name: 'Wrap-up', detail: 'Dex asks whether the candidate has questions about the role or the next steps.' },
+  { name: 'Closing', detail: 'Dex closes the interview.' },
 ];
 
 export interface BriefingPanelProps {

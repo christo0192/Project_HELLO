@@ -193,9 +193,9 @@ class RenderTests(unittest.TestCase):
             self.assertEqual(safe_first_name(bad), "there", repr(bad))
 
     def test_lines_render_with_the_sanitised_name(self):
-        self.assertTrue(line("L-OPEN", first_name="Arjun").startswith("Hi Arjun, I'm Christy"))
+        self.assertTrue(line("L-OPEN", first_name="Arjun").startswith("Hi Arjun, I'm Dex"))
         # A name the sanitiser rejects is unknown, not "there": the slot is dropped.
-        self.assertTrue(line("L-OPEN", first_name="Arjun<b>").startswith("Hi, I'm Christy"))
+        self.assertTrue(line("L-OPEN", first_name="Arjun<b>").startswith("Hi, I'm Dex"))
         self.assertEqual(line("L-SIL-IB", first_name="Arjun"), "Are you still with me, Arjun?")
         self.assertEqual(line("L-WRAP"), LINES["L-WRAP"])
 
@@ -282,8 +282,9 @@ class UnknownNameTests(unittest.TestCase):
     def test_each_name_line_reads_naturally_without_a_name(self):
         values = self.persona_values()
         expected = {
-            "L-OPEN": "Hi, I'm Christy, an AI interviewer from Interview Kickstart, and I'll",
-            "L-OPEN-HELLO": "Hi, I'm Christy, an AI interviewer from Interview Kickstart. Can you",
+            "L-OPEN": "Hi, I'm Dex, an AI interviewer from Interview Kickstart, and I'll",
+            "L-OPEN-HELLO": "Hi, I'm Dex, an AI interviewer from Interview Kickstart. Can you",
+            "L-OPEN-HI": "Hi, I'm Dex, an AI interviewer from Interview Kickstart.",
             "L-TRANSITION": "Thank you. Next, let's do a sales role-play. I'll play",
             "L-TRANSITION-V20": (
                 "Thank you. We'll now move to the role-play. I'll play a prospective"
@@ -350,7 +351,7 @@ class UnknownNameTests(unittest.TestCase):
 
     def test_name_free_lines_are_untouched_by_an_unknown_name(self):
         for line_id in NAME_FREE_LINES:
-            self.assertEqual(line(line_id, first_name=""), LINES[line_id])
+            self.assertEqual(line(line_id, first_name=""), r1_script.persona_text(line_id))
 
     def test_an_unknown_name_does_not_change_which_lines_may_be_cached(self):
         # Cacheability is a property of the template (its slots), not of the name we have.
@@ -607,6 +608,17 @@ class OpeningSoundCheckLineTests(unittest.TestCase):
 
     AGENDAS = ("L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-CONTINUE")
 
+    def test_hello_without_hearing_check(self):
+        self.assertEqual(placeholders("L-OPEN-HI"), {"first_name"})
+        self.assertFalse(is_candidate_free("L-OPEN-HI"))
+        self.assertEqual(line("L-OPEN-HI", first_name="Arjun"),
+                         "Hi Arjun, I'm Dex, an AI interviewer from Interview Kickstart.")
+        self.assertEqual(line("L-OPEN-HI", first_name=""),
+                         "Hi, I'm Dex, an AI interviewer from Interview Kickstart.")
+        self.assertNotIn("?", LINES["L-OPEN-HI"])
+        self.assertNotIn("hear", LINES["L-OPEN-HI"].lower())
+        self.assertIn("AI interviewer", LINES["L-OPEN-HI"])
+
     def test_the_texts_word_for_word(self):
         self.assertEqual(
             LINES["L-OPEN-HELLO"],
@@ -635,11 +647,11 @@ class OpeningSoundCheckLineTests(unittest.TestCase):
         self.assertIn("AI interviewer", LINES["L-OPEN-HELLO"])
         self.assertFalse(is_candidate_free("L-OPEN-HELLO"))
         self.assertTrue(
-            line("L-OPEN-HELLO", first_name="Arjun").startswith("Hi Arjun, I'm Christy, an AI")
+            line("L-OPEN-HELLO", first_name="Arjun").startswith("Hi Arjun, I'm Dex, an AI")
         )
         self.assertEqual(
             line("L-OPEN-HELLO", first_name=""),
-            "Hi, I'm Christy, an AI interviewer from Interview Kickstart. Can you hear me okay?",
+            "Hi, I'm Dex, an AI interviewer from Interview Kickstart. Can you hear me okay?",
         )
 
     def test_every_agenda_keeps_the_owner_durations_once_and_is_short(self):

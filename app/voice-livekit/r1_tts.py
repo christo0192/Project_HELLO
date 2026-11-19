@@ -31,8 +31,9 @@ prosody per call and a two-letter first fragment sounds choppy.
 R1's two voices (owner decision 2026-10-30) are resolved here too, in pure code:
 
 * ``R1_TTS_PROFILE`` picks a WHOLE voice set, atomically.  ``v4`` (the default) is Bulbul v4
-  Flash with Christy as ``simran_en_customer`` and the learner as ``zarina_en_conversation``;
-  ``v3`` is exactly today's voice (``r1_tts_kwargs``, the browser screener's Simran) for both.
+  Flash with Dex as ``deven_en_conversation`` since 2026-11-19 (Christy as ``simran_en_customer``
+  with ``R1_INTERVIEWER_DEX=0``) and the learner as ``zarina_en_conversation``; ``v3`` is exactly
+  today's voice (``r1_tts_kwargs``, the browser screener's Simran) for both.
   A model and a speaker are never set apart, because each half-applied flip fails badly on
   plugin 1.6.4 (measured live 2026-10-29): bulbul:v3 with a v4 id raises ``ValueError`` when
   the TTS is built, and bulbul:v4-flash with ``simran`` fails EVERY utterance in-band with a
@@ -43,8 +44,11 @@ R1's two voices (owner decision 2026-10-30) are resolved here too, in pure code:
   (``bind_voice``): ``r1_sarvam.R1SarvamTTS.stream`` reads it, so concurrent speeches never
   cross voices and the session's TTS instance is never mutated.
 
-This module logs nothing and imports no R1 module: ``r1_session`` supplies the callbacks, and
-turns the voice set's ``notes`` into log lines.
+Under Dex the v3 rollback must be paired with ``R1_INTERVIEWER_DEX=0`` (v3 is female Simran);
+a mismatch is logged by r1_session as ``r1_interviewer_voice_mismatch``.
+
+This module logs nothing and imports no R1 module except the stdlib-only r1_script (the persona
+flag). ``r1_session`` supplies the callbacks and turns the voice set's ``notes`` into log lines.
 """
 from __future__ import annotations
 
@@ -54,6 +58,8 @@ import inspect
 import os
 from dataclasses import dataclass
 from typing import Any, AsyncIterable, AsyncIterator, Callable, Mapping
+
+from r1_script import interviewer_dex_enabled
 
 FLUSH_MIN_CHARS_DEFAULT = 60
 FIRST_FRAGMENT_MIN_ALPHA = 14
@@ -103,6 +109,10 @@ PROFILE_DEFAULT = PROFILE_V4
 V4_MODEL = "bulbul:v4-flash"
 V4_PACE = 1.0  # v4 accepts 0.5-2.0; R1 speaks at the v3 voice's pace
 V4_DEFAULT_SPEAKERS: Mapping[str, str] = {
+    INTERVIEWER: "deven_en_conversation",  # Deven: male, conversational.
+    LEARNER: "zarina_en_conversation",  # "Zarina - A deep, full and flowing female voice"
+}
+V4_CHRISTY_SPEAKERS: Mapping[str, str] = {
     INTERVIEWER: "simran_en_customer",  # "Simran - A confident and low female voice"
     LEARNER: "zarina_en_conversation",  # "Zarina - A deep, full and flowing female voice"
 }
@@ -171,7 +181,17 @@ V4_SPEAKERS = frozenset(
     }
 )
 
+# Dex is male (owner 2026-11-19); an id missing here only logs a warning.
+V4_MALE_SPEAKERS = frozenset({
+    "deven_en_conversation", "dev_en_conversational", "dev_en_recovery",
+    "ashwin_en_sports", "ashwin_en_sports_energetic", "kalpit_en_edtech",
+    "nachiket_en_ads", "rohan_en_recovery", "rustom_en_suspense",
+    *(speaker for speaker in V4_SPEAKERS if speaker.startswith("shubh_en_")),
+})
+
 NOTE_PROFILE_UNKNOWN = "profile_unknown"
+NOTE_DEX_LEGACY_VOICE = "legacy_voice"
+NOTE_DEX_VOICE_NOT_MALE = "voice_not_male"
 
 
 def voice_role(voice: Any) -> str:
@@ -224,6 +244,11 @@ def legacy_voice_set(notes: tuple[str, ...] = ()) -> R1VoiceSet:
     return R1VoiceSet(PROFILE_V3, kwargs, dict(kwargs), notes)
 
 
+def v4_default_speakers() -> Mapping[str, str]:
+    """Follow R1_INTERVIEWER_DEX; 0 gives the Christy voice."""
+    return V4_DEFAULT_SPEAKERS if interviewer_dex_enabled() else V4_CHRISTY_SPEAKERS
+
+
 def _v4_speaker(role: str, raw: str | None, notes: list[str]) -> str:
     """An override of ``role``'s v4 id, if it is allowlisted; otherwise the owner's default.
 
@@ -231,16 +256,20 @@ def _v4_speaker(role: str, raw: str | None, notes: list[str]) -> str:
     in ``V4_SPEAKERS`` (``simran``, a typo) keeps the default and notes ``<role>_voice_rejected``.
     """
     if raw is None or raw == "":
-        return V4_DEFAULT_SPEAKERS[role]
+        return v4_default_speakers()[role]
     value = raw.strip()
     if value in V4_SPEAKERS:
         return value
     notes.append(f"{role}_voice_rejected")
-    return V4_DEFAULT_SPEAKERS[role]
+    return v4_default_speakers()[role]
 
 
 def r1_voice_set() -> R1VoiceSet:
     """R1's voices for this session, read from the environment (once per session).
+
+    The v4 defaults follow ``R1_INTERVIEWER_DEX``.
+    Under Dex the v3 rollback must be paired with ``R1_INTERVIEWER_DEX=0`` (v3 is female
+    Simran); a mismatch is logged by r1_session as ``r1_interviewer_voice_mismatch``.
 
     ``R1_TTS_PROFILE`` unset, empty or ``v4`` is the v4 set; ``v3`` is the legacy set; any other
     value is the legacy set too, noted ``profile_unknown`` (an unknown value is most likely a
@@ -263,6 +292,22 @@ def r1_voice_set() -> R1VoiceSet:
         {"model": V4_MODEL, "speaker": learner, "pace": V4_PACE},
         tuple(notes),
     )
+
+
+def interviewer_voice_mismatch(voice_set: R1VoiceSet) -> str | None:
+    """The reason Dex (``R1_INTERVIEWER_DEX`` on) would speak a non-male voice, or None.
+
+    ``legacy_voice``: the v3 set (``R1_TTS_PROFILE=v3``, an unknown profile, or the v4 build
+    fallback); ``voice_not_male``: an interviewer override outside ``V4_MALE_SPEAKERS``.  The
+    voice is never changed here; the v3 rollback is paired with ``R1_INTERVIEWER_DEX=0``.
+    """
+    if not interviewer_dex_enabled():
+        return None
+    if voice_set.profile != PROFILE_V4:
+        return NOTE_DEX_LEGACY_VOICE
+    if voice_set.speaker(INTERVIEWER) not in V4_MALE_SPEAKERS:
+        return NOTE_DEX_VOICE_NOT_MALE
+    return None
 
 
 # Whose line the TTS of THIS task is speaking.  Set by ``r1_session`` at the top of its

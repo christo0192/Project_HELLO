@@ -9,8 +9,10 @@ import asyncio
 import contextlib
 import io
 import json
+import os
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +21,7 @@ for path in (HERE, HERE / "tools"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+import r1_script  # noqa: E402
 import r1_end_intent_eval as ev  # noqa: E402
 
 try:
@@ -177,6 +180,29 @@ class RunTests(unittest.TestCase):
         self.assertGreaterEqual(answer["seconds"], 0.0)
         bad = asyncio.run(ev._classify(Client("no idea"), row, 2, 1.0))
         self.assertEqual((bad["verdict"], bad["outcome"]), (None, "parse_failed"))
+
+
+class PersonaQuestionTests(unittest.TestCase):
+    def test_question_uses_dex_by_default(self):
+        self.assertEqual(ev.aside_question(), r1_script.line("L-ASIDE-END", lead_name="Meera Iyer"))
+        self.assertIn("Dex", ev.aside_question())
+
+    def test_question_uses_original_persona_with_flag_off(self):
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
+            self.assertEqual(ev.aside_question(), r1_script.line("L-ASIDE-END", lead_name="Meera Iyer"))
+            self.assertIn("Christy", ev.aside_question())
+
+
+def setUpModule():
+    global _persona_environment
+    env = dict(os.environ)
+    env.pop("R1_INTERVIEWER_DEX", None)
+    _persona_environment = mock.patch.dict(os.environ, env, clear=True)
+    _persona_environment.start()
+
+
+def tearDownModule():
+    _persona_environment.stop()
 
 
 if __name__ == "__main__":

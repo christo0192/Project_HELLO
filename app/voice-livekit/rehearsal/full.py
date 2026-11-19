@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping
 
-from rehearsal import HARNESS_VERSION, flags, vloop
+from rehearsal import HARNESS_VERSION, flags, flow_judge, vloop
 from rehearsal.call import _plan_summary, _suppressed_why, git_sha
 from rehearsal.candidate import CandidateSim, ScenarioAdvisor, View, heard_since
 from rehearsal.llm import (
@@ -1029,7 +1029,7 @@ def transcript_text(record: Mapping[str, Any]) -> str:
     ]
     items: list[tuple[float, int, str]] = []
     for order, row in enumerate(record.get("rows") or []):
-        speaker = {"christy": "CHRISTY", "learner": "LEARNER", "candidate": "CANDIDATE"}.get(
+        speaker = flow_judge.speakers().get(
             str(row.get("voice")), str(row.get("speaker")).upper()
         )
         act = f" [{row['act']}]" if row.get("act") and row.get("speaker") == "candidate" else ""

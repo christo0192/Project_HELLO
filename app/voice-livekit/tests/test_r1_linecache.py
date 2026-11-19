@@ -507,6 +507,39 @@ class TestLineCacheWarm(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events.of("warm_done")[0][2]["count"], 2)
         self.assertEqual(cache.size, 2)
 
+    async def test_interviewer_personas_have_distinct_cache_keys(self) -> None:
+        import r1_script
+
+        cache, *_ = make_cache(FakeSynthesizer(), directory=self.directory)
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "1"}):
+            dex = r1_script.line("L-OPEN-HI", first_name="Asha")
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
+            christy = r1_script.line("L-OPEN-HI", first_name="Asha")
+        self.assertNotEqual(cache.key(dex), cache.key(christy))
+
+    async def test_persona_voice_separates_disk_cache(self) -> None:
+        import r1_script
+        import r1_tts
+
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}, clear=True):
+            christy_text = r1_script.line("L-MUTE")
+            christy_voice = r1_tts.r1_voice_set().interviewer
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "1"}, clear=True):
+            dex_text = r1_script.line("L-MUTE")
+            dex_voice = r1_tts.r1_voice_set().interviewer
+        old = LineCache(FakeSynthesizer(), voice=christy_voice, sample_rate=RATE,
+                        directory=self.directory)
+        synth = FakeSynthesizer()
+        new = LineCache(synth, voice=dex_voice, sample_rate=RATE, directory=self.directory)
+        self.assertNotEqual(old.key(christy_text), new.key(dex_text))
+        text = "Synthetic name-free line."
+        self.assertNotEqual(old.key(text), new.key(text))
+        await old.warm((LineSpec("L-TEST", text, True),))
+        self.assertFalse((self.directory / f"{new.key(text)}.wav").exists())
+        stats = await new.warm((LineSpec("L-TEST", text, True),))
+        self.assertEqual(stats["disk"], 0)
+        self.assertEqual(synth.texts, [text])
+
     async def test_only_a_candidate_free_line_is_written_to_disk(self) -> None:
         cache, *_ = make_cache(FakeSynthesizer(), directory=self.directory)
         await cache.warm(self.SPECS)
@@ -843,6 +876,7 @@ class TestBuildLineCache(unittest.TestCase):
 
 
 V3 = {"model": "bulbul:v3", "speaker": "simran", "pace": 1.0, "temperature": 0.8}
+V4_DEX = {"model": "bulbul:v4-flash", "speaker": "deven_en_conversation", "pace": 1.0}
 V4_CHRISTY = {"model": "bulbul:v4-flash", "speaker": "simran_en_customer", "pace": 1.0}
 V4_LEARNER = {"model": "bulbul:v4-flash", "speaker": "zarina_en_conversation", "pace": 1.0}
 # Today's single-voice key of this text at 22050 Hz mono, computed with the cache before it
@@ -987,7 +1021,7 @@ class TestBuildLineCacheVoices(unittest.TestCase):
         voices = r1_tts.r1_voice_set()  # v4: R1_TTS_PROFILE is unset
         tts = SimpleNamespace(sample_rate=RATE, num_channels=1, r1_voice_set=voices)
         cache = build_line_cache(SimpleNamespace(tts=tts), synthesizer_factory=self.factory)
-        self.assertEqual(self.seen, [V4_CHRISTY, V4_LEARNER])
+        self.assertEqual(self.seen, [V4_DEX, V4_LEARNER])
         self.assertEqual(
             cache.key("x", "learner"),
             LineCache(FakeSynthesizer(), voice=V4_LEARNER, sample_rate=RATE).key("x"),
@@ -1016,6 +1050,7 @@ class TestBuildLineCacheVoices(unittest.TestCase):
         self.assertIsInstance(synths["learner"], SarvamSynthesizer)
         self.assertIsNot(synths["learner"], synths["interviewer"])
         self.assertEqual(synths["learner"]._kwargs, V4_LEARNER)
+        self.assertEqual(synths["interviewer"]._kwargs, V4_DEX)
         plain = SimpleNamespace(sample_rate=RATE, num_channels=1)
         cache = build_line_cache(SimpleNamespace(tts=plain))
         self.assertIs(cache._synthesizers["learner"], cache._synthesizers["interviewer"])

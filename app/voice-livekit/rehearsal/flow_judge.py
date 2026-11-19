@@ -1,19 +1,19 @@
 """The conversation-flow judge of the full-interview tier (D-M032-10): one LLM call per transcript.
 
 The per-phase checks (``rehearsal.full_metrics``) say whether a rule held; this judge says how the
-whole interview sounded.  It reads the full transcript (Christy's phases and the role-play), what the
+whole interview sounded.  It reads the full transcript (the interviewer's phases and the role-play), what the
 simulated candidate was set up to do (the scenario and its ground truth) and the call's facts (the
 graded objections delivered, how the role-play started and ended, the end requests), and scores the
 BOT on six axes, each 1 (poor) to 5 (excellent):
 
-* ``christy_flow``: Christy's phases flow (smooth hand-offs, she answers what was asked, no loops);
+* ``christy_flow``: the interviewer's flow (smooth hand-offs, answers, no loops); the key keeps its name;
 * ``learner_flow``: the learner reacts to what the advisor just said and builds on it;
 * ``adaptability``: the bot follows and responds to what THIS candidate actually does;
 * ``objective_kept``: the objective holds (graded objections delivered, the consent rules kept);
 * ``repetition``: 5 is no repeated sentences, openers or stock reactions;
 * ``naturalness``: spoken English, no stock phrases, no praise of the candidate.
 
-Each score comes with short evidence quotes copied from BOT lines only (Christy's or the learner's),
+Each score comes with short evidence quotes copied from BOT lines only (the interviewer's or the learner's),
 with their turn numbers; a quote that is not in a bot line is rejected (``evidence_rejected``), never
 counted.  ``worst_moments`` lists the worst bot turns (turn, speaker, why).  Parsing is strict and
 fail closed: a reply without all six scores is an error, never a guess.
@@ -42,7 +42,9 @@ import json
 import re
 from typing import Any, Mapping, Sequence
 
-from rehearsal import flags
+import r1_script
+
+from rehearsal import flags, persona
 
 AXES = ("christy_flow", "learner_flow", "adaptability", "objective_kept", "repetition", "naturalness")
 # The axes a call with no role-play (no learner line) cannot be scored on (D4-H-SILENT1).
@@ -62,8 +64,6 @@ MAX_QUOTE_WORDS = 16
 MAX_EVIDENCE = 3
 MAX_WORST = 6
 RETRYABLE = frozenset({"no_json", "bad_json", "bad_scores"})
-SPEAKERS = {"christy": "CHRISTY", "learner": "LEARNER", "candidate": "CANDIDATE"}
-BOT_SPEAKERS = frozenset({"CHRISTY", "LEARNER"})
 
 RUBRIC = (
     "You review a recorded first-round job interview run by an AI. Two BOT voices speak: CHRISTY, "
@@ -154,6 +154,31 @@ RETRY_NUDGE = (
 )
 
 
+def speakers() -> dict[str, str]:
+    """Map stored voices to active speaker labels."""
+    return {"christy": persona.upper_name(), "learner": "LEARNER", "candidate": "CANDIDATE"}
+
+
+def bot_speakers() -> frozenset[str]:
+    """Return the active bot speaker labels."""
+    return frozenset({persona.upper_name(), "LEARNER"})
+
+
+def render_persona(text: str) -> str:
+    """Render rubric text for the active interviewer."""
+    if persona.name() == r1_script.INTERVIEWER_NAME:
+        return text
+    for old, new in (
+        ("- christy_flow: Christy's phases flow like a good human interviewer: smooth hand-offs, she answers",
+         "- christy_flow: the interviewer's ({NAME}) phases flow like a good human interviewer: "
+         "smooth hand-offs, {he} answers"),
+        ("in the interview: she declines", "in the interview: {he} declines"),
+        ("CHRISTY", "{NAME}"), ("Christy", "{name}"),
+    ):
+        text = text.replace(old, new)
+    return persona.fill(text)
+
+
 # ------------------------------------------------------------------------------ the input
 def _norm(text: Any) -> str:
     return " ".join(re.findall(r"[a-z0-9$']+", str(text or "").lower()))
@@ -175,7 +200,7 @@ def judged_turns(record: Mapping[str, Any]) -> list[dict[str, Any]]:
             {
                 "turn": order,
                 "phase": row.get("phase"),
-                "speaker": SPEAKERS.get(voice, voice.upper()),
+                "speaker": speakers().get(voice, voice.upper()),
                 "text": str(row.get("text") or ""),
                 "s_sec": row.get("s_sec"),
                 "r_sec": row.get("r_sec"),
@@ -199,7 +224,7 @@ def behaviour_text(record: Mapping[str, Any]) -> str:
     """What the simulated candidate was set up to do (the scenario and its ground truth)."""
     header = record.get("header") or {}
     truth = header.get("ground_truth") or {}
-    parts = [f"Scenario '{header.get('scenario')}': {header.get('scenario_title')}"]
+    parts = [f"Scenario '{header.get('scenario')}': {persona.swap_name(str(header.get('scenario_title')))}"]
     if truth.get("adapt"):
         parts.append(f"Behaviour: {truth['adapt']} (tags: {', '.join(header.get('scenario_tags') or [])}).")
     acts: dict[str, int] = {}
@@ -276,7 +301,10 @@ def ended_by(record: Mapping[str, Any]) -> str:
             return f"candidate end request, agreed at R {_clock(agreed)}"
         at_once = next((item for item in _requests(record) if item.get("exited_at_once") and not item.get("asked")), None)
         if at_once is not None:
-            why = {"names_the_end": " (the request named the end)", "asked_before": " (Christy had asked before)"}
+            why = {
+                "names_the_end": " (the request named the end)",
+                "asked_before": persona.fill(" ({name} had asked before)"),
+            }
             return (
                 f"candidate end request at R {_clock(at_once.get('r'))}, ended at once"
                 + why.get(str(at_once.get("exit_basis")), "")
@@ -322,7 +350,8 @@ def flow_messages(record: Mapping[str, Any]) -> list[dict[str, str]]:
     note = f"{NO_ROLEPLAY_NOTE}\n\n" if na else ""
     user = (
         f"CANDIDATE BEHAVIOUR:\n{behaviour_text(record)}\n\nCALL FACTS:\n{facts}\n\n{note}"
-        f"TRANSCRIPT:\n{transcript_for_flow(turns)}\n\nSCHEMA:\n{SCHEMA_TEXT_NA if na else SCHEMA_TEXT}"
+        f"TRANSCRIPT:\n{transcript_for_flow(turns)}\n\nSCHEMA:\n"
+        f"{render_persona(SCHEMA_TEXT_NA if na else SCHEMA_TEXT)}"
     )
     return [{"role": "system", "content": rubric_text()}, {"role": "user", "content": user}]
 
@@ -330,8 +359,8 @@ def flow_messages(record: Mapping[str, Any]) -> list[dict[str, str]]:
 def rubric_text() -> str:
     """The system prompt the switches choose: the first rubric, the round-5 one or the agenda rules."""
     if not flags.on(flags.FLOW_DESIGN_RULES):
-        return RUBRIC
-    return RUBRIC_V3 if flags.on(flags.FLOW_AGENDA_RULES) else RUBRIC_V2
+        return render_persona(RUBRIC)
+    return render_persona(RUBRIC_V3 if flags.on(flags.FLOW_AGENDA_RULES) else RUBRIC_V2)
 
 
 # ------------------------------------------------------------------------------ the verdict
@@ -394,7 +423,7 @@ def validate_flow(verdict: Mapping[str, Any], record: Mapping[str, Any]) -> dict
         return dict(verdict)
     turns = judged_turns(record)
     by_turn = {turn["turn"]: turn for turn in turns}
-    bots = [turn for turn in turns if turn["speaker"] in BOT_SPEAKERS]
+    bots = [turn for turn in turns if turn["speaker"] in bot_speakers()]
     kept: dict[str, list[dict[str, Any]]] = {axis: [] for axis in AXES}
     rejected: list[dict[str, Any]] = []
     for axis in AXES:
@@ -404,7 +433,7 @@ def validate_flow(verdict: Mapping[str, Any], record: Mapping[str, Any]) -> dict
             reason = ""
             if not quote:
                 reason = "empty_quote"
-            elif turn is not None and turn["speaker"] in BOT_SPEAKERS and quote in _norm(turn["text"]):
+            elif turn is not None and turn["speaker"] in bot_speakers() and quote in _norm(turn["text"]):
                 pass
             elif turn is not None and turn["speaker"] == "CANDIDATE" and quote in _norm(turn["text"]):
                 reason = "candidate_line"
@@ -422,7 +451,7 @@ def validate_flow(verdict: Mapping[str, Any], record: Mapping[str, Any]) -> dict
     worst = []
     for item in verdict.get("worst_moments") or []:
         turn = by_turn.get(item.get("turn"))
-        if turn is None or turn["speaker"] not in BOT_SPEAKERS:
+        if turn is None or turn["speaker"] not in bot_speakers():
             rejected.append({"axis": "worst_moments", **item, "rejected": "not_a_bot_turn"})
             continue
         if len(worst) < MAX_WORST:

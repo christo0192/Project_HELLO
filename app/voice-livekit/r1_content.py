@@ -406,7 +406,12 @@ import r1_world
 # 43: PROOF-1 pins the declined upgrade condition note.
 # 44: render the declined upgrade condition as a bullet.
 # 45: Keep the upgrade commitment in one sentence for scorer masking.
-CONTENT_REVISION = 45
+# 46: owner 2026-11-19 (R1_OPENING_NO_HEARING_CHECK): L-OPEN-HI, the hello without the hearing
+#    question. No other text changed.
+# 47: owner 2026-11-19 (R1_INTERVIEWER_DEX): Dex, a male interviewer, replaces Christy in the
+#    spoken lines (r1_script.DEX_LINES); the Christy texts stay as the flag-off rollback.
+#    Dex prefixes, wrap-up note, end-intent system and after-aside context are pinned.
+CONTENT_REVISION = 47
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -867,6 +872,9 @@ def manifest() -> dict[str, Any]:
         },
         "script": {
             "interviewer_name": r1_script.INTERVIEWER_NAME,
+            # Revision 47 (R1_INTERVIEWER_DEX).
+            "interviewer_name_dex": r1_script.INTERVIEWER_NAME_DEX,
+            "dex_lines": dict(r1_script.DEX_LINES),
             "exit_cue": r1_script.EXIT_CUE,
             "lines": dict(r1_script.LINES),
             # Revision 31 (D4-BRIEF2, D4-TRANS-PRESENT1, D4-TRANS-Q1).
@@ -1041,17 +1049,27 @@ def manifest() -> dict[str, Any]:
         },
         "prompts": {
             "interviewer_prefix": r1_prompts.interviewer_prefix(
-                voice=True, reactions=False, reactions_v2=False
+                voice=True, reactions=False, reactions_v2=False, name=r1_script.INTERVIEWER_NAME
+            ),
+            # Revision 47 (R1_INTERVIEWER_DEX).
+            "interviewer_prefix_dex": r1_prompts.interviewer_prefix(
+                voice=True, reactions=False, reactions_v2=False, name=r1_script.INTERVIEWER_NAME_DEX
+            ),
+            "interviewer_prefix_reactions_dex": r1_prompts.interviewer_prefix(
+                voice=True, reactions=True, reactions_v2=False, name=r1_script.INTERVIEWER_NAME_DEX
+            ),
+            "interviewer_prefix_reactions_v2_dex": r1_prompts.interviewer_prefix(
+                voice=True, reactions=True, reactions_v2=True, name=r1_script.INTERVIEWER_NAME_DEX
             ),
             "interviewer_voice_text": r1_prompts.INTERVIEWER_VOICE_TEXT,
             "interviewer_delivery_rider": r1_prompts.INTERVIEWER_DELIVERY_RIDER,
             # Revision 29 (D3-ICE1, R1_REACTION_VARIETY): the reworded react clause.
             "interviewer_prefix_reactions": r1_prompts.interviewer_prefix(
-                voice=True, reactions=True, reactions_v2=False
+                voice=True, reactions=True, reactions_v2=False, name=r1_script.INTERVIEWER_NAME
             ),
             # Revision 31 (D4-ICE-ECHO1, R1_REACTION_VARIETY_V2; D4-TRANS-Q1).
             "interviewer_prefix_reactions_v2": r1_prompts.interviewer_prefix(
-                voice=True, reactions=True, reactions_v2=True
+                voice=True, reactions=True, reactions_v2=True, name=r1_script.INTERVIEWER_NAME
             ),
             "interviewer_voice_text_reactions_v2": r1_prompts.INTERVIEWER_VOICE_TEXT_REACTIONS_V2,
             "interviewer_delivery_rider_reactions_v2": (
@@ -1061,6 +1079,7 @@ def manifest() -> dict[str, Any]:
             "interviewer_voice_text_reactions": r1_prompts.INTERVIEWER_VOICE_TEXT_REACTIONS,
             "interviewer_delivery_rider_reactions": r1_prompts.INTERVIEWER_DELIVERY_RIDER_REACTIONS,
             "wrapup_note": r1_prompts.WRAPUP_NOTE,
+            "wrapup_note_dex": r1_prompts.WRAPUP_NOTE_DEX,
             "wrapup_reminder": r1_prompts.WRAPUP_REMINDER,
             "transition_reminder": r1_prompts.TRANSITION_REMINDER,
             "transition_reminder_repaired": r1_prompts.TRANSITION_REMINDER_REPAIRED,
@@ -1248,8 +1267,10 @@ def manifest() -> dict[str, Any]:
         },
         "end_intent": {
             "system": r1_end_intent.END_INTENT_SYSTEM,
+            "system_dex": r1_end_intent.END_INTENT_SYSTEM_DEX,
             "roleplay_context": r1_end_intent.ROLEPLAY_CONTEXT,
             "after_aside_context": r1_end_intent.AFTER_ASIDE_CONTEXT,
+            "after_aside_context_dex": r1_end_intent.AFTER_ASIDE_CONTEXT_DEX,
             "window_words": r1_end_intent.END_INTENT_WINDOW_WORDS,
             "labels": list(r1_end_intent.END_INTENT_LABELS),
         },

@@ -600,7 +600,7 @@ test.describe('the states', () => {
     await app.goto(`${ADDRESS}?tab=recording`);
     await expect(page.getByText('No recording was made for this attempt.')).toBeVisible();
     await expect(page.getByRole('button', { name: 'Play', exact: true })).toHaveCount(0);
-    await expect(page.getByText('Hello Naveen, I am Christy')).toBeVisible();
+    await expect(page.getByText('Hello Naveen, I am Dex')).toBeVisible();
     await look(page, 'state-no-recording', testInfo.project.name);
     await auditA11y(page, testInfo, 'r1-review-no-recording', { strict: true });
   });
@@ -617,7 +617,7 @@ test.describe('the states', () => {
     const { review } = app.db.r1;
     app.db.r1.review = { ...review, round: { ...review.round, recommendation: 'reject', status_write: 'pending_reject', pending_reject_until: review.round.expires_at } };
     await app.goto(`${ADDRESS}?tab=recording`);
-    await expect(page.getByText('Hello Naveen, I am Christy')).toBeVisible();
+    await expect(page.getByText('Hello Naveen, I am Dex')).toBeVisible();
     await expect(page.getByRole('button', { name: 'Cancel rejection' })).toHaveCount(0);
   });
 });

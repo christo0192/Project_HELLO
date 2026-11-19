@@ -4,7 +4,9 @@ The phone bot is scripted too; what makes it feel natural is the manners around 
 code chooses what each of Christy's icebreaker questions is FOR (``OBJECTIVES``) and the model only
 words it, after a few words of reaction to what the candidate just said.  L-OPEN already asks the
 first objective (background and sales work), so the cursor starts there; so does the opening's
-agenda (M032 S7C, ``R1_OPENING_SOUND_CHECK``), or it invites an early answer to carry on.
+agenda (M032 S7C, ``R1_OPENING_SOUND_CHECK``), or it invites an early answer to carry on. By
+default the hello has no hearing question and the plain agenda follows
+(``R1_OPENING_NO_HEARING_CHECK``).
 
 One decision per committed icebreaker answer (``IcebreakerPlan.next_job``), read by
 ``disposition``:
@@ -41,6 +43,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from r1_guard import GuardContext, check_sentence, praise_detected
+from r1_script import INTERVIEWER_ADDRESS_ALT, INTERVIEWER_ADDRESS_NAMES
 from r1_text import fold, split_sentences
 
 
@@ -505,7 +508,7 @@ _FILLER_WORDS = frozenset(
     {
         "um", "umm", "uh", "uhh", "er", "erm", "hmm", "hm", "mm", "well", "okay", "ok", "so",
         "sorry", "yeah", "yes", "right", "alright", "actually", "just", "oh", "ah", "please",
-        "christy", "ma'am", "madam", "sir",
+        *INTERVIEWER_ADDRESS_NAMES, "ma'am", "madam", "sir",
     }
 )
 # "Let me think", "give me a second", "one moment please", "I'm just thinking": a thinking
@@ -579,7 +582,10 @@ _DECLINE_RE = re.compile(
 # an auxiliary with "you" ("could you repeat that"); "What matters to me is that you ...", "What you
 # get here is ..." and "When you're ready ..." are answers.  A bare "?" is never enough:
 # speech-to-text marks rising answers with one.
-_ASK_LEAD = r"^(?:(?:so|and|but|okay|ok|sorry|um|uh|yeah|yes|well|christy|actually|just) ){0,4}"
+_ASK_LEAD = (
+    r"^(?:(?:so|and|but|okay|ok|sorry|um|uh|yeah|yes|well|" + INTERVIEWER_ADDRESS_ALT
+    + r"|actually|just) ){0,4}"
+)
 _ASK_WH = r"(?:what|why|how|where|who|which|when)"
 _ASK_AUX = (
     r"(?:do|does|did|is|are|was|were|would|will|can|could|should|have|has|shall|may|might)"
@@ -647,7 +653,10 @@ def _asking_sentences(text: object) -> list[tuple[str, bool]]:
 
 
 def asks_christy(text: object) -> bool:
-    """True when some sentence of ``text`` is a question aimed at the interviewer."""
+    """True when a sentence asks the interviewer (Dex, or Christy with the flag off).
+
+    The function name is historical.
+    """
     return any(asks for _, asks in _asking_sentences(text))
 
 
@@ -1052,10 +1061,12 @@ _HOLD_RE = re.compile(
     r"(?:pause|take a (?:quick |short )?break)"
     r"|(?:please|let's|let us) (?:pause|take a (?:quick |short )?break)"
     r")\b"
-    r"|^(?:(?:sorry|um|uh|okay|ok|oh|yeah|just|christy|ma'am|madam|sir|hey) )*"
+    r"|^(?:(?:sorry|um|uh|okay|ok|oh|yeah|just|" + INTERVIEWER_ADDRESS_ALT
+    + r"|ma'am|madam|sir|hey) )*"
     r"(?:(?:wait|hold(?: on)?)" + _HOLD_OBJECT + r"(?: for)? " + _HOLD_TIME + r"|hold on|pause)\b"
 )
-# Revision 30's reader exactly (``R1_IB_HOLD_V2=0``, review of diagnosis 4: NO-ISOLATED-ROLLBACK).
+# Revision 30's reader (``R1_IB_HOLD_V2=0``, review of diagnosis 4: NO-ISOLATED-ROLLBACK).
+# Interviewer address names are widened in this rollback too.
 _HOLD_RE_V1 = re.compile(
     r"\b(?:"
     + _HOLD_MODAL + r"?give (?:me|us) " + _HOLD_TIME
@@ -1066,7 +1077,7 @@ _HOLD_RE_V1 = re.compile(
     r"(?:pause|take a (?:quick |short )?break)"
     r"|(?:please|let's|let us) (?:pause|take a (?:quick |short )?break)"
     r")\b"
-    r"|^(?:(?:sorry|um|uh|okay|ok|oh|yeah|just|christy|ma'am|madam|sir) )*"
+    r"|^(?:(?:sorry|um|uh|okay|ok|oh|yeah|just|" + INTERVIEWER_ADDRESS_ALT + r"|ma'am|madam|sir) )*"
     r"(?:(?:wait|hold(?: on)?)(?: for)? " + _HOLD_TIME + r"|hold on|pause)\b"
 )
 # The direct request shapes alone (a modal, "please", "let's"): the last sentence of a turn is read

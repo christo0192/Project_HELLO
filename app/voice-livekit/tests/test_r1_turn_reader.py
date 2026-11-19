@@ -431,7 +431,7 @@ class MessagesTests(unittest.TestCase):
             seed="s",
             turn=1,
         )[1]["content"]
-        self.assertTrue(user.startswith(r1_turn_reader.TRANSITION_CONTEXT))
+        self.assertTrue(user.startswith(r1_turn_reader.transition_context()))
         self.assertNotIn("should not be shown", user)
         self.assertNotIn("learner's last line", user)
 
@@ -495,7 +495,7 @@ class MessagesTests(unittest.TestCase):
         self.assertEqual(
             r1,
             {"r1_commitment", "r1_negotiation", "r1_personas", "r1_scheduler", "r1_text",
-             "r1_tracker"},
+             "r1_tracker", "r1_script"},
         )
         self.assertEqual(imported - r1, {"__future__", "hashlib", "json", "math", "os", "re",
                                          "dataclasses", "typing"})
@@ -503,11 +503,18 @@ class MessagesTests(unittest.TestCase):
     def test_the_prompt_version_is_pinned(self):
         # Changing the prompt changes what the owner's comparison means: bump the version on
         # purpose (r1_turn_reader.READER_PROMPT_REVISION) and update this pin.
-        self.assertEqual(READER_PROMPT_VERSION, "r1-reader-v2+" + r1_turn_reader._prompt_sha()[:12])
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                r1_turn_reader.reader_prompt_version(), "r1-reader-v3+" + PINNED_PROMPT_SHA
+            )
         self.assertEqual(r1_turn_reader._prompt_sha()[:12], PINNED_PROMPT_SHA)
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
+            self.assertEqual(r1_turn_reader._prompt_sha()[:12], PINNED_PROMPT_SHA_CHRISTY)
+            self.assertEqual(r1_turn_reader.reader_prompt_version(), "r1-reader-v2+a015037dcc35")
 
 
-PINNED_PROMPT_SHA = "a015037dcc35"
+PINNED_PROMPT_SHA = "4381c2cb5af3"
+PINNED_PROMPT_SHA_CHRISTY = "a015037dcc35"
 
 
 class RegexLabelTests(unittest.TestCase):
@@ -1510,7 +1517,7 @@ class TestTheReaderOutsideTheRolePlay(R1TestCase):
         self.assertIsNotNone(self.interview._turn_reader_call)
         await self.settle()
         self.assertTrue(
-            runner.calls[0][1]["content"].startswith(r1_turn_reader.TRANSITION_CONTEXT)
+            runner.calls[0][1]["content"].startswith(r1_turn_reader.transition_context())
         )
         self.interview._flush_candidate_row()
         await self.settle()

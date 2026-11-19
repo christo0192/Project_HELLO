@@ -33,7 +33,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from rehearsal import flags
+from rehearsal import flags, persona
 from rehearsal.advisor import AdvisorTurn
 from rehearsal.scenarios import (
     GROUPS,
@@ -135,7 +135,7 @@ def render(text: str, names: Mapping[str, str]) -> str:
     out = out.replace("{wrong_name}", names.get("wrong_name") or WRONG_NAMES[0])
     out = out.replace("{other_wrong_name}", names.get("other_wrong_name") or WRONG_NAMES[1])
     out = out.replace("{candidate}", names.get("candidate") or CANDIDATE)
-    return re.sub(r"\s+", " ", out).strip()
+    return persona.swap_name(re.sub(r"\s+", " ", out).strip())
 
 
 def is_press(text: str) -> bool:
@@ -518,7 +518,7 @@ REWRITE_SYSTEM = (
 WHO = {
     "candidate": (
         "Alex, a job candidate in a first-round interview for the Sales Program Advisor role at "
-        "Interview Kickstart, talking to Christy, the AI interviewer"
+        "Interview Kickstart, talking to {interviewer}, the AI interviewer"
     ),
     "advisor": (
         "Alex, playing the Program Advisor in a sales role-play: you called back {learner}, a "
@@ -537,12 +537,14 @@ class Rewriter:
     async def reword(
         self, role: str, intent: str, text: str, history: Sequence[Mapping[str, str]], names: Mapping[str, str]
     ) -> str:
-        who = WHO[role].format(learner=names.get("learner") or "the learner")
+        who = WHO[role].format(learner=names.get("learner") or "the learner", interviewer=persona.name())
         words = max(3, len(text.split()))
         messages = [
             {
                 "role": "system",
-                "content": REWRITE_SYSTEM.format(who=who, intent=intent, text=text.replace('"', "'"), words=words),
+                "content": REWRITE_SYSTEM.format(
+                    who=who, intent=persona.swap_name(intent), text=text.replace('"', "'"), words=words
+                ),
             }
         ]
         messages += [dict(item) for item in list(history)[-16:]]

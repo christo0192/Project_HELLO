@@ -64,6 +64,7 @@ from r1_personas import (
     has_question,
 )
 from r1_scheduler import has_refusal, is_pitch_statement, quotes_price
+from r1_script import INTERVIEWER_ADDRESS_ALT, INTERVIEWER_ADDRESS_NAMES
 from r1_text import (
     canonical_amounts,
     clause_after,
@@ -1505,12 +1506,12 @@ _END_NEGATED_ANSWER = re.compile(
     re.IGNORECASE,
 )
 # What may open an answer that is only a stop phrase: acknowledgements and courtesy words, and the
-# interviewer's name (r1_lines.INTERVIEWER_NAME, which a content module may not import).  At most
-# six, each with one reading (the separator is required, and no filler is a prefix of another that
-# is followed by one); _CONFIRM_CLOSER is what may follow the phrase.
+# interviewer's names (r1_script.INTERVIEWER_ADDRESS_NAMES).  At most six, each with one reading
+# (the separator is required, and no filler is a prefix of another that is followed by one);
+# _CONFIRM_CLOSER is what may follow the phrase.
 _CONFIRM_FILLER = (
     r"(?:um+|uh+|hmm+|so|okay|ok|yes|yeah|yep|yup|sure|right|alright|all right|well|fine|"
-    r"actually|just|then|now|please|sorry|christy|that'?s (?:it|all))"
+    r"actually|just|then|now|please|sorry|" + INTERVIEWER_ADDRESS_ALT + r"|that'?s (?:it|all))"
 )
 _CONFIRM_OPENER = rf"(?:{_CONFIRM_FILLER}[,.!\s]+){{0,6}}"
 _CONFIRM_CLOSER = (
@@ -1639,7 +1640,7 @@ _BARE_YES_PHRASE = re.compile(r"\b(?:please go ahead|go ahead|please do|haan ji|
 _BARE_YES_FILLER = frozenset(
     {
         "ok", "okay", "alright", "so", "um", "uh", "hmm", "well", "please", "then", "thank",
-        "thanks", "you", "christy", "christie", "kristy", "maam", "mam", "madam", "sir",
+        "thanks", "you", *INTERVIEWER_ADDRESS_NAMES, "maam", "mam", "madam", "sir",
     }
 )
 # "do" only after a yes word: "yes please do", "sure do".
@@ -1710,13 +1711,15 @@ _WRAP_ASKED = re.compile(
 )
 # A whole short answer that says yes, on ``normalize`` text (so "that's" is "thats").
 _WRAP_SHORT_YES = re.compile(
-    r"(?:(?:um+|uh+|hmm+|so|well|okay|ok|alright|yes|yeah|yep|sure|christy|christie|kristy|maam|"
+    r"(?:(?:um+|uh+|hmm+|so|well|okay|ok|alright|yes|yeah|yep|sure|"
+    + INTERVIEWER_ADDRESS_ALT + r"|maam|"
     r"madam|sir|i think|i guess|then)\s+)*"
     r"(?:yes|yeah|yep|yup|ya|yah|yea|sure|okay|ok|alright|all right|fine|absolutely|definitely|"
     r"of course|haan|haan ji|hanji|ji haan|go ahead|please do|sounds good|that works|"
     r"thats fine|that is fine|thats good|lets do that|lets do it|we can|yes we can|"
     r"that would be (?:good|great|fine)|good idea|perfect|great)"
-    r"(?:\s+(?:please|then|thanks|thank you|christy|christie|kristy|maam|madam|sir|sure|yes|"
+    r"(?:\s+(?:please|then|thanks|thank you|" + INTERVIEWER_ADDRESS_ALT
+    + r"|maam|madam|sir|sure|yes|"
     r"yeah|okay|ok|fine|great))*"
 )
 
@@ -1822,7 +1825,7 @@ def names_exercise(text: object) -> bool:
 _STRICT_FILLER = (
     r"(?:um+|uh+|hmm+|so|okay|ok|well|yeah|yes|yep|right|alright|now|then|just|actually|"
     r"never mind|please|sorry|and|but|also|hi|hello|hey|fine|thanks|thank you|ji|haan|arre|"
-    r"christy|christie|kristy|cristy|maam|mam|madam|sir|i think|i guess|honestly|basically|"
+    + INTERVIEWER_ADDRESS_ALT + r"|maam|mam|madam|sir|i think|i guess|honestly|basically|"
     r"i said|i told you|im saying|i am saying)"
 )
 # One word of the learner's (or anybody's) name may open it too ("Priya end the interview", with or
@@ -1857,7 +1860,8 @@ _STRICT_CLOSER = (
     r"(?: (?:now|here|please|itself|only|na|naa|yaar|ya|yeah|yes|then|already|immediately|"
     r"right now|right away|at once|asap|fast|quickly|soon|as soon as possible|for now|"
     r"for today|today|for me|at this point|if possible|thanks|thank you(?: so much| very much)?|"
-    r"thank u|ji|sir|maam|mam|madam|christy|ok|okay|bye|goodbye|bye bye|completely|up))*"
+    r"thank u|ji|sir|maam|mam|madam|" + INTERVIEWER_ADDRESS_ALT
+    + r"|ok|okay|bye|goodbye|bye bye|completely|up))*"
 )
 _STRICT_CLOSER_ONLY = re.compile(_STRICT_CLOSER)
 _STRICT_HINDI = r"(?:khatam|khatm|band|end|stop|finish|complete|samapt)"
@@ -1882,7 +1886,7 @@ _STRICT_QUESTION = re.compile(
 _STRICT_COURTESY = frozenset(
     {
         "thanks", "thank", "you", "u", "so", "much", "very", "a", "lot", "please", "bye",
-        "goodbye", "christy", "christie", "kristy", "maam", "mam", "madam", "sir", "ok", "okay",
+        "goodbye", *INTERVIEWER_ADDRESS_NAMES, "maam", "mam", "madam", "sir", "ok", "okay",
         "ji", "yeah", "for", "your", "time", "is", "that", "it", "fine", "alright",
     }
 )
@@ -1900,10 +1904,11 @@ def _closers_only(text: str) -> bool:
 def strictly_names_end(text: object) -> bool:
     """The turn ENDS on a request to stop the interview or the role play (a model END's rail).
 
-    "Kindly end the interview.", "We can end the interview.", "End the interview na.", "Christy end
-    the interview", "end the inter view", "I'm done, we can end the interview.", "Interview khatam
-    karo.", "I want to end the interview now. Is that okay?": True.  "Once you finish the course
-    you will clear the interview easily.", "Before we end, tell me when is the interview?",
+    "Kindly end the interview.", "We can end the interview.", "End the interview na.",
+    "Dex end the interview.", "Christy end the interview", "end the inter view",
+    "I'm done, we can end the interview.", "Interview khatam karo.", "I want to end the interview
+    now. Is that okay?": True.  "Once you finish the course you will clear the interview
+    easily.", "Before we end, tell me when is the interview?",
     "Please stop the interview, I need a moment.", "Can we stop the interview for a second? My
     doorbell is ringing.": False (a model "end" for them is asked first).
     """

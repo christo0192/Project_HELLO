@@ -58,7 +58,7 @@ const turn = (index: number, sec: number | null, speaker: 'bot' | 'candidate', p
 });
 
 const TURNS: R1ReviewTurn[] = [
-  turn(0, 5, 'bot', 'opening', 'Hello, I am Christy.'),
+  turn(0, 5, 'bot', 'opening', 'Hello, I am Dex.'),
   turn(1, 30, 'candidate', 'icebreaker', 'Happy to be here today.'),
   turn(2, 120, 'bot', 'roleplay', 'Hi, I saw your course.'),
   turn(3, 125, 'candidate', 'roleplay', 'What made you look at it now?'),
@@ -257,7 +257,7 @@ describe('the header', () => {
     expect(address).toContain('attempt=2');
     await userEvent.click(tab('Recording'));
     expect(await within(panel('Recording')).findByText('Welcome back.')).toBeInTheDocument();
-    expect(within(panel('Recording')).queryByText('Hello, I am Christy.')).not.toBeInTheDocument();
+    expect(within(panel('Recording')).queryByText('Hello, I am Dex.')).not.toBeInTheDocument();
   });
 
   it('has no feedback tab and no placeholder for one', async () => {
@@ -400,7 +400,7 @@ describe('Overview, scored', () => {
     await opened(review({ attempts: [attempt(), second] }), '?attempt=2');
     await userEvent.click(screen.getByRole('button', { name: /What made you look at it now/ }));
     expect(address).toContain('attempt=1');
-    expect(within(panel('Recording')).getByText('Hello, I am Christy.')).toBeInTheDocument();
+    expect(within(panel('Recording')).getByText('Hello, I am Dex.')).toBeInTheDocument();
   });
 
   it('leaves a quote it cannot place as plain text', async () => {
@@ -745,7 +745,7 @@ describe('Overview, in every other state', () => {
 
   it('an appeal keeps the interview itself: the transcript still reads', async () => {
     await opened(review({ assessment: null, round: { ...review().round, recommendation: null, overall: null, scores_withheld: true } }), '?tab=recording');
-    expect(within(panel('Recording')).getByText('Hello, I am Christy.')).toBeInTheDocument();
+    expect(within(panel('Recording')).getByText('Hello, I am Dex.')).toBeInTheDocument();
   });
 });
 
@@ -1427,7 +1427,7 @@ describe('Recording: the transcript panel', () => {
   it('names each speaker, AI as AI', async () => {
     await opened(review(), '?tab=recording');
     const transcript = screen.getByRole('region', { name: 'Transcript' });
-    expect(within(transcript).getAllByText('Christy (AI interviewer)').length).toBeGreaterThan(0);
+    expect(within(transcript).getAllByText('Dex (AI interviewer)').length).toBeGreaterThan(0);
     expect(within(transcript).getAllByText('Priya Nair (AI learner)').length).toBeGreaterThan(0);
     expect(within(transcript).getAllByText('Ava Example').length).toBeGreaterThan(0);
   });
@@ -1482,7 +1482,7 @@ describe('Recording: the transcript panel', () => {
     await opened(review(), '?tab=recording');
     await userEvent.type(screen.getByRole('searchbox', { name: 'Search the transcript' }), 'plant');
     expect(screen.getByText('My plant is closing.')).toBeInTheDocument();
-    expect(screen.queryByText('Hello, I am Christy.')).not.toBeInTheDocument();
+    expect(screen.queryByText('Hello, I am Dex.')).not.toBeInTheDocument();
     expect(screen.getByText('1 of 6 turns')).toBeInTheDocument();
   });
 
@@ -1496,7 +1496,7 @@ describe('Recording: the transcript panel', () => {
     await opened(review(), '?tab=recording');
     await userEvent.click(screen.getByRole('button', { name: 'Candidate only' }));
     expect(screen.getByText('Happy to be here today.')).toBeInTheDocument();
-    expect(screen.queryByText('Hello, I am Christy.')).not.toBeInTheDocument();
+    expect(screen.queryByText('Hello, I am Dex.')).not.toBeInTheDocument();
   });
 
   it('stops following when the reader scrolls, and Back to current brings them back', async () => {
@@ -1707,7 +1707,7 @@ describe('Recording: notes', () => {
   it('keeps the rest of the page working when the notes cannot be read', async () => {
     mockApi.listRoundNotes.mockRejectedValue(new TestApiError('service_unavailable', 503));
     await opened(review(), '?tab=recording');
-    expect(screen.getByRole('region', { name: 'Transcript' })).toHaveTextContent('Hello, I am Christy.');
+    expect(screen.getByRole('region', { name: 'Transcript' })).toHaveTextContent('Hello, I am Dex.');
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
@@ -2229,7 +2229,7 @@ describe('Recording: when there is nothing to play', () => {
     const recordingPanel = panel('Recording');
     expect(recordingPanel).toHaveTextContent(sentence);
     expect(screen.queryByRole('button', { name: 'Play' })).not.toBeInTheDocument();
-    expect(within(recordingPanel).getByText('Hello, I am Christy.')).toBeInTheDocument();
+    expect(within(recordingPanel).getByText('Hello, I am Dex.')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /^Play from/ })).not.toBeInTheDocument();
   });
 

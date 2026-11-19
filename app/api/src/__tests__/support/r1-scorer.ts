@@ -61,7 +61,7 @@ export function interviewRows(): R1TurnRow[] {
     index += 1;
     rows.push({ turn_index: index, speaker, phase, text, interrupted });
   };
-  push('bot', 'opening', 'Hi Ava, I am Christy, an AI interviewer from Interview Kickstart.');
+  push('bot', 'opening', 'Hi Ava, I am Dex, an AI interviewer from Interview Kickstart.');
   push('candidate', 'icebreaker', 'Hello, I am Ava O\'Neil and I have five years in customer success at an edtech company.');
   push('bot', 'icebreaker', 'Thank you. What did you enjoy most about that work?');
   push('candidate', 'icebreaker', 'I enjoy helping learners find the right path and watching them succeed.');

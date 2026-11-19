@@ -15,7 +15,7 @@ function strip(over: Partial<CallStripProps> = {}) {
     durationSec: 600,
     speakers: [
       { id: 'candidate', label: 'Ava Example', kind: 'candidate', turns: [{ startSec: 60 }, { startSec: 120, endSec: 150 }] },
-      { id: 'interviewer', label: 'Christy (AI interviewer)', kind: 'ai', turns: [{ startSec: 0 }] },
+      { id: 'interviewer', label: 'Dex (AI interviewer)', kind: 'ai', turns: [{ startSec: 0 }] },
     ],
     phases: [{ label: 'Opening', startSec: 0, endSec: 100 }, { label: 'Role-play', startSec: 100, endSec: 600 }],
     markers: [{ sec: 400, label: '14:00', detail: 'Earliest offer to wrap up' }],
@@ -41,7 +41,7 @@ describe('what it draws', () => {
     strip();
     const group = screen.getByRole('group', { name: 'Call strip' });
     expect(within(group).getByText('Ava Example')).toBeInTheDocument();
-    expect(within(group).getByText('Christy (AI interviewer)')).toBeInTheDocument();
+    expect(within(group).getByText('Dex (AI interviewer)')).toBeInTheDocument();
   });
 
   it('draws a tick at the start of each turn, to the scale of the call', () => {

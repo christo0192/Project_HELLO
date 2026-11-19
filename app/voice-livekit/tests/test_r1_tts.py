@@ -405,11 +405,13 @@ class TestModuleSurface(unittest.TestCase):
                 imported.add((node.module or "").split(".")[0])
         self.assertEqual(
             imported,
-            {"__future__", "contextlib", "contextvars", "dataclasses", "inspect", "os", "typing"},
+            {"__future__", "contextlib", "contextvars", "dataclasses", "inspect", "os",
+             "typing", "r1_script"},
         )
 
 
 VOICE_ENV = (
+    "R1_INTERVIEWER_DEX",
     "R1_TTS_PROFILE",
     "R1_TTS_INTERVIEWER_VOICE",
     "R1_TTS_LEARNER_VOICE",
@@ -461,7 +463,7 @@ class TestVoices(unittest.TestCase):
                 self.assertEqual(voices.profile, "v4")
                 self.assertEqual(
                     voices.kwargs("interviewer"),
-                    {"model": "bulbul:v4-flash", "speaker": "simran_en_customer", "pace": 1.0},
+                    {"model": "bulbul:v4-flash", "speaker": "deven_en_conversation", "pace": 1.0},
                 )
                 self.assertEqual(
                     voices.kwargs("learner"),
@@ -497,7 +499,7 @@ class TestVoices(unittest.TestCase):
                 os.environ["R1_TTS_INTERVIEWER_VOICE"] = bad
                 voices = r1_tts.r1_voice_set()
                 self.assertEqual(voices.speaker("learner"), "zarina_en_conversation")
-                self.assertEqual(voices.speaker("interviewer"), "simran_en_customer")
+                self.assertEqual(voices.speaker("interviewer"), "deven_en_conversation")
                 self.assertEqual(
                     voices.notes, ("interviewer_voice_rejected", "learner_voice_rejected")
                 )
@@ -536,7 +538,7 @@ class TestVoices(unittest.TestCase):
         with self.assertRaises(ValueError):
             r1_tts.R1VoiceSet(
                 "v4",
-                {"model": "bulbul:v4-flash", "speaker": "simran_en_customer"},
+                {"model": "bulbul:v4-flash", "speaker": "deven_en_conversation"},
                 {"model": "bulbul:v3", "speaker": "simran"},
             )
 
@@ -544,9 +546,14 @@ class TestVoices(unittest.TestCase):
         self.assertEqual(r1_tts.V4_MODEL, "bulbul:v4-flash")
         self.assertEqual(
             dict(r1_tts.V4_DEFAULT_SPEAKERS),
+            {"interviewer": "deven_en_conversation", "learner": "zarina_en_conversation"},
+        )
+        self.assertEqual(
+            dict(r1_tts.V4_CHRISTY_SPEAKERS),
             {"interviewer": "simran_en_customer", "learner": "zarina_en_conversation"},
         )
-        for speaker in r1_tts.V4_DEFAULT_SPEAKERS.values():
+        for speaker in (*r1_tts.V4_DEFAULT_SPEAKERS.values(),
+                        *r1_tts.V4_CHRISTY_SPEAKERS.values()):
             self.assertIn(speaker, r1_tts.V4_SPEAKERS)
         self.assertNotIn("simran", r1_tts.V4_SPEAKERS)
         self.assertNotIn("nobody_en_test", r1_tts.V4_SPEAKERS)
@@ -596,6 +603,33 @@ class TestBoundVoice(unittest.IsolatedAsyncioTestCase):
             return r1_tts.current_voice()
 
         self.assertIsNone(await asyncio.create_task(speech()))
+
+
+class TestInterviewerVoiceMismatch(unittest.TestCase):
+    def test_male_speakers(self):
+        self.assertLessEqual(r1_tts.V4_MALE_SPEAKERS, r1_tts.V4_SPEAKERS)
+        self.assertIn(r1_tts.V4_DEFAULT_SPEAKERS[r1_tts.INTERVIEWER], r1_tts.V4_MALE_SPEAKERS)
+        self.assertNotIn("simran_en_customer", r1_tts.V4_MALE_SPEAKERS)
+        self.assertNotIn("zarina_en_conversation", r1_tts.V4_MALE_SPEAKERS)
+
+    def test_mismatches(self):
+        cases = [
+            ({}, False, None),
+            ({"R1_TTS_PROFILE": "v3"}, False, "legacy_voice"),
+            ({"R1_TTS_PROFILE": "unknown"}, False, "legacy_voice"),
+            ({}, True, "legacy_voice"),
+            ({"R1_TTS_INTERVIEWER_VOICE": "simran_en_customer"}, False, "voice_not_male"),
+            ({"R1_TTS_INTERVIEWER_VOICE": "shubh_en_narration"}, False, None),
+            ({"R1_INTERVIEWER_DEX": "0"}, False, None),
+            ({"R1_INTERVIEWER_DEX": "0", "R1_TTS_PROFILE": "v3"}, False, None),
+            ({"R1_INTERVIEWER_DEX": "0"}, True, None),
+        ]
+        for env, fallback, expected in cases:
+            with self.subTest(env=env, fallback=fallback), mock.patch.dict(
+                os.environ, env, clear=True
+            ):
+                voices = r1_tts.legacy_voice_set() if fallback else r1_tts.r1_voice_set()
+                self.assertEqual(r1_tts.interviewer_voice_mismatch(voices), expected)
 
 
 if __name__ == "__main__":
