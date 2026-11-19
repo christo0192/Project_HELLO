@@ -461,7 +461,7 @@ class TestVoices(unittest.TestCase):
                 self.assertEqual(voices.profile, "v4")
                 self.assertEqual(
                     voices.kwargs("interviewer"),
-                    {"model": "bulbul:v4-flash", "speaker": "simran_en_customer", "pace": 1.0},
+                    {"model": "bulbul:v4-flash", "speaker": "zarina_en_conversation", "pace": 1.0},
                 )
                 self.assertEqual(
                     voices.kwargs("learner"),
@@ -469,7 +469,7 @@ class TestVoices(unittest.TestCase):
                 )
                 self.assertNotIn("temperature", voices.kwargs("learner"))
                 self.assertEqual(voices.notes, ())
-                self.assertTrue(voices.distinct)
+                self.assertFalse(voices.distinct)
         for raw in ("v3", " V3 ", "v3\n"):
             with self.subTest(raw=raw):
                 os.environ["R1_TTS_PROFILE"] = raw
@@ -497,7 +497,7 @@ class TestVoices(unittest.TestCase):
                 os.environ["R1_TTS_INTERVIEWER_VOICE"] = bad
                 voices = r1_tts.r1_voice_set()
                 self.assertEqual(voices.speaker("learner"), "zarina_en_conversation")
-                self.assertEqual(voices.speaker("interviewer"), "simran_en_customer")
+                self.assertEqual(voices.speaker("interviewer"), "zarina_en_conversation")
                 self.assertEqual(
                     voices.notes, ("interviewer_voice_rejected", "learner_voice_rejected")
                 )
@@ -506,6 +506,16 @@ class TestVoices(unittest.TestCase):
         voices = r1_tts.r1_voice_set()
         self.assertEqual(voices.notes, ())
         self.assertEqual(voices.speaker("learner"), "zarina_en_conversation")
+
+    def test_the_interviewer_override_restores_the_previous_voice(self) -> None:
+        os.environ["R1_TTS_INTERVIEWER_VOICE"] = "simran_en_customer"
+        voices = r1_tts.r1_voice_set()
+        self.assertEqual(voices.speaker("interviewer"), r1_tts.V4_PREVIOUS_INTERVIEWER_SPEAKER)
+        self.assertEqual(voices.speaker("interviewer"), "simran_en_customer")
+        self.assertEqual(voices.speaker("learner"), "zarina_en_conversation")
+        self.assertEqual(voices.model, "bulbul:v4-flash")
+        self.assertTrue(voices.distinct)
+        self.assertEqual(voices.notes, ())
 
     def test_both_voices_always_share_one_model(self) -> None:
         profiles = (None, "", "v4", "v3", "V3", "bogus")
@@ -544,8 +554,10 @@ class TestVoices(unittest.TestCase):
         self.assertEqual(r1_tts.V4_MODEL, "bulbul:v4-flash")
         self.assertEqual(
             dict(r1_tts.V4_DEFAULT_SPEAKERS),
-            {"interviewer": "simran_en_customer", "learner": "zarina_en_conversation"},
+            {"interviewer": "zarina_en_conversation", "learner": "zarina_en_conversation"},
         )
+        self.assertEqual(r1_tts.V4_PREVIOUS_INTERVIEWER_SPEAKER, "simran_en_customer")
+        self.assertIn(r1_tts.V4_PREVIOUS_INTERVIEWER_SPEAKER, r1_tts.V4_SPEAKERS)
         for speaker in r1_tts.V4_DEFAULT_SPEAKERS.values():
             self.assertIn(speaker, r1_tts.V4_SPEAKERS)
         self.assertNotIn("simran", r1_tts.V4_SPEAKERS)

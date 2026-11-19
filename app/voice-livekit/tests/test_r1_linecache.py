@@ -973,7 +973,8 @@ class TestBuildLineCacheVoices(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {}, clear=False)
         patcher.start()
         self.addCleanup(patcher.stop)
-        for key in ("R1_LINE_CACHE", "R1_TTS_PROFILE", "SARVAM_TTS_VOICE", "SARVAM_TTS_MODEL"):
+        for key in ("R1_LINE_CACHE", "R1_TTS_PROFILE", "SARVAM_TTS_VOICE", "SARVAM_TTS_MODEL",
+                    "R1_TTS_INTERVIEWER_VOICE", "R1_TTS_LEARNER_VOICE"):
             os.environ.pop(key, None)
         self.seen: list[dict] = []
 
@@ -982,6 +983,7 @@ class TestBuildLineCacheVoices(unittest.TestCase):
         return FakeSynthesizer()
 
     def test_build_line_cache_takes_the_voices_from_the_session_tts(self) -> None:
+        os.environ["R1_TTS_INTERVIEWER_VOICE"] = "simran_en_customer"
         import r1_tts
 
         voices = r1_tts.r1_voice_set()  # v4: R1_TTS_PROFILE is unset
@@ -1006,7 +1008,28 @@ class TestBuildLineCacheVoices(unittest.TestCase):
         build_line_cache(SimpleNamespace(tts=odd), synthesizer_factory=self.factory)
         self.assertEqual(self.seen, [V3])
 
+    def test_default_cache_shares_zarina_and_is_separate_from_rollback(self) -> None:
+        import r1_tts
+
+        def build(voices):
+            tts = SimpleNamespace(sample_rate=RATE, num_channels=1, r1_voice_set=voices)
+            return build_line_cache(SimpleNamespace(tts=tts), synthesizer_factory=self.factory)
+
+        default = build(r1_tts.r1_voice_set())
+        self.assertEqual(self.seen, [V4_LEARNER])
+        self.assertIs(default._synthesizers["interviewer"], default._synthesizers["learner"])
+        text = "A synthetic line."
+        self.assertEqual(default.key(text, "interviewer"), default.key(text, "learner"))
+        self.assertEqual(
+            default.key(text, "interviewer"),
+            LineCache(FakeSynthesizer(), voice=V4_LEARNER, sample_rate=RATE).key(text),
+        )
+        os.environ["R1_TTS_INTERVIEWER_VOICE"] = "simran_en_customer"
+        rollback = build(r1_tts.r1_voice_set())
+        self.assertNotEqual(default.key(text, "interviewer"), rollback.key(text, "interviewer"))
+
     def test_the_v4_cache_builds_two_rest_synthesizers_and_v3_one(self) -> None:
+        os.environ["R1_TTS_INTERVIEWER_VOICE"] = "simran_en_customer"
         import r1_tts
 
         voices = r1_tts.r1_voice_set()

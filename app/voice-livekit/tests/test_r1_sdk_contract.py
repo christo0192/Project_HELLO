@@ -2166,7 +2166,7 @@ class TestR1VoicesOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
             if line.get("error_type") == "r1_tts_voice"
         }
         self.assertEqual(
-            voices, {"interviewer": "simran_en_customer", "learner": "zarina_en_conversation"}
+            voices, {"interviewer": "zarina_en_conversation", "learner": "zarina_en_conversation"}
         )
         profile = next(line for line in lines if line.get("error_type") == "r1_tts_profile")
         self.assertEqual(profile.get("model"), "bulbul:v4-flash")
