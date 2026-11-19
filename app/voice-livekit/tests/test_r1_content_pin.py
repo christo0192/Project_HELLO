@@ -278,7 +278,8 @@ import r1_world
 # 45: Keep the upgrade commitment in one sentence for scorer masking.
 # 46: L-OPEN-HI, the hello without the hearing question (R1_OPENING_NO_HEARING_CHECK).
 # 47: Dex, the male interviewer, in the spoken lines (R1_INTERVIEWER_DEX, DEX_LINES).
-PINNED_CONTENT_SHA256 = "f8d5a0ac8583211c7315829960a14d20fd84392fe82f015df0e8d72b01272501"
+#     Also the Dex prompts: prefixes, wrap-up note, end-intent system, after-aside context.
+PINNED_CONTENT_SHA256 = "8dc0c3f6604e9b552e5e6ce3a4e5255c70a5d21f99a512daa83ab9fc6b5f9d19"
 
 CONTENT_MODULES = (
     "r1_text",

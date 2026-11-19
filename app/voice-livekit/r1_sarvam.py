@@ -1,7 +1,8 @@
 """R1's Sarvam providers: the voiced TTS, the TTS build with its fallback, and the STT model.
 
-Owner decision 2026-10-30: R1 (and only R1) speaks with Bulbul v4 Flash, Christy as
-``simran_en_customer`` and the role-play learner as ``zarina_en_conversation``, behind the
+Owner decision 2026-10-30: R1 (and only R1) speaks with Bulbul v4 Flash, Dex as
+``deven_en_conversation`` (since 2026-11-19; Christy on ``simran_en_customer`` with
+``R1_INTERVIEWER_DEX=0``) and the role-play learner as ``zarina_en_conversation``, behind the
 ``R1_TTS_PROFILE`` flip back to today's voice (``v3``).  R1's STT is Saaras v4 by default, with
 ``R1_STT_MODEL=saaras:v3`` the rollback (verified live 2026-10-30 on the production account).
 

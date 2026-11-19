@@ -144,7 +144,7 @@ class TestBuildR1Tts(EnvCase):
         self.assertEqual(tts.label, "r1_sarvam.R1SarvamTTS")
         self.assertEqual(tts.model, "bulbul:v4-flash")
         self.assertEqual(tts.provider, "Sarvam")
-        self.assertEqual(tts._opts.speaker, "simran_en_customer")
+        self.assertEqual(tts._opts.speaker, "deven_en_conversation")
         self.assertEqual(tts._opts.pace, 1.0)
         self.assertEqual(str(tts._opts.target_language_code), "en-IN")
         self.assertEqual((tts.sample_rate, tts.num_channels), (22050, 1))
@@ -219,10 +219,10 @@ class TestVoicedStreams(unittest.IsolatedAsyncioTestCase):
             return self.open()._opts.speaker
 
         self.assertEqual(await asyncio.create_task(speech("learner")), "zarina_en_conversation")
-        self.assertEqual(await asyncio.create_task(speech("interviewer")), "simran_en_customer")
-        self.assertEqual(await asyncio.create_task(speech(None)), "simran_en_customer")
+        self.assertEqual(await asyncio.create_task(speech("interviewer")), "deven_en_conversation")
+        self.assertEqual(await asyncio.create_task(speech(None)), "deven_en_conversation")
         # The instance's own options are never touched.
-        self.assertEqual(self.tts._opts.speaker, "simran_en_customer")
+        self.assertEqual(self.tts._opts.speaker, "deven_en_conversation")
         self.assertEqual(self.tts._opts.model, "bulbul:v4-flash")
         for stream in self.streams:
             self.assertEqual(stream._opts.model, "bulbul:v4-flash")
@@ -246,8 +246,8 @@ class TestVoicedStreams(unittest.IsolatedAsyncioTestCase):
             asyncio.create_task(speech("learner")), asyncio.create_task(speech("interviewer"))
         )
         self.assertEqual(learner, ["zarina_en_conversation"] * 2)
-        self.assertEqual(interviewer, ["simran_en_customer"] * 2)
-        self.assertEqual(self.tts._opts.speaker, "simran_en_customer")
+        self.assertEqual(interviewer, ["deven_en_conversation"] * 2)
+        self.assertEqual(self.tts._opts.speaker, "deven_en_conversation")
 
     async def test_an_override_voice_is_what_the_stream_speaks(self) -> None:
         os.environ["R1_TTS_LEARNER_VOICE"] = "neha_en_customer"

@@ -4041,6 +4041,13 @@ class TestWrapupAndReadyDriveTheDriver(R1TestCase):
     rebuilds the interview (``asyncSetUp``) because a driver run changes its flags.
     """
 
+    async def test_agent_instructions_follow_persona(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(r1_session.r1_agent_instructions().startswith("You are Dex."))
+            self.assertIn("You are Dex.", R1Agent(self.interview).instructions)
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}, clear=True):
+            self.assertTrue(r1_session.r1_agent_instructions().startswith("You are Christy."))
+
     async def hook(self, text: str) -> None:
         agent = R1Agent(self.interview)
         await agent.on_user_turn_completed(
@@ -9191,9 +9198,9 @@ class TestEndIntentClassification(R1TestCase):
         await self.until(lambda: self.spoken_and_played("L-ASIDE-END"))
         await self.settle()
         self.assertEqual(len(runner.calls), 1)
-        self.assertNotIn("Christy has just asked", runner.calls[0][1]["content"])
+        self.assertNotIn("Dex has just asked", runner.calls[0][1]["content"])
         self.assertTrue(await self.commit_turn("Okay, let's wrap it up then."))
-        self.assertIn("Christy has just asked", runner.calls[-1][1]["content"])
+        self.assertIn("Dex has just asked", runner.calls[-1][1]["content"])
         self.assertTrue(self.interview.engine.end_confirmed)
 
 
@@ -9331,7 +9338,7 @@ class TestBareYesConfirmsTheEnd(R1TestCase):
         await self.settle()
         self.assertFalse(await self.commit_turn(text))
         self.assertTrue(runner.calls)
-        self.assertNotIn("Christy has just asked", runner.calls[-1][1]["content"])
+        self.assertNotIn("Dex has just asked", runner.calls[-1][1]["content"])
         self.assertFalse(engine.end_confirmed)
         self.assertFalse(self.interview._roleplay_exit_requested())
 

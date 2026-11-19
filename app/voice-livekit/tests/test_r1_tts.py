@@ -405,11 +405,13 @@ class TestModuleSurface(unittest.TestCase):
                 imported.add((node.module or "").split(".")[0])
         self.assertEqual(
             imported,
-            {"__future__", "contextlib", "contextvars", "dataclasses", "inspect", "os", "typing"},
+            {"__future__", "contextlib", "contextvars", "dataclasses", "inspect", "os",
+             "typing", "r1_script"},
         )
 
 
 VOICE_ENV = (
+    "R1_INTERVIEWER_DEX",
     "R1_TTS_PROFILE",
     "R1_TTS_INTERVIEWER_VOICE",
     "R1_TTS_LEARNER_VOICE",
@@ -461,7 +463,7 @@ class TestVoices(unittest.TestCase):
                 self.assertEqual(voices.profile, "v4")
                 self.assertEqual(
                     voices.kwargs("interviewer"),
-                    {"model": "bulbul:v4-flash", "speaker": "simran_en_customer", "pace": 1.0},
+                    {"model": "bulbul:v4-flash", "speaker": "deven_en_conversation", "pace": 1.0},
                 )
                 self.assertEqual(
                     voices.kwargs("learner"),
@@ -497,7 +499,7 @@ class TestVoices(unittest.TestCase):
                 os.environ["R1_TTS_INTERVIEWER_VOICE"] = bad
                 voices = r1_tts.r1_voice_set()
                 self.assertEqual(voices.speaker("learner"), "zarina_en_conversation")
-                self.assertEqual(voices.speaker("interviewer"), "simran_en_customer")
+                self.assertEqual(voices.speaker("interviewer"), "deven_en_conversation")
                 self.assertEqual(
                     voices.notes, ("interviewer_voice_rejected", "learner_voice_rejected")
                 )
@@ -536,7 +538,7 @@ class TestVoices(unittest.TestCase):
         with self.assertRaises(ValueError):
             r1_tts.R1VoiceSet(
                 "v4",
-                {"model": "bulbul:v4-flash", "speaker": "simran_en_customer"},
+                {"model": "bulbul:v4-flash", "speaker": "deven_en_conversation"},
                 {"model": "bulbul:v3", "speaker": "simran"},
             )
 
@@ -544,9 +546,14 @@ class TestVoices(unittest.TestCase):
         self.assertEqual(r1_tts.V4_MODEL, "bulbul:v4-flash")
         self.assertEqual(
             dict(r1_tts.V4_DEFAULT_SPEAKERS),
+            {"interviewer": "deven_en_conversation", "learner": "zarina_en_conversation"},
+        )
+        self.assertEqual(
+            dict(r1_tts.V4_CHRISTY_SPEAKERS),
             {"interviewer": "simran_en_customer", "learner": "zarina_en_conversation"},
         )
-        for speaker in r1_tts.V4_DEFAULT_SPEAKERS.values():
+        for speaker in (*r1_tts.V4_DEFAULT_SPEAKERS.values(),
+                        *r1_tts.V4_CHRISTY_SPEAKERS.values()):
             self.assertIn(speaker, r1_tts.V4_SPEAKERS)
         self.assertNotIn("simran", r1_tts.V4_SPEAKERS)
         self.assertNotIn("nobody_en_test", r1_tts.V4_SPEAKERS)

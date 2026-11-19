@@ -3,7 +3,8 @@
 Pure tests (no livekit): the default renders Dex in exactly the 21 lines that name the interviewer
 and never Christy, the flag off renders content revision 46's Christy texts byte for byte, the
 placeholders and cacheability do not change, and the content pin does not depend on the flag.
-Synthetic names only.
+It also covers Dex model prompts, agent instructions and voice defaults. No livekit is needed:
+r1_session falls back to Agent = object. Synthetic names only.
 """
 import itertools
 import os
@@ -14,6 +15,11 @@ from unittest import mock
 import r1_script
 import r1_lines
 import r1_content
+import r1_end_intent
+import r1_prompts
+import r1_session
+import r1_tts
+import r1_turn_reader
 
 
 IDS = set('''L-OPEN L-OPEN-HELLO L-OPEN-HI L-EXIT L-ASIDE-COACH L-ASIDE-COACH-V20
@@ -105,4 +111,75 @@ class TestInterviewerPersona(unittest.TestCase):
                 self.assertEqual(script["interviewer_name"], "Christy")
                 self.assertEqual(script["interviewer_name_dex"], "Dex")
                 self.assertEqual(script["dex_lines"], r1_script.DEX_LINES)
+                manifest = r1_content.manifest()
+                prompts = manifest["prompts"]
+                self.assertTrue(prompts["interviewer_prefix"].startswith("You are Christy"))
+                self.assertTrue(prompts["interviewer_prefix_dex"].startswith("You are Dex"))
+                self.assertIn("Dex", prompts["wrapup_note_dex"])
+                self.assertIn("Dex", manifest["end_intent"]["system_dex"])
+                self.assertIn("Dex", manifest["end_intent"]["after_aside_context_dex"])
         self.assertEqual(len(set(hashes)), 1)
+
+
+class TestPersonaPrompts(unittest.TestCase):
+    def test_default_and_rollback_prompts(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            for text in (r1_prompts.interviewer_prefix(),
+                         r1_prompts.interviewer_prefix(voice=False),
+                         r1_prompts.wrapup_note(), r1_prompts.interviewer_control_prose(),
+                         r1_end_intent.end_intent_system(), r1_end_intent.after_aside_context(),
+                         r1_turn_reader.reader_system(), r1_turn_reader.transition_context()):
+                self.assertNotIn("christy", text.casefold())
+            self.assertTrue(
+                r1_prompts.interviewer_prefix().startswith("You are Dex, an AI interviewer")
+            )
+            self.assertIn(
+                "stopping THIS interview with Dex or this role-play",
+                r1_end_intent.END_INTENT_SYSTEM_DEX,
+            )
+            self.assertIn("The interviewer, Dex, has", r1_end_intent.END_INTENT_SYSTEM_DEX)
+            messages = r1_end_intent.build_end_intent_messages("synthetic", context="after_aside",
+                                                               question="Ready?", seed="s", turn=1)
+            self.assertTrue(messages[1]["content"].startswith("Dex has just asked:"))
+            self.assertNotIn("christy", str(messages).casefold())
+            reader_messages = r1_turn_reader.build_reader_messages(
+                "synthetic", phase="transition", seed="s", turn=1)
+            self.assertNotIn("christy", str(reader_messages).casefold())
+            self.assertEqual(r1_turn_reader.READER_PROMPT_REVISION, 3)
+            self.assertTrue(r1_session.r1_agent_instructions().startswith("You are Dex."))
+            explicit = r1_prompts.interviewer_prefix(name="Christy")
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}, clear=True):
+            self.assertEqual(explicit, r1_prompts.interviewer_prefix())
+            self.assertTrue(explicit.startswith("You are Christy, an AI interviewer"))
+            self.assertEqual(r1_prompts.wrapup_note(), r1_prompts.WRAPUP_NOTE)
+            self.assertEqual(r1_end_intent.end_intent_system(), r1_end_intent.END_INTENT_SYSTEM)
+            self.assertEqual(r1_end_intent.after_aside_context(), r1_end_intent.AFTER_ASIDE_CONTEXT)
+            self.assertEqual(r1_turn_reader.reader_system(), r1_turn_reader.READER_SYSTEM)
+            self.assertEqual(r1_turn_reader.transition_context(), r1_turn_reader.TRANSITION_CONTEXT)
+            self.assertTrue(r1_session.r1_agent_instructions().startswith("You are Christy."))
+
+    def test_voice_personas_and_overrides(self):
+        for flag, expected in (("1", "deven_en_conversation"), ("0", "simran_en_customer")):
+            with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": flag}, clear=True):
+                voices = r1_tts.r1_voice_set()
+                self.assertEqual(voices.interviewer["speaker"], expected)
+                self.assertEqual(voices.learner["speaker"], "zarina_en_conversation")
+                self.assertTrue(voices.distinct)
+                self.assertEqual(voices.interviewer["model"], "bulbul:v4-flash")
+                self.assertEqual(voices.learner["model"], "bulbul:v4-flash")
+
+    def test_voice_override_rejection_and_v3(self):
+        for flag, default, override in (("1", "deven_en_conversation", "simran_en_customer"),
+                                        ("0", "simran_en_customer", "deven_en_conversation")):
+            env = {"R1_INTERVIEWER_DEX": flag, "R1_TTS_INTERVIEWER_VOICE": override}
+            with mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(r1_tts.r1_voice_set().speaker(), override)
+            env["R1_TTS_INTERVIEWER_VOICE"] = "synthetic_invalid"
+            with mock.patch.dict(os.environ, env, clear=True):
+                voices = r1_tts.r1_voice_set()
+                self.assertEqual(voices.speaker(), default)
+                self.assertIn("interviewer_voice_rejected", voices.notes)
+        with mock.patch.dict(os.environ, {"R1_TTS_PROFILE": "v3"}, clear=True):
+            before = r1_tts.r1_voice_set()
+            os.environ["R1_INTERVIEWER_DEX"] = "0"
+            self.assertEqual(r1_tts.r1_voice_set(), before)

@@ -34,6 +34,7 @@ import os
 import re
 from typing import Any
 
+from r1_script import interviewer_dex_enabled
 from r1_text import normalize
 from r1_tracker import (
     END_INTENT_LEVELS,
@@ -47,6 +48,10 @@ from r1_tracker import (
 __all__ = [
     "END_INTENT_LABELS",
     "END_INTENT_SYSTEM",
+    "END_INTENT_SYSTEM_DEX",
+    "AFTER_ASIDE_CONTEXT_DEX",
+    "end_intent_system",
+    "after_aside_context",
     "END_INTENT_WINDOW_WORDS",
     "build_end_intent_messages",
     "end_intent_enabled",
@@ -130,7 +135,19 @@ END_INTENT_SYSTEM = (
 # The context lines of the user message (pinned with the prompt).
 ROLEPLAY_CONTEXT = 'The learner\'s last line: "{learner_last}"'
 AFTER_ASIDE_CONTEXT = 'Christy has just asked: "{question}"'
+END_INTENT_SYSTEM_DEX = END_INTENT_SYSTEM.replace("Christy", "Dex")
+AFTER_ASIDE_CONTEXT_DEX = 'Dex has just asked: "{question}"'
 CONTEXTS = ("roleplay", "after_aside")
+
+
+def end_intent_system() -> str:
+    """Follow R1_INTERVIEWER_DEX; 0 gives the Christy text."""
+    return END_INTENT_SYSTEM_DEX if interviewer_dex_enabled() else END_INTENT_SYSTEM
+
+
+def after_aside_context() -> str:
+    """Follow R1_INTERVIEWER_DEX; 0 gives the Christy text."""
+    return AFTER_ASIDE_CONTEXT_DEX if interviewer_dex_enabled() else AFTER_ASIDE_CONTEXT
 
 
 def prefilter_hit(text: object) -> bool:
@@ -169,9 +186,9 @@ def build_end_intent_messages(
     through ``neutralise_candidate_text``, and no candidate text is put in the system message.
     """
     sentinel = sentinel_for(seed, turn)
-    system = END_INTENT_SYSTEM.replace("{sentinel}", sentinel)
+    system = end_intent_system().replace("{sentinel}", sentinel)
     if context == "after_aside":
-        lead = AFTER_ASIDE_CONTEXT.replace(
+        lead = after_aside_context().replace(
             "{question}", neutralise_candidate_text(question, sentinel)
         )
     else:

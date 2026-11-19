@@ -50,7 +50,7 @@ from r1_personas import PERSONA_IDS, PERSONAS, resolve_persona
 from r1_phases import R1Phase, R1PhaseMachine
 from r1_prompts import (
     TRANSITION_IB_ANSWER_NOTE,
-    WRAPUP_NOTE,
+    wrapup_note,
     WRAPUP_REMINDER,
     interviewer_prefix,
     learner_prefix,
@@ -798,7 +798,7 @@ class TestInterviewerContext(unittest.IsolatedAsyncioTestCase):
         messages = llm_messages(reply, persona, self.full_history(persona))
         blob = blob_of(messages)
         self.assertEqual(messages[0], {"role": "system", "content": interviewer_prefix()})
-        self.assertEqual(messages[1], {"role": "system", "content": WRAPUP_NOTE})
+        self.assertEqual(messages[1], {"role": "system", "content": wrapup_note()})
         self.assertIn(line("L-WRAP"), blob)
         self.assertEqual(messages[-1], {"role": "user", "content": "When will I hear back?"})
         for earlier in (
@@ -1193,7 +1193,9 @@ class TestInjectionCannotMoveAPhase(unittest.IsolatedAsyncioTestCase):
         await wrap.interview.say("L-WRAP")
         await wrap.converse(INJECTION)
         self.assertIs(wrap.machine.phase, R1Phase.WRAPUP)
-        self.assertEqual(wrap.last_messages()[1], {"role": "system", "content": WRAPUP_NOTE})
+        self.assertEqual(
+            wrap.last_messages()[1], {"role": "system", "content": wrapup_note()}
+        )
 
     # Simulation diagnosis 3, both lanes: the release before (the learner's wrap-up next steps and
     # Christy's reworded react clause in the rider, R1_REACTION_VARIETY).
@@ -1217,7 +1219,7 @@ class TestInjectionCannotMoveAPhase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(spoken)
         messages = wrap.last_messages()
         self.assertEqual(messages[0], {"role": "system", "content": interviewer_prefix()})
-        self.assertEqual(messages[1], {"role": "system", "content": WRAPUP_NOTE})
+        self.assertEqual(messages[1], {"role": "system", "content": wrapup_note()})
         # M032 SWEEP-26: with its flags on (the default) the reminder carries the what's-left and
         # cannot-answer sentences; with them off it is WRAPUP_REMINDER exactly.  M032 S5: Christy's
         # delivery rider follows the note while R1_INTERVIEWER_VOICE is on (the default).
