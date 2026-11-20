@@ -107,6 +107,7 @@ export interface R1ScoreInput {
   readonly log: R1AdministrationLog;
   readonly stats: R1TranscriptStats;
   readonly deckFacts: string;
+  readonly indiaPlaybook?: boolean;
   readonly thresholds: R1Thresholds;
 }
 
@@ -438,6 +439,7 @@ export async function scoreR1Transcript(
     log: input.log,
     stats: input.stats,
     deckFacts: input.deckFacts,
+    indiaPlaybook: input.indiaPlaybook,
     sentinel: deps.sentinel,
   });
   // Run 0: any failure (provider or validation) propagates here and no further run starts.

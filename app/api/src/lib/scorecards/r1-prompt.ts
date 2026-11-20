@@ -35,8 +35,10 @@ export interface BuildR1ScorerPromptInput {
   readonly turns: readonly R1Turn[];
   readonly log: R1AdministrationLog;
   readonly stats: R1TranscriptStats;
-  /** `r1DeckFactsBlock()`. */
+  /** The flag-aware `r1DeckFactsBlock()`. */
   readonly deckFacts: string;
+  /** Enables India playbook rules; defaults to false for the original prompt. */
+  readonly indiaPlaybook?: boolean;
   /** Test seam: a fixed sentinel. Production leaves it unset (random per call). */
   readonly sentinel?: string;
 }
@@ -148,6 +150,13 @@ export function formatCommunicationFacts(
   ].join('\n');
 }
 
+const INDIA_BULLET =
+  '- Apply the IK INDIA SALES PLAYBOOK in the prep-guide facts: never lower a score for ' +
+  'no-cost EMI, monthly instalments, 0% interest or a limited-time offer that uses the ' +
+  '$500/$1,000/$1,500 discounts; for "Urgency & close" such an offer is a prep-guide lever ' +
+  'used without coercion, and for "Negotiation & discount discipline" a deck discount tied ' +
+  'to EMI or to a limited-time offer is tied to a payment plan or an urgency lever.';
+
 export function buildR1ScorerPrompt(input: BuildR1ScorerPromptInput): string {
   const metricBlocks = input.metrics.map(formatMetric).join('\n\n');
   const idList = input.metrics.map((metric) => metric.id).join(', ');
@@ -199,7 +208,7 @@ RULES:
 - Every "evidenceRefs" entry MUST be written "T<turn number>: <excerpt>". The turn number is the number after "T" at the start of a transcript line. The excerpt MUST be copied verbatim from that line, at most 80 characters (hard limit 100).
 - A reference may cite ONLY a CANDIDATE line (labelled "Candidate" or "Candidate (as Program Advisor)") in one of the phases listed for that metric. NEVER cite an "Interviewer" line or a "Learner (simulated by the AI; never evidence)" line. Use at most 5 entries per metric. Use [] ONLY for a score of 1 or 2 (or insufficient_evidence): a score of 3 or 4 MUST cite at least one CANDIDATE line.
 - Count the metric's countable behaviours from the candidate's turns; use the administration log for what the learner revealed and which objections were raised. Score only objections that were actually raised.
-- "rationale" must cite specifics from the candidate's turns, not generic praise. Never copy personal identifiers into "rationale": no phone numbers, email addresses, postal addresses, ID numbers or names of third parties.
+${input.indiaPlaybook === true ? INDIA_BULLET + '\n' : ''}- "rationale" must cite specifics from the candidate's turns, not generic praise. Never copy personal identifiers into "rationale": no phone numbers, email addresses, postal addresses, ID numbers or names of third parties.
 - "score" must be a JSON integer, not a string. For an insufficient_evidence metric "score" MUST be JSON null.
 - "rationale" MUST be at most 900 characters (hard limit 1000).
 

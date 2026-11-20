@@ -88,7 +88,7 @@ describe('a valid gated score', () => {
     });
     expect(row.raw.r1.administration_quality).toMatchObject({ status: 'ok', failures: [] });
     expect(row.raw.r1.versions).toMatchObject({
-      scorer: 'r1-scoring-2026-10.1', rubric: 'r1-rubric-2026-10.2', deck_facts: 'r1-deck-facts-2026-10.1',
+      scorer: 'r1-scoring-2026-10.1', rubric: 'r1-rubric-2026-10.2', deck_facts: 'r1-deck-facts-2026-11.1',
     });
     // The phone scorer's template version is not used: R1 has its own provenance version.
     expect(validateProvenance(row.provenance).valid).toBe(true);
@@ -118,7 +118,7 @@ describe('a valid gated score', () => {
     expect(attach!.args.p_audit).toMatchObject({
       scorer_version: 'r1-scoring-2026-10.1',
       rubric_version: 'r1-rubric-2026-10.2',
-      deck_facts_version: 'r1-deck-facts-2026-10.1',
+      deck_facts_version: 'r1-deck-facts-2026-11.1',
       outcome: 'scored',
       thresholds: { advance: 65, hold: 45, settings_updated_at: '2026-10-06T09:00:00+00:00' },
       gate_passed: true,
@@ -988,6 +988,29 @@ describe('r1ErrorCode', () => {
     }
     for (const code of ['deepseek_insufficient_balance', 'deepseek_auth']) {
       expect(r1OperatorMessage(code)).not.toMatch(/sk-|bearer|authorization/i);
+    }
+  });
+});
+
+describe('India playbook service flag', () => {
+  it('keeps facts, rule and stored versions aligned for on and off', async () => {
+    try {
+      for (const enabled of [true, false]) {
+        vi.stubEnv('R1_INDIA_PLAYBOOK', enabled ? undefined : '0');
+        const { db } = setup(tablesWithInterview());
+        const infer = goodInfer();
+        await runR1Assessment(SESSION_ID, { client: db.client, infer, now: () => NOW });
+        const prompt = infer.mock.calls[0]![0];
+        const facts = prompt.split('PREP-GUIDE FACTS (the only product facts')[1]!.split('OUTPUT CONTRACT')[0]!;
+        const rules = prompt.split('RULES:')[1]!;
+        expect(facts.includes('IK INDIA SALES PLAYBOOK')).toBe(enabled);
+        expect(rules.includes('IK INDIA SALES PLAYBOOK')).toBe(enabled);
+        const version = enabled ? 'r1-deck-facts-2026-11.1' : 'r1-deck-facts-2026-10.1';
+        expect(db.tables.assessments![0]!.raw.r1.versions.deck_facts).toBe(version);
+        expect(db.rpcCalls[0]!.args.p_audit.deck_facts_version).toBe(version);
+      }
+    } finally {
+      vi.unstubAllEnvs();
     }
   });
 });

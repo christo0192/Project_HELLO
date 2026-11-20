@@ -339,6 +339,9 @@ describe('R1 source fences', () => {
       'R1_RECORDING_MAX_BYTES',
       'R1_RECORDING_DOWNLOAD_TTL_SEC',
       'R1_RECORDING_RETENTION_DAYS',
+      // Owner decision 2026-11-20 (India sales playbook for the post-session scorer): declared
+      // in config/environment.schema.json (api) and read ONLY by lib/r1/config.ts.
+      'R1_INDIA_PLAYBOOK',
     ]);
     for (const file of r1Sources) {
       const reads = code(file)
