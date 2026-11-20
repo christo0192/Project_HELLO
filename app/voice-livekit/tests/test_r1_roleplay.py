@@ -8917,6 +8917,7 @@ class IndiaPlaybookEngineTests(unittest.TestCase):
 class TimeOfferEngineTests(unittest.TestCase):
     OFFER = "I can give you $1,500 off if you enrol today; the offer ends tonight."
 
+    @mock.patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "1"})
     def test_open_ready_and_limit(self):
         session = Session(engine())
         session.say(OPENER, 20)
@@ -8962,6 +8963,7 @@ class TimeOfferEngineTests(unittest.TestCase):
         self.assertIn("seasonal_discount", levers)
         self.assertIn("seasonal_discount", r1_roleplay._PRESSING_LEVERS)
 
+    @mock.patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "1"})
     def test_lost_reply_returns_note(self):
         session = Session(engine())
         session.say(OPENER, 20)
@@ -8999,6 +9001,7 @@ class OfferNotesTests(unittest.TestCase):
         self.assertNotIn("pleasantly surprised", plan.reminder)
         self.assertNotIn("better than you expected", plan.reminder)
 
+    @mock.patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "1"})
     def test_an_offer_with_instalments_gets_one_reaction_to_the_terms(self):
         s = Session(engine())
         s.say(OPENER, 20)
@@ -9474,6 +9477,7 @@ class S2ReviewFixTests(unittest.TestCase):
         self.assertEqual(only._preempted_label("F3"), "")
 
     @mock.patch.dict(r1_roleplay.os.environ, {"R1_COACH_AFTER_INROLE": "0"})  # Simulation diagnosis 3: the release before
+    @mock.patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "1"})
     def test_s2r6c_a_lost_reply_gives_its_s2_notes_back(self):
         """S2R-6: the heard reply after a lost one carries the notes nobody heard, counted once."""
         s = Session(engine())

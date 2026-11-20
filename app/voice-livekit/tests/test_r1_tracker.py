@@ -13,6 +13,8 @@ HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
+import r1_tracker
+
 from r1_commitment import AskKind, Level, grade
 from r1_personas import resolve_persona
 from r1_text import dollar_amounts
@@ -2743,6 +2745,28 @@ class ReviewEvidenceTests(unittest.TestCase):
         self.assertTrue(tracker.discount_ok)
 
 
+class ReconcileWorkTests(unittest.TestCase):
+    def test_repeated_prices_do_not_scan_totals(self):
+        text = "the price is $8,500 but i can do $7,500 " * 300
+        counts = []
+        for reconcile in (False, True):
+            with patch.object(r1_tracker, "_declined", wraps=r1_tracker._declined) as declined:
+                parse_discounts(text, reconcile=reconcile)
+                counts.append(declined.call_count)
+        self.assertEqual(counts[1], counts[0])
+
+    def test_repeated_misheard_discount_scans_each_total_once(self):
+        sentence = "we give a discount of $100 and the total is $8,500 "
+        counts = []
+        for reconcile in (False, True):
+            with patch.object(r1_tracker, "_declined", wraps=r1_tracker._declined) as declined:
+                result = parse_discounts(sentence * 300, reconcile=reconcile)
+                counts.append(declined.call_count)
+        self.assertLessEqual(counts[1] - counts[0], 2)
+        self.assertEqual(result, parse_discounts(sentence, reconcile=True))
+        self.assertEqual([(m.usd, m.heard_usd) for m in result], [(500, 100)])
+
+
 class ReconcileTotalTests(unittest.TestCase):
     def test_reconcile_and_integrity(self):
         from unittest.mock import patch
@@ -2832,6 +2856,7 @@ class ReconcileTotalTests(unittest.TestCase):
 
 
 class IndiaMoneyPathTests(unittest.TestCase):
+    @patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "1"})
     def test_money_paths_and_probes(self):
         for text, expected in (
             ("You could split the cost with your husband.", False),
@@ -2867,6 +2892,7 @@ class IndiaMoneyPathTests(unittest.TestCase):
                 self.assertFalse(tracker.invented_offer)
                 self.assertFalse(evidence.pressured)
 
+    @patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "1"})
     def test_invented_and_conditional(self):
         self.assertFalse(invented_offer_in("We waive the interest on the EMI.", v2=False))
         self.assertTrue(invented_offer_in(

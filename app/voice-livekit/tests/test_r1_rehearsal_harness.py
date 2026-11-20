@@ -1154,6 +1154,7 @@ class ScriptedStandInTests(unittest.TestCase):
         for phrase in ("enrol", "enrolment link", "payment plan details", "webinar", "guarantee"):
             self.assertIn(phrase, prompt)
 
+    @mock.patch.dict("os.environ", {"R1_INDIA_PLAYBOOK": "1"})
     def test_closer_india_scenario_and_safe_banks(self) -> None:
         from rehearsal.scenarios import SCENARIOS, SCENARIO_NAMES, GROUPS, parse_scenarios
         from r1_world import claims_guarantee, deck_conflicts

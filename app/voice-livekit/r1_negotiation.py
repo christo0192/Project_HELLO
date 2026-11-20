@@ -3231,7 +3231,8 @@ def _reconcile_price_offers(
         return offers
     if len(offers) < 2 or not any(net in NET_PRICES_USD for net, _ in offers):
         return offers
-    reconciled = [m for m in parse_discounts(text, reconcile=True) if m.heard_usd is not None]
+    reconciled = [m for m in parse_discounts(_tail(text), reconcile=True)
+                  if m.heard_usd is not None]
     if len(reconciled) != 1:
         return offers
     mention = reconciled[0]

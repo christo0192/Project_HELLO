@@ -959,25 +959,29 @@ def parse_discounts(
         and any(abs(m.usd - d) <= 500 for d in
                 origins[m.sentence_index][0] & set(DISCOUNTS_USD))
     )]
-    totals: list[tuple[int, int, bool]] = []
-    for index, sentence in enumerate(sentences):
-        folded = canonical_amounts(sentence)
-        for match in re.finditer(r"\$\s*(\d[\d,]*)", folded):
-            value = int(match.group(1).replace(",", ""))
-            if value in NET_PRICES_USD and not _declined(folded, match, verb_in_match=False):
-                totals.append((value, index, bool(_CONDITIONAL.search(folded))))
     nondeck = [m for m in mentions if m.usd not in DISCOUNTS_USD]
-    distinct = {total for total, _, _ in totals}
-    if (len(nondeck) == 1 and len(distinct) == 1
-            and nondeck[0].usd in origins[nondeck[0].sentence_index][0]):
-        old = nondeck[0]
-        nearby = [(index, cond) for _, index, cond in totals
-                  if abs(index - old.sentence_index) <= 1]
-        if nearby:
-            new = DiscountMention(PRICE_USD - next(iter(distinct)),
-                                  old.conditional or any(c for _, c in nearby),
-                                  old.sentence_index, old.usd)
-            mentions = [new if m is old else m for m in mentions]
+    if len(nondeck) == 1 and nondeck[0].usd in origins[nondeck[0].sentence_index][0]:
+        totals: list[tuple[int, int, bool]] = []
+        for index, sentence in enumerate(sentences):
+            folded = canonical_amounts(sentence)
+            conditional = bool(_CONDITIONAL.search(folded))
+            seen: set[int] = set()
+            for match in re.finditer(r"\$\s*(\d[\d,]*)", folded):
+                value = int(match.group(1).replace(",", ""))
+                if (value in NET_PRICES_USD and value not in seen
+                        and not _declined(folded, match, verb_in_match=False)):
+                    totals.append((value, index, conditional))
+                    seen.add(value)
+        distinct = {total for total, _, _ in totals}
+        if len(distinct) == 1:
+            old = nondeck[0]
+            nearby = [(index, cond) for _, index, cond in totals
+                      if abs(index - old.sentence_index) <= 1]
+            if nearby:
+                new = DiscountMention(PRICE_USD - next(iter(distinct)),
+                                      old.conditional or any(c for _, c in nearby),
+                                      old.sentence_index, old.usd)
+                mentions = [new if m is old else m for m in mentions]
     dedup: dict[tuple[int, int], DiscountMention] = {}
     for mention in mentions:
         key = (mention.sentence_index, mention.usd)
