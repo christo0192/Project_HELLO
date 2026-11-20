@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from rehearsal import HARNESS_VERSION
 from rehearsal.advisor import AdvisorTurn
@@ -172,6 +172,7 @@ async def run_call(spec: CallSpec, deps: CallDeps) -> dict[str, Any]:
         "rows": [],
         "exchanges": [],
         "admin_log": {},
+        "integrity": {},
         "guard_trips": [],
         "posted_events": [],
         "log_counts": {},
@@ -272,6 +273,31 @@ async def _play(
     record["stop_reason"] = "max_exchanges"
 
 
+def integrity_summary(admin_log: Mapping, exchanges: Sequence[Mapping]) -> dict:
+    """Summarise integrity signals even when a call produced incomplete records."""
+    def mapping(value: Any) -> Mapping:
+        return value if isinstance(value, Mapping) else {}
+
+    tracker = mapping(mapping(admin_log).get("tracker"))
+    discounts = mapping(tracker.get("discounts"))
+    urgency = mapping(tracker.get("urgency"))
+    turns = []
+    for exchange in exchanges if isinstance(exchanges, (list, tuple)) else ():
+        item = mapping(exchange)
+        learner = mapping(item.get("learner"))
+        plan = mapping(learner.get("plan"))
+        reasons = plan.get("reasons")
+        n = item.get("n")
+        if isinstance(reasons, (list, tuple, set)) and "advisor_pressured" in reasons:
+            if isinstance(n, int) and not isinstance(n, bool):
+                turns.append(n)
+    return {
+        "invented_offer": bool(discounts.get("invented_offer", False)),
+        "coercive": bool(urgency.get("coercive", False)),
+        "pressured_reason_turns": sorted(turns),
+    }
+
+
 def _collect(rig: Any, record: dict[str, Any]) -> None:
     """The engine's final log, the rows and the events, from whatever state the call reached."""
     elapsed = float(rig.machine.roleplay_elapsed)
@@ -282,6 +308,7 @@ def _collect(rig: Any, record: dict[str, Any]) -> None:
     record["rows"] = _rows(rig, record["exchanges"])
     record["posted_events"] = _posted(rig, admin)
     record["header"]["learner_first_name"] = rig.persona.first_name
+    record["integrity"] = integrity_summary(admin, record.get("exchanges", []))
 
 
 async def _exchange(

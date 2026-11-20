@@ -1154,6 +1154,81 @@ class ScriptedStandInTests(unittest.TestCase):
         for phrase in ("enrol", "enrolment link", "payment plan details", "webinar", "guarantee"):
             self.assertIn(phrase, prompt)
 
+    def test_closer_india_scenario_and_safe_banks(self) -> None:
+        from rehearsal.scenarios import SCENARIOS, SCENARIO_NAMES, GROUPS, parse_scenarios
+        from r1_world import claims_guarantee, deck_conflicts
+        from r1_commitment import detect_ask, AskKind
+        from r1_tracker import invented_offer_in, urgency_levers, time_limited_offer_in
+
+        self.assertEqual(SCENARIOS["skilled-closer-india"].level, "closer_india")
+        self.assertNotIn("skilled-closer-india", SCENARIO_NAMES)
+        for group in ("india", "closer"):
+            self.assertIn("skilled-closer-india", GROUPS[group])
+        self.assertEqual(parse_scenarios("india"), ("skilled-closer-india",))
+        self.assertIn("closer_india", advisor.KNOWN_LEVELS)
+        self.assertNotIn("closer_india", advisor.ADVISOR_LEVELS)
+        self.assertEqual(run.parse_levels("skilled-closer-india"), ("closer_india",))
+        self.assertIsNotNone(advisor.LLMAdvisor(None, "test", "closer_india"))
+        prompt = advisor.advisor_system_prompt("closer_india").lower()
+        for phrase in ("no-cost emi", "zero percent interest", "one-day offer",
+                       "enrolment link", "guarantee", "webinar"):
+            self.assertIn(phrase, prompt)
+        old_prompt = advisor.advisor_system_prompt("closer").lower()
+        self.assertNotRegex(old_prompt, r"\bemi\b|one-day")
+        banks = [sa.MONEY_PATH_CLOSER_INDIA, sa.CLOSE_CLOSER_INDIA,
+                 *sa.QUESTION_CLOSER_INDIA.values()]
+        for line in (line for bank in banks for line in bank):
+            self.assertLessEqual(metrics._dollar_figures(line),
+                                 {9000, 8500, 8000, 7500, 500, 1000, 1500, 625})
+            self.assertFalse(claims_guarantee(line), line)
+            self.assertNotRegex(line.lower(), r"webinar|refund|money.back|free|\bseats?\b|placement")
+            if "guarantee" in line.lower():
+                self.assertIn(line, sa.REASSURE_CLOSER)
+            trimmed = line.replace(", which is about $625 a month over twelve months", "")
+            self.assertFalse(deck_conflicts(trimmed), line)
+        money, close = sa.MONEY_PATH_CLOSER_INDIA[0], sa.CLOSE_CLOSER_INDIA[0]
+        for line in (money, close):
+            self.assertFalse(invented_offer_in(line, v2=True))
+        self.assertFalse(urgency_levers(close, playbook=True)[1])
+        self.assertTrue(time_limited_offer_in(close, prior_deck_discount=True))
+        self.assertIs(detect_ask(close).kind, AskKind.ENROL)
+
+        async def exercise():
+            a = sa.ScriptedAdvisor("closer_india", "synthetic")
+            inputs = [(None, 10), ("What is the price? I saw 7000.", 100),
+                      ("My schedule is packed.", 200), ("I need to talk to my husband.", 300)]
+            inputs += [("Okay.", 350 + n * 45) for n in range(14)]
+            turns = []
+            for i, (text, clock) in enumerate(inputs):
+                turns.append(await a.next_turn(text, clock, i))
+                if turns[-1].intent == "close_ask":
+                    break
+            turns.append(await a.next_turn(
+                "Okay, let's do it. Send me the enrolment link and the payment plan details, "
+                "and I'll get started today.", 835, 33))
+            return turns
+
+        turns = asyncio.run(exercise())
+        texts = [t.text for t in turns]
+        close_index = next(i for i, t in enumerate(turns) if t.intent == "close_ask")
+        self.assertEqual(texts.count(money), 1)
+        self.assertLess(texts.index(money), close_index)
+        self.assertEqual(texts[close_index], close)
+        self.assertTrue(all(a != b for a, b in zip(texts, texts[1:])))
+        self.assertIn(turns[-1].text, sa.ACCEPT_ENROL_CLOSER)
+
+    def test_integrity_summary_incomplete_and_sorted(self) -> None:
+        from rehearsal.call import integrity_summary
+
+        self.assertEqual(integrity_summary(None, None), {
+            "invented_offer": False, "coercive": False, "pressured_reason_turns": []})
+        admin = {"tracker": {"discounts": {"invented_offer": True},
+                             "urgency": {"coercive": True}}}
+        exchanges = [{"n": 4, "learner": {"plan": {"reasons": ["advisor_pressured"]}}},
+                     {}, {"n": 2, "learner": {"plan": {"reasons": ["advisor_pressured"]}}}]
+        self.assertEqual(integrity_summary(admin, exchanges), {
+            "invented_offer": True, "coercive": True, "pressured_reason_turns": [2, 4]})
+
     def test_closer_answers_then_closes_and_accepts(self) -> None:
         async def run_closer():
             a = sa.ScriptedAdvisor("closer", "synthetic")

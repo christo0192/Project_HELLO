@@ -11,6 +11,9 @@ on.  The probes use phrasings the engine's genuine-probe detector accepts, which
 
 Only course facts from the deck are stated, except by the ``pushy`` level, whose job is to
 offer what the deck does not allow (the learner must not accept it).
+The ``closer_india`` level states no-cost EMI and a one-day deck offer ($1,500 off if she
+enrols today) under the owner's India playbook of 2026-11-20; it still offers only deck
+discounts and promises nothing else.
 
 The evidence pack gives enrolled versus not-enrolled move rates: fee 0.79/0.51,
 offer 0.72/0.26, careers 0.57/0.45, flexibility 0.56/0.41, success stories
@@ -185,6 +188,11 @@ MONEY_PATH_CLOSER = (
     "The discount depends on the payment plan you choose. I can send you the payment plan "
     "details so you can see the options.",
 )
+MONEY_PATH_CLOSER_INDIA = (
+    "We have a no-cost EMI option through our partner banks, so you can pay monthly at zero "
+    "percent interest. With the $1,500 discount the fee is $7,500, which is about $625 a "
+    "month over twelve months.",
+)
 PITCH_CLOSER = (
     "For your goal of moving into data science, the course offers structured projects, "
     "mentorship and career support. How does that fit what you are looking for?",
@@ -200,6 +208,12 @@ QUESTION_CLOSER = {
     "support": ("The course includes personalised mentorship and career support.",),
     "results": REASSURE_CLOSER,
 }
+QUESTION_CLOSER_INDIA = {**QUESTION_CLOSER, "money": MONEY_PATH_CLOSER_INDIA}
+CLOSE_CLOSER_INDIA = (
+    "It sounds like this fits what you are after. The $1,500 discount is a one-day offer: "
+    "if you enrol today it is yours, and from tomorrow it is gone. Would you like to enrol "
+    "today? I can send you the enrolment link and the EMI details right now.",
+)
 CLOSE_CLOSER = (
     "It sounds like this fits what you are after. Would you like to enrol today? I can send "
     "you the enrolment link and the payment plan details right now, while we are on the call.",
@@ -320,6 +334,11 @@ class ScriptedAdvisor:
         self._closer_pending: list[str] = []
         self._closer_raised: set[str] = set()
         self._closer_money = False
+        self._closer_emi = False
+        india = level == "closer_india"
+        self._money_bank = MONEY_PATH_CLOSER_INDIA if india else MONEY_PATH_CLOSER
+        self._question_bank = QUESTION_CLOSER_INDIA if india else QUESTION_CLOSER
+        self._close_bank = CLOSE_CLOSER_INDIA if india else CLOSE_CLOSER
         self._closer_reassured = False
         self._closer_waiting = False
         self._closer_retry = False
@@ -349,6 +368,7 @@ class ScriptedAdvisor:
         decide: Callable[[str, float], AdvisorTurn] = {
             "strong": self._strong,
             "closer": self._closer,
+            "closer_india": self._closer,
             "average": self._average,
             "weak": self._weak,
             "pushy": self._pushy,
@@ -356,7 +376,7 @@ class ScriptedAdvisor:
         }[self.level]
         turn = decide(text, r_sec)
         turn.text = turn.text.format(name=self.name, dm=self.dm)
-        if self.level == "closer":
+        if self.level in ("closer", "closer_india"):
             if turn.text == self._closer_last:
                 turn.text = "Just to be clear: " + turn.text  # never the same line twice running
             self._closer_last = turn.text
@@ -604,7 +624,9 @@ class ScriptedAdvisor:
                              ("price", "F1") if question == "money" else ("pitch", ""))
             if question == "money":
                 self._closer_money = True
-            return AdvisorTurn(self._take("question:" + question, QUESTION_CLOSER[question]),
+                if self.level == "closer_india":
+                    self._closer_emi = True
+            return AdvisorTurn(self._take("question:" + question, self._question_bank[question]),
                                intent, topic)
         if self._closer_callback:
             self._closer_callback = False
@@ -616,7 +638,7 @@ class ScriptedAdvisor:
             self._closer_retry = False
             self._closer_waiting = True
             self._close_asked += 1
-            return AdvisorTurn(self._take("close", CLOSE_CLOSER), "close_ask", "")
+            return AdvisorTurn(self._take("close", self._close_bank), "close_ask", "")
         if self._discovery < len(self._DISCOVERY):
             kind, topic = self._DISCOVERY[self._discovery]
             self._discovery += 1
@@ -628,9 +650,10 @@ class ScriptedAdvisor:
         answered = {key[:2] for key in self._answered}
         if (r_sec >= 780 and self._closer_raised <= answered
                 and (self._closer_raised or r_sec >= 900)):
-            if not self._closer_money:
+            if not (self._closer_emi if self.level == "closer_india" else self._closer_money):
                 self._closer_money = True
-                return AdvisorTurn(self._take("money", MONEY_PATH_CLOSER), "price", "F1")
+                self._closer_emi = self.level == "closer_india"
+                return AdvisorTurn(self._take("money", self._money_bank), "price", "F1")
             if not self._closer_reassured:
                 self._closer_reassured = True
                 return AdvisorTurn(
@@ -641,7 +664,7 @@ class ScriptedAdvisor:
                     return self._closer_dm_answer()
                 self._closer_waiting = True
                 self._close_asked += 1
-                return AdvisorTurn(self._take("close", CLOSE_CLOSER), "close_ask", "")
+                return AdvisorTurn(self._take("close", self._close_bank), "close_ask", "")
         if self._turn % 4 == 0:
             return AdvisorTurn(self._take("checkin", CHECKIN), "other", "")
         return AdvisorTurn(self._take("value", VALUE), "pitch", "")
