@@ -2723,3 +2723,91 @@ class ReviewEvidenceTests(unittest.TestCase):
                                              discount_question_open=True)
         self.assertTrue(obs.discounts[0].conditional)
         self.assertTrue(tracker.discount_ok)
+
+
+class ReconcileTotalTests(unittest.TestCase):
+    def test_reconcile_and_integrity(self):
+        from unittest.mock import patch
+        import os
+        cases = [
+            ("We can take a 100 dollar discount, so your total is 8500 dollars.", 500, 100),
+            ("We can take a hundred dollar discount, so your total is eight thousand "
+             "five hundred dollars.", 500, 100),
+            ("There is a $200 discount. That makes the total $8,000.", 1000, 200),
+            ("I can give you $100 off, so I can do it for $8,500.", 500, 100),
+            ("Ten percent off, so the total is $8,000.", 1000, 900),
+        ]
+        with patch.dict(os.environ, {"R1_DISCOUNT_TOTAL_RECONCILE": "1"}):
+            for text, amount, heard in cases:
+                with self.subTest(text=text):
+                    mentions = parse_discounts(text)
+                    self.assertEqual([(m.usd, m.heard_usd) for m in mentions], [(amount, heard)])
+                    self.assertFalse(invented_offer_in(text, v2=True))
+            self.assertEqual([m.usd for m in parse_discounts(
+                "$1,500 off, I can do it for $7,600.")], [1500])
+            for text in ("$2,000 off, so the total is $6,000.", "$100 off.",
+                         "$700 off and $300 off, total $8,000.",
+                         "We can do $100 off, but I can't make the total $8,500."):
+                self.assertTrue(invented_offer_in(text, v2=True), text)
+            for text, expected in (
+                ("I can do it for $6,000, or $8,500 with the standard discount.", [3000]),
+                ("I can do it for $8,600. Your total is $8,500.", [400]),
+                ("$100 off, or I can do it for $6,000, total $8,500.", [100, 3000]),
+            ):
+                with self.subTest(text=text):
+                    self.assertEqual([m.usd for m in parse_discounts(text)], expected)
+                    self.assertTrue(invented_offer_in(text, v2=True))
+            self.assertEqual(parse_discounts(cases[0][0], reconcile=False)[0].usd, 100)
+        with patch.dict(os.environ, {"R1_DISCOUNT_TOTAL_RECONCILE": "0"}):
+            self.assertEqual(parse_discounts(cases[0][0])[0].usd, 100)
+            self.assertEqual([m.usd for m in parse_discounts(
+                "$1,500 off, I can do it for $7,600.")], [1400, 1500])
+
+    def test_tracker_and_prompt(self):
+        tracker = CoverageTracker(PERSONA, invented_v2=True, total_reconcile=True)
+        tracker.observe_candidate_turn(
+            "We can take a 100 dollar discount, so your total is 8500 dollars.")
+        self.assertEqual(tracker.discount_log[0]["heard_usd"], 100)
+        self.assertFalse(tracker.invented_offer)
+        tracker.observe_candidate_turn("$500 off.")
+        self.assertNotIn("heard_usd", tracker.discount_log[1])
+        sentence = "If the candidate states a total of $8500"
+        self.assertIn(sentence, build_judge_messages("", "", seed="x", turn=1,
+                                                     v2=True, reconcile=True)[0]["content"])
+        self.assertNotIn(sentence, build_judge_messages("", "", seed="x", turn=1,
+                                                        v2=True)[0]["content"])
+
+    def test_previous_judge_prompt_and_tracker_when_off(self):
+        from unittest.mock import patch
+
+        args = ("", "")
+        kwargs = {"seed": "x", "turn": 1, "v2": False}
+        self.assertEqual(build_judge_messages(*args, reconcile=True, **kwargs),
+                         build_judge_messages(*args, **kwargs))
+        text = "We can take a 100 dollar discount, so your total is 8500 dollars."
+        explicit = CoverageTracker(PERSONA, invented_v2=True, total_reconcile=False)
+        with patch.dict("os.environ", {"R1_DISCOUNT_TOTAL_RECONCILE": "0"}):
+            default = CoverageTracker(PERSONA, invented_v2=True)
+            explicit.observe_candidate_turn(text)
+            default.observe_candidate_turn(text)
+        self.assertEqual(explicit.admin_view(), default.admin_view())
+        offer = default.admin_view()["discounts"]["offers"][0]
+        self.assertEqual(offer["usd"], 100)
+        self.assertNotIn("heard_usd", offer)
+
+    def test_judge_and_admin(self):
+        text = "We can take a 100 dollar discount, so your total is 8500 dollars."
+        verdict = JudgeResult(invented_offer=True)
+        for enabled in (True, False):
+            tracker = CoverageTracker(PERSONA, invented_v2=True, total_reconcile=enabled)
+            tracker.observe_candidate_turn(text, 1, discount_question_open=True)
+            offer = tracker.admin_view()["discounts"]["offers"][0]
+            self.assertEqual(offer.get("heard_usd"), 100 if enabled else None)
+            tracker.apply_judge(verdict, 1)
+            self.assertEqual(tracker.judge_invented_turns, 0 if enabled else 1)
+            self.assertEqual(tracker.invented_offer, not enabled)
+        tracker = CoverageTracker(PERSONA, invented_v2=True, total_reconcile=True)
+        tracker.observe_candidate_turn("Our mentors provide feedback.", 1)
+        tracker.apply_judge(verdict, 1)
+        self.assertTrue(tracker.invented_offer)
+        self.assertEqual(tracker.judge_invented_turns, 1)

@@ -3649,3 +3649,31 @@ class MoveConditionContractTests(unittest.TestCase):
                         deep_need_topics_in(rendered, text), (persona.id, clause.id, text)
                     )
         self.assertNotIn("condition_named", Negotiation("husband").log())
+
+
+class DiscountTotalReconcileTests(unittest.TestCase):
+    def test_explicit_net_below_floor_is_preserved(self):
+        from unittest.mock import patch
+
+        text = "I can do it for $6,000, or $8,500 with the standard discount."
+        with patch.dict("os.environ", {"R1_DISCOUNT_TOTAL_RECONCILE": "1"}):
+            for v2 in (False, True):
+                with self.subTest(v2=v2):
+                    self.assertIn(6000, [net for net, _ in neg.parse_price_offers(text, v2=v2)])
+
+    def test_phantom_prices(self):
+        from unittest.mock import patch
+        from r1_negotiation import parse_price_offers
+        for v2 in (False, True):
+            for text, phantom, total in (
+                ("We can take a 100 dollar discount, so your total is 8500 dollars.", 8900, 8500),
+                ("There is a $200 discount. That makes the total $8,000.", 8800, 8000),
+            ):
+                with self.subTest(v2=v2, text=text):
+                    with patch.dict("os.environ", {"R1_DISCOUNT_TOTAL_RECONCILE": "1"}):
+                        self.assertEqual(parse_price_offers(text, v2=v2), [(total, False)])
+                    with patch.dict("os.environ", {"R1_DISCOUNT_TOTAL_RECONCILE": "0"}):
+                        result = parse_price_offers(text, v2=v2)
+                        self.assertIn((total, False), result)
+                        if not v2 or phantom == 8800:
+                            self.assertIn((phantom, False), result)

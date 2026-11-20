@@ -34,6 +34,7 @@ Invariants (each has a test in ``tests/test_r1_negotiation.py``):
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, replace
 from typing import Any, Iterable
@@ -63,7 +64,8 @@ from r1_text import (
     parse_amount,
     split_sentences,
 )
-from r1_world import PRICE_USD
+from r1_tracker import parse_discounts
+from r1_world import NET_PRICES_USD, PRICE_USD
 
 # A turn longer than this is read from its end: closing proposals come last, and a hostile
 # or runaway transcript cannot make the detectors slow.
@@ -3178,7 +3180,11 @@ def parse_price_offers(
     off the price ``stated_price_usd`` reads (L5), as before.
     """
     if v2:
-        return _parse_price_offers_v2(text, own_amounts, require_cue=require_cue, base_usd=base_usd)
+        offers = _parse_price_offers_v2(
+            text, own_amounts, require_cue=require_cue, base_usd=base_usd
+        )
+        base = stated_price_usd(text, v2=True) or base_usd or PRICE_USD
+        return _reconcile_price_offers(text, offers, base)
     own = frozenset({ANCHOR_USD, *own_amounts})
     offers: dict[int, bool] = {}
     base = stated_price_usd(text) or PRICE_USD
@@ -3198,7 +3204,32 @@ def parse_price_offers(
                         base_usd=base,
                     )
                 )
-    return sorted(offers.items(), reverse=True)
+    return _reconcile_price_offers(text, sorted(offers.items(), reverse=True), base)
+
+
+def _total_reconcile_on() -> bool:
+    return os.getenv("R1_DISCOUNT_TOTAL_RECONCILE", "1").strip().lower() not in (
+        "0", "off", "false", "no"
+    )
+
+
+def _reconcile_price_offers(
+    text: object, offers: list[tuple[int, bool]], base: int
+) -> list[tuple[int, bool]]:
+    if not _total_reconcile_on():
+        return offers
+    if len(offers) < 2 or not any(net in NET_PRICES_USD for net, _ in offers):
+        return offers
+    reconciled = [m for m in parse_discounts(text, reconcile=True) if m.heard_usd is not None]
+    if len(reconciled) != 1:
+        return offers
+    mention = reconciled[0]
+    total = PRICE_USD - mention.usd
+    if not any(net == total for net, _ in offers):
+        return offers
+    phantom = base - mention.heard_usd
+    return [(net, conditional) for net, conditional in offers
+            if net != phantom or net == total]
 
 
 def _parse_price_offers_v2(

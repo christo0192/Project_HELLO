@@ -16211,3 +16211,17 @@ class SpeculativeCopyTest(unittest.TestCase):
             timings.append(time.perf_counter() - start)
         print(f"speculative_copy median: {statistics.median(timings) * 1000:.3f} ms",
               file=sys.stderr)
+
+
+class DiscountTotalReconcileEngineTests(unittest.TestCase):
+    def test_flag_latches_and_prompt(self):
+        for value in ("0", "1"):
+            with mock.patch.dict(os.environ, {"R1_DISCOUNT_TOTAL_RECONCILE": value,
+                                               "R1_INVENTED_OFFER_V2": "1"}):
+                eng = engine(seed="reconcile")
+                with mock.patch.dict(os.environ, {"R1_DISCOUNT_TOTAL_RECONCILE": "0"}):
+                    self.assertEqual(eng._total_reconcile, value == "1")
+                    self.assertEqual(eng.tracker.total_reconcile, value == "1")
+                    prompt = eng.judge_messages("hi", "hi")[0]["content"]
+                    self.assertEqual("If the candidate states a total of $8500" in prompt,
+                                     value == "1")

@@ -1311,6 +1311,9 @@ FLAG_PERSONA_TIMELINE_V3 = "R1_PERSONA_TIMELINE_V3"
 FLAG_PERK_HISTORY = "R1_PERK_HISTORY"
 # PROOF-1: recognize explicit discount lists as offers; 0 restores the previous reader.
 FLAG_DISCOUNT_READ_V3 = "R1_DISCOUNT_READ_V3"
+# Owner 2026-11-20: a discount next to a stated deck total reads as that deck discount; 0
+# restores the previous reader.
+FLAG_DISCOUNT_TOTAL_RECONCILE = "R1_DISCOUNT_TOTAL_RECONCILE"
 # PROOF-1: exclude learner conditions from concessions; 0 restores the previous reader.
 FLAG_CONCESSION_CONDITION = "R1_CONCESSION_CONDITION"
 
@@ -1483,6 +1486,7 @@ _FLAG_READS = {
     FLAG_MOVE_CONDITION: lambda: os.getenv("R1_MOVE_CONDITION"),
     FLAG_PERK_HISTORY: lambda: os.getenv("R1_PERK_HISTORY"),
     FLAG_DISCOUNT_READ_V3: lambda: os.getenv("R1_DISCOUNT_READ_V3"),
+    FLAG_DISCOUNT_TOTAL_RECONCILE: lambda: os.getenv("R1_DISCOUNT_TOTAL_RECONCILE"),
     FLAG_CONCESSION_CONDITION: lambda: os.getenv("R1_CONCESSION_CONDITION"),
     FLAG_PERSONA_TIMELINE_V3: lambda: os.getenv("R1_PERSONA_TIMELINE_V3"),
 }
@@ -1817,6 +1821,7 @@ class RolePlayEngine:
         self._move_condition = flag_on(FLAG_MOVE_CONDITION)
         self._perk_history = flag_on(FLAG_PERK_HISTORY)
         self._discount_read_v3 = flag_on(FLAG_DISCOUNT_READ_V3)
+        self._total_reconcile = flag_on(FLAG_DISCOUNT_TOTAL_RECONCILE)
         self._concession_condition = flag_on(FLAG_CONCESSION_CONDITION)
         self._condition_planned: list[dict[str, Any]] = []
         self._upgrade_condition_used = False
@@ -1841,6 +1846,7 @@ class RolePlayEngine:
             persona, seed=self.seed, invented_v2=self._invented_v2,
             discipline_v2=self._discipline_v2, perk_history=self._perk_history,
             discount_read_v3=self._discount_read_v3, strong_v2=self._strong_v2,
+            total_reconcile=self._total_reconcile,
         )
         self.tracker.families_planned = families
         self.ledger = GuardLedger()
@@ -7914,7 +7920,7 @@ class RolePlayEngine:
             learner_last,
             seed=self.seed,
             turn=self.turn if turn is None else turn,
-            v2=self._invented_v2,
+            v2=self._invented_v2, reconcile=self._total_reconcile,
         )
 
     def apply_judge(self, raw: Any, judged_turn: int) -> bool:

@@ -46,7 +46,7 @@ import hashlib
 import os
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Mapping
 
@@ -79,7 +79,7 @@ from r1_text import (
     split_sentences,
     word_count,
 )
-from r1_world import DISCOUNTS_USD, PRICE_USD, URGENCY_LEVER_IDS, claims_guarantee
+from r1_world import DISCOUNTS_USD, NET_PRICES_USD, PRICE_USD, URGENCY_LEVER_IDS, claims_guarantee
 
 SENTINEL_PREFIX = "CANDIDATE"
 
@@ -772,6 +772,7 @@ class DiscountMention:
     usd: int
     conditional: bool
     sentence_index: int
+    heard_usd: int | None = None
 
 
 def _amount_usd(digits: str, thousands: str | None) -> int | None:
@@ -798,7 +799,9 @@ def _declined(folded: str, match: re.Match[str], *, verb_in_match: bool) -> bool
     return bool(_ASK_ECHO.search(before)) and has_refusal(folded[match.end() :])
 
 
-def parse_discounts(text: object, *, v3: bool | None = None) -> list[DiscountMention]:
+def parse_discounts(
+    text: object, *, v3: bool | None = None, reconcile: bool | None = None
+) -> list[DiscountMention]:
     """Dollar discounts the candidate OFFERS, parsed deterministically.
 
     Covers "$500 off", "a discount of $1,000", "discounts of $500, $1000 and $1500",
@@ -810,16 +813,26 @@ def parse_discounts(text: object, *, v3: bool | None = None) -> list[DiscountMen
     "1500 dollars", "1500 usd", "$1.5k", "fifteen hundred dollars", "ten percent"), so it
     does not matter how speech-to-text writes a number.  A refusal is not an offer: see
     ``_declined``.
+
+    R1_DISCOUNT_TOTAL_RECONCILE implements the owner decision of 2026-11-20: a
+    stated deck total resolves one adjacent misheard discount.
     """
+    if reconcile is None:
+        reconcile = os.getenv("R1_DISCOUNT_TOTAL_RECONCILE", "1").strip().lower() not in (
+            "0", "off", "false", "no"
+        )
     if v3 is None:
         v3 = os.getenv("R1_DISCOUNT_READ_V3", "1").strip().lower() not in (
             "0", "off", "false", "no"
         )
     sentences = split_sentences(text)
     mentions: list[DiscountMention] = []
+    origins: dict[int, tuple[set[int], set[int]]] = {}
     for index, sentence in enumerate(sentences):
         folded = canonical_amounts(sentence)
         amounts: list[int] = []
+        explicit: set[int] = set()
+        derived: set[int] = set()
         for pattern in (_DISC_BEFORE, _DISC_VERB, _NET_OFFER):
             for match in pattern.finditer(folded):
                 value = _amount_usd(match.group(1), match.group(2))
@@ -832,9 +845,12 @@ def parse_discounts(text: object, *, v3: bool | None = None) -> list[DiscountMen
                 if _declined(folded, match, verb_in_match=pattern is not _DISC_BEFORE):
                     continue
                 amounts.append(value)
+                (derived if pattern is _NET_OFFER else explicit).add(value)
         for match in _DISC_LIST.finditer(folded):
             if not _declined(folded, match, verb_in_match=False):
-                amounts.extend(dollar_amounts(match.group(1)))
+                values = dollar_amounts(match.group(1))
+                amounts.extend(values)
+                explicit.update(values)
         if v3:
             mixed_list = re.compile(
                 r"\b(?:discounts?|reductions?|rebates?)\s+(?:of|worth)\s+"
@@ -843,11 +859,15 @@ def parse_discounts(text: object, *, v3: bool | None = None) -> list[DiscountMen
             )
             for match in mixed_list.finditer(folded):
                 if not _declined(folded, match, verb_in_match=False):
-                    amounts.extend(int(n.replace(",", "")) for n in
-                                   re.findall(r"\d+(?:,\d{3})*", match.group(1)))
+                    values = [int(n.replace(",", "")) for n in
+                              re.findall(r"\d+(?:,\d{3})*", match.group(1))]
+                    amounts.extend(values)
+                    explicit.update(values)
         for match in _DISC_PERCENT.finditer(folded):
             if not _declined(folded, match, verb_in_match=False):
-                amounts.append(int(round(PRICE_USD * float(match.group(1)) / 100)))
+                value = int(round(PRICE_USD * float(match.group(1)) / 100))
+                amounts.append(value)
+                explicit.add(value)
         if not amounts:
             continue
         conditional = bool(_CONDITIONAL.search(folded))
@@ -864,9 +884,44 @@ def parse_discounts(text: object, *, v3: bool | None = None) -> list[DiscountMen
                     following,
                 )
             )
+        origins[index] = (explicit, derived)
         for value in sorted(set(amounts)):
             mentions.append(DiscountMention(value, conditional, index))
-    return mentions
+    if not reconcile:
+        return mentions
+    # Prefer a stated deck discount over a nearby net-offer approximation.
+    mentions = [m for m in mentions if not (
+        m.usd not in DISCOUNTS_USD and m.usd in origins[m.sentence_index][1]
+        and m.usd not in origins[m.sentence_index][0]
+        and PRICE_USD - m.usd >= min(NET_PRICES_USD)
+        and any(abs(m.usd - d) <= 500 for d in
+                origins[m.sentence_index][0] & set(DISCOUNTS_USD))
+    )]
+    totals: list[tuple[int, int, bool]] = []
+    for index, sentence in enumerate(sentences):
+        folded = canonical_amounts(sentence)
+        for match in re.finditer(r"\$\s*(\d[\d,]*)", folded):
+            value = int(match.group(1).replace(",", ""))
+            if value in NET_PRICES_USD and not _declined(folded, match, verb_in_match=False):
+                totals.append((value, index, bool(_CONDITIONAL.search(folded))))
+    nondeck = [m for m in mentions if m.usd not in DISCOUNTS_USD]
+    distinct = {total for total, _, _ in totals}
+    if (len(nondeck) == 1 and len(distinct) == 1
+            and nondeck[0].usd in origins[nondeck[0].sentence_index][0]):
+        old = nondeck[0]
+        nearby = [(index, cond) for _, index, cond in totals
+                  if abs(index - old.sentence_index) <= 1]
+        if nearby:
+            new = DiscountMention(PRICE_USD - next(iter(distinct)),
+                                  old.conditional or any(c for _, c in nearby),
+                                  old.sentence_index, old.usd)
+            mentions = [new if m is old else m for m in mentions]
+    dedup: dict[tuple[int, int], DiscountMention] = {}
+    for mention in mentions:
+        key = (mention.sentence_index, mention.usd)
+        if key not in dedup or mention.heard_usd is not None:
+            dedup[key] = mention
+    return [dedup[key] for key in sorted(dedup)]
 
 
 def urgency_levers(text: object) -> tuple[frozenset[str], bool]:
@@ -886,7 +941,7 @@ def urgency_levers(text: object) -> tuple[frozenset[str], bool]:
 
 def invented_offer_in(
     text: object, *, v2: bool = False, perk_history: bool | None = None,
-    discount_v3: bool | None = None,
+    discount_v3: bool | None = None, reconcile: bool | None = None,
 ) -> bool:
     """A free extra, a guarantee, or a discount outside the deck's $500/$1000/$1500 set.
 
@@ -965,7 +1020,7 @@ def invented_offer_in(
         return True
     return any(
         mention.usd not in DISCOUNTS_USD or mention.usd > DISCOUNT_CAP_USD
-        for mention in parse_discounts(text, v3=discount_v3)
+        for mention in parse_discounts(text, v3=discount_v3, reconcile=reconcile)
     )
 
 
@@ -2014,7 +2069,8 @@ def neutralise_candidate_text(text: object, sentinel: str) -> str:
 
 
 def build_judge_messages(
-    candidate_text: object, learner_last: object, *, seed: str, turn: int, v2: bool = False
+    candidate_text: object, learner_last: object, *, seed: str, turn: int, v2: bool = False,
+    reconcile: bool = False
 ) -> list[dict[str, str]]:
     """Messages for the shadow judge.  JSON is requested in the prompt, not by a flag."""
     sentinel = sentinel_for(seed, turn)
@@ -2045,6 +2101,12 @@ def build_judge_messages(
             "promise, or a guaranteed job, placement or salary. The deck discounts, a payment "
             "plan, comparing the course with free online courses, and saying no guarantee is "
             "possible are NOT invented offers."
+        )
+    if v2 and reconcile:
+        system += (
+            " If the candidate states a total of $8500, $8000 or $7500, read the discount "
+            "as $500, $1000 or $1500 respectively, whatever discount figure is written "
+            "(speech-to-text often mishears it)."
         )
     user = (
         f"Learner's last line: {neutralise_candidate_text(learner_last, sentinel)}\n"
@@ -2189,6 +2251,7 @@ class CoverageTracker:
         self, persona: RenderedPersona, *, seed: str = "", invented_v2: bool = False,
         discipline_v2: bool = False, perk_history: bool = True,
         discount_read_v3: bool = True, strong_v2: bool | None = None,
+        total_reconcile: bool | None = None,
     ) -> None:
         self.persona = persona
         self.seed = seed
@@ -2196,6 +2259,12 @@ class CoverageTracker:
         self.discipline_v2 = discipline_v2
         self.perk_history = perk_history
         self.discount_read_v3 = discount_read_v3
+        self.total_reconcile = total_reconcile if total_reconcile is not None else (
+            os.getenv("R1_DISCOUNT_TOTAL_RECONCILE", "1").strip().lower()
+            not in ("0", "off", "false", "no")
+        )
+        self._reconciled_turns: set[int] = set()
+        self._rule_invented_turns: set[int] = set()
         self.strong_v2 = strong_v2 if strong_v2 is not None else (
             os.getenv("R1_STRONG_EVIDENCE_V2", "1").strip().lower()
             not in ("0", "off", "false", "no")
@@ -2235,7 +2304,9 @@ class CoverageTracker:
         for sentence in split_sentences(text):
             canonical = canonical_amounts(expand_shorthand_amounts(sentence))
             discount_amounts = {
-                mention.usd for mention in parse_discounts(sentence, v3=self.discount_read_v3)
+                mention.usd for mention in parse_discounts(
+                    sentence, v3=self.discount_read_v3, reconcile=self.total_reconcile
+                )
             }
             self.fee_named |= any(
                 amount in {PRICE_USD, *(PRICE_USD - d for d in DISCOUNTS_USD)}
@@ -2261,14 +2332,25 @@ class CoverageTracker:
         self.guarantee_claimed |= claims_guarantee(text)
         self._turn_had_question[self.turn] = update.question
         value_index = _first_value_sentence(text)
-        discounts = parse_discounts(text, v3=self.discount_read_v3)
+        discounts = parse_discounts(
+            text, v3=self.discount_read_v3, reconcile=self.total_reconcile
+        )
+        reverse_candidate = self.total_reconcile and any(
+            _NET_OFFER.search(canonical_amounts(sentence)) for sentence in split_sentences(text)
+        )
+        if (any(m.heard_usd is not None for m in discounts) or
+                (reverse_candidate and discounts != parse_discounts(
+                    text, v3=self.discount_read_v3, reconcile=False))):
+            self._reconciled_turns.add(self.turn)
         if discount_question_open:
-            discounts = [DiscountMention(m.usd, True, m.sentence_index) for m in discounts]
+            discounts = [replace(m, conditional=True) for m in discounts]
         if self.discipline_v2:
             sentences = split_sentences(canonical_amounts(expand_shorthand_amounts(text)))
             previous_amounts: list[tuple[int, int, int]] = []
             for index, sentence in enumerate(sentences):
-                offered = {m.usd for m in parse_discounts(sentence, v3=self.discount_read_v3)}
+                offered = {m.usd for m in parse_discounts(
+                    sentence, v3=self.discount_read_v3, reconcile=self.total_reconcile
+                )}
                 figures = [(m.start(), m.end(), int(m.group(1).replace(",", "")))
                            for m in re.finditer(r"\$\s*(\d[\d,]*)", sentence)]
                 deck_list = {500, 1000, 1500}.issubset({v for _, _, v in figures})
@@ -2308,6 +2390,8 @@ class CoverageTracker:
                     "usd": mention.usd,
                     "conditional": mention.conditional,
                     "value_before": value_before,
+                    **({"heard_usd": mention.heard_usd}
+                       if mention.heard_usd is not None else {}),
                 }
             )
         if value_index is not None and self.first_value_turn is None:
@@ -2318,7 +2402,7 @@ class CoverageTracker:
         self.coercive_urgency = self.coercive_urgency or coercive
         invented = invented_offer_in(
             text, v2=self.invented_v2, perk_history=self.perk_history,
-            discount_v3=self.discount_read_v3,
+            discount_v3=self.discount_read_v3, reconcile=self.total_reconcile,
         )
         if self.invented_v2 and not invented and (
             re.search(r"\bfree\b|\bat no (?:extra |additional )?(?:cost|charge)\b",
@@ -2329,6 +2413,7 @@ class CoverageTracker:
             self._perk_shape_turns.add(self.turn)
         if self.invented_v2 and invented:
             self._rule_invented = True
+            self._rule_invented_turns.add(self.turn)
         self.invented_offer = self.invented_offer or invented
         injection = detect_injection(text)
         if injection:
@@ -2372,11 +2457,15 @@ class CoverageTracker:
             current = self.family_quality.get(family)
             self.family_quality[family] = value if current is None else max(current, value)
         if self.invented_v2:
-            if result.invented_offer:
+            judge_invented = result.invented_offer and not (
+                self.total_reconcile and judged_turn in self._reconciled_turns
+                and judged_turn not in self._rule_invented_turns
+            )
+            if judge_invented:
                 self.judge_invented_turns += 1
             self.invented_offer = self.invented_offer or (
                 self.judge_invented_turns >= 2
-                or (result.invented_offer and judged_turn not in self._perk_shape_turns)
+                or (judge_invented and judged_turn not in self._perk_shape_turns)
                 or (self.judge_invented_turns >= 1 and self._rule_invented)
             )
         else:
