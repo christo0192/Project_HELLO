@@ -303,6 +303,7 @@
         "R1_DISCOUNT_TOTAL_RECONCILE": { "requiredInProduction": false, "secret": false },
         "R1_INDIA_PLAYBOOK": { "requiredInProduction": false, "secret": false },
         "R1_CONCESSION_CONDITION": { "requiredInProduction": false, "secret": false },
+        "R1_CONCESSION_FRAMES_V3": { "requiredInProduction": false, "secret": false },
         "R1_PERSONA_TIMELINE_V3": { "requiredInProduction": false, "secret": false },
         "R1_CLOSING_STATE": { "requiredInProduction": false, "secret": false },
         "R1_EARLY_CLOSE_ASIDE": { "requiredInProduction": false, "secret": false },

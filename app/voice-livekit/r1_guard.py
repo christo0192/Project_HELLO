@@ -2444,6 +2444,7 @@ def _price_accepted(sentence: str, ctx: GuardContext) -> bool:
     return any(
         not negated_before(folded, match.start())
         and _DOUBT_FRAME.search(clause_before(folded, match.start())) is None
+        and not _concession_frames_v3(folded, match)
         and (os.getenv("R1_CONCESSION_CONDITION", "1").strip().lower()
              in ("0", "off", "false", "no")
              or _CONDITION_FRAME.search(clause_before(folded, match.start())) is None)
@@ -4201,6 +4202,34 @@ _CONDITION_FRAME = re.compile(
 )
 
 
+_DOUBT_FRAME_V3 = re.compile(
+    r"\b(?:(?:want|need|have|like|got) to feel (?:sure|certain|confident|comfortable)"
+    r"|i'?d (?:want|like) to (?:feel|know|see))\b", re.IGNORECASE,
+)
+_CONDITION_FRAME_V3 = re.compile(
+    r"\b(?:if|once|as long as|provided(?: that)?|unless|until|only if)\s+"
+    r"(?:i'm|i am|i feel|i felt|i was|i were|we're|we are)\s+"
+    r"(?:(?:really|fully|truly|completely)\s+)?(?:convinced|sure|certain|confident)\b",
+    re.IGNORECASE,
+)
+
+
+def _concession_frames_v3(folded: str, match: re.Match) -> bool:
+    """Recognize frames starting before the match, including a matched state word."""
+    if os.getenv("R1_CONCESSION_FRAMES_V3", "1").strip().lower() in (
+        "0", "off", "false", "no",
+    ):
+        return False
+    before = clause_before(folded, match.start())
+    # A state word such as "convinced" can itself be the concession match.
+    clause = before + match.group()
+    return any(
+        frame.start() < len(before)
+        for pattern in (_DOUBT_FRAME_V3, _CONDITION_FRAME_V3)
+        for frame in pattern.finditer(clause)
+    )
+
+
 def has_concession(text: object) -> bool:
     """True when ``text`` expresses resolution, acceptance or "you've convinced me".
 
@@ -4218,6 +4247,7 @@ def has_concession(text: object) -> bool:
     return any(
         not negated_before(folded, match.start())
         and _DOUBT_FRAME.search(clause_before(folded, match.start())) is None
+        and not _concession_frames_v3(folded, match)
         and (os.getenv("R1_CONCESSION_CONDITION", "1").strip().lower()
              in ("0", "off", "false", "no")
              or _CONDITION_FRAME.search(clause_before(folded, match.start())) is None)
