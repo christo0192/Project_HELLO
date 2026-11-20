@@ -22,16 +22,38 @@
  * membership test compares lower-cased. Times are strict ISO-8601 with `Z` or `+hh:mm` and are
  * returned as canonical `toISOString()` instants.
  *
+ * Dex membership fails closed (PR #433 review F3): `dex_absent` is destructive, so it is only ever
+ * decided from interviewer data that is present and readable. A missing or non-UUID Dex user id
+ * refuses the parse (`invalid_dex_user_id`); an event with neither `interviewers` nor the deprecated
+ * `interviewerUserIds` is `malformed_event`; and Dex counts as an interviewer when EITHER list names
+ * him (an empty `interviewers` never hides him in the deprecated list).
+ *
+ * One bad event does not hide the rest (review F5): an event that breaks a per-event rule but whose
+ * readable interviewer data proves Dex is NOT on it is skipped (counted in
+ * `skippedNonDexEventCount`). Any other event-level refusal still refuses the whole schedule, but
+ * the failure then carries the schedule's `identity` (id, status, updatedAt), so a cancellation
+ * still reaches the runtime.
+ *
  * Contracts handed to later slices:
  *  - S03 routes these two actions BEFORE the generic Ashby extractor (which finds no id in a
  *    schedule payload and would answer 400), using `parseR1MeetAshbyScheduleWebhook` and
- *    `r1MeetAshbyScheduleDedupKey` (Ashby sends no delivery id for these actions) for receipts.
- *  - S06 acts on `selectR1MeetDexEvents`: only `cancelled`, `dex_absent` and "the event is no
- *    longer in the schedule" are destructive for an existing booking; `not_scheduled`,
- *    `no_attester`, `no_meet_link` and `in_past` hold. Once a bot is in the call only the
- *    destructive outcomes act, so a status flip to `WaitingOnFeedback` / `Complete` at the end of
- *    the call never ends a live interview. S06 also ignores a payload whose `latestUpdatedAt` is
- *    older than the booking's stored one (out-of-order delivery).
+ *    `r1MeetAshbyScheduleDedupKey(schedule, receivedAtMs)` (Ashby sends no delivery id for these
+ *    actions) for receipts.
+ *  - S06 acts on `selectR1MeetDexEvents` (precedence: `dex_absent`, `cancelled`, `in_past`,
+ *    `not_scheduled`, `no_attester`, `no_meet_link`, `eligible`; review F2):
+ *     - destructive for an existing booking, even with a bot in the call: `cancelled`, `dex_absent`,
+ *       the event no longer in the schedule, and a REFUSED schedule whose `identity.status` is
+ *       `Cancelled` (every booking of `identity.scheduleId`);
+ *     - `in_past` (the slot has started, or the clock is unusable) holds, so a status flip to
+ *       `WaitingOnFeedback` / `Complete`, or a dropped link, during or after the call never ends a
+ *       live interview;
+ *     - `not_scheduled`, `no_attester` and `no_meet_link` are only ever decided for a FUTURE slot:
+ *       S06 unschedules a bot that has not been dispatched yet (keeping the booking, so a later
+ *       update can re-arm it) and holds one already dispatched for the join window;
+ *     - any other refused schedule holds (changes nothing);
+ *     - S06 ignores a payload whose `latestUpdatedAt` is older than the booking's stored one
+ *       (out-of-order delivery); when it is null S06 cannot tell, applies payloads in receipt order
+ *       and compares each with the stored booking, so a re-processed duplicate is a no-op.
  *  - `R1_MEET_DEX_EVENT_DECISIONS` is the contract for the booking reason CHECK (S02).
  *
  * Pure: reads no environment, performs no I/O, reads no clock (the selector takes `nowMs`) and does
@@ -83,15 +105,17 @@ export const R1_MEET_ASHBY_MAX_EVENT_DURATION_MS = 24 * 3600 * 1000;
 
 /**
  * The per-event decisions of `selectR1MeetDexEvents`, in precedence order (the first that applies
- * wins). The booking reason CHECK (M034 S02) must accept every value. Frozen.
+ * wins). `in_past` precedes the three decisions S06 may act on before the call (review F2), so those
+ * are only ever decided for a future slot. The booking reason CHECK (M034 S02) must accept every
+ * value. Frozen.
  */
 export const R1_MEET_DEX_EVENT_DECISIONS = Object.freeze([
   'dex_absent',
   'cancelled',
+  'in_past',
   'not_scheduled',
   'no_attester',
   'no_meet_link',
-  'in_past',
   'eligible',
 ] as const);
 
@@ -99,6 +123,7 @@ export type R1MeetDexEventDecision = (typeof R1_MEET_DEX_EVENT_DECISIONS)[number
 
 /** Why `parseR1MeetAshbySchedule` refused a schedule (closed set). Frozen. */
 export const R1_MEET_ASHBY_SCHEDULE_PARSE_FAILURES = Object.freeze([
+  'invalid_dex_user_id',
   'not_object',
   'malformed_schedule',
   'malformed_status',
@@ -160,20 +185,43 @@ export interface R1MeetAshbySchedule {
   readonly latestUpdatedAt: string | null;
   /** Sorted by `startTime`, then `eventId`. */
   readonly events: readonly R1MeetAshbyScheduleEvent[];
+  /** Malformed events whose readable interviewer data proves Dex is not on them (review F5). */
+  readonly skippedNonDexEventCount: number;
 }
 
 export interface R1MeetAshbyScheduleParseOptions {
-  /** The Ashby user id of "Dex (AI Interviewer)"; null (or anything not a UUID) matches no one. */
+  /**
+   * The Ashby user id of "Dex (AI Interviewer)": a UUID. Null, or anything else, refuses the parse
+   * (`invalid_dex_user_id`) rather than reading every event as Dex-absent (review F3).
+   */
   readonly dexUserId: string | null;
+}
+
+/**
+ * The schedule-level fields of a schedule refused for an EVENT-level reason (review F5), so the
+ * runtime can still act on a cancellation. Absent when the schedule's own fields did not parse.
+ */
+export interface R1MeetAshbyScheduleIdentity {
+  readonly scheduleId: string;
+  readonly status: R1MeetAshbyScheduleStatus;
+  readonly updatedAt: string | null;
 }
 
 export type R1MeetAshbyScheduleParseResult =
   | { readonly ok: true; readonly schedule: R1MeetAshbySchedule }
-  | { readonly ok: false; readonly reason: R1MeetAshbyScheduleParseFailure };
+  | {
+    readonly ok: false;
+    readonly reason: R1MeetAshbyScheduleParseFailure;
+    readonly identity?: R1MeetAshbyScheduleIdentity;
+  };
 
 export type R1MeetAshbyScheduleWebhookResult =
   | { readonly ok: true; readonly action: R1MeetAshbyScheduleAction; readonly schedule: R1MeetAshbySchedule }
-  | { readonly ok: false; readonly reason: R1MeetAshbyScheduleWebhookFailure };
+  | {
+    readonly ok: false;
+    readonly reason: R1MeetAshbyScheduleWebhookFailure;
+    readonly identity?: R1MeetAshbyScheduleIdentity;
+  };
 
 export interface R1MeetDexEventSelection {
   readonly eventId: string;
@@ -201,7 +249,10 @@ const EMAIL_FORBIDDEN_CHARS = /[\s\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Zl}\p{Zp}]/u;
 const KNOWN_STATUSES: ReadonlySet<string> = new Set(ASHBY_INTERVIEW_SCHEDULE_STATUSES);
 
 class ParseFailure {
-  constructor(readonly reason: R1MeetAshbyScheduleParseFailure) {}
+  constructor(
+    readonly reason: R1MeetAshbyScheduleParseFailure,
+    readonly identity?: R1MeetAshbyScheduleIdentity,
+  ) {}
 }
 
 function fail(reason: R1MeetAshbyScheduleParseFailure): never {
@@ -318,19 +369,24 @@ function boundedArray(value: unknown, max: number): readonly unknown[] {
 }
 
 /**
- * Interviewer ids from `interviewers[].id`; the deprecated `interviewerUserIds` is read only when
- * `interviewers` is absent or null. Entries must be objects (resp. strings); entries without a UUID
- * are skipped.
+ * Interviewer ids: the UNION of `interviewers[].id` and the deprecated `interviewerUserIds`, each
+ * read when present (review F3: an empty `interviewers` must not hide Dex named in the deprecated
+ * list). Entries must be objects (resp. strings); entries without a UUID are skipped. With neither
+ * list present Dex membership is unknown, which is `malformed_event`, never "Dex absent".
  */
 function parseInterviewerIds(rawInterviewers: unknown, rawLegacyIds: unknown): string[] {
+  const hasInterviewers = rawInterviewers !== undefined && rawInterviewers !== null;
+  const hasLegacyIds = rawLegacyIds !== undefined && rawLegacyIds !== null;
+  if (!hasInterviewers && !hasLegacyIds) fail('malformed_event');
   const ids: string[] = [];
-  if (rawInterviewers !== undefined && rawInterviewers !== null) {
+  if (hasInterviewers) {
     for (const entry of boundedArray(rawInterviewers, R1_MEET_ASHBY_MAX_INTERVIEWERS)) {
       if (!isPlainObject(entry)) fail('malformed_event');
       const id = entry.id;
       if (isUuid(id)) ids.push(id);
     }
-  } else if (rawLegacyIds !== undefined && rawLegacyIds !== null) {
+  }
+  if (hasLegacyIds) {
     for (const entry of boundedArray(rawLegacyIds, R1_MEET_ASHBY_MAX_INTERVIEWERS)) {
       if (typeof entry !== 'string') fail('malformed_event');
       if (isUuid(entry)) ids.push(entry);
@@ -339,7 +395,25 @@ function parseInterviewerIds(rawInterviewers: unknown, rawLegacyIds: unknown): s
   return canonicalIds(ids);
 }
 
-function parseEvent(raw: unknown, dexLower: string | null): R1MeetAshbyScheduleEvent {
+function hasDex(interviewerUserIds: readonly string[], dexLower: string): boolean {
+  return interviewerUserIds.some((id) => id.toLowerCase() === dexLower);
+}
+
+/**
+ * True only when `raw` is an object whose interviewer data is present and readable and does not
+ * name Dex (review F5). Unknown membership is false. A throwing getter propagates.
+ */
+function isProvablyNotDexEvent(raw: unknown, dexLower: string): boolean {
+  if (!isPlainObject(raw)) return false;
+  try {
+    return !hasDex(parseInterviewerIds(raw.interviewers, raw.interviewerUserIds), dexLower);
+  } catch (error) {
+    if (error instanceof ParseFailure) return false;
+    throw error;
+  }
+}
+
+function parseEvent(raw: unknown, dexLower: string): R1MeetAshbyScheduleEvent {
   if (!isPlainObject(raw)) fail('malformed_event');
   const eventId = raw.id;
   const interviewId = raw.interviewId;
@@ -351,7 +425,7 @@ function parseEvent(raw: unknown, dexLower: string | null): R1MeetAshbyScheduleE
   const updatedAt = optionalInstant(raw.updatedAt, 'malformed_event');
   const link = parseMeetingLink(raw.meetingLink);
   const interviewerUserIds = parseInterviewerIds(raw.interviewers, raw.interviewerUserIds);
-  const dexIsInterviewer = dexLower !== null && interviewerUserIds.some((id) => id.toLowerCase() === dexLower);
+  const dexIsInterviewer = hasDex(interviewerUserIds, dexLower);
   return {
     eventId,
     interviewId,
@@ -386,15 +460,44 @@ function latestOf(instants: ReadonlyArray<string | null>): string | null {
   return latest;
 }
 
-function dexLowerOf(options: unknown): string | null {
-  if (!isPlainObject(options)) return null;
-  const dexUserId = options.dexUserId;
-  return isUuid(dexUserId) ? dexUserId.toLowerCase() : null;
+/** The lower-cased Dex user id, or `invalid_dex_user_id` (review F3: never "Dex matches no one"). */
+function dexLowerOf(options: unknown): string {
+  const dexUserId = isPlainObject(options) ? options.dexUserId : undefined;
+  if (!isUuid(dexUserId)) fail('invalid_dex_user_id');
+  return dexUserId.toLowerCase();
+}
+
+/** The events (sorted), and how many provably non-Dex malformed events were skipped (review F5). */
+function parseEvents(rawEvents: unknown, dexLower: string): { events: R1MeetAshbyScheduleEvent[]; skipped: number } {
+  if (rawEvents === undefined || rawEvents === null) return { events: [], skipped: 0 };
+  if (!Array.isArray(rawEvents)) fail('malformed_events');
+  const list = Array.from(rawEvents as readonly unknown[]);
+  if (list.length > R1_MEET_ASHBY_MAX_EVENTS) fail('too_many_events');
+  const events: R1MeetAshbyScheduleEvent[] = [];
+  const seen = new Set<string>();
+  let skipped = 0;
+  for (const entry of list) {
+    let event: R1MeetAshbyScheduleEvent;
+    try {
+      event = parseEvent(entry, dexLower);
+    } catch (error) {
+      if (error instanceof ParseFailure && isProvablyNotDexEvent(entry, dexLower)) {
+        skipped += 1;
+        continue;
+      }
+      throw error;
+    }
+    const key = event.eventId.toLowerCase();
+    if (seen.has(key)) fail('duplicate_event_id');
+    seen.add(key);
+    events.push(event);
+  }
+  return { events: events.sort(compareEvents), skipped };
 }
 
 function buildSchedule(raw: unknown, options: unknown): R1MeetAshbySchedule {
-  if (!isPlainObject(raw)) fail('not_object');
   const dexLower = dexLowerOf(options);
+  if (!isPlainObject(raw)) fail('not_object');
 
   const scheduleId = raw.id;
   const applicationId = raw.applicationId;
@@ -413,22 +516,15 @@ function buildSchedule(raw: unknown, options: unknown): R1MeetAshbySchedule {
   const createdAt = optionalInstant(raw.createdAt, 'malformed_schedule');
   const updatedAt = optionalInstant(raw.updatedAt, 'malformed_schedule');
 
-  const rawEvents = raw.interviewEvents;
-  let events: R1MeetAshbyScheduleEvent[] = [];
-  if (rawEvents !== undefined && rawEvents !== null) {
-    if (!Array.isArray(rawEvents)) fail('malformed_events');
-    const list = Array.from(rawEvents as readonly unknown[]);
-    if (list.length > R1_MEET_ASHBY_MAX_EVENTS) fail('too_many_events');
-    const seen = new Set<string>();
-    for (const entry of list) {
-      const event = parseEvent(entry, dexLower);
-      const key = event.eventId.toLowerCase();
-      if (seen.has(key)) fail('duplicate_event_id');
-      seen.add(key);
-      events.push(event);
-    }
-    events = events.sort(compareEvents);
+  let parsedEvents: { events: R1MeetAshbyScheduleEvent[]; skipped: number };
+  try {
+    parsedEvents = parseEvents(raw.interviewEvents, dexLower);
+  } catch (error) {
+    // Review F5: an event-level refusal still tells the runtime which schedule it was and its status.
+    if (error instanceof ParseFailure) throw new ParseFailure(error.reason, { scheduleId, status, updatedAt });
+    throw error;
   }
+  const { events, skipped } = parsedEvents;
 
   // The email is added below as a non-enumerable property (R28), so it is not in this literal.
   const schedule: Omit<R1MeetAshbySchedule, 'scheduledByEmail'> = {
@@ -442,6 +538,7 @@ function buildSchedule(raw: unknown, options: unknown): R1MeetAshbySchedule {
     updatedAt,
     latestUpdatedAt: latestOf([updatedAt, ...events.map((event) => event.updatedAt)]),
     events,
+    skippedNonDexEventCount: skipped,
   };
   Object.defineProperty(schedule, 'scheduledByEmail', {
     value: scheduledBy.email,
@@ -455,7 +552,8 @@ function buildSchedule(raw: unknown, options: unknown): R1MeetAshbySchedule {
 /**
  * Parse an Ashby `interviewSchedule` object (the `data.interviewSchedule` of the two webhook
  * actions). Unknown fields are ignored; the result is deep-frozen. Never throws: any failure,
- * including a throwing getter, is a closed reason.
+ * including a throwing getter, is a closed reason. A refusal for an event-level reason carries the
+ * schedule's `identity` (review F5); every other refusal is exactly `{ ok: false, reason }`.
  */
 export function parseR1MeetAshbySchedule(
   raw: unknown,
@@ -464,8 +562,9 @@ export function parseR1MeetAshbySchedule(
   try {
     return Object.freeze({ ok: true as const, schedule: buildSchedule(raw, options) });
   } catch (error) {
-    const reason = error instanceof ParseFailure ? error.reason : 'malformed_schedule';
-    return Object.freeze({ ok: false as const, reason });
+    if (!(error instanceof ParseFailure)) return Object.freeze({ ok: false as const, reason: 'malformed_schedule' as const });
+    if (error.identity === undefined) return Object.freeze({ ok: false as const, reason: error.reason });
+    return deepFreeze({ ok: false as const, reason: error.reason, identity: { ...error.identity } });
   }
 }
 
@@ -520,6 +619,7 @@ function fingerprintProjection(schedule: R1MeetAshbySchedule): unknown {
     updatedAt: schedule.updatedAt,
     latestUpdatedAt: schedule.latestUpdatedAt,
     events,
+    skippedNonDexEventCount: schedule.skippedNonDexEventCount,
   };
 }
 
@@ -531,15 +631,34 @@ export function r1MeetAshbyScheduleFingerprint(schedule: R1MeetAshbySchedule): s
   return createHash('sha256').update(JSON.stringify(fingerprintProjection(schedule)), 'utf8').digest('hex');
 }
 
+/** Largest epoch ms a `Date` can hold. */
+const MAX_EPOCH_MS = 8.64e15;
+
 /**
  * The receipt dedupe id for an Ashby schedule webhook (Ashby sends no delivery id for these
- * actions): `ashby-schedule:<scheduleId>:<latestUpdatedAt epoch ms or 0>:<16 hex of the
- * fingerprint>`, at most 256 characters of `[A-Za-z0-9_.:-]`. Identical retries converge; a change
- * that is later reverted (A→B→A) stays distinct while Ashby bumps `updatedAt`.
+ * actions), at most 256 characters of `[A-Za-z0-9_.:-]`:
+ *  - `ashby-schedule:<scheduleId>:<latestUpdatedAt epoch ms>:<16 hex of the fingerprint>` while the
+ *    payload carries an `updatedAt`. Identical retries converge, and a change that is later reverted
+ *    (A→B→A) stays distinct because Ashby bumps `updatedAt`. `receivedAtMs` is ignored.
+ *  - `ashby-schedule:<scheduleId>:r<receivedAtMs>:<16 hex>` when nothing carries `updatedAt`
+ *    (review F4). Without a stamp A→B→A would collapse onto the first A's key and the revert would
+ *    be dropped as a duplicate, so the receipt time (S03's clock, epoch ms, truncated) keeps every
+ *    delivery distinct. The price: Ashby's own retries of such a delivery are processed again,
+ *    which is harmless because S06 compares each payload with the stored booking. A receipt time
+ *    that is not a finite epoch ms in range becomes `r0`.
  */
-export function r1MeetAshbyScheduleDedupKey(schedule: R1MeetAshbySchedule): string {
-  const latestMs = schedule.latestUpdatedAt === null ? 0 : Date.parse(schedule.latestUpdatedAt);
-  const stamp = Number.isFinite(latestMs) ? String(latestMs) : '0';
+export function r1MeetAshbyScheduleDedupKey(schedule: R1MeetAshbySchedule, receivedAtMs: number): string {
+  const latestMs = schedule.latestUpdatedAt === null ? Number.NaN : Date.parse(schedule.latestUpdatedAt);
+  let stamp: string;
+  if (Number.isFinite(latestMs)) {
+    stamp = String(latestMs);
+  } else {
+    const received =
+      typeof receivedAtMs === 'number' && Number.isFinite(receivedAtMs) && receivedAtMs >= 0 && receivedAtMs <= MAX_EPOCH_MS
+        ? Math.trunc(receivedAtMs)
+        : 0;
+    stamp = `r${received}`;
+  }
   const fingerprint = r1MeetAshbyScheduleFingerprint(schedule).slice(0, 16);
   return `ashby-schedule:${schedule.scheduleId}:${stamp}:${fingerprint}`;
 }
@@ -553,20 +672,24 @@ function decide(
 ): R1MeetDexEventDecision {
   if (event.dexIsInterviewer !== true) return 'dex_absent';
   if (schedule.status === 'Cancelled') return 'cancelled';
-  if (schedule.status !== 'Scheduled') return 'not_scheduled';
-  if (typeof schedule.scheduledByUserId !== 'string') return 'no_attester';
-  if (event.meetingLinkKind !== 'google_meet' || typeof event.meetUrl !== 'string') return 'no_meet_link';
+  // Review F2: decided before the status, attester and link checks, so those three are only ever
+  // reported for a future slot (S06 may unschedule an undispatched bot) and a change during or
+  // after the call holds.
   const startMs = Date.parse(event.startTime);
   if (typeof nowMs !== 'number' || !Number.isFinite(nowMs) || !Number.isFinite(startMs) || startMs <= nowMs) {
     return 'in_past';
   }
+  if (schedule.status !== 'Scheduled') return 'not_scheduled';
+  if (typeof schedule.scheduledByUserId !== 'string') return 'no_attester';
+  if (event.meetingLinkKind !== 'google_meet' || typeof event.meetUrl !== 'string') return 'no_meet_link';
   return 'eligible';
 }
 
 /**
  * One decision per event of `schedule` (same order as `schedule.events`); the first decision of
- * `R1_MEET_DEX_EVENT_DECISIONS` that applies wins. A non-finite `nowMs` makes every Dex event
- * `in_past`. Frozen; never throws (an unreadable schedule yields an empty list).
+ * `R1_MEET_DEX_EVENT_DECISIONS` that applies wins. A non-finite `nowMs` makes every Dex event that
+ * is not cancelled `in_past` (hold). Frozen; never throws (an unreadable schedule yields an empty
+ * list).
  */
 export function selectR1MeetDexEvents(
   schedule: R1MeetAshbySchedule,

@@ -57,6 +57,8 @@ import {
 const OPTIONS = { dexUserId: FIXTURE_DEX_USER_ID } as const;
 /** Ten days before the fixture slot. */
 const NOW_MS = Date.parse('2026-11-21T10:00:00.000Z');
+/** When S03 received the webhook (only used by the dedupe key when nothing carries `updatedAt`). */
+const RECEIVED_MS = Date.parse('2026-11-20T09:00:06.000Z');
 
 /** A synthetic UUID for index `n` (distinct from every fixture id). */
 function uuidFor(n: number): string {
@@ -144,7 +146,27 @@ const EXPECTED_SCHEDULE = {
   updatedAt: FIXTURE_SCHEDULE_UPDATED_AT,
   latestUpdatedAt: FIXTURE_EVENT_UPDATED_AT,
   events: [EXPECTED_EVENT],
+  skippedNonDexEventCount: 0,
 };
+
+/** The schedule-level identity a refused schedule carries once its own fields parsed (review F5). */
+const EXPECTED_IDENTITY = {
+  scheduleId: FIXTURE_SCHEDULE_ID,
+  status: 'Scheduled',
+  updatedAt: FIXTURE_SCHEDULE_UPDATED_AT,
+};
+
+/** A non-Dex event on another day (so it never collides with the fixture event). */
+function nonDexEvent(options: AshbyInterviewEventOptions = {}): Record<string, unknown> {
+  return makeAshbyInterviewEvent({
+    id: uuidFor(0x51),
+    interviewId: uuidFor(0x52),
+    startTime: '2026-12-02T10:30:00Z',
+    endTime: '2026-12-02T11:00:00Z',
+    interviewerIds: [FIXTURE_OTHER_INTERVIEWER_ID],
+    ...options,
+  });
+}
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -182,13 +204,15 @@ describe('contract constants', () => {
   });
 
   it('pins the Dex decisions in precedence order (the S02 booking reason contract), frozen', () => {
+    // `in_past` comes before the hold-or-unschedule decisions (review F2): a future event that
+    // loses its Meet link or its Scheduled status is told apart from one whose call has started.
     expect(R1_MEET_DEX_EVENT_DECISIONS).toEqual([
       'dex_absent',
       'cancelled',
+      'in_past',
       'not_scheduled',
       'no_attester',
       'no_meet_link',
-      'in_past',
       'eligible',
     ]);
     expect(Object.isFrozen(R1_MEET_DEX_EVENT_DECISIONS)).toBe(true);
@@ -196,6 +220,7 @@ describe('contract constants', () => {
 
   it('pins the closed parse failure reasons, frozen', () => {
     expect(R1_MEET_ASHBY_SCHEDULE_PARSE_FAILURES).toEqual([
+      'invalid_dex_user_id',
       'not_object',
       'malformed_schedule',
       'malformed_status',
@@ -226,6 +251,7 @@ describe('parseR1MeetAshbySchedule: the full fixture', () => {
       'updatedAt',
       'latestUpdatedAt',
       'events',
+      'skippedNonDexEventCount',
     ]);
     expect(Object.keys(parsed.events[0]!)).toEqual([
       'eventId',
@@ -444,6 +470,19 @@ describe('parseR1MeetAshbyScheduleWebhook', () => {
     expect(result).toStrictEqual({ ok: false, reason: 'malformed_status' });
     expect(Object.isFrozen(result)).toBe(true);
   });
+
+  it('passes the identity of a schedule refused for an event through, so a cancellation still arrives', () => {
+    const broken = makeAshbyInterviewEvent({ startTime: 'soon' });
+    const body = makeAshbyScheduleWebhookBody('interviewScheduleUpdate', schedule({ status: 'Cancelled', interviewEvents: [broken] }));
+    const result = parseR1MeetAshbyScheduleWebhook(body, OPTIONS);
+    expect(result).toStrictEqual({ ok: false, reason: 'malformed_event', identity: { ...EXPECTED_IDENTITY, status: 'Cancelled' } });
+    expect(isDeepFrozen(result)).toBe(true);
+  });
+
+  it('refuses a missing or non-UUID Dex user id before reading the schedule', () => {
+    const body = makeAshbyScheduleWebhookBody('interviewScheduleCreate');
+    expect(parseR1MeetAshbyScheduleWebhook(body, { dexUserId: null })).toStrictEqual({ ok: false, reason: 'invalid_dex_user_id' });
+  });
 });
 
 // ── Status ──────────────────────────────────────────────────────────────────
@@ -647,6 +686,78 @@ describe('interview events', () => {
   });
 });
 
+// ── One bad event does not hide the Dex event or a cancellation (review F5) ──
+
+describe('a malformed event elsewhere in the schedule', () => {
+  /** A non-Dex event, then `mutate` applied to the raw object. */
+  const badNonDex = (mutate: (event: Record<string, unknown>) => void, options: AshbyInterviewEventOptions = {}) => {
+    const event = nonDexEvent(options);
+    mutate(event);
+    return event;
+  };
+
+  it.each<[string, (event: Record<string, unknown>) => void]>([
+    ['a null interview id', (event) => { event.interviewId = null; }],
+    ['a non-UUID event id', (event) => { event.id = 'take-home-1'; }],
+    ['no event id at all', (event) => { delete event.id; }],
+    ['a take-home block longer than 24 h', (event) => { event.endTime = '2026-12-05T10:30:00Z'; }],
+    ['a non-string meeting link', (event) => { event.meetingLink = { url: 'https://example.invalid/room' }; }],
+    ['a malformed start', (event) => { event.startTime = 'tomorrow'; }],
+    ['a malformed updatedAt', (event) => { event.updatedAt = 'soon'; }],
+  ])('skips a non-Dex event with %s and keeps the Dex event', (_label, mutate) => {
+    const parsed = parseOk(schedule({ interviewEvents: [badNonDex(mutate), makeAshbyInterviewEvent()] }));
+    expect(parsed.events).toStrictEqual([EXPECTED_EVENT]);
+    expect(parsed.skippedNonDexEventCount).toBe(1);
+    expect(selectR1MeetDexEvents(parsed, NOW_MS).map((s) => s.decision)).toEqual(['eligible']);
+  });
+
+  it('still delivers a cancellation when a non-Dex event is malformed', () => {
+    const bad = badNonDex((event) => { event.interviewId = null; });
+    const parsed = parseOk(schedule({ status: 'Cancelled', interviewEvents: [bad, makeAshbyInterviewEvent()] }));
+    expect(selectR1MeetDexEvents(parsed, NOW_MS).map((s) => s.decision)).toEqual(['cancelled']);
+  });
+
+  it('counts skipped events and keeps a well-formed non-Dex event', () => {
+    const parsed = parseOk(
+      schedule({
+        interviewEvents: [
+          badNonDex((event) => { event.interviewId = null; }),
+          badNonDex((event) => { event.startTime = 'never'; }, { id: uuidFor(0x61) }),
+          nonDexEvent({ id: uuidFor(0x62), interviewId: uuidFor(0x63) }),
+          makeAshbyInterviewEvent(),
+        ],
+      }),
+    );
+    expect(parsed.skippedNonDexEventCount).toBe(2);
+    expect(parsed.events.map((event) => event.eventId)).toEqual([FIXTURE_EVENT_ID, uuidFor(0x62)]);
+  });
+
+  it.each<[string, unknown]>([
+    ['the Dex event itself is malformed', makeAshbyInterviewEvent({ interviewId: 'not-a-uuid' })],
+    ['an event lists no interviewers at all (Dex membership unknown)', nonDexEvent({ interviewers: null, interviewerUserIds: null })],
+    ['an event has an unreadable interviewer list', nonDexEvent({ interviewers: 'Dex' })],
+    ['an event is not an object', 'event'],
+  ])('refuses the schedule when %s, carrying the schedule identity', (_label, bad) => {
+    const result = parseR1MeetAshbySchedule(schedule({ status: 'Cancelled', interviewEvents: [bad, nonDexEvent({ id: uuidFor(0x70) })] }), OPTIONS);
+    expect(result).toStrictEqual({ ok: false, reason: 'malformed_event', identity: { ...EXPECTED_IDENTITY, status: 'Cancelled' } });
+    expect(isDeepFrozen(result)).toBe(true);
+  });
+
+  it.each<[string, Record<string, unknown>, R1MeetAshbyScheduleParseFailure]>([
+    ['too many events', schedule({ interviewEvents: Array.from({ length: 21 }, (_, i) => nonDexEvent({ id: uuidFor(i + 1) })) }), 'too_many_events'],
+    ['a non-array event list', schedule({ interviewEvents: 'events' }), 'malformed_events'],
+    ['duplicate event ids', schedule({ interviewEvents: [makeAshbyInterviewEvent(), makeAshbyInterviewEvent({ startTime: '2026-12-02T10:30:00Z', endTime: '2026-12-02T11:00:00Z' })] }), 'duplicate_event_id'],
+  ])('event-level refusal (%s) carries the identity too', (_label, raw, reason) => {
+    expect(parseR1MeetAshbySchedule(raw, OPTIONS)).toStrictEqual({ ok: false, reason, identity: EXPECTED_IDENTITY });
+  });
+
+  it('a refusal before the schedule fields parse carries no identity', () => {
+    expect(parseR1MeetAshbySchedule(schedule({ id: 'schedule-1' }), OPTIONS)).toStrictEqual({ ok: false, reason: 'malformed_schedule' });
+    expect(parseR1MeetAshbySchedule(schedule({ status: 7 }), OPTIONS)).toStrictEqual({ ok: false, reason: 'malformed_status' });
+    expect(parseR1MeetAshbySchedule(schedule({ updatedAt: 'soon' }), OPTIONS)).toStrictEqual({ ok: false, reason: 'malformed_schedule' });
+  });
+});
+
 // ── Meeting links ───────────────────────────────────────────────────────────
 
 describe('meeting links', () => {
@@ -683,23 +794,37 @@ describe('meeting links', () => {
 // ── Interviewers ────────────────────────────────────────────────────────────
 
 describe('interviewers', () => {
-  it('reads interviewers[].id and ignores the deprecated list when interviewers is present', () => {
+  it('unions interviewers[].id with the deprecated list: Dex in either one counts (review F3)', () => {
     const raw = withEvent({
       interviewers: [makeAshbyUser({ id: FIXTURE_OTHER_INTERVIEWER_ID })],
       interviewerUserIds: [FIXTURE_DEX_USER_ID],
     });
     const event = parseOk(raw).events[0]!;
-    expect(event.interviewerUserIds).toEqual([FIXTURE_OTHER_INTERVIEWER_ID]);
-    expect(event.dexIsInterviewer).toBe(false);
+    expect(event.interviewerUserIds).toEqual([FIXTURE_OTHER_INTERVIEWER_ID, FIXTURE_DEX_USER_ID]);
+    expect(event.dexIsInterviewer).toBe(true);
   });
 
-  it('an empty interviewers list is authoritative (no fallback)', () => {
+  it('an empty interviewers list does not hide Dex in the deprecated list', () => {
     const event = parseOk(withEvent({ interviewers: [], interviewerUserIds: [FIXTURE_DEX_USER_ID] })).events[0]!;
-    expect(event.interviewerUserIds).toEqual([]);
-    expect(event.dexIsInterviewer).toBe(false);
+    expect(event.interviewerUserIds).toEqual([FIXTURE_DEX_USER_ID]);
+    expect(event.dexIsInterviewer).toBe(true);
+    expect(selectR1MeetDexEvents(parseOk(withEvent({ interviewers: [], interviewerUserIds: [FIXTURE_DEX_USER_ID] })), NOW_MS)[0]!.decision).toBe(
+      'eligible',
+    );
   });
 
-  it('falls back to interviewerUserIds only when interviewers is absent or null', () => {
+  it('two present lists without Dex, empty ones included, make Dex absent', () => {
+    for (const [interviewers, interviewerUserIds] of [
+      [[], []],
+      [[makeAshbyUser({ id: FIXTURE_OTHER_INTERVIEWER_ID })], []],
+      [[], [FIXTURE_OTHER_INTERVIEWER_ID]],
+    ] as const) {
+      const event = parseOk(withEvent({ interviewers, interviewerUserIds })).events[0]!;
+      expect(event.dexIsInterviewer).toBe(false);
+    }
+  });
+
+  it('reads either list alone when the other is absent or null', () => {
     const absent = withEvent({ interviewerUserIds: [FIXTURE_DEX_USER_ID] });
     delete (absent.interviewEvents as Array<Record<string, unknown>>)[0]!.interviewers;
     for (const raw of [absent, withEvent({ interviewers: null, interviewerUserIds: [FIXTURE_DEX_USER_ID] })]) {
@@ -707,19 +832,22 @@ describe('interviewers', () => {
       expect(event.interviewerUserIds).toEqual([FIXTURE_DEX_USER_ID]);
       expect(event.dexIsInterviewer).toBe(true);
     }
+    const onlyNew = withEvent({ interviewers: [makeAshbyUser({ id: FIXTURE_DEX_USER_ID })], interviewerUserIds: null });
+    expect(parseOk(onlyNew).events[0]).toMatchObject({ interviewerUserIds: [FIXTURE_DEX_USER_ID], dexIsInterviewer: true });
   });
 
-  it('gives no interviewers when both lists are absent', () => {
+  it('refuses an event with no interviewer data at all: Dex membership is unknown, never "absent"', () => {
     const raw = withEvent({});
     const event = (raw.interviewEvents as Array<Record<string, unknown>>)[0]!;
     delete event.interviewers;
     delete event.interviewerUserIds;
-    expect(parseOk(raw).events[0]).toMatchObject({ interviewerUserIds: [], dexIsInterviewer: false });
+    expect(parseReason(raw)).toBe('malformed_event');
+    expect(parseReason(withEvent({ interviewers: null, interviewerUserIds: null }))).toBe('malformed_event');
   });
 
   it('skips entries without a UUID id', () => {
     const interviewers = [{ id: 'user-1' }, { firstName: 'Example' }, { id: 5 }, makeAshbyUser({ id: FIXTURE_DEX_USER_ID })];
-    expect(parseOk(withEvent({ interviewers })).events[0]!.interviewerUserIds).toEqual([FIXTURE_DEX_USER_ID]);
+    expect(parseOk(withEvent({ interviewers, interviewerUserIds: null })).events[0]!.interviewerUserIds).toEqual([FIXTURE_DEX_USER_ID]);
     const legacy = withEvent({ interviewers: null, interviewerUserIds: ['user-1', '', FIXTURE_DEX_USER_ID] });
     expect(parseOk(legacy).events[0]!.interviewerUserIds).toEqual([FIXTURE_DEX_USER_ID]);
   });
@@ -731,6 +859,7 @@ describe('interviewers', () => {
     ['a null interviewer entry', { interviewers: [null] }],
     ['a non-array legacy list', { interviewers: null, interviewerUserIds: FIXTURE_DEX_USER_ID }],
     ['a non-string legacy entry', { interviewers: null, interviewerUserIds: [7] }],
+    ['a non-array legacy list next to interviewers', { interviewerUserIds: FIXTURE_DEX_USER_ID }],
   ])('refuses %s', (_label, eventOptions) => {
     expect(parseReason(withEvent(eventOptions))).toBe('malformed_event');
   });
@@ -762,19 +891,21 @@ describe('interviewers', () => {
   });
 
   it.each([[null], ['not-a-uuid'], [''], [FIXTURE_OTHER_INTERVIEWER_ID.slice(0, 35)]])(
-    'a Dex id of %j matches no one',
+    'refuses a Dex id of %j instead of reading every event as Dex-absent (review F3)',
     (dexUserId) => {
       const raw = schedule({ interviewEvents: [makeAshbyInterviewEvent(), makeAshbyInterviewEvent({ id: uuidFor(2), interviewerIds: ['not-a-uuid'] })] });
-      for (const event of parseOk(raw, { dexUserId }).events) expect(event.dexIsInterviewer).toBe(false);
+      expect(parseR1MeetAshbySchedule(raw, { dexUserId })).toStrictEqual({ ok: false, reason: 'invalid_dex_user_id' });
     },
   );
 
-  it('treats missing or broken options as no Dex id', () => {
+  it('refuses missing or broken options, before looking at the schedule', () => {
     for (const options of [undefined, null, {}, { dexUserId: 7 }, [FIXTURE_DEX_USER_ID]]) {
-      const result = parseR1MeetAshbySchedule(schedule(), options as never);
-      expect(result.ok, JSON.stringify(options)).toBe(true);
-      if (result.ok) expect(result.schedule.events[0]!.dexIsInterviewer).toBe(false);
+      expect(parseR1MeetAshbySchedule(schedule(), options as never), JSON.stringify(options)).toStrictEqual({
+        ok: false,
+        reason: 'invalid_dex_user_id',
+      });
     }
+    expect(parseR1MeetAshbySchedule('not a schedule', { dexUserId: null })).toStrictEqual({ ok: false, reason: 'invalid_dex_user_id' });
   });
 });
 
@@ -808,12 +939,14 @@ describe('fingerprint and dedupe key', () => {
     makeAshbyInterviewEvent({ id: uuidFor(4), interviewId: uuidFor(5), startTime: '2026-12-02T10:30:00Z', endTime: '2026-12-02T11:00:00Z' }),
   ];
   const fingerprintOf = (raw: unknown) => r1MeetAshbyScheduleFingerprint(parseOk(raw));
-  const keyOf = (raw: unknown) => r1MeetAshbyScheduleDedupKey(parseOk(raw));
+  const keyOf = (raw: unknown, receivedAtMs = RECEIVED_MS) => r1MeetAshbyScheduleDedupKey(parseOk(raw), receivedAtMs);
+  const noUpdatedAt = (eventOptions: AshbyInterviewEventOptions = {}) =>
+    schedule({ updatedAt: null, interviewEvents: [makeAshbyInterviewEvent({ updatedAt: null, ...eventOptions })] });
 
   it('is a SHA-256 hex digest and the key has the documented shape', () => {
     const parsed = parseOk(schedule());
     expect(r1MeetAshbyScheduleFingerprint(parsed)).toMatch(/^[0-9a-f]{64}$/);
-    const key = r1MeetAshbyScheduleDedupKey(parsed);
+    const key = r1MeetAshbyScheduleDedupKey(parsed, RECEIVED_MS);
     expect(key).toBe(
       `ashby-schedule:${FIXTURE_SCHEDULE_ID}:${Date.parse(FIXTURE_EVENT_UPDATED_AT)}:${r1MeetAshbyScheduleFingerprint(parsed).slice(0, 16)}`,
     );
@@ -821,9 +954,32 @@ describe('fingerprint and dedupe key', () => {
     expect(key.length).toBeLessThanOrEqual(256);
   });
 
-  it('uses 0 when nothing carries updatedAt', () => {
-    const raw = schedule({ updatedAt: null, interviewEvents: [makeAshbyInterviewEvent({ updatedAt: null })] });
-    expect(keyOf(raw)).toMatch(new RegExp(`^ashby-schedule:${FIXTURE_SCHEDULE_ID}:0:[0-9a-f]{16}$`));
+  it('ignores the receipt time while Ashby sends updatedAt, so retries converge', () => {
+    expect(keyOf(schedule(), RECEIVED_MS)).toBe(keyOf(schedule(), RECEIVED_MS + 60_000));
+  });
+
+  it('uses the receipt time when nothing carries updatedAt (review F4)', () => {
+    expect(keyOf(noUpdatedAt())).toMatch(new RegExp(`^ashby-schedule:${FIXTURE_SCHEDULE_ID}:r${RECEIVED_MS}:[0-9a-f]{16}$`));
+  });
+
+  it('keeps A -> B -> A distinct without updatedAt when the deliveries arrive at different times', () => {
+    const a = () => noUpdatedAt();
+    const b = () => noUpdatedAt({ startTime: '2026-12-01T11:30:00Z', endTime: '2026-12-01T12:15:00Z' });
+    const keys = [keyOf(a(), RECEIVED_MS), keyOf(b(), RECEIVED_MS + 5_000), keyOf(a(), RECEIVED_MS + 10_000)];
+    expect(new Set(keys).size).toBe(3);
+    // The same delivery seen twice in one millisecond is one receipt.
+    expect(keyOf(a(), RECEIVED_MS)).toBe(keys[0]);
+  });
+
+  it.each([[Number.NaN], [-1], [Number.POSITIVE_INFINITY], ['soon' as unknown as number]])(
+    'a broken receipt time (%s) falls back to r0 and never throws',
+    (receivedAtMs) => {
+      expect(keyOf(noUpdatedAt(), receivedAtMs)).toMatch(new RegExp(`^ashby-schedule:${FIXTURE_SCHEDULE_ID}:r0:[0-9a-f]{16}$`));
+    },
+  );
+
+  it('truncates a fractional receipt time', () => {
+    expect(keyOf(noUpdatedAt(), RECEIVED_MS + 0.75)).toBe(keyOf(noUpdatedAt(), RECEIVED_MS));
   });
 
   it('is identical for retries, key-order shuffles, event-order shuffles and added unknown fields', () => {
@@ -863,6 +1019,7 @@ describe('fingerprint and dedupe key', () => {
     ['scheduledBy removed', () => schedule({ scheduledBy: null })],
     ['an extra event', () => schedule({ interviewEvents: twoEvents() })],
     ['candidate id', () => ({ ...schedule(), candidateId: FIXTURE_CANDIDATE_ID })],
+    ['skipped-event count', () => schedule({ interviewEvents: [makeAshbyInterviewEvent(), nonDexEvent({ startTime: 'never' })] })],
   ])('changes when the %s changes', (_label, build) => {
     expect(fingerprintOf(build())).not.toBe(fingerprintOf(schedule()));
     expect(keyOf(build())).not.toBe(keyOf(schedule()));
@@ -896,6 +1053,7 @@ describe('selectR1MeetDexEvents', () => {
     return selections[0]!.decision;
   };
   const noDex = { interviewerIds: [FIXTURE_OTHER_INTERVIEWER_ID] };
+  const PAST = { startTime: '2026-11-01T10:30:00Z', endTime: '2026-11-01T11:00:00Z' };
   const startMs = Date.parse(FIXTURE_START_TIME);
 
   it.each([
@@ -914,8 +1072,19 @@ describe('selectR1MeetDexEvents', () => {
     ['Cancelled + no scheduler', () => schedule({ status: 'Cancelled', scheduledBy: null }), 'cancelled'],
     ['OnHold + no scheduler', () => schedule({ status: 'OnHold', scheduledBy: null }), 'not_scheduled'],
     ['no scheduler + no Meet link', () => schedule({ scheduledBy: null, interviewEvents: [makeAshbyInterviewEvent({ meetingLink: null })] }), 'no_attester'],
-    ['no Meet link + in the past', () => withEvent({ meetingLink: null, startTime: '2026-11-01T10:30:00Z', endTime: '2026-11-01T11:00:00Z' }), 'no_meet_link'],
     ['in the past', () => withEvent({ startTime: '2026-11-01T10:30:00Z', endTime: '2026-11-01T11:00:00Z' }), 'in_past'],
+    // Review F2: once the slot has started, only cancelled / dex_absent outrank in_past (hold), so a
+    // status flip or a dropped link during or after the call is told apart from one before it.
+    ['no Meet link + in the past', () => withEvent({ meetingLink: null, ...PAST }), 'in_past'],
+    ['a Zoom link + in the past', () => withEvent({ meetingLink: 'https://example.zoom.us/j/1234567890', ...PAST }), 'in_past'],
+    ['WaitingOnFeedback + in the past', () => schedule({ status: 'WaitingOnFeedback', interviewEvents: [makeAshbyInterviewEvent(PAST)] }), 'in_past'],
+    ['OnHold + in the past', () => schedule({ status: 'OnHold', interviewEvents: [makeAshbyInterviewEvent(PAST)] }), 'in_past'],
+    ['no scheduler + in the past', () => schedule({ scheduledBy: null, interviewEvents: [makeAshbyInterviewEvent(PAST)] }), 'in_past'],
+    ['Cancelled + in the past', () => schedule({ status: 'Cancelled', interviewEvents: [makeAshbyInterviewEvent(PAST)] }), 'cancelled'],
+    ['Dex absent + in the past', () => withEvent({ ...noDex, ...PAST }), 'dex_absent'],
+    // ... while a FUTURE event that loses its Meet link or its Scheduled status says so.
+    ['OnHold in the future', () => schedule({ status: 'OnHold' }), 'not_scheduled'],
+    ['NeedsScheduling in the future', () => schedule({ status: 'NeedsScheduling' }), 'not_scheduled'],
   ] as const)('%s -> %s', (_label, build, expected) => {
     expect(decisionOf(build())).toBe(expected);
   });
@@ -936,6 +1105,9 @@ describe('selectR1MeetDexEvents', () => {
         ],
       });
       expect(selectR1MeetDexEvents(parseOk(raw), nowMs).map((s) => s.decision)).toEqual(['in_past', 'in_past', 'dex_absent']);
+      // A broken clock never turns a held booking into an unschedule.
+      const onHold = schedule({ status: 'OnHold', scheduledBy: null, interviewEvents: [makeAshbyInterviewEvent({ meetingLink: null })] });
+      expect(selectR1MeetDexEvents(parseOk(onHold), nowMs).map((s) => s.decision)).toEqual(['in_past']);
     },
   );
 
