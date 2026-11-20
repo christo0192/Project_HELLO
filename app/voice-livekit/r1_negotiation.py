@@ -64,7 +64,7 @@ from r1_text import (
     parse_amount,
     split_sentences,
 )
-from r1_tracker import parse_discounts
+from r1_tracker import _TIME_LIMIT, parse_discounts
 from r1_world import NET_PRICES_USD, PRICE_USD
 
 # A turn longer than this is read from its end: closing proposals come last, and a hostile
@@ -1686,6 +1686,8 @@ _HANDLED_TIMING = _compile(
     r"\btake your time\b",
     r"\b(?:weekend|evening) batch\b",
 )
+# Owner 2026-11-20: limited-time offers address timing under the India playbook.
+_HANDLED_TIMING_PLAYBOOK = (_TIME_LIMIT,)
 _HANDLED_MONEY = _compile(
     r"\binstal+ments?\b",
     r"\bemi\b",
@@ -2125,7 +2127,9 @@ def asks_decider(text: object) -> bool:
     return False
 
 
-def reasons_handled_in(text: object, decision_maker: str = "") -> frozenset[str]:
+def reasons_handled_in(
+    text: object, decision_maker: str = "", *, playbook: bool = False
+) -> frozenset[str]:
     """The stall reasons the advisor's ``text`` speaks to (it must still follow the reason)."""
     folded = _tail(text).lower()
     found: set[str] = set()
@@ -2133,7 +2137,8 @@ def reasons_handled_in(text: object, decision_maker: str = "") -> frozenset[str]
     dm_pattern = re.compile(r"\b(?:" + own + _DM_WORDS + r")\b")
     verb_pattern = re.compile(r"\b" + _HANDLED_DM_VERB + r"\w*\b")
     for sentence in split_sentences(folded):
-        if any(pattern.search(sentence) for pattern in _HANDLED_TIMING):
+        if (any(pattern.search(sentence) for pattern in _HANDLED_TIMING)
+                or (playbook and any(p.search(sentence) for p in _HANDLED_TIMING_PLAYBOOK))):
             found.add(REASON_TIMING)
         for pattern in _HANDLED_MONEY:
             match = pattern.search(sentence)
@@ -4362,8 +4367,11 @@ class Negotiation:
 
     def __init__(
         self, decision_maker: str, *, max_stall_rounds: int = MAX_STALL_ROUNDS,
-        timeline_v3: bool = False,
+        timeline_v3: bool = False, india_playbook: bool | None = None,
     ) -> None:
+        self.india_playbook = _india_playbook_on() if india_playbook is None else india_playbook
+        # Set by the engine only under the India playbook.
+        self.time_offer_turn: int | None = None
         self.decision_maker = decision_maker
         self.timeline_v3 = timeline_v3
         self.condition_named: list[dict[str, Any]] = []
@@ -4584,7 +4592,7 @@ class Negotiation:
                 self.figure_challenged_turn = turn  # L3: "Who told you that?"
         self.offers.extend(offers)
         newly: set[str] = set()
-        addressed = reasons_handled_in(text, self.decision_maker)
+        addressed = reasons_handled_in(text, self.decision_maker, playbook=self.india_playbook)
         if REASON_DECISION_MAKER in addressed:
             self.decider_handled_turn = turn
         early = self.pre_window_decline_turn
@@ -4972,11 +4980,14 @@ class Negotiation:
         husband before anything moves forward" and "waiting feels more realistic" got "Okay, let's
         do it, I'll pay the deposit today" in the live sweep.  STRONG is for a learner who has no
         decider left to consult, is not waiting and did not turn a call down.
+        Owner 2026-11-20: a later time-limited deck offer can answer a prior wait.
         """
         if self.call_declined():
             return "call_declined"
         waited = self.wait_said_turn
-        if waited is not None and 0 <= turn - waited <= WAIT_RECENT_TURNS:
+        if (waited is not None and 0 <= turn - waited <= WAIT_RECENT_TURNS
+                and not (self.india_playbook and self.time_offer_turn is not None
+                         and self.time_offer_turn > waited)):
             return "learner_waiting"
         if self.decider_unresolved():
             return "decider_unresolved"

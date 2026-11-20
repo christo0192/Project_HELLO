@@ -8914,6 +8914,79 @@ class IndiaPlaybookEngineTests(unittest.TestCase):
                                  enabled == "1")
 
 
+class TimeOfferEngineTests(unittest.TestCase):
+    OFFER = "I can give you $1,500 off if you enrol today; the offer ends tonight."
+
+    def test_open_ready_and_limit(self):
+        session = Session(engine())
+        session.say(OPENER, 20)
+        plan = session.say(self.OFFER, 40)
+        self.assertIn(P2.TIME_OFFER_OPEN_NOTE, plan.reminder)
+        self.assertNotIn(P2.TIME_OFFER_READY_NOTE, plan.reminder)
+        self.assertTrue(r1_roleplay._adds_pressure(self.OFFER, playbook=True))
+        self.assertEqual(session.eng.negotiation.time_offer_turn,
+                         session.eng.tracker.last_time_offer_turn)
+        with mock.patch.object(r1_roleplay, "strong_gaps", return_value=()):
+            plan = session.say(self.OFFER, 60)
+            self.assertIn(P2.TIME_OFFER_READY_NOTE, plan.reminder)
+            plan = session.say(self.OFFER, 80)
+            self.assertNotIn(P2.TIME_OFFER_READY_NOTE, plan.reminder or "")
+            self.assertNotIn(P2.TIME_OFFER_OPEN_NOTE, plan.reminder or "")
+
+    def test_flag_off(self):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_INDIA_PLAYBOOK": "0"}):
+            session = Session(engine())
+            session.say(OPENER, 20)
+            plan = session.say("This discount is valid only for today.", 40)
+            self.assertTrue(session.eng.tracker.coercive_urgency)
+            self.assertNotIn(P2.TIME_OFFER_OPEN_NOTE, plan.reminder or "")
+
+    def test_timing_skip_tracks_offer_and_flag(self):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled), mock.patch.dict(
+                r1_roleplay.os.environ, {"R1_INDIA_PLAYBOOK": "1" if enabled else "0"}
+            ), mock.patch.object(r1_roleplay.RolePlayEngine, "_reasons_owned_by_f4",
+                                 return_value=frozenset()):
+                session = Session(engine())
+                session.say(OPENER, 20)
+                self.assertNotIn(NEG.REASON_TIMING, session.eng._stall_skip())
+                plan = session.say(self.OFFER, 40)
+                self.assertEqual(NEG.REASON_TIMING in session.eng._stall_skip(), enabled)
+                if not enabled:
+                    self.assertNotIn(P2.TIME_OFFER_OPEN_NOTE, plan.reminder or "")
+                    self.assertNotIn(P2.TIME_OFFER_READY_NOTE, plan.reminder or "")
+                    self.assertNotIn("time_offer_notes", session.eng.admin_log()["voice"])
+
+    def test_time_offer_is_not_a_back_off(self):
+        levers, _ = r1_roleplay.urgency_levers(self.OFFER, playbook=True)
+        self.assertIn("seasonal_discount", levers)
+        self.assertIn("seasonal_discount", r1_roleplay._PRESSING_LEVERS)
+
+    def test_lost_reply_returns_note(self):
+        session = Session(engine())
+        session.say(OPENER, 20)
+        first = session.eng.plan_turn(self.OFFER, 40)
+        self.assertIn(P2.TIME_OFFER_OPEN_NOTE, first.reminder)
+        session.eng.reply_lost(first)
+        heard = session.eng.plan_turn("That offer is valid till Friday.", 44)
+        count = sum(note in (heard.reminder or "") for note in
+                    (P2.TIME_OFFER_OPEN_NOTE, P2.TIME_OFFER_READY_NOTE))
+        self.assertEqual(session.eng.admin_log()["voice"]["time_offer_notes"], count)
+
+    def test_scripted_plan_does_not_add_offer_note(self):
+        session, r = run_cooperative(72.5, script=strong_script())
+        session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+        with mock.patch.object(session.eng, "_offer_extra_notes",
+                               wraps=session.eng._offer_extra_notes) as notes:
+            plan = session.eng.plan_turn(self.OFFER + " " + ASK, r)
+        if plan.mode is TurnMode.SAY_ONLY:
+            notes.assert_not_called()
+            self.assertNotIn(P2.TIME_OFFER_OPEN_NOTE, plan.reminder or "")
+            self.assertNotIn(P2.TIME_OFFER_READY_NOTE, plan.reminder or "")
+        else:
+            self.fail("Expected a scripted commitment plan")
+
+
 class OfferNotesTests(unittest.TestCase):
     """SWEEP-5 (R1_LEARNER_VOICE_V2 texts, R1_OFFER_TERMS) and SWEEP-13 (R1_OFFER_REALISM)."""
 

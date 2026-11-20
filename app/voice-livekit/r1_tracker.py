@@ -645,6 +645,68 @@ _COERCIVE = re.compile(
     + r"|\b(?:available|valid|open|good) (?:for |until |till )?(?:today|tonight) only\b",
     re.IGNORECASE,
 )
+# Owner 2026-11-20, R1_INDIA_PLAYBOOK: urgency creation with a deck discount is a closing move,
+# not coercion.
+_TIME_LIMIT = re.compile(
+    r"\b(?:today only|tonight only|one[- ]day (?:only|offer|deal|discount|sale)|"
+    r"early[- ]?bird)\b"
+    r"|\b(?:just|only) for (?:today|tonight)" + _DAY_ENDS +
+    r"|\b(?:just|only) for (?:one day|24 hours)\b(?!\s+(?:a|per|each|every|in)\b)"
+    r"|\b(?:only (?:for |until |till )?|(?:available|valid|open|good) only "
+    r"(?:for |until |till )?)(?:today|tonight)" + _DAY_ENDS +
+    r"|\b(?:available|valid|open|good) (?:for |until |till )?(?:today|tonight) only\b"
+    r"|\b(?:offer|discount|price|pricing|deal)\b"
+    r"(?:(?!\b(?:that|which|who|includes?|covers?|comes? with|has|have|with)\b)"
+    r"[^.?!;]){0,40}?\b"
+    r"(?:ends?|expires?|closes?|is gone|will be gone|is over|is not available|isn't available|"
+    r"won't be available|will not be available|goes back|goes up|will go up|"
+    r"(?:is |are |stays? |remains? )?(?:valid|available|open|good|on) "
+    r"(?:only )?(?:until|till|through|for|by)|lasts? (?:until|till|through|only))"
+    r"\b[^.?!;]{0,25}?\b"
+    r"(?:today|tonight|tomorrow|this week|(?:at )?midnight|"
+    r"(?:mon|tues|wednes|thurs|fri|satur|sun)day|(?:the )?end of (?:the |this )?(?:day|week))\b"
+    r"|\bfrom tomorrow\b[^.?!;]{0,40}?\b"
+    r"(?:not available|unavailable|gone|back to|goes back|go back|full price|ends|no longer)\b"
+    r"|\bif you(?: are)?(?: don't| do not)? (?:enrol+|enroll|sign|join|register|decide|commit)"
+    r"\w*(?: up)?\b[^.?!;]{0,30}?\b(?:today|tonight|this week|by (?:the end of )?"
+    r"(?:today|tonight|tomorrow|(?:mon|tues|wednes|thurs|fri|satur|sun)day|"
+    r"the weekend|this week))\b(?!'s)"
+    r"|\b(?:hold|keep|reserve|lock)\b[^.?!;]{0,30}?\b(?:offer|discount|price|deal)\b"
+    r"[^.?!;]{0,25}?\b(?:until|till|through)\b[^.?!;]{0,15}?\b"
+    r"(?:today|tonight|tomorrow|this week|(?:at )?midnight|"
+    r"(?:mon|tues|wednes|thurs|fri|satur|sun)day|(?:the )?end of (?:the |this )?(?:day|week))\b"
+    r"|\bthis (?:cohort|batch)(?:'s| only)\b[^.?!;]{0,30}?\b(?:offer|discount|price|deal)\b"
+    r"|\b(?:offer|discount|price|deal) (?:is )?(?:only )?for this (?:cohort|batch)\b"
+    r"|\boffer expires? (?:tonight|today|tomorrow)\b"
+    r"|\bprice (?:goes|will go) up (?:tomorrow|tonight|today)\b"
+    r"|\blast chance (?:for|to get|to grab|to avail)\b[^.?!;]{0,30}?\b"
+    r"(?:offer|discount|price|deal)\b", re.IGNORECASE,
+)
+_DEMAND = re.compile(
+    r"\b(?:now or never|no second chance)\b"
+    r"|\b(?:i|we) need (?:your|a) (?:decision|yes|answer|commitment)(?: right)? "
+    r"(?:now|today|on this call|before we hang up)\b"
+    r"|\b(?:have|need|must|got) to (?:decide|say yes|commit|sign|enrol+\w*|pay)\b"
+    r"[^.?!;]{0,15}?\b(?:on this call|right now|now|before (?:we|you) hang up)\b", re.I,
+)
+_DEMAND_BARE = re.compile(
+    r"\bmust (?:decide|sign|enrol+\w*|commit|pay) (?:today|now|tonight)\b"
+    r"|\blast chance\b|\byou(?:'ll| will) (?:lose|miss) (?:out|your)\b", re.I,
+)
+_GUILT = re.compile(
+    r"\byou(?:'ll| will| would|'d)? regret\b|\b(?:don't|do not) let me down\b"
+    r"|\bi (?:really )?thought you were serious\b"
+    r"|\b(?:you(?:'ll| will| would|'d)?|you're going to|you are going to|don't|do not) "
+    r"(?:get |be |end up |stay |fall )?left behind\b"
+    r"|\beveryone else\b[^.?!;]{0,30}?\b(?:signed|enrol+\w*|joined)\b"
+    r"|\byour (?:family|parents|husband|wife|father|mother) "
+    r"(?:expects?|is expecting|are expecting)\b"
+    r"|\bi(?:'ve| have) spent (?:a lot of|so much) time on you\b"
+    r"|\bwhat will your (?:family|parents|husband|wife|father|mother) think\b", re.I,
+)
+_OFFER_NOUN = re.compile(r"\b(?:offer|discount|deal|price|pricing|early[- ]?bird)\b", re.I)
+_OFFER_WORD = re.compile(_OFFER_NOUN.pattern + r"|\$\s?\d", re.I)
+
 # L6 (mock call aa166f09, turn 84): "if you wanted to see that later, then you will have to pay
 # $13000".  A price later is coercive only as a threat or a comparison (review fix): "more" or
 # "higher" about the price (never "nothing more" / "no extra", nor a plan's surcharge), or "have
@@ -924,19 +986,63 @@ def parse_discounts(
     return [dedup[key] for key in sorted(dedup)]
 
 
-def urgency_levers(text: object) -> tuple[frozenset[str], bool]:
+def urgency_levers(text: object, *, playbook: bool | None = None) -> tuple[frozenset[str], bool]:
     """Deck urgency levers named in non-question sentences, and whether any is coercive."""
+    if playbook is None:
+        playbook = os.getenv("R1_INDIA_PLAYBOOK", "1").strip().lower() not in (
+            "0", "off", "false", "no"
+        )
     levers: set[str] = set()
     coercive = False
     for sentence in split_sentences(text):
-        if _COERCIVE.search(sentence) or _later_price_threat(sentence):
-            coercive = True
+        if playbook:
+            sentence = fold(sentence)
+            limited = bool(_TIME_LIMIT.search(sentence))
+            demand = any(not negated_before(sentence, m.start())
+                         for m in _DEMAND.finditer(sentence))
+            guilt = any(not negated_before(sentence, m.start())
+                        for m in _GUILT.finditer(sentence))
+            bare = any(not negated_before(sentence, m.start())
+                       for m in _DEMAND_BARE.finditer(sentence))
+            if (demand or guilt
+                    or (bare and not _OFFER_WORD.search(sentence))
+                    or _later_price_threat(sentence)
+                    or (limited and any(n > PRICE_USD for n in
+                                        dollar_amounts(canonical_amounts(sentence))))):
+                coercive = True
+        else:
+            if _COERCIVE.search(sentence) or _later_price_threat(sentence):
+                coercive = True
         if is_question_like(sentence):
             continue
+        if playbook and limited:
+            levers.add("seasonal_discount")
         for lever, pattern in URGENCY_RES.items():
             if pattern.search(sentence):
                 levers.add(lever)
     return frozenset(levers), coercive
+
+
+def time_limited_offer_in(
+    text: object, *, prior_deck_discount: bool = False, reconcile: bool | None = None
+) -> bool:
+    """Owner 2026-11-20 (R1_INDIA_PLAYBOOK): a deadline tied to a deck discount or net price.
+
+    Off-deck discounts do not count. A prior deck discount lets an offer noun
+    refer back to that discount without repeating its amount.
+    """
+    sentences = [fold(s) for s in split_sentences(text)
+                 if not is_question_like(s) and _TIME_LIMIT.search(fold(s))]
+    if not sentences:
+        return False
+    if urgency_levers(text, playbook=True)[1]:
+        return False
+    parsed = {m.usd for m in parse_discounts(text, reconcile=reconcile)}
+    if parsed - set(DISCOUNTS_USD):
+        return False
+    figures = {n for s in sentences for n in dollar_amounts(canonical_amounts(s))}
+    return bool(parsed & set(DISCOUNTS_USD) or figures & (set(DISCOUNTS_USD) | set(NET_PRICES_USD))
+                or (prior_deck_discount and any(_OFFER_NOUN.search(s) for s in sentences)))
 
 
 def invented_offer_in(
@@ -2223,6 +2329,7 @@ class TrackerObservation:
     value_statement: bool
     invented_offer: bool
     injection: bool
+    time_offer: bool = False
 
 
 # Narrow readers for payment options and past learner outcomes.
@@ -2324,6 +2431,8 @@ class CoverageTracker:
             not in ("0", "off", "false", "no")
         )
         self._india_plan_turns: set[int] = set()
+        self.time_offer_turns: set[int] = set()
+        self.last_time_offer_turn: int | None = None
         self._reconciled_turns: set[int] = set()
         self._rule_invented_turns: set[int] = set()
         self.strong_v2 = strong_v2 if strong_v2 is not None else (
@@ -2473,7 +2582,7 @@ class CoverageTracker:
         if value_index is not None and self.first_value_turn is None:
             self.first_value_turn = self.turn
         value_statement = value_index is not None
-        levers, coercive = urgency_levers(text)
+        levers, coercive = urgency_levers(text, playbook=self.india_playbook)
         self.levers |= levers
         self.coercive_urgency = self.coercive_urgency or coercive
         invented = invented_offer_in(
@@ -2481,6 +2590,16 @@ class CoverageTracker:
             discount_v3=self.discount_read_v3, reconcile=self.total_reconcile,
             india_playbook=self.india_playbook,
         )
+        time_offer = False
+        if self.india_playbook:
+            prior = any(item["usd"] in DISCOUNTS_USD for item in self.discount_log
+                        if item["turn"] != self.turn)
+            time_offer = (time_limited_offer_in(text, prior_deck_discount=prior,
+                                               reconcile=self.total_reconcile)
+                          and not invented and self.turn not in self._stacked_turns)
+            if time_offer:
+                self.time_offer_turns.add(self.turn)
+                self.last_time_offer_turn = self.turn
         if self.invented_v2 and not invented and (
             re.search(r"\bfree\b|\bat no (?:extra |additional )?(?:cost|charge)\b",
                       fold(text), re.I)
@@ -2504,6 +2623,7 @@ class CoverageTracker:
             value_statement=value_statement,
             invented_offer=invented,
             injection=injection,
+            time_offer=time_offer,
         )
 
     def note_learner_text(
@@ -2515,7 +2635,7 @@ class CoverageTracker:
         )
 
     def _playbook_judge_exempt(self, turn: int) -> bool:
-        return turn in self._india_plan_turns
+        return turn in self._india_plan_turns or turn in self.time_offer_turns
 
     def apply_judge(self, result: JudgeResult | None, judged_turn: int) -> bool:
         """Merge a validated judge result for ``judged_turn``; None changes nothing."""

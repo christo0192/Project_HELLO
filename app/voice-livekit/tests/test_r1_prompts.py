@@ -1485,6 +1485,8 @@ class LearnerVoiceS2PromptTests(unittest.TestCase):
             p.IMPLAUSIBLE_PRICE_NOTE.format(amount="$500"),
             " ".join((p.OFFER_TERMS_HEADER, p.OFFER_TERMS_INSTALMENTS, p.OFFER_TERMS_FREE_EXTRA)),
             " ".join((p.OFFER_TERMS_HEADER, p.OFFER_TERMS_INSTALMENTS_V2)),
+            p.TIME_OFFER_OPEN_NOTE,
+            p.TIME_OFFER_READY_NOTE,
             " ".join((p.OFFER_TERMS_HEADER, p.OFFER_TERMS_IN_PARTS)),
         )
         yield turn_reminder(P1, r_sec=10, voice_v2=True, notes=notes)
@@ -1719,3 +1721,22 @@ class TestReactionVarietyPrompt(unittest.TestCase):
         with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"}):
             off = r1_prompts.interviewer_reminder("transition", rider=False)
         self.assertEqual(off, r1_prompts.TRANSITION_REMINDER)  # byte-identical with the flag off
+
+
+class TimeOfferNotesTests(unittest.TestCase):
+    def test_exact_notes(self):
+        import r1_prompts as p
+
+        self.assertEqual(p.TIME_OFFER_OPEN_NOTE,
+            "- The advisor's discount is for a limited time. That is a normal, fair offer: do "
+            "not call it pressure, and never say you won't decide because of a deadline or an "
+            "offer ending. You may say it is tempting, then ask about the one thing that is "
+            "still unclear to you.")
+        self.assertEqual(p.TIME_OFFER_READY_NOTE,
+            "- The advisor's discount is for a limited time, and your questions have been "
+            "answered. A time-limited offer like this makes it easier for you to decide now: "
+            "you may say so in your own words. Do not agree to enrol or pay unless a system "
+            "note gives you the exact words.")
+        for note in (p.TIME_OFFER_OPEN_NOTE, p.TIME_OFFER_READY_NOTE):
+            self.assertTrue(note.startswith("- "))
+            self.assertLess(len(note.split()), 60)

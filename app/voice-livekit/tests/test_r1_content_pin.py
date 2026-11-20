@@ -280,7 +280,8 @@ import r1_world
 # 47: Dex, the male interviewer, in the spoken lines (R1_INTERVIEWER_DEX, DEX_LINES).
 #     Also the Dex prompts: prefixes, wrap-up note, end-intent system, after-aside context.
 # 48: pin the India money path and calmer instalment note.
-PINNED_CONTENT_SHA256 = "df20430571521ac8ff5a1802a38c64cbbad56fb98aa403736917760a709dd8e4"
+# 49: pin the time-limit, demand and guilt readers and the time-offer notes.
+PINNED_CONTENT_SHA256 = "f9e2a1891f02d7bf3a38e489d32571bbe91dcbca8dba88644fbd487240eb3d13"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -348,6 +349,10 @@ def _imports(path: Path) -> set[str]:
 
 
 class PinTests(unittest.TestCase):
+    def test_time_limit_manifest(self):
+        self.assertEqual(r1_content.manifest()["tracker"]["time_limit_pattern"],
+                         r1_tracker._TIME_LIMIT.pattern)
+
     def test_the_content_sha_is_pinned(self):
         self.assertEqual(
             r1_content.CONTENT_SHA256,
@@ -469,6 +474,8 @@ class PinTests(unittest.TestCase):
             (r1_prompts, "OFFER_ON_TABLE_NOTE_V2", "- {amount}"),
             (r1_prompts, "OFFER_TERMS_INSTALMENTS", "x"),
             (r1_prompts, "OFFER_TERMS_INSTALMENTS_V2", "x"),
+            (r1_prompts, "TIME_OFFER_OPEN_NOTE", "x"),
+            (r1_prompts, "TIME_OFFER_READY_NOTE", "x"),
             (r1_prompts, "OFFER_TERMS_IN_PARTS", "x"),
             (r1_prompts, "IMPLAUSIBLE_FREE_NOTE", "- x"),
             (r1_prompts, "NOT_TODAY_RESERVED_NOTE", "- x"),
@@ -1077,6 +1084,11 @@ class FinalReviewRoundOnePinTests(unittest.TestCase):
         self.assertEqual(
             manifest["tracker"],
             {
+                "time_limit_pattern": r1_tracker._TIME_LIMIT.pattern,
+                "demand_pattern": r1_tracker._DEMAND.pattern,
+                "demand_bare_pattern": r1_tracker._DEMAND_BARE.pattern,
+                "guilt_pattern": r1_tracker._GUILT.pattern,
+                "offer_word_pattern": r1_tracker._OFFER_WORD.pattern,
                 "max_deep_offers": r1_tracker.MAX_DEEP_OFFERS,
                 "max_deep_misses": r1_tracker.MAX_DEEP_MISSES,
             },

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 import unittest
@@ -352,6 +353,7 @@ class UrgencyAndOfferTests(unittest.TestCase):
         levers, _ = urgency_levers("Do you know about the application deadline?")
         self.assertEqual(levers, frozenset())
 
+    @patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "0"})
     def test_coercive_pressure_is_flagged(self):
         for text in (
             "This is your last chance, the price goes up tomorrow.",
@@ -550,6 +552,7 @@ class TrackerTests(unittest.TestCase):
     def tracker(self) -> CoverageTracker:
         return CoverageTracker(PERSONA, seed="seed")
 
+    @patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "0"})
     def test_observe_runs_the_gate_and_the_deterministic_extractors(self):
         t = self.tracker()
         obs = t.observe_candidate_turn(
@@ -645,6 +648,7 @@ class TrackerTests(unittest.TestCase):
         self.assertTrue(evidence.discount_ok)
         self.assertEqual(grade(evidence), Level.MEDIUM)
 
+    @patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "0"})
     def test_coercive_urgency_is_not_a_legitimate_lever(self):
         t = self.tracker()
         t.observe_candidate_turn("We have limited enrollment spots, last chance, only today!", 1)
@@ -2082,6 +2086,7 @@ class WrapOfferAnswerTests(unittest.TestCase):
 class CoerciveS03Tests(unittest.TestCase):
     """Mock call aa166f09 (L6): a deadline of today and a higher price later are coercive."""
 
+    @patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "0"})
     def test_only_for_today_and_pay_more_later_are_coercive(self):
         for text in (
             "You can speak to your partner, but this discount is available only for today.",
@@ -2118,6 +2123,7 @@ class CoerciveS03Tests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(urgency_levers(text)[1])
 
+    @patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "0"})
     def test_the_seasonal_lever_said_honestly_keeps_its_credit(self):
         text = "This seasonal discount ends Friday; if you join later you will need to pay $9,000."
         self.assertIn("seasonal_discount", urgency_levers(text)[0])
@@ -2127,6 +2133,7 @@ class CoerciveS03Tests(unittest.TestCase):
         self.assertFalse(evidence.pressured)
         self.assertTrue(evidence.urgency_lever)
 
+    @patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "0"})
     def test_a_higher_price_later_said_as_a_comparison_is_coercive(self):
         for text in (
             "Later it will cost more.",
@@ -2888,3 +2895,161 @@ class IndiaMoneyPathTests(unittest.TestCase):
             tracker.apply_judge(JudgeResult(invented_offer=True), 1)
             self.assertEqual(tracker.invented_offer, not enabled)
             self.assertEqual(tracker.judge_invented_turns, int(not enabled))
+
+
+class UrgencyCreationTests(unittest.TestCase):
+    def test_no_deadline_is_fast(self):
+        from r1_tracker import time_limited_offer_in
+
+        # A turn with no deadline returns before the discount reader runs.
+        text = "the price is $8,500 but i can do $7,500 " * 500
+        start = time.perf_counter()
+        self.assertFalse(time_limited_offer_in(text))
+        self.assertLess(time.perf_counter() - start, 1.0)
+
+    def test_original_observation_with_playbook(self):
+        tracker = CoverageTracker(PERSONA, india_playbook=True)
+        obs = tracker.observe_candidate_turn(
+            f"{H1_PROBE} Our curriculum covers python. I can give you $500 off if you enrol "
+            "today. We have limited enrollment spots.", 1)
+        self.assertEqual(obs.levers, {"limited_spots", "seasonal_discount"})
+        self.assertTrue(obs.time_offer)
+
+    def test_honest_existing_examples(self):
+        for text in (
+            "Are you available today?", "You can pay later, you will not have to pay upfront.",
+            "Later on you can pay in instalments.",
+            "Pay $1,000 now and later you pay $700 a month.",
+            "Later it will cost you nothing extra, there are no hidden fees.",
+            "You can decide later, you will pay the same 9000.",
+            "If you want to upgrade later, you would have to pay $500 extra for the career module.",
+            "Our support team is available only now and then on weekends.",
+            "Our office is open only until today 6 pm, but you can call tomorrow.",
+            "The scholarship is there only for today and tomorrow.",
+            "Later it will cost you nothing more.",
+            "This seasonal discount ends Friday; if you join later you will need to pay $9,000.",
+            "The discount is for this batch only. Later you will have to pay the full price.",
+            "Later you will have to pay the full price.",
+            "You can pay the rest later, it costs $500 more in total for the EMI plan.",
+            "If you pay later in EMIs, it costs a little more because of the interest.",
+            "If you add it later, it costs $300 more for the mentoring module.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(urgency_levers(text, playbook=True)[1])
+
+    def test_reassurances_and_coercive_phrases(self):
+        for text in ("You don't have to decide now, take your time.",
+                     "You do not need to decide on this call.",
+                     "There is no need to commit right now.",
+                     "It's not now or never, the next cohort is fine too.",
+                     "Nobody gets left behind in our cohorts, mentors check in weekly.",
+                     "No one is left behind here.", "I don't think you'll regret it."):
+            with self.subTest(text=text):
+                self.assertFalse(urgency_levers(text, playbook=True)[1])
+        for text in ("you will be left behind if you wait", "Don't get left behind.",
+                     "You'd regret missing it."):
+            with self.subTest(text=text):
+                self.assertTrue(urgency_levers(text, playbook=True)[1])
+
+    def test_unrelated_availability_is_not_a_deadline(self):
+        from r1_tracker import time_limited_offer_in
+        for text in ("The price includes live sessions available every Friday.",
+                     "The price covers mentoring that is available on Friday.",
+                     "The deal includes recordings that are available until the end of the week.",
+                     "If you join today's session you will see the dashboard.",
+                     "Classes are only for one day a week.",
+                     "The scholarship is there only for today and tomorrow."):
+            with self.subTest(text=text):
+                self.assertFalse(urgency_levers(text, playbook=True)[0])
+                self.assertFalse(time_limited_offer_in(text, prior_deck_discount=True))
+
+    def test_more_offer_deadlines(self):
+        from r1_tracker import time_limited_offer_in
+        for text in ("This discount is valid only for today.",
+                     "The offer is valid only until tonight.",
+                     "The discount is only for today.", "This offer is valid until Friday.",
+                     "This offer is not available from tomorrow.",
+                     "From tomorrow the price goes back to $9,000.",
+                     "I can hold the $1,000 discount for you until Friday."):
+            with self.subTest(text=text):
+                self.assertIn("seasonal_discount", urgency_levers(text, playbook=True)[0])
+                self.assertTrue(time_limited_offer_in(text, prior_deck_discount=True))
+
+    def test_deck_deadlines_and_pressure(self):
+        from r1_tracker import time_limited_offer_in
+
+        for text in (
+            "One day only: enrol today and you get $1,500 off; from tomorrow the offer is gone.",
+            "The $1,000 early-bird offer ends Friday.",
+            "If you are enrolling in the program today, you get the $1,500 discount.",
+            "Today only you can have it at $7,500.",
+        ):
+            with self.subTest(text=text):
+                levers, pressure = urgency_levers(text, playbook=True)
+                self.assertFalse(pressure)
+                self.assertIn("seasonal_discount", levers)
+                self.assertTrue(time_limited_offer_in(text))
+                tracker = CoverageTracker(PERSONA, india_playbook=True)
+                tracker.observe_candidate_turn(text, 1)
+                self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).pressured)
+                off = CoverageTracker(PERSONA, india_playbook=False)
+                off.observe_candidate_turn(text, 1)
+                self.assertFalse(off.time_offer_turns)
+        text = "This discount is valid only for today."
+        self.assertFalse(time_limited_offer_in(text))
+        self.assertTrue(time_limited_offer_in(text, prior_deck_discount=True))
+        tracker = CoverageTracker(PERSONA, invented_v2=True, discipline_v2=True,
+                                  india_playbook=True)
+        tracker.observe_candidate_turn("I can give you $1,000 off the fee.", 1)
+        obs = tracker.observe_candidate_turn(text, 2)
+        self.assertTrue(obs.time_offer)
+        self.assertEqual(tracker.last_time_offer_turn, 2)
+
+    def test_coercion_and_invented_discount(self):
+        for text in (
+            "I need your decision right now.", "You have to decide on this call.",
+            "Now or never.", "If you walk away today, you'll regret it.",
+            "I really thought you were serious about your career.",
+            "Everyone else in your position has already signed up.",
+            "Decide now or later you will have to pay $13000.",
+            "You must decide today or you'll lose out.",
+            "Today only, otherwise it will be $13,000.",
+            "We have limited enrollment spots, last chance, only today!",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(urgency_levers(text, playbook=True)[1])
+                tracker = CoverageTracker(PERSONA, india_playbook=True)
+                obs = tracker.observe_candidate_turn(text, 1)
+                self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).pressured)
+                self.assertFalse(obs.time_offer)
+        self.assertFalse(urgency_levers(
+            "You'll miss out on the $1,500 discount if you don't enrol today.",
+            playbook=True)[1])
+        tracker = CoverageTracker(PERSONA, invented_v2=True, discipline_v2=True,
+                                  india_playbook=True)
+        obs = tracker.observe_candidate_turn("Today only, $2,000 off.", 1)
+        self.assertTrue(tracker.invented_offer)
+        self.assertFalse(obs.time_offer)
+
+    def test_judge_exemption_and_flag_off(self):
+        text = "Today only, $1,500 off."
+        for enabled in (True, False):
+            tracker = CoverageTracker(PERSONA, invented_v2=True, india_playbook=enabled)
+            tracker.observe_candidate_turn(text, 1)
+            tracker.apply_judge(JudgeResult(invented_offer=True), 1)
+            self.assertEqual(tracker.invented_offer, not enabled)
+            self.assertEqual(tracker.judge_invented_turns, int(not enabled))
+            self.assertEqual(bool(tracker.time_offer_turns), enabled)
+        tracker = CoverageTracker(PERSONA, invented_v2=True, india_playbook=False)
+        obs = tracker.observe_candidate_turn("This discount is valid only for today.", 1)
+        self.assertTrue(obs.coercive)
+        self.assertFalse(obs.time_offer)
+
+    def test_offer_deadline_and_bare_demand(self):
+        for text in ("The offer is valid only until tonight.",
+                     "The discount is only for today."):
+            levers, coercive = urgency_levers(text, playbook=True)
+            self.assertFalse(coercive)
+            self.assertIn("seasonal_discount", levers)
+        self.assertTrue(urgency_levers(
+            "We have limited enrollment spots, last chance, only today!", playbook=True)[1])

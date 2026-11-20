@@ -3688,3 +3688,20 @@ class IndiaInterestTests(unittest.TestCase):
                 self.assertEqual(neg.TERM_INSTALMENTS in neg.offer_terms_in(text), enabled == "1")
                 self.assertEqual(neg.instalments_are_monthly(text), enabled == "1")
                 self.assertEqual(neg.offer_terms_in("We don't offer zero interest."), frozenset())
+
+
+class IndiaUrgencyTests(unittest.TestCase):
+    def test_timing_and_wait(self):
+        text = "This $1,500 discount is valid only for today."
+        self.assertIn(neg.REASON_TIMING, neg.reasons_handled_in(text, playbook=True))
+        self.assertNotIn(neg.REASON_TIMING, neg.reasons_handled_in(text))
+        state = neg.Negotiation("husband", india_playbook=True)
+        state.wait_said_turn = 8
+        self.assertEqual(state.strong_blocked(9), "learner_waiting")
+        state.time_offer_turn = 9
+        self.assertNotEqual(state.strong_blocked(9), "learner_waiting")
+        state.wait_said_turn = 10
+        self.assertEqual(state.strong_blocked(11), "learner_waiting")
+        state.india_playbook = False
+        state.wait_said_turn = 8
+        self.assertEqual(state.strong_blocked(9), "learner_waiting")
