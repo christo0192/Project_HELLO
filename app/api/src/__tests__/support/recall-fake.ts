@@ -6,12 +6,17 @@
  * - `POST /api/v1/bot/` answers 201 with a deterministic lowercase UUID, echoing `join_at` and
  *   `metadata`, with one `ready` status change.
  * - POST responses are cached by `Idempotency-Key` + method + path, so a replay returns the SAME
- *   bot without creating another (Recall caches for an hour; 429/507 are never cached).
+ *   bot without creating another. Like Recall (reference_idempotency) the cache also keeps errors,
+ *   400 and 500 included, and canned `failNext` responses too; it never keeps 429, 507, a 409 whose
+ *   body says the key "is being processed", or a 502/503/504 gateway error (Recall: retry those with
+ *   the same key).
  * - `GET` of an unknown bot is 404; `DELETE` is 204, or 405 once the bot was dispatched
  *   (`markDispatched`, or after `leave_call`).
  * - `leave_call` answers 200 with the bot and an appended `call_ended` status change.
  * - `output_media` POST/DELETE answer 200 `{}`.
- * - `failNext` injects one canned response for the next call (e.g. 429 with `Retry-After: 7`).
+ * - `failNext` injects one canned response for the next call (e.g. 429 with `Retry-After: 7`). It is
+ *   served ahead of the cache lookup (like a failure of that request) and then cached by the rule
+ *   above, so a canned 500 on a keyed create is replayed to the next request with the same key.
  *
  * `calls` records `{method, path, headers, body}` with the authorization value replaced by
  * `<redacted>` and the body parsed as JSON (null when absent). Responses include `meeting_url`,
@@ -98,6 +103,23 @@ function parseBody(body: string | undefined): unknown {
 }
 
 const BOT_ROUTE = /^\/api\/v1\/bot\/([^/]+)\/(?:(leave_call|output_media)\/)?$/;
+
+const IN_PROGRESS_RE = /^\s*another request with this idempotency-key is being processed/i;
+
+/** Recall never caches these under an Idempotency-Key (and says to retry the gateway errors with the same key). */
+function isCacheable(status: number, body: unknown): boolean {
+  if (status === 429 || status === 507 || status === 502 || status === 503 || status === 504) return false;
+  if (status === 409) {
+    const text =
+      typeof body === 'string'
+        ? body
+        : body && typeof body === 'object' && typeof (body as { detail?: unknown }).detail === 'string'
+          ? (body as { detail: string }).detail
+          : '';
+    if (IN_PROGRESS_RE.test(text)) return false;
+  }
+  return true;
+}
 
 export function createFakeRecall(options: { apiKey?: string; now?: () => Date } = {}): FakeRecall {
   const apiKey = options.apiKey ?? FAKE_RECALL_API_KEY;
@@ -201,23 +223,29 @@ export function createFakeRecall(options: { apiKey?: string; now?: () => Date } 
       body,
     });
 
+    const idempotencyKey = headers['idempotency-key'];
+    const cacheKey = idempotencyKey !== undefined && req.method === 'POST'
+      ? `${idempotencyKey} ${req.method} ${url.pathname}`
+      : null;
+
     const next = canned.shift();
-    if (next) return response(next.status, next.body, next.headers);
+    if (next) {
+      if (cacheKey !== null && isCacheable(next.status, next.body)) {
+        idempotencyCache.set(cacheKey, { status: next.status, body: next.body });
+      }
+      return response(next.status, next.body, next.headers);
+    }
 
     if (headers.authorization !== `Token ${apiKey}`) {
       return response(401, { detail: 'Invalid token.' });
     }
 
-    const idempotencyKey = headers['idempotency-key'];
-    const cacheKey = idempotencyKey !== undefined && req.method === 'POST'
-      ? `${idempotencyKey} ${req.method} ${url.pathname}`
-      : null;
     if (cacheKey !== null) {
       const cached = idempotencyCache.get(cacheKey);
       if (cached) return response(cached.status, cached.body);
     }
     const result = simulate(req.method, url.pathname, body);
-    if (cacheKey !== null && result.status !== 429 && result.status !== 507) {
+    if (cacheKey !== null && isCacheable(result.status, result.body)) {
       idempotencyCache.set(cacheKey, { status: result.status, body: result.body });
     }
     return response(result.status, result.body);

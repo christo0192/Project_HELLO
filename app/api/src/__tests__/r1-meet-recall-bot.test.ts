@@ -327,7 +327,7 @@ describe('buildR1MeetCreateBotRequest: round trip through RecallClient.createBot
     const fake = createFakeRecall();
     const client = new RecallClient({ apiKey: FAKE_RECALL_API_KEY, transport: fake.transport });
     const body = bodyOf(build());
-    const idempotencyKey = r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, 1);
+    const idempotencyKey = r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, 1, 0);
 
     const bot = await client.createBot(body, { idempotencyKey });
     expect(fake.calls).toHaveLength(1);
@@ -344,16 +344,44 @@ describe('buildR1MeetCreateBotRequest: round trip through RecallClient.createBot
     expect(fake.bots.size).toBe(1);
 
     // A new booking version (the old bot deleted after a reschedule) deliberately creates a new bot.
-    const next = await client.createBot(body, { idempotencyKey: r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, 2) });
+    const next = await client.createBot(body, { idempotencyKey: r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, 2, 0) });
     expect(next.id).not.toBe(bot.id);
     expect(fake.bots.size).toBe(2);
+  });
+
+  it('a create answered with a cached error is retried under the next key attempt; a network blip keeps the key', async () => {
+    const fake = createFakeRecall();
+    const client = new RecallClient({ apiKey: FAKE_RECALL_API_KEY, transport: fake.transport });
+    const body = bodyOf(build());
+    let keyAttempt = 0;
+    const key = () => r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, 1, keyAttempt);
+
+    // The S06 loop in miniature: rotate only when the client says the response was cached.
+    fake.failNext(500, { body: { detail: 'internal error' } });
+    const first = await client.createBot(body, { idempotencyKey: key() }).catch((error: unknown) => error);
+    expect(first).toMatchObject({ category: 'http_server_error', retriable: true, rotateIdempotencyKey: true });
+    // The same key would only replay the cached 500.
+    await expect(client.createBot(body, { idempotencyKey: key() })).rejects.toMatchObject({ category: 'http_server_error' });
+    keyAttempt += 1;
+    fake.failNext(503);
+    const second = await client.createBot(body, { idempotencyKey: key() }).catch((error: unknown) => error);
+    expect(second).toMatchObject({ category: 'http_server_error', rotateIdempotencyKey: false });
+    const bot = await client.createBot(body, { idempotencyKey: key() });
+    expect(fake.bots.size).toBe(1);
+    expect(fake.calls.map((call) => call.headers['idempotency-key'])).toEqual([
+      'r1-meet-4e5f6a7b-8c9d-4e0f-a1b2-c3d4e5f6a7b8-v1-k0',
+      'r1-meet-4e5f6a7b-8c9d-4e0f-a1b2-c3d4e5f6a7b8-v1-k0',
+      'r1-meet-4e5f6a7b-8c9d-4e0f-a1b2-c3d4e5f6a7b8-v1-k1',
+      'r1-meet-4e5f6a7b-8c9d-4e0f-a1b2-c3d4e5f6a7b8-v1-k1',
+    ]);
+    expect(fake.bots.has(bot.id)).toBe(true);
   });
 
   it('passes the client checks with output media armed at creation', async () => {
     const fake = createFakeRecall();
     const client = new RecallClient({ apiKey: FAKE_RECALL_API_KEY, transport: fake.transport });
     const body = bodyOf(build({}, { outputMediaUrl: PAGE_URL, joinLeadSec: 0 }));
-    await client.createBot(body, { idempotencyKey: r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, 0) });
+    await client.createBot(body, { idempotencyKey: r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, 0, 0) });
     expect(fake.calls[0].body).toStrictEqual(body);
     expect([...fake.bots.values()][0].outputMedia).toBe('webpage');
   });
@@ -362,21 +390,45 @@ describe('buildR1MeetCreateBotRequest: round trip through RecallClient.createBot
 // ── Idempotency-Key ─────────────────────────────────────────────────────────
 
 describe('r1MeetCreateBotIdempotencyKey', () => {
-  it('is r1-meet-<ashby event id>-v<version>', () => {
-    expect(r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, 3)).toBe('r1-meet-4e5f6a7b-8c9d-4e0f-a1b2-c3d4e5f6a7b8-v3');
+  it('is r1-meet-<ashby event id>-v<version>-k<key attempt>', () => {
+    expect(r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, 3, 0)).toBe('r1-meet-4e5f6a7b-8c9d-4e0f-a1b2-c3d4e5f6a7b8-v3-k0');
+    expect(r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, 3, 2)).toBe('r1-meet-4e5f6a7b-8c9d-4e0f-a1b2-c3d4e5f6a7b8-v3-k2');
+  });
+
+  it('gives a distinct key for every (version, key attempt) pair', () => {
+    const keys = new Set<string>();
+    for (const version of [0, 1, 11]) {
+      for (const attempt of [0, 1, 11]) keys.add(r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, version, attempt));
+    }
+    expect(keys.size).toBe(9);
   });
 
   it('lower-cases an upper-case Ashby event id', () => {
-    expect(r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID.toUpperCase(), 3)).toBe(
-      r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, 3),
+    expect(r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID.toUpperCase(), 3, 1)).toBe(
+      r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, 3, 1),
     );
   });
 
-  it('always satisfies RECALL_IDEMPOTENCY_KEY_RE, up to the largest safe version', () => {
+  it('always satisfies RECALL_IDEMPOTENCY_KEY_RE, up to the largest safe version and key attempt', () => {
     for (const version of [0, 1, 3, 999, Number.MAX_SAFE_INTEGER]) {
-      const key = r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID.toUpperCase(), version);
-      expect(key, String(version)).toMatch(RECALL_IDEMPOTENCY_KEY_RE);
+      for (const attempt of [0, 7, Number.MAX_SAFE_INTEGER]) {
+        const key = r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID.toUpperCase(), version, attempt);
+        expect(key, `${version}/${attempt}`).toMatch(RECALL_IDEMPOTENCY_KEY_RE);
+      }
     }
+  });
+
+  it.each([
+    ['-1', -1],
+    ['1.5', 1.5],
+    ['2 ** 53', 2 ** 53],
+    ['NaN', Number.NaN],
+    ['a string', '0'],
+    ['undefined', undefined],
+  ])('throws r1_meet_idempotency_invalid_key_attempt for key attempt %s', (_label, attempt) => {
+    const error = thrownBy(() => r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, 1, attempt as never));
+    expect(error).toBeInstanceOf(TypeError);
+    expect((error as Error).message).toBe('r1_meet_idempotency_invalid_key_attempt');
   });
 
   it.each([
@@ -387,7 +439,7 @@ describe('r1MeetCreateBotIdempotencyKey', () => {
     ['a number', 42],
     ['null', null],
   ])('throws r1_meet_idempotency_invalid_event_id for %s, never echoing it', (_label, eventId) => {
-    const error = thrownBy(() => r1MeetCreateBotIdempotencyKey(eventId as never, 1));
+    const error = thrownBy(() => r1MeetCreateBotIdempotencyKey(eventId as never, 1, 0));
     expect(error).toBeInstanceOf(TypeError);
     expect((error as Error).message).toBe('r1_meet_idempotency_invalid_event_id');
   });
@@ -400,13 +452,17 @@ describe('r1MeetCreateBotIdempotencyKey', () => {
     ['Infinity', Number.POSITIVE_INFINITY],
     ['a string', '3'],
   ])('throws r1_meet_idempotency_invalid_version for version %s', (_label, version) => {
-    const error = thrownBy(() => r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, version as never));
+    const error = thrownBy(() => r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, version as never, 0));
     expect(error).toBeInstanceOf(TypeError);
     expect((error as Error).message).toBe('r1_meet_idempotency_invalid_version');
   });
 
-  it('checks the event id before the version', () => {
-    const error = thrownBy(() => r1MeetCreateBotIdempotencyKey('evt-1', -1));
-    expect((error as Error).message).toBe('r1_meet_idempotency_invalid_event_id');
+  it('checks the event id, then the version, then the key attempt', () => {
+    expect((thrownBy(() => r1MeetCreateBotIdempotencyKey('evt-1', -1, -1)) as Error).message).toBe(
+      'r1_meet_idempotency_invalid_event_id',
+    );
+    expect((thrownBy(() => r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, -1, -1)) as Error).message).toBe(
+      'r1_meet_idempotency_invalid_version',
+    );
   });
 });

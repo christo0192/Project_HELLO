@@ -14,15 +14,21 @@
  *   `RecallError` with `retriable: true` and a bounded `retryAfterMs` (Retry-After delta-seconds
  *   clamped to 1 s..300 s, else 409 5 s, 429 30 s, 507 30 s, 5xx 10 s, network/timeout 5 s); the
  *   durable queue reschedules.
- * - `createBot` REQUIRES an Idempotency-Key (Recall caches key + method + path for an hour, so a
- *   retried create returns the same bot). The key is optional on the other mutations and never sent
- *   on a GET (Recall's WAF rejects a GET that carries a body, so a GET carries none).
+ * - `createBot` REQUIRES an Idempotency-Key. Recall caches the response of a keyed POST under key +
+ *   method + path for an hour, so a create retried after a network failure or timeout returns the
+ *   same bot. The cache also holds 400 and 500 errors (PR #433 review F1): a keyed POST answered with
+ *   a cacheable error throws with `rotateIdempotencyKey: true`, and the caller must retry under a NEW
+ *   key. Kept for the same key: 429, 507, a 409 whose body says the key "is being processed"
+ *   (`conflict/idempotency_in_progress`) and the 502/503/504 gateway errors, which Recall says to
+ *   retry with the same key. The key is optional on the other mutations and never sent on a GET
+ *   (Recall's WAF rejects a GET that carries a body, so a GET carries none).
  * - Pre-transport validation refuses, with ZERO network calls: a non-canonical meeting URL, any
  *   output-media kind other than `webpage` (never a LiveKit hand-off: that would give Recall our SFU
  *   secret, critic C6), a non-https or credentialed page URL, an unknown variant, a malformed
  *   `join_at`, a non-webhook or non-https realtime endpoint, and a body over 64 KiB.
  * - Deadline (default 15 s, clamp 1..60 s) covers the response body too; the body is capped at
- *   2 MiB by default.
+ *   2 MiB by default, by a declared Content-Length and, when the transport exposes the body stream
+ *   (fetch does), WHILE reading, so a chunked body without a length is never buffered past the cap.
  * - Logging is metadata only: `{operation, outcome, category, httpStatus, durationMs}`. The key,
  *   URLs, bot ids, meeting URLs, bodies and bridge tickets are never logged or put into an error.
  */
@@ -112,6 +118,11 @@ export interface RecallTransportRequest {
 export interface RecallTransportResponse {
   status: number;
   headers: { get(name: string): string | null };
+  /**
+   * The body as a byte stream (fetch's `Response.body`). When present it is read instead of
+   * `text()`, and the byte cap is enforced while reading.
+   */
+  body?: ReadableStream<Uint8Array> | null;
   text(): Promise<string>;
 }
 
@@ -336,21 +347,64 @@ function safeHeader(response: RecallTransportResponse, name: string): string | n
   }
 }
 
+/** How Recall's 409 "the same key is still in flight" body starts (reference_idempotency). */
+const IDEMPOTENCY_IN_PROGRESS_PREFIX = 'another request with this idempotency-key is being processed';
+
+/** Statuses Recall does not cache under an Idempotency-Key, or says to retry with the same key. */
+const SAME_KEY_RETRY_STATUSES: ReadonlySet<number> = new Set([429, 502, 503, 504, 507]);
+
+/**
+ * A 409 body (plain text, or a JSON `detail` / `message` / `error`) that says the same key is still
+ * being processed. Only a boolean leaves this function: the body is never echoed.
+ */
+function isIdempotencyInProgress(raw: string, parsed: unknown): boolean {
+  const says = (text: unknown) =>
+    typeof text === 'string' && text.trimStart().slice(0, 128).toLowerCase().startsWith(IDEMPOTENCY_IN_PROGRESS_PREFIX);
+  if (says(raw)) return true;
+  return isPlainObject(parsed) && (says(parsed.detail) || says(parsed.message) || says(parsed.error));
+}
+
+/**
+ * Whether Recall has (or may have) cached this error response under the request's key (review F1):
+ * only a keyed POST (Recall's idempotency covers PUT/POST/PATCH; this client sends no PUT or PATCH),
+ * only a 4xx/5xx, and not one of the statuses Recall keeps retryable under the same key. A 401/403
+ * is probably answered before the cache, but rotating is harmless there: a 4xx created nothing.
+ */
+function isCachedUnderKey(prepared: PreparedRequest, status: number, inProgress: boolean): boolean {
+  if (prepared.idempotencyKey === undefined || prepared.method !== 'POST') return false;
+  if (status < 400 || status > 599 || SAME_KEY_RETRY_STATUSES.has(status)) return false;
+  return !(status === 409 && inProgress);
+}
+
 /** Map a non-2xx status to the sanitized taxonomy (single attempt; the caller decides to retry). */
-function statusError(operation: RecallOperation, response: RecallTransportResponse, raw: string): RecallError {
+function statusError(
+  operation: RecallOperation,
+  prepared: PreparedRequest,
+  response: RecallTransportResponse,
+  raw: string,
+): RecallError {
   const status = response.status;
   const retryAfterHeader = safeHeader(response, 'retry-after');
   const parsed = status >= 400 && status <= 499 ? parseJson(raw) : undefined;
   const vendorCode = knownVendorCode(parsed);
+  const inProgress = status === 409 && isIdempotencyInProgress(raw, parsed);
+  const rotateIdempotencyKey = isCachedUnderKey(prepared, status, inProgress);
   const fixed = (category: RecallErrorCategory, code?: string) =>
-    new RecallError(category, { operation, httpStatus: status, code: code ?? vendorCode, retriable: false });
-  const retriable = (category: keyof typeof RECALL_DEFAULT_RETRY_AFTER_MS & RecallErrorCategory) =>
     new RecallError(category, {
       operation,
       httpStatus: status,
-      code: vendorCode,
+      code: code ?? vendorCode,
+      retriable: false,
+      rotateIdempotencyKey,
+    });
+  const retriable = (category: keyof typeof RECALL_DEFAULT_RETRY_AFTER_MS & RecallErrorCategory, code?: string) =>
+    new RecallError(category, {
+      operation,
+      httpStatus: status,
+      code: code ?? vendorCode,
       retriable: true,
       retryAfterMs: retryAfterMs(retryAfterHeader, RECALL_DEFAULT_RETRY_AFTER_MS[category]),
+      rotateIdempotencyKey,
     });
 
   switch (status) {
@@ -361,6 +415,7 @@ function statusError(operation: RecallOperation, response: RecallTransportRespon
         code: vendorCode,
         retriable: false,
         fieldCodes: fieldCodesFrom(parsed),
+        rotateIdempotencyKey,
       });
     case 401:
       return fixed('unauthorized');
@@ -374,7 +429,7 @@ function statusError(operation: RecallOperation, response: RecallTransportRespon
       // Recall answers 405 to DELETE once a scheduled bot has been sent to its call.
       return fixed('not_allowed', operation === 'bot.delete_scheduled' ? 'bot_already_dispatched' : undefined);
     case 409:
-      return retriable('conflict');
+      return retriable('conflict', inProgress ? 'idempotency_in_progress' : undefined);
     case 429:
       return retriable('rate_limited');
     case 507:
@@ -391,6 +446,55 @@ function abortError(): Error {
   const error = new Error('recall_timeout');
   error.name = 'AbortError';
   return error;
+}
+
+/** `readBody`'s answer when the body went past the byte cap. */
+const OVER_LIMIT = Symbol('recall_output_limit');
+
+function isByteStream(value: unknown): value is ReadableStream<Uint8Array> {
+  return typeof value === 'object' && value !== null && typeof (value as { getReader?: unknown }).getReader === 'function';
+}
+
+function cancelQuietly(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  try {
+    reader.cancel().catch(() => {});
+  } catch {
+    // A reader that cannot be cancelled is dropped; the request controller aborts the fetch.
+  }
+}
+
+/**
+ * The response body as UTF-8 (a leading byte-order mark dropped, as `Response.text()` does), or
+ * `OVER_LIMIT`. With a body stream the cap is enforced WHILE reading (review F6): the stream is
+ * cancelled as soon as the running byte count passes `maxBytes`, so a chunked body that declares no
+ * length is never buffered past the cap. Without one, `text()` is read and then measured. A chunk
+ * that is not bytes, or a failing stream, throws (mapped to `network` by the caller).
+ */
+async function readBody(response: RecallTransportResponse, maxBytes: number): Promise<string | typeof OVER_LIMIT> {
+  const stream = (response as { body?: unknown }).body;
+  if (isByteStream(stream)) {
+    const reader = stream.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!(value instanceof Uint8Array)) {
+        cancelQuietly(reader);
+        throw new Error('recall_body_not_bytes');
+      }
+      total += value.byteLength;
+      if (total > maxBytes) {
+        cancelQuietly(reader);
+        return OVER_LIMIT;
+      }
+      chunks.push(value);
+    }
+    return new TextDecoder('utf-8').decode(Buffer.concat(chunks));
+  }
+  const raw = await response.text();
+  if (typeof raw !== 'string') return '';
+  return Buffer.byteLength(raw, 'utf8') > maxBytes ? OVER_LIMIT : raw;
 }
 
 // ── Parsed Bot ──────────────────────────────────────────────────────────────
@@ -634,18 +738,19 @@ export class RecallClient {
         controller.abort();
         throw new RecallError('output_limit', { operation, httpStatus: status });
       }
-      let raw: string;
+      let body: string | typeof OVER_LIMIT;
       try {
-        raw = await Promise.race([response.text(), deadline]);
+        body = await Promise.race([readBody(response, this.#maxResponseBytes), deadline]);
       } catch {
         throw transportFailure();
       }
-      if (typeof raw !== 'string') raw = '';
-      if (Buffer.byteLength(raw, 'utf8') > this.#maxResponseBytes) {
+      if (body === OVER_LIMIT) {
+        controller.abort();
         throw new RecallError('output_limit', { operation, httpStatus: status });
       }
+      const raw = body;
 
-      if (status < 200 || status > 299) throw statusError(operation, response, raw);
+      if (status < 200 || status > 299) throw statusError(operation, prepared, response, raw);
       if (!expectBot) return { status, bot: undefined };
 
       const parsed = parseJson(raw);

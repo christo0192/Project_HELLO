@@ -553,6 +553,67 @@ describe('RecallClient status mapping (single attempt, bounded retry hints)', ()
     expect(JSON.stringify(error)).not.toContain('xqz-wvut-srp');
   });
 
+  it.each([
+    [400, true],
+    [401, true],
+    [402, true],
+    [403, true],
+    [404, true],
+    [405, true],
+    [409, true],
+    [410, true],
+    [422, true],
+    [429, false],
+    [500, true],
+    [501, true],
+    [502, false],
+    [503, false],
+    [504, false],
+    [507, false],
+    [301, false],
+  ])('a keyed POST answered %i → rotateIdempotencyKey %s; unkeyed calls and non-POSTs never', async (status, rotate) => {
+    const { client } = makeClient([res(status, '{"detail":"x"}')]);
+    const keyed = { idempotencyKey: IDEMPOTENCY };
+    expect((await failure(client.createBot(createBody(), keyed))).rotateIdempotencyKey).toBe(rotate);
+    expect((await failure(client.leaveCall(BOT_ID, keyed))).rotateIdempotencyKey).toBe(rotate);
+    expect((await failure(client.startOutputMedia(BOT_ID, { cameraWebpageUrl: PAGE_URL }, keyed))).rotateIdempotencyKey).toBe(rotate);
+    // Nothing is cached under a key that was not sent, and Recall's idempotency covers PUT/POST/PATCH only.
+    expect((await failure(client.leaveCall(BOT_ID))).rotateIdempotencyKey).toBe(false);
+    expect((await failure(client.getBot(BOT_ID))).rotateIdempotencyKey).toBe(false);
+    expect((await failure(client.deleteScheduledBot(BOT_ID))).rotateIdempotencyKey).toBe(false);
+    expect((await failure(client.stopOutputMedia(BOT_ID, keyed))).rotateIdempotencyKey).toBe(false);
+  });
+
+  it.each([
+    ['plain text', 'Another request with this Idempotency-Key is being processed. Retry later.'],
+    ['a JSON detail', { detail: 'Another request with this Idempotency-Key is being processed.' }],
+    ['a JSON message, other case, leading space', { message: '  another request with this idempotency-key is being processed' }],
+  ])('a 409 saying the key is still being processed (%s) keeps the key and echoes nothing', async (_label, body) => {
+    const { client } = makeClient([res(409, body)]);
+    const error = await failure(client.createBot(createBody(), { idempotencyKey: IDEMPOTENCY }));
+    expect(error).toMatchObject({
+      category: 'conflict',
+      code: 'idempotency_in_progress',
+      retriable: true,
+      retryAfterMs: 5_000,
+      rotateIdempotencyKey: false,
+    });
+    expect(JSON.stringify(error) + String(error)).not.toMatch(/another request/i);
+  });
+
+  it('a network failure, a timeout or a malformed 2xx keeps the key (the bot may already exist)', async () => {
+    const keyed = { idempotencyKey: IDEMPOTENCY };
+    const network = makeClient([new Error('ECONNRESET')]);
+    expect(await failure(network.client.createBot(createBody(), keyed))).toMatchObject({ category: 'network', rotateIdempotencyKey: false });
+    const slow = makeClient(['hang'], { timeoutMs: 20 });
+    expect(await failure(slow.client.createBot(createBody(), keyed))).toMatchObject({ category: 'timeout', rotateIdempotencyKey: false });
+    const garbled = makeClient([res(201, 'not json')]);
+    expect(await failure(garbled.client.createBot(createBody(), keyed))).toMatchObject({
+      category: 'malformed_response',
+      rotateIdempotencyKey: false,
+    });
+  });
+
   it('never retries: a retriable failure followed by success still costs one call per invocation', async () => {
     const { client, calls } = makeClient([res(503, ''), res(200, botJson())]);
     await failure(client.getBot(BOT_ID));
@@ -632,6 +693,82 @@ describe('RecallClient deadline, transport, size and shape failures', () => {
     const { client } = makeClient([declared]);
     expect(await failure(client.getBot(BOT_ID))).toMatchObject({ category: 'output_limit' });
     expect(read).toBe(false);
+  });
+
+  it('enforces the cap WHILE streaming a body that declares no length, without buffering it all', async () => {
+    let pulls = 0;
+    const chunk = new Uint8Array(256).fill(0x61);
+    let cancelled = false;
+    const endless = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        controller.enqueue(chunk);
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    let textCalled = false;
+    const streamed: RecallTransportResponse = {
+      status: 200,
+      headers: { get: () => null },
+      body: endless,
+      text: () => {
+        textCalled = true;
+        return new Promise<string>(() => {});
+      },
+    };
+    const { client } = makeClient([streamed], { maxResponseBytes: 1024, timeoutMs: 2_000 });
+    expect(await failure(client.getBot(BOT_ID))).toMatchObject({ category: 'output_limit', httpStatus: 200, retriable: false });
+    expect(textCalled).toBe(false);
+    expect(cancelled).toBe(true);
+    expect(pulls).toBeLessThanOrEqual(8);
+  });
+
+  it('reads a streamed body under the cap, across chunk boundaries and with a byte-order mark', async () => {
+    const bytes = new TextEncoder().encode('﻿' + JSON.stringify(botJson({ note: 'é'.repeat(50) })));
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let i = 0; i < bytes.length; i += 7) controller.enqueue(bytes.slice(i, i + 7));
+        controller.close();
+      },
+    });
+    const streamed: RecallTransportResponse = {
+      status: 200,
+      headers: { get: () => null },
+      body: stream,
+      text: async () => {
+        throw new Error('text() must not be used when a stream is available');
+      },
+    };
+    const { client } = makeClient([streamed]);
+    await expect(client.getBot(BOT_ID)).resolves.toMatchObject({ id: BOT_ID });
+  });
+
+  it('maps a failing or non-byte stream to network', async () => {
+    const failing: RecallTransportResponse = {
+      status: 200,
+      headers: { get: () => null },
+      body: new ReadableStream<Uint8Array>({
+        pull(controller) {
+          controller.error(new Error('socket hang up'));
+        },
+      }),
+      text: async () => '',
+    };
+    expect(await failure(makeClient([failing]).client.getBot(BOT_ID))).toMatchObject({ category: 'network', retriable: true });
+    const strings: RecallTransportResponse = {
+      status: 200,
+      headers: { get: () => null },
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue('not bytes');
+          controller.close();
+        },
+      }) as unknown as ReadableStream<Uint8Array>,
+      text: async () => '',
+    };
+    expect(await failure(makeClient([strings]).client.getBot(BOT_ID))).toMatchObject({ category: 'network' });
   });
 
   it('the default cap is 2 MiB', async () => {
@@ -835,7 +972,12 @@ describe('RecallError', () => {
       retriable: true,
       retryAfterMs: 7_000,
       fieldCodes: ['a'],
+      rotateIdempotencyKey: false,
     });
+    const cached = new RecallError('http_server_error', { retriable: true, rotateIdempotencyKey: true });
+    expect(cached.rotateIdempotencyKey).toBe(true);
+    expect(cached.toJSON()).toMatchObject({ rotateIdempotencyKey: true });
+    expect(new RecallError('bad_request', { rotateIdempotencyKey: 'yes' as never }).rotateIdempotencyKey).toBe(false);
   });
 
   it('drops unsafe codes and operations, nulls the hint of a non-retriable error, caps the hint', () => {
@@ -1001,30 +1143,78 @@ describe('RecallClient against createFakeRecall', () => {
     expect(await failure(client.deleteScheduledBot(second.id))).toMatchObject({ code: 'bot_already_dispatched' });
   });
 
-  it('answers 401 to a wrong key and serves failNext once, without the client retrying', async () => {
+  it('answers 401 to a wrong key and serves failNext once, caching a canned failure under its key like Recall', async () => {
     const fake = createFakeRecall();
     const wrong = new RecallClient({ apiKey: 'recall-wrong-' + 'w'.repeat(20), transport: fake.transport });
     expect(await failure(wrong.getBot(BOT_ID))).toMatchObject({ category: 'unauthorized', httpStatus: 401 });
 
     const client = new RecallClient({ apiKey: FAKE_RECALL_API_KEY, transport: fake.transport });
+    // 429 and 507 are never cached by Recall: the same key may be retried.
     fake.failNext(429, { headers: { 'Retry-After': '7' } });
     const limited = await failure(client.createBot(createBody(), { idempotencyKey: IDEMPOTENCY }));
-    expect(limited).toMatchObject({ category: 'rate_limited', retriable: true, retryAfterMs: 7_000 });
+    expect(limited).toMatchObject({ category: 'rate_limited', retriable: true, retryAfterMs: 7_000, rotateIdempotencyKey: false });
     fake.failNext(507);
     expect(await failure(client.createBot(createBody(), { idempotencyKey: IDEMPOTENCY }))).toMatchObject({
       category: 'capacity_exhausted',
       retryAfterMs: 30_000,
+      rotateIdempotencyKey: false,
     });
+    // A 500 IS cached under the key for an hour (reference_idempotency): the client says so ...
     fake.failNext(500, { body: { detail: 'boom' } });
     expect(await failure(client.createBot(createBody(), { idempotencyKey: IDEMPOTENCY }))).toMatchObject({
       category: 'http_server_error',
+      retriable: true,
       retryAfterMs: 10_000,
+      rotateIdempotencyKey: true,
     });
-    // After the canned failures, the same key creates exactly one bot.
-    const bot = await client.createBot(createBody(), { idempotencyKey: IDEMPOTENCY });
+    // ... because the same key now replays the cached 500 instead of creating a bot.
+    expect(await failure(client.createBot(createBody(), { idempotencyKey: IDEMPOTENCY }))).toMatchObject({
+      category: 'http_server_error',
+      rotateIdempotencyKey: true,
+    });
+    expect(fake.bots.size).toBe(0);
+    // A new key creates exactly one bot.
+    const bot = await client.createBot(createBody(), { idempotencyKey: `${IDEMPOTENCY}-k1` });
     expect(fake.bots.size).toBe(1);
     expect(fake.bots.has(bot.id)).toBe(true);
-    expect(fake.calls).toHaveLength(5);
+    expect(fake.calls).toHaveLength(6);
+  });
+
+  it('caches like Recall: an in-progress 409 and 502/503/504 are not cached; a 400 and any other 409 are', async () => {
+    const fake = createFakeRecall();
+    const client = new RecallClient({ apiKey: FAKE_RECALL_API_KEY, transport: fake.transport });
+    const create = (idempotencyKey: string) => client.createBot(createBody(), { idempotencyKey });
+
+    fake.failNext(409, { body: 'Another request with this Idempotency-Key is being processed. Retry later.' });
+    expect(await failure(create('key-in-flight-1'))).toMatchObject({
+      category: 'conflict',
+      code: 'idempotency_in_progress',
+      rotateIdempotencyKey: false,
+    });
+    for (const gateway of [502, 503, 504]) {
+      fake.failNext(gateway);
+      expect(await failure(create('key-in-flight-1'))).toMatchObject({ category: 'http_server_error', rotateIdempotencyKey: false });
+    }
+    const created = await create('key-in-flight-1');
+    expect(fake.bots.has(created.id)).toBe(true);
+
+    // A 400 for a bad setting is replayed for the same key even after the setting is fixed.
+    fake.failNext(400, { body: { google_meet: ['Unknown login group.'] } });
+    for (let i = 0; i < 2; i += 1) {
+      expect(await failure(create('key-bad-setting-1'))).toMatchObject({
+        category: 'bad_request',
+        retriable: false,
+        rotateIdempotencyKey: true,
+        fieldCodes: ['google_meet'],
+      });
+    }
+    fake.failNext(409, { body: { detail: 'Conflict.' } });
+    for (let i = 0; i < 2; i += 1) {
+      expect(await failure(create('key-conflict-1'))).toMatchObject({ category: 'conflict', code: 'conflict', rotateIdempotencyKey: true });
+    }
+    expect(fake.bots.size).toBe(1);
+    // 409 + three gateway errors + the create + 2 x 400 + 2 x 409.
+    expect(fake.calls).toHaveLength(9);
   });
 
   it('answers 404 for unknown bots and unknown routes', async () => {

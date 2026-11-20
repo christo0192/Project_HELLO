@@ -237,20 +237,36 @@ export function buildR1MeetCreateBotRequest(
 }
 
 /**
- * The Idempotency-Key for creating the bot of one Ashby interview event (S01 plan R7):
- * `r1-meet-<ashbyEventId lower-cased>-v<version>`, where `version` is the booking row's version.
- * Recall caches key + method + path for an hour, so a retried create with the same key returns the
- * same bot; the runtime (S06) bumps `version` whenever it deletes a bot and creates a new one (a
- * reschedule or a new Meet link), so the cache never hands back the deleted bot. The result always
- * satisfies `RECALL_IDEMPOTENCY_KEY_RE`. Throws a `TypeError` with a fixed message (never echoing
- * the input) on a non-UUID event id or a version that is not a non-negative safe integer.
+ * The Idempotency-Key for creating the bot of one Ashby interview event (S01 plan R7, revised by the
+ * PR #433 review F1): `r1-meet-<ashbyEventId lower-cased>-v<version>-k<keyAttempt>`.
+ *
+ * Recall caches the response of a keyed create under key + method + path for an hour, errors
+ * included (400 and 500), and replays it to every request with the same key. So the key must change
+ * whenever the runtime (S06) starts a NEW create, and must stay the same when it retries the SAME one:
+ *  - `version` is the booking row's version: S06 bumps it whenever it deletes a bot and creates a new
+ *    one (a reschedule or a new Meet link), so the cache never hands back the deleted bot;
+ *  - `keyAttempt` (stored on the booking, starting at 0) is bumped whenever `createBot` throws a
+ *    `RecallError` with `rotateIdempotencyKey: true` (a cached 4xx/5xx), so a transient 500, or a 400
+ *    from a setting the operator then fixed, is not replayed for an hour;
+ *  - neither changes on a network failure, a timeout, 429, 507, a 409 `idempotency_in_progress` or a
+ *    502/503/504: that create may still finish, or may already have made the bot, and the same key
+ *    is what returns it.
+ * A 500 that Recall sent AFTER creating a bot could leave a second bot once the key rotates; both
+ * carry `metadata.booking_id`, so S06 deletes any bot that is not the booking's current one.
+ *
+ * The result always satisfies `RECALL_IDEMPOTENCY_KEY_RE` (at most 80 characters). Throws a
+ * `TypeError` with a fixed message (never echoing the input) on a non-UUID event id, or on a version
+ * or key attempt that is not a non-negative safe integer, checked in that order.
  */
-export function r1MeetCreateBotIdempotencyKey(ashbyEventId: string, version: number): string {
+export function r1MeetCreateBotIdempotencyKey(ashbyEventId: string, version: number, keyAttempt: number): string {
   if (typeof ashbyEventId !== 'string' || !ASHBY_EVENT_ID_RE.test(ashbyEventId)) {
     throw new TypeError('r1_meet_idempotency_invalid_event_id');
   }
   if (typeof version !== 'number' || !Number.isSafeInteger(version) || version < 0) {
     throw new TypeError('r1_meet_idempotency_invalid_version');
   }
-  return `r1-meet-${ashbyEventId.toLowerCase()}-v${version}`;
+  if (typeof keyAttempt !== 'number' || !Number.isSafeInteger(keyAttempt) || keyAttempt < 0) {
+    throw new TypeError('r1_meet_idempotency_invalid_key_attempt');
+  }
+  return `r1-meet-${ashbyEventId.toLowerCase()}-v${version}-k${keyAttempt}`;
 }

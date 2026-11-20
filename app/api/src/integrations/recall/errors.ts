@@ -10,6 +10,11 @@
  * Retry policy (S01 plan R6): the client makes ONE attempt per call and never sleeps. A retryable
  * outcome comes back as `retriable: true` with a bounded `retryAfterMs`, and the durable queue
  * (S07) reschedules the job.
+ *
+ * Idempotency-Key policy (PR #433 review F1): Recall caches the response of a keyed POST for one
+ * hour, INCLUDING 400 and 500 errors, and replays it to any request with the same key, method and
+ * path. `rotateIdempotencyKey: true` says this happened (or may have), so a retry, now or after a
+ * settings fix, must use a NEW key; with the old key it would only get the cached error back.
  */
 
 /** Stable, sanitized error categories. */
@@ -20,7 +25,7 @@ export type RecallErrorCategory =
   | 'forbidden' //           403: Recall's WAF blocked the request
   | 'not_found' //           404: unknown bot (or already deleted)
   | 'not_allowed' //         405: e.g. DELETE on a bot that was already dispatched
-  | 'conflict' //            409: the same Idempotency-Key is still being processed (retriable)
+  | 'conflict' //            409 (retriable): code `idempotency_in_progress` = the same key is still being processed
   | 'bad_request' //         400: Recall rejected the body (fieldCodes names the fields)
   | 'rate_limited' //        429 (retriable, honours a bounded Retry-After)
   | 'capacity_exhausted' //  507: the ad-hoc bot pool is empty (retriable)
@@ -65,6 +70,8 @@ export interface RecallErrorInit {
   /** Only kept when `retriable` is true; a non-negative integer, capped at five minutes. */
   retryAfterMs?: number | null;
   fieldCodes?: readonly unknown[];
+  /** Only `true` sets it; anything else is false. */
+  rotateIdempotencyKey?: boolean;
 }
 
 export class RecallError extends Error {
@@ -77,6 +84,14 @@ export class RecallError extends Error {
   public readonly retryAfterMs: number | null;
   /** Up to ten sanitized top-level keys of a 400 body: field NAMES only, never values. */
   public readonly fieldCodes: readonly string[];
+  /**
+   * True when Recall has (or may have) cached this response under the request's Idempotency-Key for
+   * an hour: a keyed POST answered with any 4xx/5xx except 429, 507, a 409 "still being processed"
+   * and the 502/503/504 gateway errors (Recall: retry those with the same key). A retry must then use
+   * a NEW key. False for network failures, timeouts and 2xx: the operation may have succeeded, so
+   * the same key is what returns its result.
+   */
+  public readonly rotateIdempotencyKey: boolean;
 
   constructor(category: RecallErrorCategory, init: RecallErrorInit = {}) {
     // Fixed text only: no dynamic value ever reaches the message.
@@ -92,6 +107,7 @@ export class RecallError extends Error {
     this.retriable = init.retriable === true;
     this.retryAfterMs = this.retriable ? sanitizeRetryAfter(init.retryAfterMs) : null;
     this.fieldCodes = Object.freeze(sanitizeFieldCodes(init.fieldCodes));
+    this.rotateIdempotencyKey = init.rotateIdempotencyKey === true;
   }
 
   /** Serialize ONLY the sanitized fields: never bodies, keys, ids or URLs. */
@@ -105,6 +121,7 @@ export class RecallError extends Error {
       retriable: this.retriable,
       retryAfterMs: this.retryAfterMs,
       fieldCodes: [...this.fieldCodes],
+      rotateIdempotencyKey: this.rotateIdempotencyKey,
     };
   }
 }
