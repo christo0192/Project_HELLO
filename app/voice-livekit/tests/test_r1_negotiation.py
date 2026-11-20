@@ -3677,3 +3677,14 @@ class DiscountTotalReconcileTests(unittest.TestCase):
                         self.assertIn((total, False), result)
                         if not v2 or phantom == 8800:
                             self.assertIn((phantom, False), result)
+
+
+class IndiaInterestTests(unittest.TestCase):
+    def test_interest_terms_flag(self):
+        from unittest.mock import patch
+        for enabled in ("1", "0"):
+            with patch.dict("os.environ", {"R1_INDIA_PLAYBOOK": enabled}):
+                text = "We can offer you zero interest on the fee."
+                self.assertEqual(neg.TERM_INSTALMENTS in neg.offer_terms_in(text), enabled == "1")
+                self.assertEqual(neg.instalments_are_monthly(text), enabled == "1")
+                self.assertEqual(neg.offer_terms_in("We don't offer zero interest."), frozenset())

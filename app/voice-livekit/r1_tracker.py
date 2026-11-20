@@ -942,6 +942,7 @@ def urgency_levers(text: object) -> tuple[frozenset[str], bool]:
 def invented_offer_in(
     text: object, *, v2: bool = False, perk_history: bool | None = None,
     discount_v3: bool | None = None, reconcile: bool | None = None,
+    india_playbook: bool | None = None,
 ) -> bool:
     """A free extra, a guarantee, or a discount outside the deck's $500/$1000/$1500 set.
 
@@ -950,6 +951,10 @@ def invented_offer_in(
     with a negator earlier in its clause is ignored.  Flagging them would cap a candidate
     for saying exactly what the deck wants said (S0-B: 24% of advisor turns had one).
     """
+    if india_playbook is None:
+        india_playbook = os.getenv("R1_INDIA_PLAYBOOK", "1").strip().lower() not in (
+            "0", "off", "false", "no"
+        )
     if perk_history is None:
         perk_history = os.getenv("R1_PERK_HISTORY", "1").strip().lower() not in (
             "0", "off", "false", "no"
@@ -958,6 +963,10 @@ def invented_offer_in(
         folded = fold(sentence)
         if not v2:
             for match in _INVENTED.finditer(folded):
+                if (india_playbook and re.fullmatch(r"waiv(?:e|ed|es)", match.group(), re.I)
+                        and re.search(r"\binterest\b", clause_before(folded, match.start())
+                                      + clause_after(folded, match.end()), re.I)):
+                    continue
                 if not negated_before(folded, match.start()):
                     return True
         else:
@@ -978,6 +987,9 @@ def invented_offer_in(
             for match in _FREE_CHARGE.finditer(folded):
                 before = clause_before(folded, match.start())
                 after = clause_after(folded, match.end())
+                if (india_playbook and re.search(
+                        r"\b(?:emis?|e\.m\.i|instal+ments?|interest)\b", before + after, re.I)):
+                    continue
                 if (not negated_before(folded, match.start())
                         and not _PERK_COMPARISON.search(before)
                         and not _PERK_LACKS.search(after)
@@ -986,6 +998,10 @@ def invented_offer_in(
                             r"\b(?:extra|additional|bonus)\b", before, re.I))):
                     return True
             for match in _INVENTED_ALWAYS.finditer(folded):
+                if (india_playbook and re.fullmatch(r"waiv(?:e|ed|es)", match.group(), re.I)
+                        and re.search(r"\binterest\b", clause_before(folded, match.start())
+                                      + clause_after(folded, match.end()), re.I)):
+                    continue
                 if not negated_before(folded, match.start()):
                     return True
             for match in _FREE_PERK.finditer(folded):
@@ -2070,7 +2086,7 @@ def neutralise_candidate_text(text: object, sentinel: str) -> str:
 
 def build_judge_messages(
     candidate_text: object, learner_last: object, *, seed: str, turn: int, v2: bool = False,
-    reconcile: bool = False
+    reconcile: bool = False, playbook: bool = False
 ) -> list[dict[str, str]]:
     """Messages for the shadow judge.  JSON is requested in the prompt, not by a flag."""
     sentinel = sentinel_for(seed, turn)
@@ -2107,6 +2123,13 @@ def build_judge_messages(
             " If the candidate states a total of $8500, $8000 or $7500, read the discount "
             "as $500, $1000 or $1500 respectively, whatever discount figure is written "
             "(speech-to-text often mishears it)."
+        )
+    if v2 and playbook:
+        system += (
+            " Under the IK India sales playbook these are also NOT invented offers: no-cost EMI, "
+            "monthly instalments, 0% or zero interest, interest-free payment, splitting the fee, "
+            "a monthly figure, and a limited-time offer (today only, early-bird, this cohort) "
+            "that uses $500, $1000 or $1500; such a limited-time offer is an urgency_lever."
         )
     user = (
         f"Learner's last line: {neutralise_candidate_text(learner_last, sentinel)}\n"
@@ -2231,6 +2254,39 @@ _PLAN_SPECIFICS = re.compile(
     r"|(?:zero|no|0\s*%)\s*interest|interest[- ]free|"
     r"(?:\$?\d[\d,]*(?:\s*dollars?)?\s*(?:a|per)\s*month))\b", re.I
 )
+# Owner 2026-11-20 (R1_INDIA_PLAYBOOK): India payment paths.
+_INDIA_PLAN = re.compile(
+    r"\b(?:no[- ]cost emis?|emis?|e\.m\.i|equated monthly instal+ments?|"
+    r"monthly instal+ments?|instal+ments?(?: (?:plans?|options?))?|"
+    r"(?:zero|no|0\s*%?)\s*(?:percent\s+)?interest(?!\s+in\b)|interest[- ]free|"
+    r"pay(?:ing)?(?: it)? (?:monthly|every month|per month|each month)|monthly payments?|"
+    r"(?:split(?:ting)?|spread(?:ing)?) (?:the|your) (?:fee|payments?|cost|amount)\b"
+    r"(?!\s+(?:with|between)\b)|"
+    r"\$?\d[\d,]*(?:\s*dollars?)?\s*(?:a|per|each|every)\s+month|financing options?)\b",
+    re.I,
+)
+# A payment path followed immediately by a negated copula is not offered.
+_INDIA_PLAN_NEGATED_AFTER = re.compile(
+    r"\s*(?:(?:options?|plans?|facilit(?:y|ies))\s+)?"
+    r"(?:(?:is|are|was|were)\s+(?:not|no longer|unavailable)\b|"
+    r"(?:isn't|aren't|wasn't|weren't)\b)", re.I,
+)
+# Existing personal debt is not an offer of a course payment path.
+_INDIA_PLAN_OWN_DEBT_BEFORE = re.compile(
+    r"\b(?:your|my|her|his|their)\s+(?:\w+\s+){0,2}?"
+    r"(?:loans?|car|home|house|mortgage|phone|existing|current|other|ongoing)\s+$", re.I,
+)
+
+
+def _india_plan_offered(folded: str) -> bool:
+    return any(
+        not negated_before(folded, match.start())
+        and not _INDIA_PLAN_NEGATED_AFTER.match(folded[match.end():])
+        and not _INDIA_PLAN_OWN_DEBT_BEFORE.search(clause_before(folded, match.start()))
+        for match in _INDIA_PLAN.finditer(folded)
+    )
+
+
 _OUTCOME_SPECIFICS = re.compile(
     r"\b(?:every|everyone|all of|all our|each one of|without exception|"
     r"hundreds? of|\d[\d,]*(?:\.\d+)?\s*(?:%|percent|k\b|alumni|graduates|students)|"
@@ -2251,7 +2307,7 @@ class CoverageTracker:
         self, persona: RenderedPersona, *, seed: str = "", invented_v2: bool = False,
         discipline_v2: bool = False, perk_history: bool = True,
         discount_read_v3: bool = True, strong_v2: bool | None = None,
-        total_reconcile: bool | None = None,
+        total_reconcile: bool | None = None, india_playbook: bool | None = None,
     ) -> None:
         self.persona = persona
         self.seed = seed
@@ -2263,6 +2319,11 @@ class CoverageTracker:
             os.getenv("R1_DISCOUNT_TOTAL_RECONCILE", "1").strip().lower()
             not in ("0", "off", "false", "no")
         )
+        self.india_playbook = india_playbook if india_playbook is not None else (
+            os.getenv("R1_INDIA_PLAYBOOK", "1").strip().lower()
+            not in ("0", "off", "false", "no")
+        )
+        self._india_plan_turns: set[int] = set()
         self._reconciled_turns: set[int] = set()
         self._rule_invented_turns: set[int] = set()
         self.strong_v2 = strong_v2 if strong_v2 is not None else (
@@ -2301,6 +2362,7 @@ class CoverageTracker:
         """Run the deterministic fast path on one candidate turn."""
         self.turn = turn if turn is not None else self.turn + 1
         update = self.gate.observe_candidate_turn(text, self.turn)
+        plan_this_turn = False
         for sentence in split_sentences(text):
             canonical = canonical_amounts(expand_shorthand_amounts(sentence))
             discount_amounts = {
@@ -2320,9 +2382,21 @@ class CoverageTracker:
             matches = list(plan_pattern.finditer(folded))
             if re.search(r"\b(?:payment|discount|fee|price|cost)\b", sentence, re.I):
                 matches += list(PAYMENT_CHOICE_PATTERN.finditer(folded))
-            if (not (self.strong_v2 and _PLAN_SPECIFICS.search(folded))
+            if (not (not self.india_playbook and self.strong_v2
+                     and _PLAN_SPECIFICS.search(folded))
                     and any(not negated_before(folded, match.start()) for match in matches)):
                 self.payment_plan_named = True
+                plan_this_turn = True
+                if self.payment_plan_turn is None:
+                    self.payment_plan_turn = self.turn
+            if self.india_playbook and (
+                not is_question_like(sentence) or re.search(
+                    r"\b(?:would you like|shall i|can i (?:set|send|put)|do you want me to)\b",
+                    sentence, re.I)
+            ) and _india_plan_offered(folded):
+                self.payment_plan_named = True
+                plan_this_turn = True
+                self._india_plan_turns.add(self.turn)
                 if self.payment_plan_turn is None:
                     self.payment_plan_turn = self.turn
             for match in OUTCOME_PATTERN.finditer(folded):
@@ -2343,6 +2417,8 @@ class CoverageTracker:
                     text, v3=self.discount_read_v3, reconcile=False))):
             self._reconciled_turns.add(self.turn)
         if discount_question_open:
+            discounts = [replace(m, conditional=True) for m in discounts]
+        if self.india_playbook and plan_this_turn:
             discounts = [replace(m, conditional=True) for m in discounts]
         if self.discipline_v2:
             sentences = split_sentences(canonical_amounts(expand_shorthand_amounts(text)))
@@ -2403,6 +2479,7 @@ class CoverageTracker:
         invented = invented_offer_in(
             text, v2=self.invented_v2, perk_history=self.perk_history,
             discount_v3=self.discount_read_v3, reconcile=self.total_reconcile,
+            india_playbook=self.india_playbook,
         )
         if self.invented_v2 and not invented and (
             re.search(r"\bfree\b|\bat no (?:extra |additional )?(?:cost|charge)\b",
@@ -2437,6 +2514,9 @@ class CoverageTracker:
             text, turn if turn is not None else self.turn, echoed=echoed
         )
 
+    def _playbook_judge_exempt(self, turn: int) -> bool:
+        return turn in self._india_plan_turns
+
     def apply_judge(self, result: JudgeResult | None, judged_turn: int) -> bool:
         """Merge a validated judge result for ``judged_turn``; None changes nothing."""
         if result is None:
@@ -2458,7 +2538,8 @@ class CoverageTracker:
             self.family_quality[family] = value if current is None else max(current, value)
         if self.invented_v2:
             judge_invented = result.invented_offer and not (
-                self.total_reconcile and judged_turn in self._reconciled_turns
+                ((self.total_reconcile and judged_turn in self._reconciled_turns)
+                 or (self.india_playbook and self._playbook_judge_exempt(judged_turn)))
                 and judged_turn not in self._rule_invented_turns
             )
             if judge_invented:
@@ -2527,7 +2608,8 @@ class CoverageTracker:
             fee_named=self.fee_named,
             money_path=self.payment_plan_named or (
                 bool(self.discount_log) and self.discount_ok and not self.invented_offer
-                and any(item["turn"] not in self._specific_plan_turns for item in self.discount_log)
+                and (self.india_playbook or any(
+                    item["turn"] not in self._specific_plan_turns for item in self.discount_log))
                 and all(item["usd"] in DISCOUNTS_USD for item in self.discount_log)
             ),
             reassurance=(self._outcome_seen or bool(self.levers & {

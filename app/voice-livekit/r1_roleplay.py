@@ -326,6 +326,7 @@ from r1_prompts import (
     OFFER_TERMS_HEADER,
     OFFER_TERMS_IN_PARTS,
     OFFER_TERMS_INSTALMENTS,
+    OFFER_TERMS_INSTALMENTS_V2,
     PRESSURE_EASED_NOTE,
     PRESSURE_EASED_NOTE_V2,
     PRICE_MET_NOTE,
@@ -1314,6 +1315,9 @@ FLAG_DISCOUNT_READ_V3 = "R1_DISCOUNT_READ_V3"
 # Owner 2026-11-20: a discount next to a stated deck total reads as that deck discount; 0
 # restores the previous reader.
 FLAG_DISCOUNT_TOTAL_RECONCILE = "R1_DISCOUNT_TOTAL_RECONCILE"
+# Owner 2026-11-20 (IK India playbook): EMI, instalments and 0% interest are a money path; 0
+# restores the previous readers.
+FLAG_INDIA_PLAYBOOK = "R1_INDIA_PLAYBOOK"
 # PROOF-1: exclude learner conditions from concessions; 0 restores the previous reader.
 FLAG_CONCESSION_CONDITION = "R1_CONCESSION_CONDITION"
 
@@ -1487,6 +1491,7 @@ _FLAG_READS = {
     FLAG_PERK_HISTORY: lambda: os.getenv("R1_PERK_HISTORY"),
     FLAG_DISCOUNT_READ_V3: lambda: os.getenv("R1_DISCOUNT_READ_V3"),
     FLAG_DISCOUNT_TOTAL_RECONCILE: lambda: os.getenv("R1_DISCOUNT_TOTAL_RECONCILE"),
+    FLAG_INDIA_PLAYBOOK: lambda: os.getenv("R1_INDIA_PLAYBOOK"),
     FLAG_CONCESSION_CONDITION: lambda: os.getenv("R1_CONCESSION_CONDITION"),
     FLAG_PERSONA_TIMELINE_V3: lambda: os.getenv("R1_PERSONA_TIMELINE_V3"),
 }
@@ -1822,6 +1827,7 @@ class RolePlayEngine:
         self._perk_history = flag_on(FLAG_PERK_HISTORY)
         self._discount_read_v3 = flag_on(FLAG_DISCOUNT_READ_V3)
         self._total_reconcile = flag_on(FLAG_DISCOUNT_TOTAL_RECONCILE)
+        self._india_playbook = flag_on(FLAG_INDIA_PLAYBOOK)
         self._concession_condition = flag_on(FLAG_CONCESSION_CONDITION)
         self._condition_planned: list[dict[str, Any]] = []
         self._upgrade_condition_used = False
@@ -1847,6 +1853,7 @@ class RolePlayEngine:
             discipline_v2=self._discipline_v2, perk_history=self._perk_history,
             discount_read_v3=self._discount_read_v3, strong_v2=self._strong_v2,
             total_reconcile=self._total_reconcile,
+            india_playbook=self._india_playbook,
         )
         self.tracker.families_planned = families
         self.ledger = GuardLedger()
@@ -5052,7 +5059,9 @@ class RolePlayEngine:
         if terms:
             clauses = {
                 TERM_INSTALMENTS: (
-                    OFFER_TERMS_INSTALMENTS if self._turn_terms_monthly else OFFER_TERMS_IN_PARTS
+                    (OFFER_TERMS_INSTALMENTS_V2 if self._india_playbook
+                     else OFFER_TERMS_INSTALMENTS)
+                    if self._turn_terms_monthly else OFFER_TERMS_IN_PARTS
                 ),
                 TERM_FREE_EXTRA: OFFER_TERMS_FREE_EXTRA,
             }
@@ -7921,6 +7930,7 @@ class RolePlayEngine:
             seed=self.seed,
             turn=self.turn if turn is None else turn,
             v2=self._invented_v2, reconcile=self._total_reconcile,
+            playbook=self._india_playbook,
         )
 
     def apply_judge(self, raw: Any, judged_turn: int) -> bool:

@@ -28,7 +28,9 @@ from r1_text import dollar_amounts, fold, negated_before, split_sentences
 #    price and the duration; she knows no course detail and says a course figure only after the
 #    advisor did.  Documentation only: the policy is pinned here, never sent to a model (the card
 #    and the prefix carry it, behind R1_PROBE_FIRST).  No deck fact, scorer rule or figure changed.
-WORLD_REVISION = 3
+# 4: owner 2026-11-20 (R1_INDIA_PLAYBOOK): PLAYBOOK_RULE documents the IK India playbook.
+#    Documentation only; no deck fact, scorer rule or figure changed.
+WORLD_REVISION = 4
 DECK_TITLE = "Interview Kickstart (IK) Sales Mock Preparation Guide"
 DECK_FILENAME = "Copy of Sales Mock Call Prep Document_Updated.pdf"
 DECK_PAGES = 3
@@ -242,6 +244,13 @@ SCORER_RULE = (
     "other than $9000, a discount outside $500/$1000/$1500 or above $1500, a duration "
     "other than 6 months, a guaranteed outcome) are violations."
 )
+PLAYBOOK_RULE = (
+    "Owner decision 2026-11-20 (IK India playbook): no-cost EMI, monthly instalments, "
+    "0% interest, splitting the fee and per-month figures are a legitimate payment path, and a "
+    "limited-time offer that uses a deck discount ($500, $1000 or $1500) is legitimate "
+    "urgency. Job or placement guarantees, refunds, free perks, discounts outside the deck set "
+    "and stacked discounts below $7,500 are still violations."
+)
 DEFLECTION_POLICY = {
     "learner": (
         "Never assert a product fact. If the advisor asks about anything off the public "
@@ -261,6 +270,7 @@ DEFLECTION_POLICY = {
 def _canonical() -> bytes:
     payload = {
         "revision": WORLD_REVISION,
+        "playbook": PLAYBOOK_RULE,
         "deck": {"title": DECK_TITLE, "pages": DECK_PAGES, "sha256": DECK_SHA256},
         "numbers": {
             "price_usd": PRICE_USD,

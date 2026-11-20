@@ -3207,6 +3207,12 @@ def parse_price_offers(
     return _reconcile_price_offers(text, sorted(offers.items(), reverse=True), base)
 
 
+def _india_playbook_on() -> bool:
+    return os.getenv("R1_INDIA_PLAYBOOK", "1").strip().lower() not in (
+        "0", "off", "false", "no"
+    )
+
+
 def _total_reconcile_on() -> bool:
     return os.getenv("R1_DISCOUNT_TOTAL_RECONCILE", "1").strip().lower() not in (
         "0", "off", "false", "no"
@@ -3948,6 +3954,10 @@ _INSTALMENT_TERM = re.compile(
     r"costs?|parts))\b",
     re.IGNORECASE,
 )
+_INSTALMENT_TERM_PLAYBOOK = re.compile(
+    r"\b(?:(?:zero|no|0\s*%?)[- ]?(?:percent\s+)?interest(?!\s+in\b)|"
+    r"interest[- ]free)\b", re.I
+)
 _INSTALMENT_OFFER = re.compile(
     r"\b(?:can|could|will|'ll|offer\w*|have|has|give|provide\w*|allow\w*|available|option|"
     r"tied up|opt|choose|let)\b",
@@ -4054,13 +4064,17 @@ def _offer_terms(text: object) -> tuple[frozenset[str], bool]:
                 ),
                 None,
             )
+            playbook_term = False
+            if term is None and _india_playbook_on():
+                term = _INSTALMENT_TERM_PLAYBOOK.search(clause)
+                playbook_term = term is not None
             if (
                 term is not None
                 and _INSTALMENT_OFFER.search(clause) is not None
                 and _offered_statement(clause, term.start())
             ):
                 found.add(TERM_INSTALMENTS)
-                monthly = monthly or _MONTHLY_TERM.search(clause) is not None
+                monthly = monthly or playbook_term or _MONTHLY_TERM.search(clause) is not None
             extra = _FREE_EXTRA_TERM.search(clause)
             if (
                 extra is not None

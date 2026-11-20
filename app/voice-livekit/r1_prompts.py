@@ -636,6 +636,14 @@ OFFER_TERMS_INSTALMENTS = (
     "you may ask what it would come to each month; do not say why monthly would help, and do not "
     "call it affordable or workable before you hear that figure."
 )
+# Owner 2026-11-20 (R1_INDIA_PLAYBOOK): a normal payment option.
+OFFER_TERMS_INSTALMENTS_V2 = (
+    "They offered EMI or monthly instalments, a normal way to pay for a course. React in a few "
+    "words; you may sound relieved, and if they named no monthly figure, you may ask what it "
+    "would come to each month. Do not say why monthly would help, do not doubt it or ask who "
+    "provides it, and do not repeat its terms back as a fact."
+)
+
 # Review S2R-8: a split that is not monthly ("two halves", "half now and half later") gets no
 # monthly wording, which would hand her a course fact the advisor never said (D-M032-7).
 OFFER_TERMS_IN_PARTS = (

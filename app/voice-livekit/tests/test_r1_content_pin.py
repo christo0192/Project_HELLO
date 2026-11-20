@@ -279,7 +279,8 @@ import r1_world
 # 46: L-OPEN-HI, the hello without the hearing question (R1_OPENING_NO_HEARING_CHECK).
 # 47: Dex, the male interviewer, in the spoken lines (R1_INTERVIEWER_DEX, DEX_LINES).
 #     Also the Dex prompts: prefixes, wrap-up note, end-intent system, after-aside context.
-PINNED_CONTENT_SHA256 = "8dc0c3f6604e9b552e5e6ce3a4e5255c70a5d21f99a512daa83ab9fc6b5f9d19"
+# 48: pin the India money path and calmer instalment note.
+PINNED_CONTENT_SHA256 = "df20430571521ac8ff5a1802a38c64cbbad56fb98aa403736917760a709dd8e4"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -467,6 +468,7 @@ class PinTests(unittest.TestCase):
             (r1_prompts, "COACH_RESUME_NOTE", "- x"),
             (r1_prompts, "OFFER_ON_TABLE_NOTE_V2", "- {amount}"),
             (r1_prompts, "OFFER_TERMS_INSTALMENTS", "x"),
+            (r1_prompts, "OFFER_TERMS_INSTALMENTS_V2", "x"),
             (r1_prompts, "OFFER_TERMS_IN_PARTS", "x"),
             (r1_prompts, "IMPLAUSIBLE_FREE_NOTE", "- x"),
             (r1_prompts, "NOT_TODAY_RESERVED_NOTE", "- x"),
@@ -1125,6 +1127,13 @@ class FinalReviewRoundOnePinTests(unittest.TestCase):
         finally:
             r1_commitment.UPGRADE_LINE = upgrade_line
         self.assertEqual(r1_content.content_sha256(), base)
+
+
+class IndiaPlanPinTests(unittest.TestCase):
+    def test_plan_pattern_is_in_manifest(self):
+        import r1_tracker
+        self.assertEqual(r1_content.manifest()["commitment"]["india_plan_pattern"],
+                         r1_tracker._INDIA_PLAN.pattern)
 
 
 if __name__ == "__main__":

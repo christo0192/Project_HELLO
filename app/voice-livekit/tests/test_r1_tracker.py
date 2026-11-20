@@ -6,6 +6,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
@@ -2519,31 +2520,35 @@ class StrongEvidenceReadersTests(unittest.TestCase):
         self.assertFalse(evidence.reassurance)
 
     def test_unrelated_plans_and_negation(self):
-        for text in ("What are your plans after the course?", "Plan your week around it.",
-                     "We don't have a payment plan.", "We don\u2019t have a payment plan.",
-                     "How do you plan to pay for it?",
-                     "Do you have plans to pay for it yourself?",
-                     "Is this part of your career plan?",
-                     "You could split the cost with your husband."):
-            with self.subTest(text=text):
+        for enabled in ("0", "1"):
+            with self.subTest(enabled=enabled), patch.dict(
+                    "os.environ", {"R1_INDIA_PLAYBOOK": enabled}):
+                for text in ("What are your plans after the course?", "Plan your week around it.",
+                             "We don't have a payment plan.", "We don\u2019t have a payment plan.",
+                             "How do you plan to pay for it?",
+                             "Do you have plans to pay for it yourself?",
+                             "Is this part of your career plan?",
+                             "You could split the cost with your husband."):
+                    with self.subTest(text=text):
+                        tracker = CoverageTracker(PERSONA)
+                        tracker.observe_candidate_turn(text)
+                        self.assertFalse(tracker.payment_plan_named)
                 tracker = CoverageTracker(PERSONA)
-                tracker.observe_candidate_turn(text)
-                self.assertFalse(tracker.payment_plan_named)
-        tracker = CoverageTracker(PERSONA)
-        tracker.observe_candidate_turn("$500 off if you enrol this week.")
-        self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).fee_named)
-        tracker.observe_candidate_turn("Our alumni are great people.")
-        tracker.observe_candidate_turn("Our graduates got really confused by data at first.")
-        self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).reassurance)
-        for text in ("Many of our graduates got hired within the year.",
-                     "Our alumni got new jobs after it."):
-            with self.subTest(text=text):
+                tracker.observe_candidate_turn("$500 off if you enrol this week.")
+                self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).fee_named)
+                tracker.observe_candidate_turn("Our alumni are great people.")
+                tracker.observe_candidate_turn(
+                    "Our graduates got really confused by data at first.")
+                self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).reassurance)
+                for text in ("Many of our graduates got hired within the year.",
+                             "Our alumni got new jobs after it."):
+                    with self.subTest(text=text):
+                        tracker = CoverageTracker(PERSONA)
+                        tracker.observe_candidate_turn(text)
+                        self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).reassurance)
                 tracker = CoverageTracker(PERSONA)
-                tracker.observe_candidate_turn(text)
-                self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).reassurance)
-        tracker = CoverageTracker(PERSONA)
-        tracker.observe_candidate_turn("We can split the fee into two payments.")
-        self.assertFalse(tracker.payment_plan_named)
+                tracker.observe_candidate_turn("We can split the fee into two payments.")
+                self.assertEqual(tracker.payment_plan_named, enabled == "1")
 
     def test_deck_discount_after_value_is_a_money_path(self):
         for amount, expected in ((500, True), (750, False)):
@@ -2607,26 +2612,32 @@ class ProofOneTrackerTests(unittest.TestCase):
 
 class ReviewEvidenceTests(unittest.TestCase):
     def test_money_and_outcomes(self):
-        for text in ("You can pay monthly, about $750 a month over twelve months, no interest.",
-                     "You can split the payment into twelve monthly instalments of 750 dollars.",
-                     "We have a payment plan, $750 a month with zero interest."):
+        with patch.dict("os.environ", {"R1_INDIA_PLAYBOOK": "0"}):
+            for text in ("You can pay monthly, about $750 a month over twelve months, "
+                         "no interest.",
+                         "You can split the payment into twelve monthly instalments of "
+                         "750 dollars.",
+                         "We have a payment plan, $750 a month with zero interest."):
+                tracker = CoverageTracker(PERSONA)
+                tracker.observe_candidate_turn(text)
+                self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).money_path, text)
+            for text in ("The discount depends on the payment plan you choose.",
+                         "There are a few payment plans, and I can send you the details."):
+                tracker = CoverageTracker(PERSONA)
+                tracker.observe_candidate_turn(text)
+                self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).money_path, text)
+            for text in ("Our alumni moved into data analyst roles, 95 percent of them "
+                         "within three months.",
+                         "95 percent of our alumni landed jobs at top tech companies within "
+                         "three months, with salaries over 150k.",
+                         "Every one of our graduates got a job."):
+                tracker = CoverageTracker(PERSONA)
+                tracker.observe_candidate_turn(text)
+                self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).reassurance, text)
             tracker = CoverageTracker(PERSONA)
-            tracker.observe_candidate_turn(text)
-            self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).money_path, text)
-        for text in ("The discount depends on the payment plan you choose.",
-                     "There are a few payment plans, and I can send you the details."):
-            tracker = CoverageTracker(PERSONA)
-            tracker.observe_candidate_turn(text)
-            self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).money_path, text)
-        for text in ("Our alumni moved into data analyst roles, 95 percent of them within three months.",
-                     "95 percent of our alumni landed jobs at top tech companies within three months, with salaries over 150k.",
-                     "Every one of our graduates got a job."):
-            tracker = CoverageTracker(PERSONA)
-            tracker.observe_candidate_turn(text)
-            self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).reassurance, text)
-        tracker = CoverageTracker(PERSONA)
-        tracker.observe_candidate_turn("Many of our alumni switched into analyst roles after the course.")
-        self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).reassurance)
+            tracker.observe_candidate_turn(
+                "Many of our alumni switched into analyst roles after the course.")
+            self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).reassurance)
 
     def test_invented_and_judge(self):
         for text in ("You will definitely get a job after this.", "You'll surely land a role.",
@@ -2811,3 +2822,69 @@ class ReconcileTotalTests(unittest.TestCase):
         tracker.apply_judge(verdict, 1)
         self.assertTrue(tracker.invented_offer)
         self.assertEqual(tracker.judge_invented_turns, 1)
+
+
+class IndiaMoneyPathTests(unittest.TestCase):
+    def test_money_paths_and_probes(self):
+        for text, expected in (
+            ("You could split the cost with your husband.", False),
+            ("You could split the cost between you and your husband.", False),
+            ("EMI is not available for this course.", False),
+            ("The EMI option isn't available right now.", False),
+            ("Instalments are not possible, sorry.", False),
+            ("You mentioned your car loan EMI.", False),
+            ("Your existing EMIs must be a lot to handle.", False),
+            ("We offer an EMI option so that you don't have to pay it all at once.", True),
+            ("We can split the fee into two payments.", True),
+            ("You can pay your fee in EMIs.", True),
+            ("We have a no-cost EMI option, so you can pay monthly at zero percent "
+             "interest.", True),
+            ("You can split the fee into twelve monthly instalments of 625 dollars.", True),
+            ("With our bank partners it is 0% interest EMI.", True),
+            ("We don't have EMI right now.", False),
+            ("Do you need an EMI?", False),
+            ("Would you like me to set up the EMI for you?", True),
+            ("We start a new cohort every month.", False),
+            ("You said you study 20 hours a month.", False),
+            ("We have no interest in data.", False),
+            ("You can pay monthly, about $750 a month over twelve months, no interest.", True),
+            ("You can split the payment into twelve monthly instalments of 750 dollars.", True),
+            ("We have a payment plan, $750 a month with zero interest.", True),
+        ):
+            with self.subTest(text=text):
+                tracker = CoverageTracker(PERSONA, invented_v2=True, discipline_v2=True)
+                tracker.observe_candidate_turn(text)
+                evidence = tracker.commitment_evidence(AskKind.ENROL)
+                self.assertEqual(evidence.money_path, expected)
+                self.assertEqual(tracker.payment_plan_named, expected)
+                self.assertFalse(tracker.invented_offer)
+                self.assertFalse(evidence.pressured)
+
+    def test_invented_and_conditional(self):
+        self.assertFalse(invented_offer_in("We waive the interest on the EMI.", v2=False))
+        self.assertTrue(invented_offer_in(
+            "We waive the interest on the EMI.", v2=False, india_playbook=False))
+        self.assertTrue(invented_offer_in("We waive the fee for you.", v2=False))
+        for text in ("We offer EMI at no extra cost.", "We waive the interest on the EMI."):
+            self.assertFalse(invented_offer_in(text, v2=True))
+            self.assertTrue(invented_offer_in(text, v2=True, india_playbook=False))
+        for text in ("We give a free laptop at no extra cost.", "We waive the fee for you."):
+            self.assertTrue(invented_offer_in(text, v2=True))
+        for enabled in ("1", "0"):
+            with patch.dict("os.environ", {"R1_INDIA_PLAYBOOK": enabled}):
+                tracker = CoverageTracker(PERSONA, invented_v2=True, discipline_v2=True)
+                tracker.observe_candidate_turn(
+                    "I can give you $1,500 off, and you can pay it in EMIs.")
+                self.assertEqual(tracker.discount_log[0]["conditional"], enabled == "1")
+
+    def test_judge_prompt_and_exemption(self):
+        phrase = "Under the IK India sales playbook"
+        for v2, playbook in ((True, True), (False, True), (True, False)):
+            prompt = build_judge_messages("", "", seed="x", turn=1, v2=v2, playbook=playbook)
+            self.assertEqual(phrase in prompt[0]["content"], v2 and playbook)
+        for enabled in (True, False):
+            tracker = CoverageTracker(PERSONA, invented_v2=True, india_playbook=enabled)
+            tracker.observe_candidate_turn("We offer EMI.", 1)
+            tracker.apply_judge(JudgeResult(invented_offer=True), 1)
+            self.assertEqual(tracker.invented_offer, not enabled)
+            self.assertEqual(tracker.judge_invented_turns, int(not enabled))

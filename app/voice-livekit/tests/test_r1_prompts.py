@@ -1484,6 +1484,7 @@ class LearnerVoiceS2PromptTests(unittest.TestCase):
             p.SOFT_TIC_NOTE.format(words='"actually"'), p.IMPLAUSIBLE_FREE_NOTE,
             p.IMPLAUSIBLE_PRICE_NOTE.format(amount="$500"),
             " ".join((p.OFFER_TERMS_HEADER, p.OFFER_TERMS_INSTALMENTS, p.OFFER_TERMS_FREE_EXTRA)),
+            " ".join((p.OFFER_TERMS_HEADER, p.OFFER_TERMS_INSTALMENTS_V2)),
             " ".join((p.OFFER_TERMS_HEADER, p.OFFER_TERMS_IN_PARTS)),
         )
         yield turn_reminder(P1, r_sec=10, voice_v2=True, notes=notes)

@@ -8895,6 +8895,25 @@ class NoCommitLedgerTests(unittest.TestCase):
         self.assertIn("before you agree", question_spec(AskKind.ENROL).brief)  # flag off
 
 
+class IndiaPlaybookEngineTests(unittest.TestCase):
+    def test_old_instalment_note_when_off(self):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_INDIA_PLAYBOOK": "0"}):
+            session = Session(engine())
+            session.say(OPENER, 20)
+            note = session.say(MONTHLY_EMI, 40).reminder
+            self.assertIn(P2.OFFER_TERMS_INSTALMENTS, note)
+            self.assertNotIn(P2.OFFER_TERMS_INSTALMENTS_V2, note)
+
+    def test_judge_prompt_flag(self):
+        for enabled in ("1", "0"):
+            with mock.patch.dict(r1_roleplay.os.environ, {"R1_INDIA_PLAYBOOK": enabled}):
+                eng = engine()
+                eng._invented_v2 = True
+                messages = eng.judge_messages("We offer EMI.", "")
+                self.assertEqual("Under the IK India sales playbook" in messages[0]["content"],
+                                 enabled == "1")
+
+
 class OfferNotesTests(unittest.TestCase):
     """SWEEP-5 (R1_LEARNER_VOICE_V2 texts, R1_OFFER_TERMS) and SWEEP-13 (R1_OFFER_REALISM)."""
 
@@ -8912,7 +8931,7 @@ class OfferNotesTests(unittest.TestCase):
         s.say(OPENER, 20)
         plan = s.say(MONTHLY_EMI, 40)
         self.assertIn(P2.OFFER_TERMS_HEADER, plan.reminder)
-        self.assertIn(P2.OFFER_TERMS_INSTALMENTS, plan.reminder)
+        self.assertIn(P2.OFFER_TERMS_INSTALMENTS_V2, plan.reminder)
         again = s.say("And yes, the monthly EMI option is available for you.", 60)
         self.assertNotIn(P2.OFFER_TERMS_HEADER, again.reminder or "")  # once per session
         self.assertEqual(s.eng.admin_log()["voice"]["offer_terms_counts"], {"instalments": 1})
@@ -9154,7 +9173,7 @@ class S2CoverageTests(unittest.TestCase):
         from r1_personas import deep_need_topics_in, resolve_persona
 
         notes = [
-            P2.OFFER_TERMS_HEADER, P2.OFFER_TERMS_INSTALMENTS, P2.OFFER_TERMS_FREE_EXTRA,
+            P2.OFFER_TERMS_HEADER, P2.OFFER_TERMS_INSTALMENTS_V2, P2.OFFER_TERMS_FREE_EXTRA,
             P2.OFFER_TERMS_IN_PARTS,
             P2.NEW_OFFER_NOTE_V2, P2.NEW_OFFER_ABOVE_ASK_NOTE, P2.OFFER_ON_TABLE_NOTE_V2,
             P2.OFFER_MET_NOTE_V2, P2.IMPLAUSIBLE_PRICE_NOTE, P2.IMPLAUSIBLE_FREE_NOTE,
@@ -9387,11 +9406,11 @@ class S2ReviewFixTests(unittest.TestCase):
         s = Session(engine())
         s.say(OPENER, 20)
         first = s.eng.plan_turn("I can do $8,000 and you can pay it in monthly EMI.", 40)
-        self.assertIn(P2.OFFER_TERMS_INSTALMENTS, first.reminder)
+        self.assertIn(P2.OFFER_TERMS_INSTALMENTS_V2, first.reminder)
         s.eng.reply_lost(first)
         heard = s.eng.plan_turn("That offer is valid till Friday.", 44)
         self.assertIn("split_replan", heard.reasons)
-        self.assertIn(P2.OFFER_TERMS_INSTALMENTS, heard.reminder)
+        self.assertIn(P2.OFFER_TERMS_INSTALMENTS_V2, heard.reminder)
         self.assertEqual(s.eng.admin_log()["voice"]["offer_terms_counts"], {"instalments": 1})
         low = Session(engine())
         low.say(OPENER, 20)
@@ -9436,7 +9455,7 @@ class S2ReviewFixTests(unittest.TestCase):
         s.say(OPENER, 20)
         plan = s.say("You can split the payment into two halves.", 40)
         self.assertIn(P2.OFFER_TERMS_IN_PARTS, plan.reminder)
-        self.assertNotIn(P2.OFFER_TERMS_INSTALMENTS, plan.reminder)
+        self.assertNotIn(P2.OFFER_TERMS_INSTALMENTS_V2, plan.reminder)
         self.assertNotIn("each month", plan.reminder)
 
     @s2p_off

@@ -411,7 +411,9 @@ import r1_world
 # 47: owner 2026-11-19 (R1_INTERVIEWER_DEX): Dex, a male interviewer, replaces Christy in the
 #    spoken lines (r1_script.DEX_LINES); the Christy texts stay as the flag-off rollback.
 #    Dex prefixes, wrap-up note, end-intent system and after-aside context are pinned.
-CONTENT_REVISION = 47
+# 48: owner 2026-11-20 (R1_INDIA_PLAYBOOK, R1_DISCOUNT_TOTAL_RECONCILE): the India playbook
+#    money path (EMI, instalments, 0% interest) reader and the calmer instalment note.
+CONTENT_REVISION = 48
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -484,6 +486,7 @@ def _learner_voice_v2(sample: r1_personas.RenderedPersona) -> dict[str, Any]:
             p.OFFER_TERMS_INSTALMENTS,
             p.OFFER_TERMS_IN_PARTS,
             p.OFFER_TERMS_FREE_EXTRA,
+            p.OFFER_TERMS_INSTALMENTS_V2,
         ],
         "implausible_notes": [p.IMPLAUSIBLE_PRICE_NOTE, p.IMPLAUSIBLE_FREE_NOTE],
         "not_today_reserved_note": p.NOT_TODAY_RESERVED_NOTE,
@@ -1003,6 +1006,7 @@ def manifest() -> dict[str, Any]:
             "strong_line_v2": r1_commitment.STRONG_LINE_V2,
             "strong_plan_line_v2": r1_commitment.STRONG_PLAN_LINE_V2,
             "payment_plan_pattern": r1_tracker.PAYMENT_PLAN_PATTERN.pattern,
+            "india_plan_pattern": r1_tracker._INDIA_PLAN.pattern,
             "payment_choice_pattern": r1_tracker.PAYMENT_CHOICE_PATTERN.pattern,
             "outcome_pattern": r1_tracker.OUTCOME_PATTERN.pattern,
             "default_slot": r1_commitment.DEFAULT_SLOT,
