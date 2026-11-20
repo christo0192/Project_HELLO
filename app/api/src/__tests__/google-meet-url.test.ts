@@ -1,6 +1,7 @@
 /**
- * The Google Meet link normaliser is the single gate both the Calendly parser and the Recall bot
- * builder use, so it must accept every real spelling of a Meet link and nothing else.
+ * The Google Meet link normaliser is the single gate both the Ashby interview-schedule parser
+ * (`lib/r1/meet/ashby-schedule.ts`) and the Recall bot builder use, so it must accept every real
+ * spelling of a Meet link and nothing else.
  */
 import { describe, expect, it } from 'vitest';
 import {

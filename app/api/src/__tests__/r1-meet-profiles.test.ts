@@ -9,11 +9,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
+  R1_MEET_CONSENT_MODES,
   R1_MEET_DEFAULT_PROFILE_ID,
   R1_MEET_PROFILES,
   R1_MEET_PROFILE_IDS,
   getR1MeetProfile,
 } from '../lib/r1/meet/profiles.js';
+
+/** D-M034-9 / D-M034-11: the exact notice Dex posts in the meeting chat (AI + recorded). */
+const DISCLOSURE = 'Dex is an AI interviewer from Interview Kickstart. This call is recorded.';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const read = (relative: string): string => readFileSync(path.resolve(here, relative), 'utf8');
@@ -64,6 +68,7 @@ describe('R1 Meet profile registry', () => {
     expect(getR1MeetProfile('r1_dex_sales')).toStrictEqual({
       id: 'r1_dex_sales',
       interviewKind: 'sales_r1',
+      consentMode: 'hr_attested_ashby',
       botDisplayName: 'Dex',
       maxCallMinutes: 45,
       botJoinLeadSec: 120,
@@ -74,9 +79,27 @@ describe('R1 Meet profile registry', () => {
         inCallNotRecordingTimeoutSec: 900,
         inCallRecordingTimeoutSec: 2700,
       },
-      disclosureChatMessage: 'Dex is an AI interviewer from Interview Kickstart.',
+      disclosureChatMessage: DISCLOSURE,
       participantMetadataRetentionHours: 1,
     });
+  });
+
+  it('records consent as HR-attested at Ashby scheduling (D-M034-11)', () => {
+    expect(R1_MEET_CONSENT_MODES).toEqual(['hr_attested_ashby']);
+    expect(Object.isFrozen(R1_MEET_CONSENT_MODES)).toBe(true);
+    expect(() => {
+      (R1_MEET_CONSENT_MODES as string[]).push('candidate_web');
+    }).toThrow(TypeError);
+    expect(R1_MEET_CONSENT_MODES).toEqual(['hr_attested_ashby']);
+    expect(getR1MeetProfile('r1_dex_sales')!.consentMode).toBe('hr_attested_ashby');
+  });
+
+  it('posts exactly the owner-approved disclosure: Dex is an AI and the call is recorded', () => {
+    const profile = getR1MeetProfile('r1_dex_sales')!;
+    expect(profile.disclosureChatMessage).toBe(DISCLOSURE);
+    expect(profile.disclosureChatMessage).toMatch(/\bAI\b/);
+    expect(profile.disclosureChatMessage).toContain('recorded');
+    expect(profile.disclosureChatMessage).toContain(profile.botDisplayName);
   });
 
   it('is deep-frozen', () => {
@@ -202,11 +225,16 @@ describe('every profile agrees with the database and the R1 worker', () => {
     expect(profile.botDisplayName).toMatch(/^[\x20-\x7e]+$/);
   });
 
-  it.each(profiles)('$id discloses that the interviewer is an AI, by name', (profile) => {
+  it.each(profiles)('$id discloses that the interviewer is an AI, by name, and that the call is recorded', (profile) => {
     const message = profile.disclosureChatMessage;
     expect(message.trim().length).toBeGreaterThan(0);
     expect(message.length).toBeLessThanOrEqual(4096);
     expect(message).toMatch(/\bAI\b/);
+    expect(message).toMatch(/\brecorded\b/);
     expect(message).toContain(profile.botDisplayName);
+  });
+
+  it.each(profiles)('$id uses a consent mode this build knows', (profile) => {
+    expect(R1_MEET_CONSENT_MODES).toContain(profile.consentMode);
   });
 });

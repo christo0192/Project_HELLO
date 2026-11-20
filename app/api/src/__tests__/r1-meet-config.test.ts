@@ -3,6 +3,9 @@
  * URLs on the first WEB_ORIGIN entry, required values present then well formed, credentials hidden,
  * one log line per fixed reason that never carries a value, and never a throw.
  *
+ * Booking source = Ashby interview schedules with "Dex (AI Interviewer)" as interviewer
+ * (D-M034-11): the Dex Ashby user id is required, a fallback service user is optional.
+ *
  * Fixture credentials are low-entropy or built at run time: no `whsec_`-prefixed base64 ever
  * appears as a literal in this file (gitleaks scans the full PR history).
  */
@@ -38,20 +41,23 @@ function runtimeWebhookSecret(bytes = 32): string {
 // is easy to spot.
 const RECALL_KEY_VALUE = 'recall-canary-' + 'k'.repeat(20);
 const RECALL_WEBHOOK_VALUE = runtimeWebhookSecret();
-const CALENDLY_TOKEN_VALUE = 'calendly-canary-' + 't'.repeat(24);
-const CALENDLY_SIGNING_VALUE = 'calendly-signing-' + 's'.repeat(20);
-const EVENT_TYPE_ID = 'EVTCANARY-0001';
-const EVENT_TYPE_URI = `https://api.calendly.com/event_types/${EVENT_TYPE_ID}`;
 const WEB = 'https://hello.example.test';
 const GROUP_ID = '7d3c2b1a-0f9e-4d8c-9b7a-6f5e4d3c2b1a';
+/** Synthetic Ashby user id of "Dex (AI Interviewer)". */
+const DEX_ID = '5e1d0c9b-8a7f-4e6d-9c5b-4a3f2e1d0c9b';
+/** Synthetic staff (auth) user id for the optional fallback owner. */
+const SERVICE_ID = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d';
+const NIL_UUID = '00000000-0000-0000-0000-000000000000';
+/** The Ashby integration's system actor (integrations/ashby/workflow-stores.ts): no auth.users row. */
+const ASHBY_SYSTEM_ACTOR = '00000000-0000-4000-8000-000000000001';
+/** The removed booking vendor's name, built so this file never spells it (the slice greps it out). */
+const OLD_BOOKING_VENDOR = 'calen' + 'dly';
 
 const valid = (extra: R1MeetEnvSource = {}): R1MeetEnvSource => ({
   R1_MEET_ENABLED: 'true',
   RECALL_API_KEY: RECALL_KEY_VALUE,
   RECALL_WEBHOOK_SECRET: RECALL_WEBHOOK_VALUE,
-  CALENDLY_API_TOKEN: CALENDLY_TOKEN_VALUE,
-  CALENDLY_WEBHOOK_SIGNING_KEY: CALENDLY_SIGNING_VALUE,
-  CALENDLY_R1_EVENT_TYPE_URI: EVENT_TYPE_URI,
+  R1_MEET_ASHBY_DEX_USER_ID: DEX_ID,
   WEB_ORIGIN: WEB,
   ...extra,
 });
@@ -60,15 +66,14 @@ const FLAG_REASON = 'R1_MEET_ENABLED must be either "true" or "false"';
 const CAP_REASON = 'R1_MEET_DAILY_BOT_CAP must be an integer from 1 to 200';
 const NAME_REASON = 'R1_MEET_BOT_NAME must be 1 to 100 characters with no control characters and no surrounding spaces';
 const GROUP_REASON = 'R1_MEET_GOOGLE_LOGIN_GROUP_ID must be a UUID';
+const SERVICE_REASON = 'R1_MEET_SERVICE_USER_ID must be the UUID of a real staff user (not the nil or system-actor id)';
 const BASE_URL_REASON = 'RECALL_BASE_URL must be an https origin on a <region>.recall.ai host, with no path, port or query';
 const ORIGIN_REASON = 'WEB_ORIGIN must start with an https origin (no path, query or credentials) when R1_MEET_ENABLED is "true"';
 const missingReason = (name: string): string => `${name} is required when R1_MEET_ENABLED is "true"`;
 const MALFORMED_REASON: Record<(typeof R1_MEET_REQUIRED_VARIABLES)[number], string> = {
   RECALL_API_KEY: 'RECALL_API_KEY is malformed',
   RECALL_WEBHOOK_SECRET: 'RECALL_WEBHOOK_SECRET is malformed (expected the whsec_-prefixed workspace verification secret)',
-  CALENDLY_API_TOKEN: 'CALENDLY_API_TOKEN is malformed',
-  CALENDLY_WEBHOOK_SIGNING_KEY: 'CALENDLY_WEBHOOK_SIGNING_KEY is malformed',
-  CALENDLY_R1_EVENT_TYPE_URI: 'CALENDLY_R1_EVENT_TYPE_URI must be https://api.calendly.com/event_types/<id>',
+  R1_MEET_ASHBY_DEX_USER_ID: 'R1_MEET_ASHBY_DEX_USER_ID must be a UUID (the Ashby user id of "Dex (AI Interviewer)")',
 };
 const UNEXPECTED_REASON = 'unexpected error while reading the Meet configuration';
 
@@ -109,7 +114,9 @@ describe('R1 Meet configuration: the flag', () => {
       R1_MEET_DAILY_BOT_CAP: '0',
       R1_MEET_BOT_NAME: ' padded ',
       R1_MEET_GOOGLE_LOGIN_GROUP_ID: 'nope',
+      R1_MEET_SERVICE_USER_ID: NIL_UUID,
       RECALL_BASE_URL: 'http://evil.example',
+      R1_MEET_ASHBY_DEX_USER_ID: 'nope',
       RECALL_API_KEY: 'short',
       RECALL_WEBHOOK_SECRET: 'nope',
       WEB_ORIGIN: 'http://localhost:5173',
@@ -137,7 +144,8 @@ describe('R1 Meet configuration: enabled', () => {
     expect(config.recall.baseUrl).toBe(RECALL_DEFAULT_BASE_URL);
     expect(RECALL_DEFAULT_BASE_URL).toBe('https://ap-northeast-1.recall.ai');
     expect(config.recall.googleLoginGroupId).toBeNull();
-    expect(config.calendly.r1EventTypeUri).toBe(EVENT_TYPE_URI);
+    expect(config.ashby).toStrictEqual({ dexUserId: DEX_ID });
+    expect(config.serviceUserId).toBeNull();
     expect(config.botNameOverride).toBeNull();
     expect(config.dailyBotCap).toBe(20);
     expect(config.bridgePageUrl).toBe('https://hello.example.test/candidate/r1/meet');
@@ -145,9 +153,31 @@ describe('R1 Meet configuration: enabled', () => {
     // The credentials are readable by name.
     expect(config.recall.apiKey).toBe(RECALL_KEY_VALUE);
     expect(config.recall.webhookSecret).toBe(RECALL_WEBHOOK_VALUE);
-    expect(config.calendly.apiToken).toBe(CALENDLY_TOKEN_VALUE);
-    expect(config.calendly.webhookSigningKey).toBe(CALENDLY_SIGNING_VALUE);
     expect(logged).toEqual([]);
+  });
+
+  it('has exactly the documented enabled shape (Ashby/Dex booking, no booking-vendor settings)', () => {
+    const config = enabled(getR1MeetConfig(valid({ R1_MEET_SERVICE_USER_ID: SERVICE_ID })));
+    expect(Object.keys(config).sort()).toEqual([
+      'ashby',
+      'botNameOverride',
+      'bridgePageUrl',
+      'dailyBotCap',
+      'enabled',
+      'recall',
+      'recallRealtimeWebhookUrl',
+      'serviceUserId',
+      'status',
+    ]);
+    expect(Object.keys(config.ashby)).toEqual(['dexUserId']);
+    expect(config.serviceUserId).toBe(SERVICE_ID);
+    expect(Object.isFrozen(config.ashby)).toBe(true);
+    expect(JSON.stringify(config).toLowerCase()).not.toContain(OLD_BOOKING_VENDOR);
+  });
+
+  it('lower-cases the Dex Ashby user id (Ashby ids compare case-insensitively)', () => {
+    const config = enabled(getR1MeetConfig(valid({ R1_MEET_ASHBY_DEX_USER_ID: DEX_ID.toUpperCase() })));
+    expect(config.ashby.dexUserId).toBe(DEX_ID);
   });
 
   it('pins the constants later slices build on', () => {
@@ -155,14 +185,8 @@ describe('R1 Meet configuration: enabled', () => {
     expect(R1_MEET_RECALL_REALTIME_PATH).toBe('/api/integrations/recall/realtime');
     expect([R1_MEET_DAILY_BOT_CAP_DEFAULT, R1_MEET_DAILY_BOT_CAP_MIN, R1_MEET_DAILY_BOT_CAP_MAX]).toEqual([20, 1, 200]);
     expect(R1_MEET_BOT_NAME_MAX_LENGTH).toBe(100);
-    expect(R1_MEET_REQUIRED_VARIABLES).toEqual([
-      'RECALL_API_KEY',
-      'RECALL_WEBHOOK_SECRET',
-      'CALENDLY_API_TOKEN',
-      'CALENDLY_WEBHOOK_SIGNING_KEY',
-      'CALENDLY_R1_EVENT_TYPE_URI',
-    ]);
-    expect(R1_MEET_SECRET_VARIABLES).toEqual(['RECALL_API_KEY', 'RECALL_WEBHOOK_SECRET', 'CALENDLY_API_TOKEN', 'CALENDLY_WEBHOOK_SIGNING_KEY']);
+    expect(R1_MEET_REQUIRED_VARIABLES).toEqual(['RECALL_API_KEY', 'RECALL_WEBHOOK_SECRET', 'R1_MEET_ASHBY_DEX_USER_ID']);
+    expect(R1_MEET_SECRET_VARIABLES).toEqual(['RECALL_API_KEY', 'RECALL_WEBHOOK_SECRET']);
   });
 
   it.each([
@@ -249,6 +273,30 @@ describe('R1 Meet configuration: knobs', () => {
     }
   });
 
+  it('takes an optional fallback service user UUID (normalised to lower case), blank = no fallback', () => {
+    expect(enabled(getR1MeetConfig(valid())).serviceUserId).toBeNull();
+    expect(enabled(getR1MeetConfig(valid({ R1_MEET_SERVICE_USER_ID: '' }))).serviceUserId).toBeNull();
+    expect(enabled(getR1MeetConfig(valid({ R1_MEET_SERVICE_USER_ID: SERVICE_ID }))).serviceUserId).toBe(SERVICE_ID);
+    expect(enabled(getR1MeetConfig(valid({ R1_MEET_SERVICE_USER_ID: SERVICE_ID.toUpperCase() }))).serviceUserId).toBe(SERVICE_ID);
+  });
+
+  it('refuses a service user that is not a UUID, the nil UUID or the Ashby system actor', () => {
+    for (const raw of [
+      'abc',
+      'replace_me', // the placeholder rule covers the two credentials only
+      NIL_UUID,
+      ASHBY_SYSTEM_ACTOR,
+      `{${SERVICE_ID}}`,
+      SERVICE_ID.replace(/-/g, ''),
+      `${SERVICE_ID} `,
+      ` ${SERVICE_ID}`,
+      `${SERVICE_ID}0`,
+    ]) {
+      expectInvalid(getR1MeetConfig(valid({ R1_MEET_SERVICE_USER_ID: raw })), SERVICE_REASON, raw);
+    }
+    expectInvalid(getR1MeetConfig(valid({ R1_MEET_SERVICE_USER_ID: 7 as unknown as string })), SERVICE_REASON, 'number');
+  });
+
   it('defaults the Recall base URL to Tokyo and accepts another region origin', () => {
     expect(enabled(getR1MeetConfig(valid({ RECALL_BASE_URL: '' }))).recall.baseUrl).toBe(RECALL_DEFAULT_BASE_URL);
     expect(enabled(getR1MeetConfig(valid({ RECALL_BASE_URL: 'https://us-east-1.recall.ai/' }))).recall.baseUrl).toBe('https://us-east-1.recall.ai');
@@ -270,16 +318,43 @@ describe('R1 Meet configuration: knobs', () => {
     expectInvalid(getR1MeetConfig({ R1_MEET_ENABLED: 'true', R1_MEET_DAILY_BOT_CAP: '0' }), CAP_REASON);
     expectInvalid(getR1MeetConfig({ R1_MEET_ENABLED: 'true', R1_MEET_BOT_NAME: ' x' }), NAME_REASON);
     expectInvalid(getR1MeetConfig({ R1_MEET_ENABLED: 'true', R1_MEET_GOOGLE_LOGIN_GROUP_ID: 'x' }), GROUP_REASON);
+    expectInvalid(getR1MeetConfig({ R1_MEET_ENABLED: 'true', R1_MEET_SERVICE_USER_ID: 'x' }), SERVICE_REASON);
     expectInvalid(getR1MeetConfig({ R1_MEET_ENABLED: 'true', RECALL_BASE_URL: 'http://x.recall.ai' }), BASE_URL_REASON);
     expectInvalid(getR1MeetConfig({ R1_MEET_ENABLED: 'true' }), ORIGIN_REASON);
     expectInvalid(getR1MeetConfig({ R1_MEET_ENABLED: 'true', WEB_ORIGIN: WEB }), missingReason('RECALL_API_KEY'));
-    // Within the knobs: cap, then bot name, then group id, then base URL.
+    // Within the knobs: cap, then bot name, then group id, then service user, then base URL.
+    const allKnobsBad: R1MeetEnvSource = {
+      R1_MEET_DAILY_BOT_CAP: '0',
+      R1_MEET_BOT_NAME: ' x',
+      R1_MEET_GOOGLE_LOGIN_GROUP_ID: 'x',
+      R1_MEET_SERVICE_USER_ID: 'x',
+      RECALL_BASE_URL: 'x',
+      WEB_ORIGIN: 'http://x',
+      R1_MEET_ASHBY_DEX_USER_ID: 'x',
+    };
+    expectInvalid(getR1MeetConfig(valid(allKnobsBad)), CAP_REASON);
+    expectInvalid(getR1MeetConfig(valid({ ...allKnobsBad, R1_MEET_DAILY_BOT_CAP: '' })), NAME_REASON);
+    expectInvalid(getR1MeetConfig(valid({ ...allKnobsBad, R1_MEET_DAILY_BOT_CAP: '', R1_MEET_BOT_NAME: '' })), GROUP_REASON);
     expectInvalid(
-      getR1MeetConfig(valid({ R1_MEET_DAILY_BOT_CAP: '0', R1_MEET_BOT_NAME: ' x', R1_MEET_GOOGLE_LOGIN_GROUP_ID: 'x', RECALL_BASE_URL: 'x' })),
-      CAP_REASON,
+      getR1MeetConfig(valid({ ...allKnobsBad, R1_MEET_DAILY_BOT_CAP: '', R1_MEET_BOT_NAME: '', R1_MEET_GOOGLE_LOGIN_GROUP_ID: '' })),
+      SERVICE_REASON,
     );
-    expectInvalid(getR1MeetConfig(valid({ R1_MEET_BOT_NAME: ' x', R1_MEET_GOOGLE_LOGIN_GROUP_ID: 'x', RECALL_BASE_URL: 'x' })), NAME_REASON);
-    expectInvalid(getR1MeetConfig(valid({ R1_MEET_GOOGLE_LOGIN_GROUP_ID: 'x', RECALL_BASE_URL: 'x' })), GROUP_REASON);
+    expectInvalid(
+      getR1MeetConfig(
+        valid({
+          ...allKnobsBad,
+          R1_MEET_DAILY_BOT_CAP: '',
+          R1_MEET_BOT_NAME: '',
+          R1_MEET_GOOGLE_LOGIN_GROUP_ID: '',
+          R1_MEET_SERVICE_USER_ID: '',
+        }),
+      ),
+      BASE_URL_REASON,
+    );
+    // Then WEB_ORIGIN before any required value, then presence before shape.
+    expectInvalid(getR1MeetConfig(valid({ WEB_ORIGIN: 'http://x', R1_MEET_ASHBY_DEX_USER_ID: '' })), ORIGIN_REASON);
+    expectInvalid(getR1MeetConfig(valid({ RECALL_API_KEY: 'short', R1_MEET_ASHBY_DEX_USER_ID: '' })), missingReason('R1_MEET_ASHBY_DEX_USER_ID'));
+    expectInvalid(getR1MeetConfig(valid({ R1_MEET_ASHBY_DEX_USER_ID: 'x', RECALL_API_KEY: 'short' })), MALFORMED_REASON.RECALL_API_KEY);
   });
 });
 
@@ -296,22 +371,23 @@ describe('R1 Meet configuration: required values', () => {
     expectInvalid(getR1MeetConfig(valid({ [name]: 'replace_me' })), missingReason(name));
   });
 
-  it('treats the placeholder as a real (malformed) value outside the four credential slots', () => {
-    expectInvalid(getR1MeetConfig(valid({ CALENDLY_R1_EVENT_TYPE_URI: 'replace_me' })), MALFORMED_REASON.CALENDLY_R1_EVENT_TYPE_URI);
+  it('treats the placeholder as a real (malformed) value outside the two credential slots', () => {
+    expectInvalid(getR1MeetConfig(valid({ R1_MEET_ASHBY_DEX_USER_ID: 'replace_me' })), MALFORMED_REASON.R1_MEET_ASHBY_DEX_USER_ID);
+    expectInvalid(getR1MeetConfig(valid({ R1_MEET_SERVICE_USER_ID: 'replace_me' })), SERVICE_REASON);
   });
 
-  it('checks presence of all five, in order, before checking any of them is well formed', () => {
+  it('checks presence of all three, in order, before checking any of them is well formed', () => {
     expectInvalid(getR1MeetConfig({ R1_MEET_ENABLED: 'true', WEB_ORIGIN: WEB }), missingReason('RECALL_API_KEY'));
     expectInvalid(
-      getR1MeetConfig(valid({ RECALL_WEBHOOK_SECRET: undefined, CALENDLY_R1_EVENT_TYPE_URI: undefined })),
+      getR1MeetConfig(valid({ RECALL_WEBHOOK_SECRET: undefined, R1_MEET_ASHBY_DEX_USER_ID: undefined })),
       missingReason('RECALL_WEBHOOK_SECRET'),
     );
     expectInvalid(
-      getR1MeetConfig(valid({ RECALL_API_KEY: 'short', CALENDLY_WEBHOOK_SIGNING_KEY: '' })),
-      missingReason('CALENDLY_WEBHOOK_SIGNING_KEY'),
+      getR1MeetConfig(valid({ RECALL_API_KEY: 'short', R1_MEET_ASHBY_DEX_USER_ID: '' })),
+      missingReason('R1_MEET_ASHBY_DEX_USER_ID'),
     );
     expectInvalid(
-      getR1MeetConfig(valid({ RECALL_WEBHOOK_SECRET: 'nope', CALENDLY_API_TOKEN: 'short' })),
+      getR1MeetConfig(valid({ RECALL_WEBHOOK_SECRET: 'nope', R1_MEET_ASHBY_DEX_USER_ID: 'not-a-uuid' })),
       MALFORMED_REASON.RECALL_WEBHOOK_SECRET,
     );
   });
@@ -328,18 +404,18 @@ describe('R1 Meet configuration: required values', () => {
       `${runtimeWebhookSecret()} `,
       42,
     ],
-    CALENDLY_API_TOKEN: ['t'.repeat(19), `token with space ${'t'.repeat(20)}`, `${'t'.repeat(20)}\r\n`, 't'.repeat(4097), {}],
-    CALENDLY_WEBHOOK_SIGNING_KEY: ['s'.repeat(15), `\t${'s'.repeat(20)}`, 's'.repeat(257), `${'s'.repeat(10)} ${'s'.repeat(10)}`, []],
-    CALENDLY_R1_EVENT_TYPE_URI: [
-      'https://api.calendly.com/event_types/',
-      `https://api.calendly.com/event_types/${EVENT_TYPE_ID}/`,
-      `https://api.calendly.com/event_types/${EVENT_TYPE_ID}?x=1`,
-      `https://api.calendly.com/users/${EVENT_TYPE_ID}`,
-      `http://api.calendly.com/event_types/${EVENT_TYPE_ID}`,
-      `https://calendly.com/event_types/${EVENT_TYPE_ID}`,
-      `https://api.calendly.com.evil.example/event_types/${EVENT_TYPE_ID}`,
-      EVENT_TYPE_ID,
+    R1_MEET_ASHBY_DEX_USER_ID: [
+      'not-a-uuid',
+      'abc',
+      `{${DEX_ID}}`,
+      DEX_ID.replace(/-/g, ''),
+      `${DEX_ID} `,
+      ` ${DEX_ID}`,
+      `${DEX_ID}0`,
+      DEX_ID.slice(0, -1),
+      `urn:uuid:${DEX_ID}`,
       7,
+      {},
     ],
   };
 
@@ -357,29 +433,28 @@ describe('R1 Meet configuration: required values', () => {
 });
 
 describe('R1 Meet configuration: secrecy', () => {
-  const SECRET_VALUES = [RECALL_KEY_VALUE, RECALL_WEBHOOK_VALUE, CALENDLY_TOKEN_VALUE, CALENDLY_SIGNING_VALUE];
+  const SECRET_VALUES = [RECALL_KEY_VALUE, RECALL_WEBHOOK_VALUE];
 
   it('keeps every credential out of every enumeration of the config', () => {
-    const config = enabled(getR1MeetConfig(valid()));
+    const config = enabled(getR1MeetConfig(valid({ R1_MEET_SERVICE_USER_ID: SERVICE_ID })));
     const text = [
       JSON.stringify(config),
       JSON.stringify(config.recall),
-      JSON.stringify(config.calendly),
+      JSON.stringify(config.ashby),
       JSON.stringify({ ...config }),
       JSON.stringify({ ...config.recall }),
-      JSON.stringify({ ...config.calendly }),
       JSON.stringify(Object.entries(config.recall)),
-      JSON.stringify(Object.values(config.calendly)),
+      JSON.stringify(Object.values(config.recall)),
+      JSON.stringify(Object.values(config)),
       Object.keys(config.recall).join(','),
-      Object.keys(config.calendly).join(','),
       JSON.stringify(describeR1MeetConfig(config)),
     ].join('\n');
     for (const secret of SECRET_VALUES) expect(text).not.toContain(secret);
+    expect(text.toLowerCase()).not.toContain(OLD_BOOKING_VENDOR);
     expect(Object.keys(config.recall).sort()).toEqual(['baseUrl', 'googleLoginGroupId']);
-    expect(Object.keys(config.calendly)).toEqual(['r1EventTypeUri']);
     expect(Object.isFrozen(config)).toBe(true);
     expect(Object.isFrozen(config.recall)).toBe(true);
-    expect(Object.isFrozen(config.calendly)).toBe(true);
+    expect(Object.isFrozen(config.ashby)).toBe(true);
     expect(() => {
       (config.recall as { apiKey: string }).apiKey = 'replaced';
     }).toThrow(TypeError);
@@ -394,13 +469,12 @@ describe('R1 Meet configuration: secrecy', () => {
       valid({ R1_MEET_DAILY_BOT_CAP: '987654' }),
       valid({ R1_MEET_BOT_NAME: `${CANARY_NAME}\u0000` }),
       valid({ R1_MEET_GOOGLE_LOGIN_GROUP_ID: 'canary-group-id' }),
+      valid({ R1_MEET_SERVICE_USER_ID: 'canary-service-user' }),
       valid({ RECALL_BASE_URL: `https://${CANARY_HOST}` }),
       valid({ WEB_ORIGIN: `http://${CANARY_HOST}` }),
       valid({ RECALL_API_KEY: `${RECALL_KEY_VALUE} ` }),
       valid({ RECALL_WEBHOOK_SECRET: RECALL_WEBHOOK_VALUE.slice(PREFIX.length) }),
-      valid({ CALENDLY_API_TOKEN: `${CALENDLY_TOKEN_VALUE}\n` }),
-      valid({ CALENDLY_WEBHOOK_SIGNING_KEY: `${CALENDLY_SIGNING_VALUE} x` }),
-      valid({ CALENDLY_R1_EVENT_TYPE_URI: `${EVENT_TYPE_URI}/` }),
+      valid({ R1_MEET_ASHBY_DEX_USER_ID: 'canary-dex-user' }),
     ];
     for (const source of cases) expect(getR1MeetConfig(source).status).toBe('invalid');
     expect(logged).toHaveLength(cases.length);
@@ -411,11 +485,10 @@ describe('R1 Meet configuration: secrecy', () => {
       '987654',
       CANARY_NAME,
       'canary-group-id',
+      'canary-service-user',
+      'canary-dex-user',
       CANARY_HOST,
-      EVENT_TYPE_ID,
       'recall-canary',
-      'calendly-canary',
-      'calendly-signing',
     ];
     for (const line of logged) {
       expect(line.startsWith('[r1-meet-config] Meet off: ')).toBe(true);
@@ -476,12 +549,11 @@ describe('R1 Meet configuration: process.env (the production path)', () => {
     R1_MEET_BOT_NAME: 'Dex',
     R1_MEET_DAILY_BOT_CAP: '7',
     R1_MEET_GOOGLE_LOGIN_GROUP_ID: GROUP_ID,
+    R1_MEET_SERVICE_USER_ID: SERVICE_ID,
     RECALL_BASE_URL: 'https://us-east-1.recall.ai',
+    R1_MEET_ASHBY_DEX_USER_ID: DEX_ID,
     RECALL_API_KEY: RECALL_KEY_VALUE,
     RECALL_WEBHOOK_SECRET: RECALL_WEBHOOK_VALUE,
-    CALENDLY_API_TOKEN: CALENDLY_TOKEN_VALUE,
-    CALENDLY_WEBHOOK_SIGNING_KEY: CALENDLY_SIGNING_VALUE,
-    CALENDLY_R1_EVENT_TYPE_URI: EVENT_TYPE_URI,
     WEB_ORIGIN: WEB,
   };
   function stubAll(overrides: Record<string, string> = {}): void {
@@ -497,9 +569,8 @@ describe('R1 Meet configuration: process.env (the production path)', () => {
     expect(config.recall.baseUrl).toBe('https://us-east-1.recall.ai');
     expect(config.recall.apiKey).toBe(RECALL_KEY_VALUE);
     expect(config.recall.webhookSecret).toBe(RECALL_WEBHOOK_VALUE);
-    expect(config.calendly.apiToken).toBe(CALENDLY_TOKEN_VALUE);
-    expect(config.calendly.webhookSigningKey).toBe(CALENDLY_SIGNING_VALUE);
-    expect(config.calendly.r1EventTypeUri).toBe(EVENT_TYPE_URI);
+    expect(config.ashby.dexUserId).toBe(DEX_ID);
+    expect(config.serviceUserId).toBe(SERVICE_ID);
     expect(config.bridgePageUrl).toBe(`${WEB}${R1_MEET_BRIDGE_PAGE_PATH}`);
   });
 
@@ -513,13 +584,12 @@ describe('R1 Meet configuration: process.env (the production path)', () => {
     ['R1_MEET_BOT_NAME', ' padded', NAME_REASON],
     ['R1_MEET_DAILY_BOT_CAP', '0', CAP_REASON],
     ['R1_MEET_GOOGLE_LOGIN_GROUP_ID', 'nope', GROUP_REASON],
+    ['R1_MEET_SERVICE_USER_ID', ASHBY_SYSTEM_ACTOR, SERVICE_REASON],
     ['RECALL_BASE_URL', 'https://evil.example', BASE_URL_REASON],
     ['WEB_ORIGIN', 'http://hello.example.test', ORIGIN_REASON],
+    ['R1_MEET_ASHBY_DEX_USER_ID', 'nope', MALFORMED_REASON.R1_MEET_ASHBY_DEX_USER_ID],
     ['RECALL_API_KEY', 'short', MALFORMED_REASON.RECALL_API_KEY],
     ['RECALL_WEBHOOK_SECRET', 'nope', MALFORMED_REASON.RECALL_WEBHOOK_SECRET],
-    ['CALENDLY_API_TOKEN', 'short', MALFORMED_REASON.CALENDLY_API_TOKEN],
-    ['CALENDLY_WEBHOOK_SIGNING_KEY', 'short', MALFORMED_REASON.CALENDLY_WEBHOOK_SIGNING_KEY],
-    ['CALENDLY_R1_EVENT_TYPE_URI', 'nope', MALFORMED_REASON.CALENDLY_R1_EVENT_TYPE_URI],
   ])('reads %s from process.env', (name, bad, reason) => {
     stubAll({ [name]: bad });
     expectInvalid(getR1MeetConfig(), reason);
@@ -547,8 +617,10 @@ describe('R1 Meet configuration: helpers', () => {
       status: 'invalid',
       reason: CAP_REASON,
     });
-    const text = JSON.stringify(describeR1MeetConfig(getR1MeetConfig(valid({ R1_MEET_GOOGLE_LOGIN_GROUP_ID: GROUP_ID }))));
-    for (const forbidden of [RECALL_KEY_VALUE, CALENDLY_TOKEN_VALUE, 'https://', GROUP_ID, EVENT_TYPE_ID]) {
+    const text = JSON.stringify(
+      describeR1MeetConfig(getR1MeetConfig(valid({ R1_MEET_GOOGLE_LOGIN_GROUP_ID: GROUP_ID, R1_MEET_SERVICE_USER_ID: SERVICE_ID }))),
+    );
+    for (const forbidden of [RECALL_KEY_VALUE, 'https://', GROUP_ID, DEX_ID, SERVICE_ID]) {
       expect(text).not.toContain(forbidden);
     }
   });
@@ -560,28 +632,39 @@ describe('R1 Meet configuration: env contract', () => {
   ) as { components: { api: { variables: Record<string, { requiredInProduction: boolean; secret: boolean; external?: boolean }> } } };
   const example = readFileSync(fileURLToPath(new URL('../../.env.example', import.meta.url)), 'utf8');
 
-  it('lists exactly the ten Meet variables: non-secrets first, then the four credentials', () => {
+  it('lists exactly the nine Meet variables: non-secrets first, then the two credentials', () => {
     expect([...R1_MEET_ENV_VARIABLES]).toEqual([
       'R1_MEET_ENABLED',
       'R1_MEET_BOT_NAME',
       'R1_MEET_DAILY_BOT_CAP',
       'R1_MEET_GOOGLE_LOGIN_GROUP_ID',
+      'R1_MEET_SERVICE_USER_ID',
       'RECALL_BASE_URL',
-      'CALENDLY_R1_EVENT_TYPE_URI',
+      'R1_MEET_ASHBY_DEX_USER_ID',
       'RECALL_API_KEY',
       'RECALL_WEBHOOK_SECRET',
-      'CALENDLY_API_TOKEN',
-      'CALENDLY_WEBHOOK_SIGNING_KEY',
     ]);
   });
 
-  it('declares each in the api schema: optional, secret exactly for the four credentials, never external', () => {
+  it('declares each in the api schema: optional, secret exactly for the two Recall credentials, never external', () => {
     const secrets = new Set<string>(R1_MEET_SECRET_VARIABLES);
+    expect([...secrets]).toEqual(['RECALL_API_KEY', 'RECALL_WEBHOOK_SECRET']);
     for (const name of R1_MEET_ENV_VARIABLES) {
       const entry = schema.components.api.variables[name];
       expect(entry, name).toBeDefined();
       expect(entry, name).toEqual({ requiredInProduction: false, secret: secrets.has(name) });
     }
+  });
+
+  it('declares no other Meet-prefixed or booking-vendor variable in the api schema or .env.example', () => {
+    const meetLike = /^(?:R1_MEET|RECALL)_/;
+    const schemaNames = Object.keys(schema.components.api.variables);
+    expect(schemaNames.filter((name) => meetLike.test(name)).sort()).toEqual([...R1_MEET_ENV_VARIABLES].sort());
+    const exampleNames = [...example.matchAll(/^([A-Z0-9_]+)=/gm)].map((match) => match[1]!);
+    expect(exampleNames.filter((name) => meetLike.test(name)).sort()).toEqual([...R1_MEET_ENV_VARIABLES].sort());
+    const vendor = new RegExp(OLD_BOOKING_VENDOR, 'i');
+    expect(schemaNames.filter((name) => vendor.test(name))).toEqual([]);
+    expect(example).not.toMatch(vendor);
   });
 
   it('puts each in the api .env.example: blank values, replace_me for the credentials, no example secret', () => {

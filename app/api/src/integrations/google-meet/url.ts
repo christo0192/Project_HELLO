@@ -1,9 +1,9 @@
 /**
  * google-meet/url.ts — the one place a Google Meet link is accepted.
  *
- * Vendor-neutral on purpose: the Calendly parser (the link Calendly put on the booking) and the
- * Recall create-bot builder (the link the bot is sent to) both call it, so a link that one side
- * accepts the other side accepts too.
+ * Vendor-neutral on purpose: the Ashby interview-schedule parser (`lib/r1/meet/ashby-schedule.ts`,
+ * the link Ashby put on the interview event) and the Recall bot builder (the link the bot is sent
+ * to) both call it, so a link that one side accepts the other side accepts too.
  *
  * Accepted: `https://meet.google.com/<abc-defg-hij>` with an optional single trailing `/`, an
  * optional query and an optional fragment. Scheme and host compare case-insensitively (RFC 3986)
@@ -59,7 +59,7 @@ export function normalizeGoogleMeetUrl(raw: unknown): string | null {
   }
 
   // The path is checked as WRITTEN as well as parsed: the parser resolves `/x/../abc-defg-hij` to an
-  // accepted path, and a link spelled like that is not a link Google or Calendly produced.
+  // accepted path, and a link spelled like that is not a link Google or Ashby produced.
   const afterOrigin = raw.slice(GOOGLE_MEET_ORIGIN.length);
   const rawPath = afterOrigin.split(/[?#]/, 1)[0];
   const match = MEET_PATH.exec(url.pathname);

@@ -12,7 +12,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -260,8 +260,11 @@ function sourceFiles(directory: string): string[] {
   });
 }
 
-/** M034: the vendor modules R1-over-Meet uses. They sit outside lib/r1 but are R1 code. */
-const meetVendorDirs = ['recall', 'calendly', 'google-meet'].map((name) => path.join(src, 'integrations', name));
+/**
+ * M034: the vendor modules R1-over-Meet uses. They sit outside lib/r1 but are R1 code. The booking
+ * source is Ashby (D-M034-11), so there is no booking-vendor module.
+ */
+const meetVendorDirs = ['recall', 'google-meet'].map((name) => path.join(src, 'integrations', name));
 const meetVendorSources = meetVendorDirs.flatMap((directory) => sourceFiles(directory));
 /** Every Meet file: the vendor modules plus lib/r1/meet. */
 const meetSources = [...meetVendorSources, ...sourceFiles(path.join(src, 'lib', 'r1', 'meet'))];
@@ -280,12 +283,11 @@ const MEET_ENV_NAMES = [
   'R1_MEET_BOT_NAME',
   'R1_MEET_DAILY_BOT_CAP',
   'R1_MEET_GOOGLE_LOGIN_GROUP_ID',
+  'R1_MEET_SERVICE_USER_ID',
   'RECALL_BASE_URL',
-  'CALENDLY_R1_EVENT_TYPE_URI',
+  'R1_MEET_ASHBY_DEX_USER_ID',
   'RECALL_API_KEY',
   'RECALL_WEBHOOK_SECRET',
-  'CALENDLY_API_TOKEN',
-  'CALENDLY_WEBHOOK_SIGNING_KEY',
 ];
 
 /** Strip comments so a fence cannot be satisfied (or tripped) by prose. */
@@ -300,7 +302,9 @@ describe('R1 source fences', () => {
     expect(r1Sources.length).toBeGreaterThanOrEqual(8);
   });
 
-  it('covers the M034 Meet files: lib/r1/meet and the Recall, Calendly and Google Meet modules', () => {
+  it('covers the M034 Meet files: lib/r1/meet and the Recall and Google Meet modules', () => {
+    // D-M034-11: Meet rounds are booked in Ashby; the booking-vendor module of the first plan is gone.
+    expect(existsSync(path.join(src, 'integrations', 'calen' + 'dly'))).toBe(false);
     for (const directory of meetVendorDirs) {
       expect(meetVendorSources.some((file) => file.startsWith(directory + path.sep)), directory).toBe(true);
     }
@@ -349,7 +353,7 @@ describe('R1 source fences', () => {
     for (const file of phoneFiles) {
       // M034: nor the R1-over-Meet vendor modules.
       expect(readFileSync(file, 'utf8'), file).not.toMatch(
-        /lib\/r1\/|routes\/r1|r1-candidate|integrations\/(?:recall|calendly|google-meet)/,
+        /lib\/r1\/|routes\/r1|r1-candidate|integrations\/(?:recall|google-meet)/,
       );
     }
   });
@@ -394,7 +398,7 @@ describe('R1 source fences', () => {
     expect(runtimeFiles).toContain(MEET_CONFIG);
     // A Meet-prefixed name read through process.env (dotted, bracketed or destructured) or through an
     // env-source object named `source` or `env`.
-    const meetName = '((?:R1_MEET|RECALL|CALENDLY)_[A-Z0-9_]+)';
+    const meetName = '((?:R1_MEET|RECALL)_[A-Z0-9_]+)';
     const meetReads = [
       new RegExp(`\\b(?:process\\.env|source|env)\\s*\\.\\s*${meetName}`, 'g'),
       new RegExp(`\\b(?:process\\.env|source|env)\\s*\\[\\s*['"\`]${meetName}['"\`]\\s*\\]`, 'g'),

@@ -1,10 +1,18 @@
 /**
  * R1-over-Google-Meet configuration (M034, dark by default).
  *
+ * Booking source (D-M034-11): HR schedules the interview IN ASHBY with the Ashby user
+ * "Dex (AI Interviewer)" as an interviewer; Ashby creates the Google Meet and invites the candidate
+ * and the bot's Google account; the Ashby `interviewScheduleCreate` / `interviewScheduleUpdate`
+ * webhooks are the source of truth. `R1_MEET_ASHBY_DEX_USER_ID` names that Ashby user, so only the
+ * events Dex is on get a bot. There is no third-party booking page, no Google Calendar sync and no
+ * Recall Calendar V2. The Ashby webhook itself reuses the existing Ashby receiver's secret: no Meet
+ * variable for it.
+ *
  * Like `../config.ts` and `../recording/config.ts`, this is deliberately NOT part of env.ts: env.ts
  * throws at import on a malformed value, which would crash-loop the API that also runs phone
  * dialing. This module is lazy and NEVER throws; a bad value turns Meet OFF (status `invalid`) and
- * logs one line that names the variable but never its value (four of them are credentials).
+ * logs one line that names the variable but never its value (two of them are credentials).
  *
  *   R1_MEET_ENABLED unset, blank or exactly "false"           -> `disabled` (nothing else is inspected)
  *   R1_MEET_ENABLED any other value than exactly "true"       -> `invalid`  (Meet off)
@@ -12,19 +20,24 @@
  *   "true" and everything present and well formed              -> `enabled`
  *
  * Check order when the flag is "true" (the first failure is the reason): the knobs
- * (R1_MEET_DAILY_BOT_CAP, R1_MEET_BOT_NAME, R1_MEET_GOOGLE_LOGIN_GROUP_ID, RECALL_BASE_URL), then
- * the first WEB_ORIGIN entry, then the five required values present (in `R1_MEET_REQUIRED_VARIABLES`
- * order), then each of them well formed in the same order.
+ * (R1_MEET_DAILY_BOT_CAP, R1_MEET_BOT_NAME, R1_MEET_GOOGLE_LOGIN_GROUP_ID, R1_MEET_SERVICE_USER_ID,
+ * RECALL_BASE_URL), then the first WEB_ORIGIN entry, then the three required values present (in
+ * `R1_MEET_REQUIRED_VARIABLES` order), then each of them well formed in the same order.
+ *
+ * `R1_MEET_SERVICE_USER_ID` is optional. Blank = no fallback: a booking whose Ashby scheduler is not
+ * one of our staff users gets no round and no bot. Set = that staff user owns such rounds
+ * (`interview_rounds.created_by`). The consent attestation always names the Ashby scheduler, never
+ * this user.
  *
  * Meet is active only when `getR1Config().enabled` AND this module says `enabled`: see
  * `r1MeetActive`.
  *
  * This is the ONLY module that reads the Meet variables. The vendor modules (integrations/recall,
- * integrations/calendly, integrations/google-meet) read no environment at all and take the values
- * below as explicit arguments; `r1-room-isolation.test.ts` pins both rules. The credentials are
- * Fly secrets on the API (`project-hello-api`) only: never in fly.toml, never on the workers. Each
- * variable is read as a literal property of process.env (never a computed key) so
- * `scripts/check-env-contract.mjs` sees it.
+ * integrations/google-meet) read no environment at all and take the values below as explicit
+ * arguments; `r1-room-isolation.test.ts` pins both rules. The credentials are Fly secrets on the
+ * API (`project-hello-api`) only: never in fly.toml, never on the workers. Each variable is read as
+ * a literal property of process.env (never a computed key) so `scripts/check-env-contract.mjs`
+ * sees it.
  *
  * Derived URLs (no variables of their own): the candidate bridge page the bot shows as its camera
  * and the Recall real-time webhook are both built on the first WEB_ORIGIN entry, the same rule as
@@ -39,11 +52,6 @@ import {
   isRecallApiKeyShaped,
   normalizeRecallBaseUrl,
 } from '../../../integrations/recall/settings.js';
-import {
-  isCalendlySigningKeyShaped,
-  isCalendlyTokenShaped,
-  parseCalendlyUri,
-} from '../../../integrations/calendly/settings.js';
 
 /** The web page the Meet bot shows as its camera (served by the web app). */
 export const R1_MEET_BRIDGE_PAGE_PATH = '/candidate/r1/meet';
@@ -56,41 +64,48 @@ export const R1_MEET_DAILY_BOT_CAP_MIN = 1;
 export const R1_MEET_DAILY_BOT_CAP_MAX = 200;
 export const R1_MEET_BOT_NAME_MAX_LENGTH = 100;
 
-/** The R1 Calendly event type: required, but not a credential. */
-const R1_MEET_EVENT_TYPE_VARIABLE = 'CALENDLY_R1_EVENT_TYPE_URI';
+/** The Ashby user id of "Dex (AI Interviewer)": required, but not a credential. */
+const R1_MEET_DEX_USER_VARIABLE = 'R1_MEET_ASHBY_DEX_USER_ID';
 
 /**
  * Every variable this module owns (WEB_ORIGIN is shared and declared elsewhere): the flag, the
- * knobs and the event type first, then the four credentials.
+ * knobs and the Dex user id first, then the two credentials.
  */
 export const R1_MEET_ENV_VARIABLES = [
   'R1_MEET_ENABLED',
   'R1_MEET_BOT_NAME',
   'R1_MEET_DAILY_BOT_CAP',
   'R1_MEET_GOOGLE_LOGIN_GROUP_ID',
+  'R1_MEET_SERVICE_USER_ID',
   'RECALL_BASE_URL',
-  R1_MEET_EVENT_TYPE_VARIABLE,
+  R1_MEET_DEX_USER_VARIABLE,
   'RECALL_API_KEY',
   'RECALL_WEBHOOK_SECRET',
-  'CALENDLY_API_TOKEN',
-  'CALENDLY_WEBHOOK_SIGNING_KEY',
 ] as const;
 export type R1MeetEnvName = (typeof R1_MEET_ENV_VARIABLES)[number];
 export type R1MeetEnvSource = Partial<Record<R1MeetEnvName | 'WEB_ORIGIN', string | undefined>>;
 
-/** The four credentials: Fly secrets only, and `replace_me` in `.env.example`. */
+/** The two credentials: Fly secrets only, and `replace_me` in `.env.example`. */
 export const R1_MEET_SECRET_VARIABLES = [
   'RECALL_API_KEY',
   'RECALL_WEBHOOK_SECRET',
-  'CALENDLY_API_TOKEN',
-  'CALENDLY_WEBHOOK_SIGNING_KEY',
 ] as const satisfies readonly R1MeetEnvName[];
 
-/** Required when the flag is "true", checked in this order: the four credentials, then the event type. */
+/** Required when the flag is "true", checked in this order: the two credentials, then the Dex user id. */
 export const R1_MEET_REQUIRED_VARIABLES = [
   ...R1_MEET_SECRET_VARIABLES,
-  R1_MEET_EVENT_TYPE_VARIABLE,
+  R1_MEET_DEX_USER_VARIABLE,
 ] as const satisfies readonly R1MeetEnvName[];
+
+/**
+ * Ids `R1_MEET_SERVICE_USER_ID` may never name: the nil UUID and the Ashby integration's system
+ * actor (`integrations/ashby/workflow-stores.ts`), which has no `auth.users` row, so a round it
+ * "created" could not own a call session.
+ */
+const R1_MEET_REFUSED_SERVICE_USER_IDS: ReadonlySet<string> = new Set([
+  '00000000-0000-0000-0000-000000000000',
+  '00000000-0000-4000-8000-000000000001',
+]);
 
 export type R1MeetConfigStatus = 'enabled' | 'disabled' | 'invalid';
 
@@ -106,11 +121,10 @@ export interface R1MeetRecallSettings {
   readonly webhookSecret: string;
 }
 
-/** What the Calendly client and webhook verifier need. Credentials non-enumerable, as above. */
-export interface R1MeetCalendlySettings {
-  readonly r1EventTypeUri: string;
-  readonly apiToken: string;
-  readonly webhookSigningKey: string;
+/** Which Ashby interview events are Dex's (D-M034-11). Not a credential. */
+export interface R1MeetAshbySettings {
+  /** The Ashby user id of "Dex (AI Interviewer)", lower-cased. */
+  readonly dexUserId: string;
 }
 
 export type R1MeetConfig =
@@ -120,7 +134,12 @@ export type R1MeetConfig =
       readonly enabled: true;
       readonly status: 'enabled';
       readonly recall: R1MeetRecallSettings;
-      readonly calendly: R1MeetCalendlySettings;
+      readonly ashby: R1MeetAshbySettings;
+      /**
+       * Our staff user (auth user id, lower-cased) that owns a round when the Ashby scheduler maps
+       * to none of our users; null = no fallback (that booking gets no round and no bot).
+       */
+      readonly serviceUserId: string | null;
       /** Overrides the objective profile's bot display name; null = use the profile's. */
       readonly botNameOverride: string | null;
       readonly dailyBotCap: number;
@@ -134,7 +153,7 @@ const reported = new Set<string>();
 function report(reason: string): void {
   if (reported.has(reason)) return;
   reported.add(reason);
-  // The reason names a variable, never a value: four of them are credentials.
+  // The reason names a variable, never a value: two of them are credentials.
   console.error(`[r1-meet-config] Meet off: ${reason}`);
 }
 /** Test seam: forget what was reported so a test can observe the lines again. */
@@ -155,9 +174,9 @@ function present(value: unknown): boolean {
   return value !== undefined && value !== '';
 }
 
-// `.env.example` carries this placeholder in the four credential slots (the env-contract check
+// `.env.example` carries this placeholder in the two credential slots (the env-contract check
 // demands it). A developer who copies the file must not get a "malformed" report for a
-// placeholder, so the exact placeholder counts as unset for those four variables only.
+// placeholder, so the exact placeholder counts as unset for those two variables only.
 const CREDENTIAL_PLACEHOLDER = 'replace_me';
 const SECRET_NAMES: ReadonlySet<string> = new Set(R1_MEET_SECRET_VARIABLES);
 function isSet(name: (typeof R1_MEET_REQUIRED_VARIABLES)[number], value: unknown): boolean {
@@ -188,6 +207,14 @@ function parseLoginGroupId(raw: unknown): string | null | undefined {
   if (!present(raw)) return null;
   if (typeof raw !== 'string' || !UUID.test(raw)) return undefined;
   return raw.toLowerCase();
+}
+
+/** `undefined` = invalid; `null` = unset (no fallback owner). */
+function parseServiceUserId(raw: unknown): string | null | undefined {
+  if (!present(raw)) return null;
+  if (typeof raw !== 'string' || !UUID.test(raw)) return undefined;
+  const id = raw.toLowerCase();
+  return R1_MEET_REFUSED_SERVICE_USER_IDS.has(id) ? undefined : id;
 }
 
 /**
@@ -234,9 +261,7 @@ function invalid(reason: string): R1MeetConfig {
 const MISSING_REASON: Readonly<Record<(typeof R1_MEET_REQUIRED_VARIABLES)[number], string>> = {
   RECALL_API_KEY: 'RECALL_API_KEY is required when R1_MEET_ENABLED is "true"',
   RECALL_WEBHOOK_SECRET: 'RECALL_WEBHOOK_SECRET is required when R1_MEET_ENABLED is "true"',
-  CALENDLY_API_TOKEN: 'CALENDLY_API_TOKEN is required when R1_MEET_ENABLED is "true"',
-  CALENDLY_WEBHOOK_SIGNING_KEY: 'CALENDLY_WEBHOOK_SIGNING_KEY is required when R1_MEET_ENABLED is "true"',
-  CALENDLY_R1_EVENT_TYPE_URI: 'CALENDLY_R1_EVENT_TYPE_URI is required when R1_MEET_ENABLED is "true"',
+  R1_MEET_ASHBY_DEX_USER_ID: 'R1_MEET_ASHBY_DEX_USER_ID is required when R1_MEET_ENABLED is "true"',
 };
 
 function readProcessEnv(): R1MeetEnvSource {
@@ -245,12 +270,11 @@ function readProcessEnv(): R1MeetEnvSource {
     R1_MEET_BOT_NAME: process.env.R1_MEET_BOT_NAME,
     R1_MEET_DAILY_BOT_CAP: process.env.R1_MEET_DAILY_BOT_CAP,
     R1_MEET_GOOGLE_LOGIN_GROUP_ID: process.env.R1_MEET_GOOGLE_LOGIN_GROUP_ID,
+    R1_MEET_SERVICE_USER_ID: process.env.R1_MEET_SERVICE_USER_ID,
     RECALL_BASE_URL: process.env.RECALL_BASE_URL,
+    R1_MEET_ASHBY_DEX_USER_ID: process.env.R1_MEET_ASHBY_DEX_USER_ID,
     RECALL_API_KEY: process.env.RECALL_API_KEY,
     RECALL_WEBHOOK_SECRET: process.env.RECALL_WEBHOOK_SECRET,
-    CALENDLY_API_TOKEN: process.env.CALENDLY_API_TOKEN,
-    CALENDLY_WEBHOOK_SIGNING_KEY: process.env.CALENDLY_WEBHOOK_SIGNING_KEY,
-    CALENDLY_R1_EVENT_TYPE_URI: process.env.CALENDLY_R1_EVENT_TYPE_URI,
     WEB_ORIGIN: process.env.WEB_ORIGIN,
   };
 }
@@ -282,6 +306,10 @@ export function getR1MeetConfig(source?: R1MeetEnvSource): R1MeetConfig {
     }
     const googleLoginGroupId = parseLoginGroupId(env.R1_MEET_GOOGLE_LOGIN_GROUP_ID);
     if (googleLoginGroupId === undefined) return invalid('R1_MEET_GOOGLE_LOGIN_GROUP_ID must be a UUID');
+    const serviceUserId = parseServiceUserId(env.R1_MEET_SERVICE_USER_ID);
+    if (serviceUserId === undefined) {
+      return invalid('R1_MEET_SERVICE_USER_ID must be the UUID of a real staff user (not the nil or system-actor id)');
+    }
     const rawBaseUrl: unknown = env.RECALL_BASE_URL;
     const baseUrl = present(rawBaseUrl) ? normalizeRecallBaseUrl(rawBaseUrl) : RECALL_DEFAULT_BASE_URL;
     if (baseUrl === null) {
@@ -303,20 +331,17 @@ export function getR1MeetConfig(source?: R1MeetEnvSource): R1MeetConfig {
     if (typeof webhookSecret !== 'string' || decodeRecallWebhookSecret(webhookSecret) === null) {
       return invalid('RECALL_WEBHOOK_SECRET is malformed (expected the whsec_-prefixed workspace verification secret)');
     }
-    const apiToken: unknown = env.CALENDLY_API_TOKEN;
-    if (!isCalendlyTokenShaped(apiToken)) return invalid('CALENDLY_API_TOKEN is malformed');
-    const webhookSigningKey: unknown = env.CALENDLY_WEBHOOK_SIGNING_KEY;
-    if (!isCalendlySigningKeyShaped(webhookSigningKey)) return invalid('CALENDLY_WEBHOOK_SIGNING_KEY is malformed');
-    const r1EventTypeUri: unknown = env.CALENDLY_R1_EVENT_TYPE_URI;
-    if (typeof r1EventTypeUri !== 'string' || parseCalendlyUri(r1EventTypeUri, 'event_types') === null) {
-      return invalid('CALENDLY_R1_EVENT_TYPE_URI must be https://api.calendly.com/event_types/<id>');
+    const dexUserId: unknown = env.R1_MEET_ASHBY_DEX_USER_ID;
+    if (typeof dexUserId !== 'string' || !UUID.test(dexUserId)) {
+      return invalid('R1_MEET_ASHBY_DEX_USER_ID must be a UUID (the Ashby user id of "Dex (AI Interviewer)")');
     }
 
     return Object.freeze({
       enabled: true as const,
       status: 'enabled' as const,
       recall: withHiddenCredentials({ baseUrl, googleLoginGroupId }, { apiKey, webhookSecret }) as R1MeetRecallSettings,
-      calendly: withHiddenCredentials({ r1EventTypeUri }, { apiToken, webhookSigningKey }) as R1MeetCalendlySettings,
+      ashby: Object.freeze({ dexUserId: dexUserId.toLowerCase() }),
+      serviceUserId,
       botNameOverride,
       dailyBotCap,
       bridgePageUrl: `${origin}${R1_MEET_BRIDGE_PAGE_PATH}`,
