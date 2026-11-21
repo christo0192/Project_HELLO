@@ -2,8 +2,9 @@
 
 Pure tests first (no livekit): the explicit default-off flag, the channel resolver (browser,
 Meet or a closed refusal reason, never an exception), the audio-only recording cap, the
-objective profiles, and the env-contract and fence pins.  The session tests (identity binding,
-lines, the ready relay and the mute ladder) are appended by later tasks of the slice.
+objective profiles, and the env-contract and fence pins.  Then the session tests: the runner's
+plumbing and identity binding (T3), and the Meet conversation (T4): the Meet lines and the
+disclosure, no button or link wording, no "I'm ready" relay, and the mute and no-audio ladder.
 
 Synthetic ids only: the distinctive session ``3f2a9c1e-5b7d-4e2a-9c1e-0123456789ab`` catches a
 slice taken from the wrong end or of the wrong length.
@@ -663,12 +664,12 @@ class RaisingMetadataRoom:
         raise RuntimeError("Quokka-meta-4471 room metadata unavailable")
 
 
-class TestMeetSessionPlumbing(unittest.IsolatedAsyncioTestCase):
-    """The runner resolves the channel once, fails closed, binds one identity, records audio only.
+class MeetRunnerRig:
+    """Mixin: ``run_r1_session`` over the session fakes, with a Meet (or browser) job context.
 
-    Every browser case (flag off, or any channel value but exactly "meet") is today's behaviour
-    exactly: no ``meet`` keyword, the first standard participant, the browser room options, the
-    original context to the recorder, and no ``r1_meet_*`` log line.
+    ``rig`` builds the context, the fetched worker context, the writer, the session and the
+    patches (``fetch_context``, ``R1TurnWriter``, a spy on ``R1Interview.__init__`` and the
+    recorder builder); ``patched`` applies them with the flag (and any other variable) set.
     """
 
     def rig(
@@ -750,10 +751,13 @@ class TestMeetSessionPlumbing(unittest.IsolatedAsyncioTestCase):
         return rig
 
     @contextlib.contextmanager
-    def patched(self, rig: SimpleNamespace, *, flag: str | None):
+    def patched(
+        self, rig: SimpleNamespace, *, flag: str | None, extra_env: dict[str, str] | None = None
+    ):
         env = env_without_flag()
         if flag is not None:
             env[FLAG] = flag
+        env.update(extra_env or {})
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
             for patch in rig.patches:
@@ -779,6 +783,15 @@ class TestMeetSessionPlumbing(unittest.IsolatedAsyncioTestCase):
             if loop.time() > deadline:
                 self.fail("condition not reached in time")
             await asyncio.sleep(0.01)
+
+
+class TestMeetSessionPlumbing(MeetRunnerRig, unittest.IsolatedAsyncioTestCase):
+    """The runner resolves the channel once, fails closed, binds one identity, records audio only.
+
+    Every browser case (flag off, or any channel value but exactly "meet") is today's behaviour
+    exactly: no ``meet`` keyword, the first standard participant, the browser room options, the
+    original context to the recorder, and no ``r1_meet_*`` log line.
+    """
 
     def assert_settled_before_connect(self, rig: SimpleNamespace, outcome: str) -> None:
         """The shape of ``TestRunR1SessionFailurePaths.assert_settled``, with nothing started."""
@@ -1032,6 +1045,567 @@ class TestMeetSessionPlumbing(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(rig.recorder_contexts[0], rig.fetched)
                 self.assertEqual(rig.ctx.connects, 1)
                 self.assert_no_meet_log(logs)
+
+
+# --------------------------------------------------------------------------------------------
+# T4: the Meet conversation (the lines, the ready relay, the mute and no-audio ladder).
+# --------------------------------------------------------------------------------------------
+
+import re  # noqa: E402
+
+from r1_phases import R1Phase  # noqa: E402
+from r1_script import LINES, MEET_LINES, active_line_id, line, meet_line_id  # noqa: E402
+from tests.test_r1_core import (  # noqa: E402
+    Clock,
+    FakePublication,
+    R1TestCase,
+    append,
+    ready_packet,
+)
+
+# Wording a Meet candidate cannot act on: they never see our page (S08 plan section 2).
+BANNED = re.compile(
+    r"\b(?:button|click|press|tap|link|refresh|reload|window|browser|tab|screen|page|"
+    r"selected)\b",
+    re.IGNORECASE,
+)
+OPENING_IDS = ("L-OPEN", "L-OPEN-HELLO", "L-OPEN-HI")
+NOT_OPENING_IDS = (
+    "L-TRANSITION-REASK-2", "L-SYSTEM-STOP", "L-CLOSE", "L-CLOSE-SHORT", "L-SIL-NOAUDIO",
+)
+# Every id a Meet round speaks at its edges: the openings, the closes, the system stop, the
+# no-audio ladder and the transition's last reask.
+EDGE_IDS = (*OPENING_IDS, *NOT_OPENING_IDS, "L-SIL-END-NOAUDIO")
+MUTE_IDS = ("L-MUTE", "L-MUTE-RP", "L-MUTE-IV")
+INTERVIEWERS = {"1": "Dex", "0": "Christy"}  # R1_INTERVIEWER_DEX -> who introduces themself
+
+
+def shrinking(seconds: float):
+    """A phase budget that really runs out as wall time passes (``TestPhaseDriver.shrinking``)."""
+    started = asyncio.get_running_loop().time()
+    return lambda: max(0.0, seconds - (asyncio.get_running_loop().time() - started))
+
+
+class MeetCase(R1TestCase):
+    """``R1TestCase`` with a Google Meet interview whose bound participant is the bridge.
+
+    ``spoken_line`` renders a line as a Meet round does; ``browser_line`` as a browser round of
+    the same context (and so the same persona) does; ``text_of`` fills a line's own text with no
+    routing at all.  ``browser_interview`` builds today's control.
+    """
+
+    LINE_CONTEXT = {"first_name": "Asha"}
+
+    async def asyncSetUp(self) -> None:
+        self.clock = Clock()
+        self.order: list = []
+        self.ctx = FakeContext(self.order)
+        self.session = FakeSession(log=self.order)
+        self.writer = FakeWriter(self.order)
+        self.interview = R1Interview(
+            self.ctx,
+            dict(self.LINE_CONTEXT),
+            self.session,
+            self.writer,
+            clock=self.clock,
+            recorder_finish=lambda: append(self.order, "recording"),
+            meet=MEET_CHANNEL,
+        )
+        self.interview.wire_events()
+        self.ctx.room.emit("participant_connected", self.bridge())
+        self.interview.machine.transition(R1Phase.OPENING)
+        self.interview.machine.transition(R1Phase.ICEBREAKER)
+
+    @staticmethod
+    def bridge() -> FakeParticipant:
+        return FakeParticipant(MEET_IDENTITY)
+
+    def spoken_line(self, line_id: str) -> str:
+        interview = R1Interview(
+            self.ctx, dict(self.LINE_CONTEXT), self.session, self.writer, meet=MEET_CHANNEL
+        )
+        return interview.render_line(line_id)
+
+    def browser_line(self, line_id: str) -> str:
+        interview = R1Interview(self.ctx, dict(self.LINE_CONTEXT), self.session, self.writer)
+        return interview.render_line(line_id)
+
+    def text_of(self, line_id: str) -> str:
+        return line(
+            line_id,
+            first_name=self.interview._first_name(),
+            **self.interview.persona.line_values,
+        )
+
+    def browser_interview(self) -> tuple[R1Interview, FakeSession]:
+        """Today's browser round, its candidate already in, in the icebreaker (the control)."""
+        ctx = FakeContext(self.order)
+        session = FakeSession(log=self.order)
+        interview = R1Interview(
+            ctx, {"first_name": "Asha", "candidate_identity": "candidate"}, session, self.writer,
+            clock=Clock(),
+        )
+        interview.wire_events()
+        ctx.room.emit("participant_connected", FakeParticipant("candidate"))
+        interview.machine.transition(R1Phase.OPENING)
+        interview.machine.transition(R1Phase.ICEBREAKER)
+        return interview, session
+
+    @staticmethod
+    def record_markers(interview: R1Interview) -> list[tuple[str, str]]:
+        """Record the (marker, text) of every scripted line ``interview`` speaks from now on."""
+        said: list[tuple[str, str]] = []
+        original = interview._say_text
+
+        async def recording(text: str, **kwargs: Any) -> None:
+            said.append((kwargs.get("marker", "llm"), text))
+            await original(text, **kwargs)
+
+        interview._say_text = recording
+        return said
+
+
+class TestMeetRendering(MeetCase):
+    """``render_line``: a Meet round speaks the Meet text of the eight ``MEET_LINES`` ids and
+    the browser text of every other id; a browser round renders exactly as it did."""
+
+    FLAG_STATES = tuple(
+        {"R1_INTERVIEWER_DEX": dex, "R1_BRIEF_WORDING_V2": wording}
+        for dex in ("1", "0")
+        for wording in ("1", "0")
+    )
+
+    def pair(self) -> tuple[R1Interview, R1Interview]:
+        meet = R1Interview(
+            self.ctx, dict(self.LINE_CONTEXT), self.session, self.writer, meet=MEET_CHANNEL
+        )
+        browser = R1Interview(self.ctx, dict(self.LINE_CONTEXT), self.session, self.writer)
+        return meet, browser
+
+    async def test_the_meet_ids_speak_the_meet_text_and_every_other_id_the_browser_text(
+        self,
+    ) -> None:
+        for env in self.FLAG_STATES:
+            with self.subTest(**env), mock.patch.dict(os.environ, env):
+                meet, browser = self.pair()
+                self.assertEqual(meet.persona.line_values, browser.persona.line_values)
+                values = {"first_name": meet._first_name(), **meet.persona.line_values}
+                for line_id in LINES:
+                    if line_id in MEET_LINES:
+                        expected = line(MEET_LINES[line_id], **values)
+                        self.assertEqual(meet.render_line(line_id), expected, line_id)
+                        self.assertNotEqual(browser.render_line(line_id), expected, line_id)
+                    else:
+                        self.assertEqual(
+                            meet.render_line(line_id), browser.render_line(line_id), line_id
+                        )
+
+    async def test_a_browser_round_renders_exactly_as_before(self) -> None:
+        for env in self.FLAG_STATES:
+            with self.subTest(**env), mock.patch.dict(os.environ, env):
+                _meet, browser = self.pair()
+                self.assertIsNone(browser._meet)
+                values = {"first_name": browser._first_name(), **browser.persona.line_values}
+                for line_id in LINES:
+                    self.assertEqual(
+                        browser.render_line(line_id), line(active_line_id(line_id), **values),
+                        line_id,
+                    )
+
+    async def test_the_meet_openings_name_the_interviewer_the_flag_picks(self) -> None:
+        for dex, name in INTERVIEWERS.items():
+            with self.subTest(interviewer=name), mock.patch.dict(
+                os.environ, {"R1_INTERVIEWER_DEX": dex}
+            ):
+                self.assertEqual(
+                    self.spoken_line("L-OPEN-HI"),
+                    f"Hi Asha, I'm {name}, an AI interviewer from Interview Kickstart. Just so "
+                    "you know, this call is recorded.",
+                )
+                self.assertEqual(
+                    self.spoken_line("L-OPEN-HELLO"),
+                    f"Hi Asha, I'm {name}, an AI interviewer from Interview Kickstart. Just so "
+                    "you know, this call is recorded. Can you hear me okay?",
+                )
+
+    async def test_the_warm_up_keeps_the_base_ids_and_their_persistence(self) -> None:
+        browser = R1Interview(self.ctx, dict(self.LINE_CONTEXT), self.session, self.writer)
+        order = self.interview._warm_order()
+        self.assertEqual(order, browser._warm_order())
+        self.assertFalse([line_id for line_id in order if line_id.endswith("-MEET")])
+        self.assertTrue(set(order) & set(MEET_LINES))  # the comparison below is not vacuous
+        for candidate_free in (True, False):
+            with self.subTest(candidate_free=candidate_free):
+                meet_specs = self.interview._warm_specs(candidate_free=candidate_free)
+                browser_specs = browser._warm_specs(candidate_free=candidate_free)
+                self.assertEqual(
+                    [(spec.line_id, spec.persist, spec.voice) for spec in meet_specs],
+                    [(spec.line_id, spec.persist, spec.voice) for spec in browser_specs],
+                )
+                for meet_spec, browser_spec in zip(meet_specs, browser_specs):
+                    self.assertEqual(meet_spec.text, self.spoken_line(meet_spec.line_id))
+                    if meet_spec.line_id in MEET_LINES:
+                        self.assertNotEqual(meet_spec.text, browser_spec.text)
+                    else:
+                        self.assertEqual(meet_spec.text, browser_spec.text)
+
+
+class TestMeetDisclosure(MeetRunnerRig, unittest.IsolatedAsyncioTestCase):
+    """Owner: "Dex still discloses he is an AI and that the call is recorded."
+
+    Through the real runner, the FIRST line a Meet round speaks carries both, in every opening
+    configuration and with either interviewer.  A browser round's first line is today's, with no
+    recording notice.
+    """
+
+    OPENINGS = (
+        ({"R1_OPENING_SOUND_CHECK": "0"}, "L-OPEN"),
+        ({"R1_OPENING_SOUND_CHECK": "1", "R1_OPENING_NO_HEARING_CHECK": "0"}, "L-OPEN-HELLO"),
+        ({"R1_OPENING_SOUND_CHECK": "1", "R1_OPENING_NO_HEARING_CHECK": "1"}, "L-OPEN-HI"),
+    )
+
+    async def first_line(
+        self, rig: SimpleNamespace, *, flag: str | None, extra_env: dict[str, str], base: str
+    ) -> tuple[str, SimpleNamespace]:
+        """Run the session until its first line has played, then cancel it.
+
+        Returns that line and ``base`` filled as the session's own interview fills it, in the
+        same environment: its browser text and its Meet text.
+        """
+        with self.patched(rig, flag=flag, extra_env=extra_env):
+            task = asyncio.create_task(run_r1_session(rig.ctx, session_factory=rig.factory))
+            try:
+                await self.until(
+                    lambda: bool(rig.session.spoken)
+                    and ("play_end", rig.session.spoken[0]) in rig.session.log
+                )
+                interview = self.main_interview(rig)[0]
+                values = {"first_name": interview._first_name(), **interview.persona.line_values}
+                first = rig.session.spoken[0]
+                expected = SimpleNamespace(
+                    interview=interview,
+                    browser=line(base, **values),
+                    meet=line(meet_line_id(base), **values),
+                )
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 10.0)
+        return first, expected
+
+    async def test_the_first_meet_line_discloses_the_ai_and_the_recording(self) -> None:
+        for env, base in self.OPENINGS:
+            for dex, name in INTERVIEWERS.items():
+                with self.subTest(opening=base, interviewer=name):
+                    rig = self.rig(activate_ok=True)
+                    first, expected = await self.first_line(
+                        rig, flag="1", extra_env={**env, "R1_INTERVIEWER_DEX": dex}, base=base
+                    )
+                    self.assertEqual(expected.interview._meet, MEET_CHANNEL)
+                    self.assertEqual(first, expected.meet)
+                    self.assertIn("AI interviewer", first)
+                    self.assertIn("this call is recorded", first)
+                    self.assertTrue(first.startswith(f"Hi Asha, I'm {name}, "), first)
+                    self.assertIsNone(BANNED.search(first), first)
+
+    async def test_the_first_browser_line_is_todays_with_no_recording_notice(self) -> None:
+        browser_dispatch = json.dumps({"session_id": MEET_SESSION_ID, "channel": "browser"})
+        cases = (
+            ("flag off, valid meet metadata", None, {}),
+            ("flag on, channel browser", "1", {"dispatch_raw": browser_dispatch}),
+        )
+        for env, base in self.OPENINGS:
+            for dex, name in INTERVIEWERS.items():
+                for case, flag, overrides in cases:
+                    with self.subTest(opening=base, interviewer=name, case=case):
+                        rig = self.rig(activate_ok=True, participants=("candidate",), **overrides)
+                        first, expected = await self.first_line(
+                            rig, flag=flag, extra_env={**env, "R1_INTERVIEWER_DEX": dex},
+                            base=base,
+                        )
+                        self.assertIsNone(expected.interview._meet)
+                        self.assertEqual(first, expected.browser)
+                        self.assertNotIn("recorded", first)
+                        self.assertTrue(first.startswith(f"Hi Asha, I'm {name}, "), first)
+
+
+class TestMeetNoButtonOrLinkWording(MeetCase):
+    """A Meet round never asks for a button, a link, a window or a refresh, and the routed lines
+    keep their base ids for everything but the spoken text."""
+
+    async def test_the_last_reask_speaks_the_meet_text_and_keeps_the_start_question(self) -> None:
+        said = self.record_markers(self.interview)
+        self.interview._enter(R1Phase.TRANSITION)
+        await self.interview.say("L-TRANSITION-REASK-2")
+        text = self.text_of("L-TRANSITION-REASK-2-MEET")
+        self.assertEqual(self.session.spoken, [text])
+        self.assertIn("say 'ready'", text)
+        self.assertIsNone(BANNED.search(text))
+        self.assertEqual(said, [("L-TRANSITION-REASK-2", text)])  # the marker is the base id
+        self.assertEqual(
+            self.interview._start_question,
+            r1_session._START_QUESTION_OF_LINE["L-TRANSITION-REASK-2"],
+        )
+        self.assertEqual(self.interview._start_question_line, "L-TRANSITION-REASK-2")
+        self.assertEqual(self.interview._last_transition_line, "L-TRANSITION-REASK-2")
+        self.assertEqual(self.interview._transition_said, ["L-TRANSITION-REASK-2"])
+        # The browser round's bookkeeping is the same; only its text differs.
+        browser, session = self.browser_interview()
+        browser._enter(R1Phase.TRANSITION)
+        await browser.say("L-TRANSITION-REASK-2")
+        self.assertEqual(session.spoken, [self.browser_line("L-TRANSITION-REASK-2")])
+        self.assertNotEqual(session.spoken, self.session.spoken)
+        for attribute in (
+            "_start_question", "_start_question_line", "_last_transition_line", "_transition_said",
+        ):
+            self.assertEqual(getattr(browser, attribute), getattr(self.interview, attribute))
+
+    async def test_a_system_stop_speaks_the_meet_text(self) -> None:
+        said = self.record_markers(self.interview)
+        await self.interview._finish("provider_error", system=True)
+        text = self.text_of("L-SYSTEM-STOP-MEET")
+        self.assertEqual(self.session.spoken, [text])
+        self.assertEqual(said, [("L-SYSTEM-STOP", text)])
+        self.assertIn("in touch to arrange a new time", text)
+        self.assertIsNone(BANNED.search(text))
+
+    async def test_the_normal_close_speaks_the_meet_text(self) -> None:
+        for short, base, meet_id in (
+            (False, "L-CLOSE", "L-CLOSE-MEET"),
+            (True, "L-CLOSE-SHORT", "L-CLOSE-SHORT-MEET"),
+        ):
+            with self.subTest(close=base):
+                await self.asyncSetUp()  # a fresh interview per close
+                said = self.record_markers(self.interview)
+                self.interview._close_short = short
+                await self.interview._finish("complete")
+                text = self.text_of(meet_id)
+                self.assertEqual(self.session.spoken, [text])
+                self.assertEqual(said, [(base, text)])
+                self.assertIn("You can leave the call now.", text)
+                self.assertIsNone(BANNED.search(text))
+
+    async def test_nothing_a_meet_round_speaks_asks_for_a_button_a_link_or_a_page(self) -> None:
+        for env in (
+            {},
+            {"R1_INTERVIEWER_DEX": "0"},
+            {"R1_BRIEF_WORDING_V2": "0", "R1_TRANSITION_REPAIR": "0"},
+            {"R1_OPENING_SOUND_CHECK": "0", "R1_MUTE_ASIDE_V2": "0"},
+        ):
+            with self.subTest(**env), mock.patch.dict(os.environ, env):
+                for line_id in (*self.interview._warm_order(), *EDGE_IDS):
+                    text = self.interview.render_line(line_id)
+                    self.assertIsNone(BANNED.search(text), f"{line_id}: {text}")
+        # Not vacuous: a browser round still says those words in the five non-opening ids.
+        for line_id in NOT_OPENING_IDS:
+            self.assertIsNotNone(BANNED.search(self.browser_line(line_id)), line_id)
+
+
+class TestMeetReadyRelay(MeetCase):
+    """No button exists in Meet: the page's "I'm ready" relay is refused (``meet_channel``) and
+    never latched; a spoken "ready" works as in a browser round, whose relay still latches."""
+
+    async def start_transition(self, interview: R1Interview) -> asyncio.Task:
+        interview._enter(R1Phase.TRANSITION)
+        task = asyncio.create_task(interview._run_transition())
+        self.addCleanup(task.cancel)
+        await self.settle()
+        return task
+
+    @staticmethod
+    def rejected(logs: list[dict]) -> list[tuple[str, str]]:
+        return [
+            (line_.get("error_category", ""), line_.get("level", ""))
+            for line_ in logs
+            if line_.get("error_type") == "r1_ready_rejected"
+        ]
+
+    async def test_the_relay_is_never_a_press_in_a_meet_round(self) -> None:
+        task = await self.start_transition(self.interview)
+        self.assertTrue(self.interview._awaiting_ready)
+        with self.capture_logs() as logs:
+            self.ctx.room.emit("data_received", ready_packet())
+            await self.settle()
+        self.assertFalse(self.interview._ready_latched)
+        self.assertTrue(self.interview._awaiting_ready)  # what the bridge tile was told stands
+        self.assertFalse(task.done())
+        self.assertEqual(self.session.spoken, [])
+        self.assertEqual(self.rejected(logs), [("meet_channel", "warn")])
+        self.assertNotIn("r1_ready_button", error_types(logs))
+        # A spoken "ready" still starts the role-play, exactly as in a browser round.
+        self.final_transcript("ok, ready")
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(self.session.spoken, [self.spoken_line("L-PICKUP")])
+        self.assertFalse(self.interview._ready_latched)
+
+    async def test_every_relay_is_refused_before_any_other_check(self) -> None:
+        # Outside the transition, or naming a sender: still the Meet refusal, never a latch.
+        with self.capture_logs() as logs:
+            self.ctx.room.emit("data_received", ready_packet())
+            self.ctx.room.emit("data_received", ready_packet(participant=self.bridge()))
+        self.assertFalse(self.interview._ready_latched)
+        self.assertEqual(self.rejected(logs), [("meet_channel", "warn")] * 2)
+
+    async def test_a_browser_round_still_latches_the_relay(self) -> None:
+        browser, session = self.browser_interview()
+        task = await self.start_transition(browser)
+        with self.capture_logs() as logs:
+            browser.ctx.room.emit("data_received", ready_packet())
+            self.assertTrue(browser._ready_latched)
+            self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(session.spoken, [browser.render_line("L-PICKUP")])
+        self.assertIn("r1_ready_button", error_types(logs))
+        self.assertEqual(self.rejected(logs), [])
+
+
+class TestMeetMuteAndNoAudioLadder(MeetCase):
+    """The bridge publishes the mixed Meet audio: a track mute is not the candidate's microphone.
+
+    In a Meet round a track mute or unmute changes nothing (``_muted`` stays False; one
+    ``r1_meet_mute_ignored`` line per session), so silence of every cause takes the existing
+    bounded ladders: never heard -> the Meet no-audio line, then L-SIL-END-NOAUDIO and
+    ``candidate_left``; heard then silent -> L-SIL-IB, L-SIL-END; the bridge gone -> the rejoin
+    grace, then ``candidate_left``.  Each ends within two prompts.  The browser round keeps its
+    mute aside.  Timings as ``TestTheNoAudioLadder``.
+    """
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        for name, value in (
+            ("ICEBREAKER_PROMPT_SECONDS", 0.05),
+            ("ICEBREAKER_END_SECONDS", 0.05),
+            ("NO_AUDIO_END_SECONDS", 0.05),
+            ("MUTE_ASIDE_DEBOUNCE_SECONDS", 0.0),
+        ):
+            patcher = mock.patch.object(r1_session, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def mute(self, muted: bool = True) -> None:
+        event = "track_muted" if muted else "track_unmuted"
+        self.ctx.room.emit(event, self.bridge(), FakePublication())
+
+    def mute_texts(self) -> list[str]:
+        texts = {self.spoken_line(i) for i in MUTE_IDS} | {self.browser_line(i) for i in MUTE_IDS}
+        return [text for text in self.session.spoken if text in texts]
+
+    def no_audio_ladder(self) -> list[str]:
+        return [self.text_of("L-SIL-NOAUDIO-MEET"), self.text_of("L-SIL-END-NOAUDIO")]
+
+    async def run_icebreaker(self) -> str | None:
+        return await asyncio.wait_for(self.interview._run_icebreaker(), 10.0)
+
+    def assert_the_mute_changed_nothing(self) -> None:
+        self.assertFalse(self.interview._muted)
+        self.assertIsNone(self.interview._muted_since)
+        self.assertIsNone(self.interview._mute_resume_phase)
+        self.assertFalse(self.interview._mute_announced)
+        self.assertFalse(self.interview._mute_pending())
+
+    async def assert_a_track_mute_is_silence(self) -> None:
+        with self.capture_logs() as logs:
+            self.mute()
+            self.assert_the_mute_changed_nothing()
+            self.mute(False)
+            self.mute()
+            self.assert_the_mute_changed_nothing()
+            outcome = await self.run_icebreaker()
+        self.assertEqual(outcome, "candidate_left")
+        self.assertEqual(self.session.spoken, self.no_audio_ladder())
+        self.assertEqual(self.mute_texts(), [])
+        self.assertTrue(self.interview._goodbye_spoken)  # no L-CLOSE after it
+        ignored = [row for row in logs if row.get("error_type") == "r1_meet_mute_ignored"]
+        self.assertEqual(len(ignored), 1)  # once per session, whatever the number of mutes
+        self.assertEqual((ignored[0]["level"], ignored[0]["phase"]), ("info", "icebreaker"))
+        self.assertNotIn(MEET_IDENTITY, json.dumps(logs))
+        self.assertNotIn("Asha", json.dumps(logs))
+
+    async def test_a_track_mute_is_silence_and_gets_the_meet_no_audio_ladder(self) -> None:
+        await self.assert_a_track_mute_is_silence()
+
+    async def test_the_same_with_the_mute_aside_v2_off(self) -> None:
+        with mock.patch.dict(os.environ, {"R1_MUTE_ASIDE_V2": "0"}):
+            await self.assert_a_track_mute_is_silence()
+
+    async def test_a_published_muted_track_is_silence_too(self) -> None:
+        # A bridge that (re)joins with its track already muted: the room's own view is ignored.
+        bridge = FakeParticipant(
+            MEET_IDENTITY, track_publications={"TR_mic": FakePublication(muted=True)}
+        )
+        with self.capture_logs() as logs:
+            self.ctx.room.emit("participant_connected", bridge)
+            self.ctx.room.emit("track_published", FakePublication(muted=True), bridge)
+        self.assert_the_mute_changed_nothing()
+        self.assertEqual(error_types(logs).count("r1_meet_mute_ignored"), 1)
+        self.assertEqual(await self.run_icebreaker(), "candidate_left")
+        self.assertEqual(self.session.spoken, self.no_audio_ladder())
+
+    async def test_silent_from_the_start_gets_the_meet_no_audio_ladder(self) -> None:
+        with self.capture_logs() as logs:
+            self.assertEqual(await self.run_icebreaker(), "candidate_left")
+        self.assertEqual(self.session.spoken, self.no_audio_ladder())
+        self.assertIn("muted in Google Meet", self.session.spoken[0])
+        self.assertNotIn("r1_meet_mute_ignored", error_types(logs))
+        self.assertIn("r1_no_audio", error_types(logs))
+
+    async def test_heard_then_silent_is_todays_ladder(self) -> None:
+        self.final_transcript("Hello")
+        self.assertEqual(await self.run_icebreaker(), "candidate_left")
+        self.assertEqual(
+            self.session.spoken, [self.spoken_line("L-SIL-IB"), self.spoken_line("L-SIL-END")]
+        )
+        self.assertEqual(
+            self.session.spoken, [self.browser_line("L-SIL-IB"), self.browser_line("L-SIL-END")]
+        )
+
+    async def test_heard_then_muted_is_still_todays_ladder_with_no_mute_line(self) -> None:
+        self.final_transcript("Hello")
+        await self.settle()
+        self.mute()
+        self.assert_the_mute_changed_nothing()
+        self.assertEqual(await self.run_icebreaker(), "candidate_left")
+        self.assertEqual(
+            self.session.spoken, [self.spoken_line("L-SIL-IB"), self.spoken_line("L-SIL-END")]
+        )
+        self.assertEqual(self.mute_texts(), [])
+
+    async def test_a_track_mute_in_the_role_play_never_enters_the_aside(self) -> None:
+        self.enter_roleplay()
+        turn = asyncio.create_task(self.interview._roleplay_turn())
+        self.addCleanup(turn.cancel)
+        await self.settle()
+        self.mute()
+        self.assertIs(self.interview.machine.phase, R1Phase.ROLEPLAY)  # the clock keeps running
+        self.assert_the_mute_changed_nothing()
+        await asyncio.sleep(0.1)
+        self.mute(False)
+        self.assertIs(self.interview.machine.phase, R1Phase.ROLEPLAY)
+        self.final_transcript("back now")
+        self.assertIsNone(await asyncio.wait_for(turn, 10.0))
+        self.assertEqual(self.mute_texts(), [])
+        self.assertEqual(self.session.spoken, [])
+
+    async def test_the_bridge_leaving_the_role_play_ends_after_the_rejoin_grace(self) -> None:
+        self.enter_roleplay()
+        with mock.patch.object(r1_session, "rejoin_grace_seconds", return_value=0.01):
+            turn = asyncio.create_task(self.interview._roleplay_turn())
+            await self.settle()
+            self.ctx.room.emit("participant_disconnected", self.bridge())
+            self.assertEqual(await asyncio.wait_for(turn, 10.0), "candidate_left")
+        self.assertLessEqual(len(self.session.spoken), 2)
+        self.assertNotIn(self.spoken_line("L-SIL-RP1"), self.session.spoken)
+        self.assertEqual(self.mute_texts(), [])
+
+    async def test_a_browser_round_still_gets_the_mute_aside(self) -> None:
+        browser, session = self.browser_interview()
+        browser.ctx.room.emit("track_muted", FakeParticipant("candidate"), FakePublication())
+        self.assertTrue(browser._muted)
+        budget = shrinking(0.3)
+        with mock.patch.object(
+            browser.machine, "remaining_icebreaker_seconds", budget
+        ), mock.patch.object(browser.machine, "icebreaker_should_end", lambda: budget() <= 0):
+            self.assertIsNone(await asyncio.wait_for(browser._run_icebreaker(), 10.0))
+        self.assertEqual(session.spoken, [browser.render_line("L-MUTE-IV")])
 
 
 if __name__ == "__main__":

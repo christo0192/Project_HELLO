@@ -348,6 +348,7 @@ from r1_script import (
     is_candidate_free,
     known_first_name,
     line,
+    meet_line_id,
     spoken_first_name,
     TRANSITION_QUIET_FALLBACK,
     transition_answers_enabled,
@@ -3732,6 +3733,8 @@ class R1Interview:
         self._room_disconnected = False
         self._provider_abort = False
         self._muted = False
+        # M034 S08: whether a Google Meet round has logged its first ignored track mute (once).
+        self._meet_mute_noted = False
         self._mute_resume_phase: R1Phase | None = None
         self._mute_announced = False
         # M032 S7C (SWEEP-36): when the current mute began (loop time; None while unmuted).
@@ -4181,9 +4184,19 @@ class R1Interview:
 
         M032 S6: ``active_line_id`` picks the text, so ``R1_TRANSITION_REPAIR=0`` speaks revision
         21's brief, pickup and coach aside under the same ids (warm-up, cache and logs follow).
+
+        M034 S08 (``R1_MEET_VOICE_ENABLED``, default off): a Google Meet round (``self._meet``)
+        then speaks the Meet text of the ids in ``MEET_LINES`` (``meet_line_id``, applied after
+        ``active_line_id``): the openings add the recording disclosure, the others drop the
+        button, link and window wording.  Only the spoken text changes: markers, the warm order,
+        cache labels, start questions and transcript markers keep ``line_id``.  A browser round
+        (``self._meet`` None) renders exactly as before.
         """
+        spoken = active_line_id(line_id)
+        if self._meet is not None:
+            spoken = meet_line_id(spoken)
         return line(
-            active_line_id(line_id),
+            spoken,
             first_name=self._first_name(),
             **self.persona.line_values,
         )
@@ -4377,6 +4390,10 @@ class R1Interview:
         Accepted only when ALL of these hold, and ignored otherwise:
 
         * the topic is ``READY_TOPIC`` (every other data message is none of our business);
+        * the round has a button at all: M034 S08 (``R1_MEET_VOICE_ENABLED``, default off), a
+          Google Meet round whose profile has no ``ready_button`` refuses the relay
+          (``r1_ready_rejected``, ``meet_channel``) before anything else is checked, because no
+          button exists in Meet; a spoken "ready" works there exactly as in a browser round;
         * the packet has NO sending participant: only server credentials produce that, and a
           candidate's token cannot publish data at all (``canPublishData`` is false), so a message
           that names a participant is never the button, whatever it says;
@@ -4409,6 +4426,15 @@ class R1Interview:
                     schema=topic_label(topic),
                     phase=self.machine.transcript_phase(),
                 )
+            return
+        if self._meet is not None and not self._meet.profile.ready_button:
+            # M034 S08: no button exists in Meet, so the relay is never a press (nor a consent).
+            _log.warn(
+                "unknown_event",
+                error_type="r1_ready_rejected",
+                error_category="meet_channel",
+                phase=self.machine.transcript_phase(),
+            )
             return
         if getattr(packet, "participant", None) is not None:
             reason = "sender"
@@ -10157,7 +10183,23 @@ class R1Interview:
         Role-play enters ASIDE (clock R paused) on mute and returns on unmute, here,
         not when the driver next runs: a quick mute/unmute while the driver is busy
         can therefore never leave the phase stuck in ASIDE.
+
+        M034 S08 (``R1_MEET_VOICE_ENABLED``, default off): a Google Meet round whose profile has
+        no ``track_mute_aside`` ignores track mute AND unmute events, with no state change at
+        all.  The bridge publishes the mixed Meet audio, so the candidate's Meet mute is only
+        silence and a mute of the bridge's own track is not the candidate's microphone; silence
+        of every cause then takes the existing bounded ladders (never heard, heard then silent,
+        the rejoin grace).  The first ignored mute is logged once (``r1_meet_mute_ignored``).
         """
+        if self._meet is not None and not self._meet.profile.track_mute_aside:
+            if muted and not self._meet_mute_noted:
+                self._meet_mute_noted = True
+                _log.info(
+                    "unknown_event",
+                    error_type="r1_meet_mute_ignored",
+                    phase=self.machine.transcript_phase(),
+                )
+            return
         self._muted = muted
         if muted:
             if self._muted_since is None:
