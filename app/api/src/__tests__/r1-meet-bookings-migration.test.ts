@@ -1082,7 +1082,8 @@ describe('migration 0142: the booking lifecycle RPCs (T3)', () => {
     );
     expect(body).toContain("set recall_bot_id = p_recall_bot_id, status = 'bot_scheduled', reason = 'eligible', updated_at = p_now");
     expect(body).toContain('set recall_bot_id = null, updated_at = p_now');
-    // version is bumped only by replace; key_attempt only by rotate_key (and reset by replace).
+    // Within set_bot, version is bumped only by replace and key_attempt only by rotate_key (reset by
+    // replace). The reschedule and create RPCs start new generations of their own (T3-C, T3-G).
     expect(body.match(/version = version \+ 1/g)).toHaveLength(1);
     expect(body.match(/key_attempt = key_attempt \+ 1/g)).toHaveLength(1);
     // Every status it writes pairs with eligible.
@@ -1170,6 +1171,12 @@ describe('migration 0142: the booking lifecycle RPCs (T3)', () => {
       'T3-G a cancelled booking on a moved slot: booking_terminal, nothing written',
       'T3-G a booking on a round HR cancelled: exists, round_live false, nothing written',
       'T3-G a lapsed browser round is left alone: blocked/round_active',
+      'T3-G a revival resets the rotated key and the spent arm budget: key attempt 0, no arms, generation 1',
+      'T3-G the revived booking arms the bridge ticket for the new slot',
+      'T3-G a revival clears the claimed ticket and the bound session of the old attempt',
+      'T3-G after the revival the old ticket is unknown; the old session itself is kept',
+      'T3-G step 8a leaves a lapsed round held by the live booking of another event: blocked/round_active',
+      'T3-G a round the sweep already expired is re-bound by the create replay: a fresh round, generation 1',
       'T3-H reissuing the link of a Meet round raises P0001',
       'T3-H a browser round is reissued unchanged',
       'T3-H exactly one r1-meet round_cancelled job, ids only',

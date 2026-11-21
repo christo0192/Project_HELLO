@@ -175,7 +175,10 @@ comment on column screening_v2.interview_round_consents.india_location_attested 
 -- ---------------------------------------------------------------------------------------------
 -- Status (closed): pending, unmatched_application, unmapped_scheduler, blocked, bot_scheduled,
 -- bot_joining, human_present, in_call (active, one bot) and completed, cancelled, failed, drained
--- (terminal, never revived; a terminal booking keeps recall_bot_id until S06 confirms the release).
+-- (terminal; a terminal booking keeps recall_bot_id until S06 confirms the release). completed,
+-- cancelled and drained are history and never revived. A failed booking is revived by the create
+-- RPC (§10) only when Ashby moves its event to a new, unstarted slot or Meet link and its bot has
+-- been released: a new bot generation on a fresh or re-linked round.
 -- Reason (closed, NOT NULL): the S01 Dex event decisions plus the matching, round-creation and
 -- runtime reasons; chk_r1_meet_bookings_status_reason ties each reason to its status family.
 create table if not exists screening_v2.r1_meet_bookings (
@@ -341,8 +344,12 @@ comment on column screening_v2.r1_meet_bookings.ticket_digest is
   'SHA-256 hex of the single-use bridge ticket (S05 owns the ticket and its HMAC domain). The raw '
   'ticket is never stored. Secret.';
 comment on column screening_v2.r1_meet_bookings.version is
-  'Recall bot generation for the Idempotency-Key r1-meet-<event>-v<version>-k<key_attempt>; '
-  'bumped only when a bot is deleted and recreated (0..50).';
+  'Recall bot generation for the Idempotency-Key r1-meet-<event>-v<version>-k<key_attempt> '
+  '(0..50). Bumped, with key_attempt back to 0, by every new generation: r1_meet_set_bot replace '
+  '(the bot was deleted to be recreated), a reschedule that moves the slot or the Meet link, and a '
+  'create replay that re-binds a lapsed round or revives a failed booking. A create for a new '
+  'generation never reuses the key of an older one, so Recall never replays an answer it cached '
+  'for another request body.';
 comment on column screening_v2.r1_meet_bookings.key_attempt is
   'Idempotency-Key rotation within one bot generation, bumped only when the Recall client asks '
   'for a new key (Recall caches 4xx/5xx answers for 1 h); reset to 0 by a new generation (0..20).';

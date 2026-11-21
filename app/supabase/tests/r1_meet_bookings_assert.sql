@@ -27,9 +27,10 @@
 --        (r1_meet_record_receipt: dedupe, one live r1-meet job, re-drive, settled work, refusals),
 --        the receipt prune (r1_meet_prune_receipts), and the behavioural privilege proof of both
 --        tables and all eleven RPCs (anon / authenticated refused, service_role runs each).
---   T3-G the per-event recovery (review F1, F6): the re-bind of a lapsed round before dispatch, the
---        revival of a moved failed booking, bot_attached, version_exhausted, replays after the slot
---        started.
+--   T3-G the per-event recovery (review F1, F6): the re-bind of a lapsed round before dispatch (also
+--        after the real sweep expired it), the revival of a moved failed booking, the reset of every
+--        counter of the old attempt (key, arm budget, ticket, session), step 8a's guard for another
+--        event's live booking, bot_attached, version_exhausted, replays after the slot started.
 --   T3-H the round side (review F3): no reissue of a Meet round's link; HR's cancel of a Meet
 --        round queues one round_cancelled job per live booking.
 --   T4-C also the receipt prune of dead-lettered enqueued receipts and r1_meet_prune_bookings
@@ -2533,15 +2534,28 @@ $$;
 -- was dispatched re-binds to a fresh round on the create replay; a failed booking that Ashby moves
 -- to a new, future slot or link is revived the same way; both start a new bot generation (a new
 -- Idempotency-Key). A replay always reads the event's booking first, also after the slot started.
--- Fixture numbers 280-299; Recall bots id(30, 2800 + n).
+-- Cases (l) to (o) (review F1, round 2): a re-bind or a revival resets every counter of the old
+-- attempt (a rotated key, a spent arm budget, a claimed ticket, a bound session); step 8a never
+-- expires a round another event's live booking holds; and a round the sweep already expired is
+-- re-bound like one that only lapsed. (o) runs the real r1_sweep_expired_rounds, so it comes last.
+-- Fixture numbers 274-278 and 280-292; Recall bots id(30, 2800 + n) in (a)-(k) and the named
+-- constants below in (l)-(o).
 do $$
 declare
   p_now constant timestamptz := '2026-12-01 04:00:00+00';
   t_lapsed constant timestamptz := '2026-12-02 14:00:00+00';
+  bot_l1 constant uuid := _r1_meet_tests.id(30, 2741);
+  bot_l2 constant uuid := _r1_meet_tests.id(30, 2742);
+  bot_m constant uuid := _r1_meet_tests.id(30, 2751);
+  bot_n constant uuid := _r1_meet_tests.id(30, 2761);
   b uuid;
   r_old uuid;
   r_new uuid;
   k_old uuid;
+  s uuid;
+  i integer;
+  n_swept integer;
+  rj jsonb;
   res jsonb;
   bj jsonb;
   st_before jsonb;
@@ -2773,6 +2787,143 @@ begin
   perform _r1_meet_tests.assert('T3-G a revival at generation 50: version_exhausted, nothing written',
     res = jsonb_build_object('status', 'version_exhausted', 'booking_id', b, 'version', 50)
     and _r1_meet_tests.booking_json(b) = bj, res::text);
+
+  -- (l) A revival resets the rotated key and the spent arm budget. The first create hit an error
+  -- Recall caches (key_attempt 1), the bot was armed 5 times (the whole budget of a generation) and
+  -- then failed fatally; S06 released it and Ashby moved the event. Without the reset the revived
+  -- booking would answer ticket_arms_exhausted and Dex could never bridge into the new slot.
+  b := _r1_meet_tests.pending_booking(274);
+  select x.round_id into r_old from screening_v2.r1_meet_bookings x where x.id = b;
+  res := _r1_meet_tests.set_bot(b, 'rotate_key');
+  res := _r1_meet_tests.set_bot(b, 'attach', bot_l1);
+  for i in 1..5 loop
+    res := screening_v2.r1_meet_arm_ticket(b, _r1_meet_tests.digest('t3g-274-' || i::text),
+                                           '2026-12-02 10:15:00+00', '2026-12-02 11:45:00+00', p_now);
+  end loop;
+  res := screening_v2.r1_meet_arm_ticket(b, _r1_meet_tests.digest('t3g-274-6'),
+                                         '2026-12-02 10:15:00+00', '2026-12-02 11:45:00+00', p_now);
+  perform _r1_meet_tests.assert('T3-G fixture: a rotated key, then the bot spent its whole arm budget',
+    res ->> 'status' = 'ticket_arms_exhausted'
+    and (select x.status = 'bot_scheduled' and x.key_attempt = 1 and x.ticket_arms = 5 and x.version = 0
+           from screening_v2.r1_meet_bookings x where x.id = b), res::text);
+  res := screening_v2.r1_meet_transition_booking(b, 'bot_scheduled', 'failed', 'bot_fatal', p_now);
+  res := _r1_meet_tests.set_bot(b, 'release', null, '2026-12-01 04:30:00+00');
+  res := _r1_meet_tests.create_round(274, jsonb_build_object(
+    'start_at', '2026-12-03T10:00:00+00:00', 'end_at', '2026-12-03T10:45:00+00:00',
+    'updated_at', '2026-12-01T04:30:00+00:00', 'now', '2026-12-01T05:00:00+00:00'));
+  select * into bk from screening_v2.r1_meet_bookings x where x.id = b;
+  perform _r1_meet_tests.assert(
+    'T3-G a revival resets the rotated key and the spent arm budget: key attempt 0, no arms, generation 1',
+    res ->> 'status' = 'relinked' and (res ->> 'rebound')::boolean and (res ->> 'round_id')::uuid = r_old
+    and (res ->> 'version')::integer = 1 and (res ->> 'key_attempt')::integer = 0
+    and bk.status = 'pending' and bk.reason = 'eligible' and bk.version = 1 and bk.key_attempt = 0
+    and bk.ticket_arms = 0 and bk.ticket_digest is null and bk.recall_bot_id is null, res::text);
+  res := screening_v2.r1_meet_set_bot(b, 'attach', 1, 0, bot_l2, '2026-12-01 05:10:00+00');
+  perform _r1_meet_tests.assert('T3-G fixture: the revived generation attaches its own bot',
+    res ->> 'status' = 'ok' and res ->> 'booking_status' = 'bot_scheduled', res::text);
+  res := screening_v2.r1_meet_arm_ticket(b, _r1_meet_tests.digest('t3g-274-next'),
+                                         '2026-12-03 09:45:00+00', '2026-12-03 11:15:00+00',
+                                         '2026-12-01 05:10:00+00');
+  perform _r1_meet_tests.assert('T3-G the revived booking arms the bridge ticket for the new slot',
+    res ->> 'status' = 'ok' and (res ->> 'ticket_arms')::integer = 1, res::text);
+
+  -- (m) A revival clears the claimed ticket and the bound session of the old attempt. The bot
+  -- joined, the bridge claimed its ticket and bound a session; the call then ended without a settled
+  -- attempt (the worker crashed), S06 failed the booking and released the bot, and Ashby moved the
+  -- event. The round is still live, so it is re-linked.
+  b := _r1_meet_tests.pending_booking(275);
+  select x.round_id into r_old from screening_v2.r1_meet_bookings x where x.id = b;
+  res := _r1_meet_tests.set_bot(b, 'attach', bot_m);
+  res := screening_v2.r1_meet_arm_ticket(b, _r1_meet_tests.digest('t3g-275'),
+                                         '2026-12-02 10:15:00+00', '2026-12-02 11:45:00+00', p_now);
+  res := screening_v2.r1_meet_claim_ticket(_r1_meet_tests.digest('t3g-275'), '2026-12-02 10:31:00+00');
+  s := _r1_meet_tests.session(275, r_old);
+  res := screening_v2.r1_meet_bind_session(b, s, '2026-12-02 10:32:00+00');
+  update screening_v2.call_sessions set status = 'failed', terminal_reason = 'worker_crash' where id = s;
+  res := screening_v2.r1_meet_transition_booking(b, 'in_call', 'failed', 'bot_fatal', '2026-12-02 10:50:00+00');
+  res := _r1_meet_tests.set_bot(b, 'release', null, '2026-12-02 10:55:00+00');
+  select * into bk from screening_v2.r1_meet_bookings x where x.id = b;
+  perform _r1_meet_tests.assert('T3-G fixture: a failed booking with a claimed ticket and a bound session',
+    bk.status = 'failed' and bk.reason = 'bot_fatal' and bk.recall_bot_id is null and bk.session_id = s
+    and bk.ticket_digest = _r1_meet_tests.digest('t3g-275')
+    and bk.ticket_claimed_at = '2026-12-02 10:31:00+00' and bk.ticket_arms = 1 and bk.version = 0,
+    res::text);
+  res := _r1_meet_tests.create_round(275, jsonb_build_object(
+    'start_at', '2026-12-04T10:00:00+00:00', 'end_at', '2026-12-04T10:45:00+00:00',
+    'updated_at', '2026-12-02T11:40:00+00:00', 'now', '2026-12-02T12:00:00+00:00'));
+  select * into bk from screening_v2.r1_meet_bookings x where x.id = b;
+  perform _r1_meet_tests.assert(
+    'T3-G a revival clears the claimed ticket and the bound session of the old attempt',
+    res ->> 'status' = 'relinked' and (res ->> 'rebound')::boolean and (res ->> 'round_id')::uuid = r_old
+    and (res ->> 'version')::integer = 1 and (res ->> 'key_attempt')::integer = 0
+    and bk.status = 'pending' and bk.round_id = r_old and bk.version = 1 and bk.session_id is null
+    and bk.ticket_digest is null and bk.ticket_not_before is null and bk.ticket_expires_at is null
+    and bk.ticket_claimed_at is null and bk.ticket_arms = 0 and bk.start_at = '2026-12-04 10:00:00+00',
+    res::text);
+  res := screening_v2.r1_meet_claim_ticket(_r1_meet_tests.digest('t3g-275'), '2026-12-04 10:31:00+00');
+  perform _r1_meet_tests.assert(
+    'T3-G after the revival the old ticket is unknown; the old session itself is kept',
+    res = jsonb_build_object('status', 'ticket_unknown')
+    and (select x.status = 'failed' from screening_v2.call_sessions x where x.id = s)
+    and _r1_meet_tests.sessions_of(r_old) = 1, res::text);
+
+  -- (n) Step 8a never expires a lapsed round that another event's live booking holds. Event 276's
+  -- bot is joining on round r_old, which lapsed at 2026-12-02 13:15; a second Dex event (277) for
+  -- the same application must not expire that round under it: blocked/round_active.
+  b := _r1_meet_tests.pending_booking(276);
+  select x.round_id into r_old from screening_v2.r1_meet_bookings x where x.id = b;
+  res := _r1_meet_tests.set_bot(b, 'attach', bot_n);
+  res := screening_v2.r1_meet_transition_booking(b, 'bot_scheduled', 'bot_joining', 'eligible', p_now);
+  bj := _r1_meet_tests.booking_json(b);
+  st_before := _r1_meet_tests.round_state(r_old);
+  res := _r1_meet_tests.create_round(277, jsonb_build_object(
+    'application_id', _r1_meet_tests.id(22, 276)::text, 'now', t_lapsed,
+    'start_at', '2026-12-04T10:00:00+00:00', 'end_at', '2026-12-04T10:45:00+00:00'));
+  perform _r1_meet_tests.assert(
+    'T3-G step 8a leaves a lapsed round held by the live booking of another event: blocked/round_active',
+    res ->> 'status' = 'blocked' and res ->> 'reason' = 'round_active'
+    and _r1_meet_tests.round_state(r_old) = st_before and _r1_meet_tests.booking_json(b) = bj
+    and (select x.candidate_id = _r1_meet_tests.id(10, 276) and x.round_id is null
+                and x.ashby_interview_event_id = _r1_meet_tests.id(20, 277)
+           from screening_v2.r1_meet_bookings x where x.id = (res ->> 'booking_id')::uuid), res::text);
+
+  -- (o) In production the R1 tick's sweep usually expires a lapsed round before S06 retries at
+  -- retry_after, so the create replay finds the round `expired`, not merely past its expiry. It
+  -- re-binds just the same (and resets the rotated key). The real sweep runs here; it expires every
+  -- lapsed fixture round, so this case is the last one of T3-G.
+  b := _r1_meet_tests.pending_booking(278);
+  select x.round_id into r_old from screening_v2.r1_meet_bookings x where x.id = b;
+  res := _r1_meet_tests.set_bot(b, 'rotate_key');
+  res := _r1_meet_tests.reschedule(b, jsonb_build_object(
+    'start_at', '2026-12-21T10:00:00+00:00', 'end_at', '2026-12-21T10:45:00+00:00'));
+  perform _r1_meet_tests.assert('T3-G fixture: a rotated key, then a move 20 days out answers slot_too_far',
+    res ->> 'status' = 'slot_too_far'
+    and (select x.key_attempt = 1 and x.version = 0 from screening_v2.r1_meet_bookings x where x.id = b),
+    res::text);
+  res := screening_v2.r1_meet_transition_booking(b, 'pending', 'blocked', 'slot_too_far', p_now);
+  for i in 1..20 loop
+    n_swept := screening_v2.r1_sweep_expired_rounds('2026-12-07 12:00:00+00', 1000);
+    exit when n_swept = 0
+           or (select x.status = 'expired' from screening_v2.interview_rounds x where x.id = r_old);
+  end loop;
+  rj := (select to_jsonb(x) from screening_v2.interview_rounds x where x.id = r_old);
+  perform _r1_meet_tests.assert('T3-G fixture: the sweep expired the lapsed round before the retry (hold released)',
+    rj ->> 'status' = 'expired' and (rj ->> 'held_minutes')::numeric = 0, rj::text);
+  res := _r1_meet_tests.create_round(278, jsonb_build_object(
+    'start_at', '2026-12-21T10:00:00+00:00', 'end_at', '2026-12-21T10:45:00+00:00',
+    'updated_at', '2026-11-30T12:00:00+00:00', 'now', '2026-12-07T12:45:00+00:00'));
+  r_new := (res ->> 'round_id')::uuid;
+  select * into bk from screening_v2.r1_meet_bookings x where x.id = b;
+  perform _r1_meet_tests.assert(
+    'T3-G a round the sweep already expired is re-bound by the create replay: a fresh round, generation 1',
+    res ->> 'status' = 'created' and (res ->> 'rebound')::boolean and (res ->> 'booking_id')::uuid = b
+    and r_new <> r_old and (res ->> 'version')::integer = 1 and (res ->> 'key_attempt')::integer = 0
+    and bk.status = 'pending' and bk.reason = 'eligible' and bk.round_id = r_new
+    and bk.version = 1 and bk.key_attempt = 0
+    and (select to_jsonb(x) from screening_v2.interview_rounds x where x.id = r_old) = rj
+    and (select x.status = 'invited' and x.channel = 'meet' and x.held_minutes = 65
+           from screening_v2.interview_rounds x where x.id = r_new)
+    and _r1_meet_tests.sessions_of(r_new) = 0, res::text);
 end;
 $$;
 
