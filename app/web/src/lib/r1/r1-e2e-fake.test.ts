@@ -5,6 +5,8 @@ vi.mock('../supabase', () => ({ supabase: { auth: { getSession: vi.fn() } } }));
 import {
   R1_ATTEMPT_TOKEN,
   R1_LINK_TOKEN,
+  R1_MEET_RESUME_TOKEN,
+  R1_MEET_TICKET,
   R1_NONCE,
   R1_TEMPLATE,
   createR1State,
@@ -16,9 +18,12 @@ import {
   parseAttempt,
   parseConsentTemplate,
   parseExchange,
+  parseMeetExchange,
   parsePreflight,
   parseStatus,
 } from './r1-api';
+import { isMeetTicket } from './r1-link';
+import { classifyMeetExchangeError } from './r1-meet';
 import { ApiError } from '../api-client';
 
 /**
@@ -129,6 +134,111 @@ describe('the fake R1 candidate API', () => {
     expect(context.liveSession).toBe(false);
   });
 
+  describe('the Meet bridge exchange', () => {
+    const meet = (state: R1MockState, body: Record<string, unknown> | null) =>
+      call(state, 'meet/exchange', body);
+    /** What the bridge makes of a refusal, read the way r1-api's errorCode() reads the body. */
+    const verdictOf = (response: { status: number; json?: unknown }) => {
+      const error = (response.json as { error?: unknown } | undefined)?.error;
+      const code = typeof error === 'string' ? error : `http_${response.status}`;
+      return classifyMeetExchangeError(new ApiError(code, response.status));
+    };
+    const TICKET_ONLY = { ticket: R1_MEET_TICKET };
+    const RESUMED = { ticket: R1_MEET_TICKET, resume_token: R1_MEET_RESUME_TOKEN };
+
+    it('carries a ticket the bridge page accepts from its fragment', () => {
+      expect(isMeetTicket(R1_MEET_TICKET)).toBe(true);
+    });
+
+    it('answers a 202 the page parses (with the resume token), then the room for the continuation', () => {
+      const state = createR1State();
+      state.meetPreparing = 1;
+      const preparing = meet(state, TICKET_ONLY);
+      expect(preparing.status).toBe(202);
+      expect(parseMeetExchange(preparing.json)).toEqual({
+        status: 'preparing',
+        resume_token: R1_MEET_RESUME_TOKEN,
+        retry_after_sec: 3,
+      });
+      expect(state.meetClaimed).toBe(true);
+
+      const ready = meet(state, RESUMED);
+      expect(ready.status).toBe(200);
+      expect(parseMeetExchange(ready.json)).toEqual({
+        status: 'ready',
+        url: 'ws://livekit.e2e.invalid',
+        livekit_token: 'e2e-meet-room-token',
+        expires_at: '2026-10-07T00:10:00.000Z',
+      });
+      // Nothing about the candidate: the room and the identity are inside the token.
+      expect(Object.keys(ready.json as object).sort()).toEqual(['expires_at', 'livekit_token', 'url']);
+    });
+
+    it('answers a ready worker with the room on the first call', () => {
+      const state = createR1State();
+      const ready = meet(state, TICKET_ONLY);
+      expect(ready.status).toBe(200);
+      expect(parseMeetExchange(ready.json)).toMatchObject({ status: 'ready', livekit_token: 'e2e-meet-room-token' });
+    });
+
+    it('answers the switch being off before anything else, and the page idles on it', () => {
+      for (const body of [TICKET_ONLY, RESUMED, { ticket: 'someone-elses-ticket' }, { extra: 1 }, null]) {
+        const state = createR1State();
+        state.meetDisabled = true;
+        const response = meet(state, body);
+        expect(response.status, JSON.stringify(body)).toBe(503);
+        expect(response.json).toEqual({ error: 'meet_disabled' });
+        expect(verdictOf(response)).toEqual({ kind: 'disabled' });
+        expect(state.meetClaimed).toBe(false);
+      }
+    });
+
+    it('refuses a replayed ticket as already claimed, which the page reads as terminal', () => {
+      const state = createR1State();
+      expect(meet(state, TICKET_ONLY).status).toBe(200);
+      const replay = meet(state, TICKET_ONLY);
+      expect(replay.status).toBe(409);
+      expect(replay.json).toEqual({ error: 'ticket_already_claimed' });
+      expect(verdictOf(replay)).toEqual({ kind: 'failed', reason: 'claimed' });
+    });
+
+    it('refuses an unknown ticket and a continuation it never handed out as unknown', () => {
+      const refusals = [
+        meet(createR1State(), { ticket: 'someone-elses-ticket-0123456789abcdef' }),
+        // A resume token before any claim, and a wrong one after the claim.
+        meet(createR1State(), RESUMED),
+        (() => {
+          const state = createR1State();
+          state.meetPreparing = 1;
+          meet(state, TICKET_ONLY);
+          return meet(state, { ticket: R1_MEET_TICKET, resume_token: 'not-the-resume-token' });
+        })(),
+      ];
+      for (const response of refusals) {
+        expect(response.status).toBe(404);
+        expect(response.json).toEqual({ error: 'ticket_unknown' });
+        expect(verdictOf(response)).toEqual({ kind: 'failed', reason: 'invalid' });
+      }
+    });
+
+    it('answers a forced refusal once, before the claim, then carries on', () => {
+      const state = createR1State();
+      state.failures.meetExchange = { status: 409, error: 'ticket_already_claimed' };
+      const forced = meet(state, TICKET_ONLY);
+      expect(forced.status).toBe(409);
+      expect(verdictOf(forced)).toEqual({ kind: 'failed', reason: 'claimed' });
+      expect(state.meetClaimed).toBe(false);
+      expect(state.failures.meetExchange).toBeUndefined();
+      expect(meet(state, TICKET_ONLY).status).toBe(200);
+    });
+
+    it('reads its strict-body refusal (the validator envelope) as an invalid request', () => {
+      const response = meet(createR1State(), { ticket: R1_MEET_TICKET, extra: 1 });
+      expect(response.status).toBe(400);
+      expect(verdictOf(response)).toEqual({ kind: 'failed', reason: 'invalid' });
+    });
+  });
+
   it('refuses a body the real routes refuse with the real validator envelope', () => {
     const bodies: Array<[string, Record<string, unknown>]> = [
       ['status', { token: R1_LINK_TOKEN, extra: 1 }],
@@ -138,6 +248,9 @@ describe('the fake R1 candidate API', () => {
       ['preflight', { token: R1_LINK_TOKEN, extra: 1 }],
       ['attempts', { token: R1_LINK_TOKEN, extra: 1 }],
       ['exchange', { attempt_token: R1_ATTEMPT_TOKEN, nonce: R1_NONCE, extra: 1 }],
+      ['meet/exchange', { ticket: R1_MEET_TICKET, extra: 1 }],
+      ['meet/exchange', { ticket: R1_MEET_TICKET, token: R1_LINK_TOKEN }],
+      ['meet/exchange', { resume_token: R1_MEET_RESUME_TOKEN }],
     ];
     for (const [path, body] of bodies) {
       const response = call(createR1State(), path, body);
