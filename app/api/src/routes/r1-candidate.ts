@@ -106,6 +106,7 @@ import {
   loadLiveConsent,
   loadNewestTemplate,
   readRoundConsent,
+  recheckRoundConsent,
   type ConsentTemplate,
   type Read,
 } from '../lib/r1/consent.js';
@@ -437,6 +438,15 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
    */
   function audienceLocale(round: RoundRow): string | null {
     return CONSENT_AUDIENCES.has(round.consent_locale) ? round.consent_locale : null;
+  }
+
+  /** The consent re-check (lib/r1/consent.ts `recheckRoundConsent`); true when granted, else the refusal is written. */
+  async function consentStillGranted(res: Response, round: RoundRow): Promise<boolean> {
+    const standing = await recheckRoundConsent(db, round);
+    if (standing.ok) return true;
+    if (standing.reason === 'unreadable') refuse(res, 503, 'service_unavailable');
+    else refuse(res, 409, 'consent_required');
+    return false;
   }
 
   /**
@@ -926,15 +936,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       refuse(res, 409, 'round_not_admissible');
       return;
     }
-    const consent = await readRoundConsent(db, round.id, round.consent_locale);
-    if (!consent.ok) {
-      refuse(res, 503, 'service_unavailable');
-      return;
-    }
-    if (consent.value.state !== 'granted') {
-      refuse(res, 409, 'consent_required');
-      return;
-    }
+    if (!(await consentStillGranted(res, round))) return;
     if (!(await maintenanceClear(res))) return;
     const endpoint = await laneForNewWork(res);
     if (!endpoint) return;
@@ -1074,15 +1076,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
         refuse(res, 404, STABLE_ATTEMPT_ERROR);
         return;
       }
-      const consent = await readRoundConsent(db, round.id, round.consent_locale);
-      if (!consent.ok) {
-        refuse(res, 503, 'service_unavailable');
-        return;
-      }
-      if (consent.value.state !== 'granted') {
-        refuse(res, 409, 'consent_required');
-        return;
-      }
+      if (!(await consentStillGranted(res, round))) return;
       const reissued = attemptResponse(
         live.value.id,
         attempt.value.attempt_number,
@@ -1112,15 +1106,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
     // the candidate notice from the staff dry-run notice (both ship at one version),
     // so the audience the consent was given under is checked here, before a start
     // is spent. The rejoin branch and the exchange re-check it the same way.
-    const standing = await readRoundConsent(db, round.id, round.consent_locale);
-    if (!standing.ok) {
-      refuse(res, 503, 'service_unavailable');
-      return;
-    }
-    if (standing.value.state !== 'granted') {
-      refuse(res, 409, 'consent_required');
-      return;
-    }
+    if (!(await consentStillGranted(res, round))) return;
 
     const nonce = generateNonce();
     const nonceDigest = hashNonce(nonce);
@@ -1266,15 +1252,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
     }
     // Consent is re-checked on EVERY exchange: a withdrawal or a newer
     // template stops a join that admission already allowed (plan 7.8).
-    const consent = await readRoundConsent(db, round.id, round.consent_locale);
-    if (!consent.ok) {
-      refuse(res, 503, 'service_unavailable');
-      return;
-    }
-    if (consent.value.state !== 'granted') {
-      refuse(res, 409, 'consent_required');
-      return;
-    }
+    if (!(await consentStillGranted(res, round))) return;
     const roomName = roomNameForSession(session.id);
     if (session.external_call_id !== null && session.external_call_id !== roomName) {
       refuse(res, 404, STABLE_ATTEMPT_ERROR);
@@ -1336,15 +1314,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       }
       // Booting a worker can take tens of seconds. A withdrawal that landed in
       // that window must still stop the join: re-check before the token exists.
-      const settled = await readRoundConsent(db, round.id, round.consent_locale);
-      if (!settled.ok) {
-        refuse(res, 503, 'service_unavailable');
-        return;
-      }
-      if (settled.value.state !== 'granted') {
-        refuse(res, 409, 'consent_required');
-        return;
-      }
+      if (!(await consentStillGranted(res, round))) return;
     }
 
     const join = await mintCandidateJoin(endpoint, session, roomName, { now });
@@ -1466,15 +1436,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       return;
     }
     // A withdrawal stops the relay as it stops the join.
-    const consent = await readRoundConsent(db, round.id, round.consent_locale);
-    if (!consent.ok) {
-      refuse(res, 503, 'service_unavailable');
-      return;
-    }
-    if (consent.value.state !== 'granted') {
-      refuse(res, 409, 'consent_required');
-      return;
-    }
+    if (!(await consentStillGranted(res, round))) return;
     let endpoint: LiveKitEndpoint;
     try {
       endpoint = requireBrowserLiveKitConfigured();
