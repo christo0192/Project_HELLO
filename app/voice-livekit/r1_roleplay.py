@@ -5086,7 +5086,7 @@ class RolePlayEngine:
                 self._terms_counts[term] = self._terms_counts.get(term, 0) + 1
         if self._turn_time_offer and self._time_offer_notes < TIME_OFFER_NOTE_LIMIT:
             gaps = set(strong_gaps(self._evidence(AskKind.ENROL)))
-            ready = not gaps.intersection({"needs", "families", "fee", "money_path", "reassurance"})
+            ready = not gaps
             ready = ready and not self.negotiation.decider_unresolved()
             notes.append(TIME_OFFER_READY_NOTE if ready else TIME_OFFER_OPEN_NOTE)
             self._time_offer_notes += 1

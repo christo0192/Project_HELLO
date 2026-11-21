@@ -2855,6 +2855,137 @@ class ReconcileTotalTests(unittest.TestCase):
         self.assertEqual(tracker.judge_invented_turns, 1)
 
 
+@patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "1", "R1_DISCOUNT_TOTAL_RECONCILE": "1"})
+class IndiaReviewRegressionTests(unittest.TestCase):
+    def test_salary_is_not_a_payment(self):
+        for enabled in (True, False):
+            for text in (
+                "Analysts earn $3,000 a month after graduating.",
+                "You could make $2,500 a month as an analyst.",
+                "Freshers get paid about $1,000 a month.",
+                "Your package could be $3,000 per month.",
+            ):
+                with self.subTest(enabled=enabled, text=text):
+                    tracker = CoverageTracker(PERSONA, india_playbook=enabled)
+                    tracker.observe_candidate_turn(text)
+                    self.assertFalse(tracker.payment_plan_named)
+
+    def test_net_result_monthly_payment(self):
+        tracker = CoverageTracker(PERSONA, india_playbook=True)
+        tracker.observe_candidate_turn(
+            "With the $1,500 discount the fee is $7,500, making it about $625 a month.")
+        self.assertTrue(tracker.payment_plan_named)
+
+    def test_zero_percent_interest_remains_a_plan(self):
+        for enabled in (True, False):
+            tracker = CoverageTracker(PERSONA, india_playbook=enabled, total_reconcile=False)
+            tracker.observe_candidate_turn("We offer 0% interest.")
+            self.assertEqual(tracker.payment_plan_named, enabled)
+
+    def test_plan_must_apply_to_discount(self):
+        for enabled in (True, False):
+            for text in (
+                "I offer $1,500 off, no strings. We also have no-cost EMI.",
+                "I offer $1,000 off regardless, and we have EMI too.",
+            ):
+                tracker = CoverageTracker(PERSONA, india_playbook=enabled)
+                tracker.observe_candidate_turn(text)
+                self.assertFalse(tracker.discount_log[0]["conditional"], text)
+
+    def test_plan_discount_is_conditional(self):
+        for enabled in (True, False):
+            for text in ("We have no-cost EMI. With it you get $500 off.",
+                         "With EMI we give $500 off, total $8,500."):
+                with self.subTest(enabled=enabled, text=text):
+                    tracker = CoverageTracker(PERSONA, india_playbook=enabled)
+                    tracker.observe_candidate_turn(text)
+                    self.assertEqual(tracker.discount_log[0]["conditional"], enabled)
+
+    def test_reconcile_does_not_hide_other_offers(self):
+        for enabled in (True, False):
+            for text, amounts in (
+                ("If you enrol I offer $3,000 off. Normally people pay $8,500.", {3000}),
+                ("I offer $1,500 off and another $700 off, total $7,500.", {700, 1500}),
+                ("Last year people paid $8,000. I offer $200 off.", {200}),
+            ):
+                with self.subTest(enabled=enabled, text=text):
+                    mentions = parse_discounts(text, reconcile=enabled)
+                    self.assertEqual({m.usd for m in mentions}, amounts)
+                    self.assertTrue(all(m.heard_usd is None for m in mentions))
+
+    def test_reconcile_higher_heard_amount(self):
+        text = "I offer $2,000 off, so your total is $8,500."
+        self.assertEqual([(m.usd, m.heard_usd) for m in parse_discounts(text, reconcile=True)],
+                         [(500, 2000)])
+        mentions = parse_discounts(text, reconcile=False)
+        self.assertEqual({m.usd for m in mentions}, {2000})
+        self.assertTrue(all(m.heard_usd is None for m in mentions))
+
+    def test_owner_reconciled_judge_amount(self):
+        text = "We can take a 100 dollar discount, so your total is 8500 dollars."
+        for enabled in (True, False):
+            tracker = CoverageTracker(PERSONA, invented_v2=True, india_playbook=enabled,
+                                      total_reconcile=enabled)
+            tracker.observe_candidate_turn(text, 1)
+            tracker.apply_judge(JudgeResult(invented_offer=True, discount_offered_usd=100), 1)
+            self.assertEqual(tracker.invented_offer, not enabled)
+            self.assertEqual(tracker.commitment_evidence(AskKind.ENROL).pressured, not enabled)
+
+    def test_get_back_to_you_is_not_a_refund(self):
+        for text, invented in (
+            ("We have no-cost EMI. I'll get back to you with the EMI details.", False),
+            ("We have no-cost EMI, and you can get your money back if it does not work out.",
+             True),
+        ):
+            with self.subTest(text=text):
+                tracker = CoverageTracker(PERSONA, invented_v2=True, india_playbook=True,
+                                          total_reconcile=True)
+                tracker.observe_candidate_turn(text, 1)
+                tracker.apply_judge(JudgeResult(invented_offer=True), 1)
+                self.assertEqual(tracker.invented_offer, invented)
+                self.assertEqual(tracker.commitment_evidence(AskKind.ENROL).pressured, invented)
+
+    def test_judge_integrity_and_amount(self):
+        for enabled in (True, False):
+            for text, amount in (
+                ("We offer EMI and return every rupee if you are not placed.", None),
+                ("Today only, $1,500 off, and we return every rupee if not placed.", None),
+                ("Today only, $1,500 off.", 2000),
+                ("A $100 discount makes the total $8,500.", 3000),
+            ):
+                with self.subTest(enabled=enabled, text=text):
+                    tracker = CoverageTracker(PERSONA, invented_v2=True, discipline_v2=True,
+                                              india_playbook=enabled, total_reconcile=enabled)
+                    tracker.observe_candidate_turn(text, 1)
+                    tracker.apply_judge(JudgeResult(invented_offer=True,
+                                                    discount_offered_usd=amount), 1)
+                    self.assertTrue(tracker.invented_offer)
+                    self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).pressured)
+
+    def test_waiving_other_fees(self):
+        for enabled in (True, False):
+            for v2 in (True, False):
+                for text in ("We waive the interest and the admission fee for you.",
+                             "We will waive the registration fee and the interest."):
+                    self.assertTrue(invented_offer_in(text, v2=v2, india_playbook=enabled))
+
+    def test_timing_lever_requires_offer(self):
+        text = "If you enrol today you can start with Monday's batch."
+        for enabled in (True, False):
+            self.assertNotIn("seasonal_discount", urgency_levers(text, playbook=enabled)[0])
+        self.assertIn("seasonal_discount", urgency_levers(
+            "If you enrol today you get the $1,500 discount.", playbook=True)[0])
+
+    def test_offer_does_not_excuse_demands(self):
+        for enabled in (True, False):
+            for text in ("You must decide today, or the $1,500 discount is gone.",
+                         "You'll lose your seat and $1,500 discount if you don't sign right now.",
+                         "You must decide now."):
+                self.assertTrue(urgency_levers(text, playbook=enabled)[1], text)
+        self.assertFalse(urgency_levers(
+            "You must enrol today to get the $1,500 discount.", playbook=True)[1])
+
+
 class IndiaMoneyPathTests(unittest.TestCase):
     @patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "1"})
     def test_money_paths_and_probes(self):

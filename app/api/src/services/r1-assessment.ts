@@ -235,11 +235,12 @@ function buildAuditMeta(
   gate: { passed: boolean; failures: readonly string[] },
   outcome: string,
   extra: { runsAgree?: boolean } = {},
+  deckFactsVersion?: string,
 ): AuditMeta {
   return {
     scorer_version: R1_SCORING_PROMPT_VERSION,
     rubric_version: R1_RUBRIC_VERSION,
-    deck_facts_version: r1DeckFactsVersion(),
+    deck_facts_version: deckFactsVersion ?? r1DeckFactsVersion(),
     model: r1ScoringModel(),
     outcome,
     thresholds: {
@@ -742,6 +743,10 @@ async function adoptStored(args: {
 }): Promise<R1AssessmentResult> {
   const { stored } = args;
   const r1 = rawR1(stored.raw);
+  const versions = r1.versions;
+  const deckFacts = versions && typeof versions === 'object'
+    ? (versions as Record<string, unknown>).deck_facts
+    : undefined;
   const recommendation = recommendationOf(stored.recommendation);
   const valid = r1.valid === true;
   const overall = stored.overall_score === null ? null : Number(stored.overall_score);
@@ -757,6 +762,8 @@ async function adoptStored(args: {
       args.settings.updatedAt,
       { passed: valid, failures: [] },
       'reused',
+      {},
+      typeof deckFacts === 'string' && deckFacts.trim() ? deckFacts : undefined,
     ),
     now: args.now(),
   });

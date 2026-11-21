@@ -415,7 +415,8 @@ import r1_world
 #    money path (EMI, instalments, 0% interest) reader and the calmer instalment note.
 # 49: owner 2026-11-20 (R1_INDIA_PLAYBOOK part 2): urgency creation with a deck discount is a
 #    closing move; the time-limit, demand and guilt readers and the two time-offer notes.
-CONTENT_REVISION = 49
+# 50: IND-REV review fixes: narrow the demand and India money-path readers.
+CONTENT_REVISION = 50
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:

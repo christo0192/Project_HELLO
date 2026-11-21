@@ -173,6 +173,9 @@ describe('R1 deck facts (owner decision: the deck is the only product source)', 
       expect(block).toContain(text);
     }
     expect(block.endsWith(R1_INDIA_PLAYBOOK_TEXT)).toBe(true);
+    expect(block).toContain(
+      'even if the transcript or the administration log shows another figure.',
+    );
     for (const value of ['0', 'off', 'false', 'no', ' OFF ', 'No']) {
       expect(r1DeckFactsBlock({ R1_INDIA_PLAYBOOK: value })).not.toContain('PLAYBOOK');
     }
@@ -228,7 +231,9 @@ describe('R1 provenance and pins', () => {
     expect(r1RubricSha()).toBe('b761b69cd498ea2d737bd669fc5a627ad9c82561bc19d0093ab60a928029605a');
     expect(r1DeckFactsSha({ R1_INDIA_PLAYBOOK: '0' })).toBe('58709110831e5a54f373d864403b1d8fcb124cb237cc9bd155784bb2f66f45f5');
     // This pin covers the India playbook text.
-    expect(r1DeckFactsSha({})).toBe('77b0ffa7378bef8aa761e17d62b5e4d571d4edd080ea9caa264ef98d39aaa489');
+    expect(r1DeckFactsSha({})).toBe(
+      '9154a5716fb723254c9960487914cf460fce888a6bf65630244cbc6a2ef31493',
+    );
   });
 });
 

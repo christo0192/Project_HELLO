@@ -64,7 +64,7 @@ from r1_text import (
     parse_amount,
     split_sentences,
 )
-from r1_tracker import _TIME_LIMIT, parse_discounts
+from r1_tracker import _TIME_LIMIT, parse_discounts, time_limited_offer_in
 from r1_world import NET_PRICES_USD, PRICE_USD
 
 # A turn longer than this is read from its end: closing proposals come last, and a hostile
@@ -2128,7 +2128,8 @@ def asks_decider(text: object) -> bool:
 
 
 def reasons_handled_in(
-    text: object, decision_maker: str = "", *, playbook: bool = False
+    text: object, decision_maker: str = "", *, playbook: bool = False,
+    prior_deck_discount: bool = False,
 ) -> frozenset[str]:
     """The stall reasons the advisor's ``text`` speaks to (it must still follow the reason)."""
     folded = _tail(text).lower()
@@ -2138,7 +2139,8 @@ def reasons_handled_in(
     verb_pattern = re.compile(r"\b" + _HANDLED_DM_VERB + r"\w*\b")
     for sentence in split_sentences(folded):
         if (any(pattern.search(sentence) for pattern in _HANDLED_TIMING)
-                or (playbook and any(p.search(sentence) for p in _HANDLED_TIMING_PLAYBOOK))):
+                or (playbook and time_limited_offer_in(
+                    sentence, prior_deck_discount=prior_deck_discount))):
             found.add(REASON_TIMING)
         for pattern in _HANDLED_MONEY:
             match = pattern.search(sentence)
@@ -4591,9 +4593,12 @@ class Negotiation:
                 self.refusals += 1
             if self.figure_challenged_turn is None and challenges_her_figure(text):
                 self.figure_challenged_turn = turn  # L3: "Who told you that?"
+        prior_deck_discount = any(item.net_usd in NET_PRICES_USD for item in self.offers)
         self.offers.extend(offers)
         newly: set[str] = set()
-        addressed = reasons_handled_in(text, self.decision_maker, playbook=self.india_playbook)
+        addressed = reasons_handled_in(
+            text, self.decision_maker, playbook=self.india_playbook,
+            prior_deck_discount=prior_deck_discount)
         if REASON_DECISION_MAKER in addressed:
             self.decider_handled_turn = turn
         early = self.pre_window_decline_turn

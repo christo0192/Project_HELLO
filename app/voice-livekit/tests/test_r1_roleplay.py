@@ -8958,6 +8958,37 @@ class TimeOfferEngineTests(unittest.TestCase):
                     self.assertNotIn(P2.TIME_OFFER_READY_NOTE, plan.reminder or "")
                     self.assertNotIn("time_offer_notes", session.eng.admin_log()["voice"])
 
+    @mock.patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "1"})
+    def test_capped_offer_stays_open(self):
+        session = Session(engine())
+        session.say(OPENER, 20)
+        session.say("You must decide now.", 30)
+        with mock.patch.object(r1_roleplay, "strong_gaps", return_value=("blocked",)), \
+                mock.patch.object(session.eng.negotiation, "decider_unresolved",
+                                  return_value=False):
+            plan = session.say(self.OFFER, 40)
+        self.assertIn(P2.TIME_OFFER_OPEN_NOTE, plan.reminder)
+        self.assertNotIn(P2.TIME_OFFER_READY_NOTE, plan.reminder)
+
+    @mock.patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "1"})
+    def test_capped_offer_ready_when_no_gaps(self):
+        session = Session(engine())
+        session.say(OPENER, 20)
+        with mock.patch.object(r1_roleplay, "strong_gaps", return_value=()), \
+                mock.patch.object(session.eng.negotiation, "decider_unresolved",
+                                  return_value=False):
+            plan = session.say(self.OFFER, 40)
+        self.assertIn(P2.TIME_OFFER_READY_NOTE, plan.reminder)
+
+    @mock.patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "0"})
+    def test_capped_offer_when_playbook_is_off(self):
+        session = Session(engine())
+        session.say(OPENER, 20)
+        session.say("You must decide now.", 30)
+        plan = session.say(self.OFFER, 40)
+        self.assertNotIn(P2.TIME_OFFER_OPEN_NOTE, plan.reminder or "")
+        self.assertNotIn(P2.TIME_OFFER_READY_NOTE, plan.reminder or "")
+
     def test_time_offer_is_not_a_back_off(self):
         levers, _ = r1_roleplay.urgency_levers(self.OFFER, playbook=True)
         self.assertIn("seasonal_discount", levers)

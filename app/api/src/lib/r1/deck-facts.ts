@@ -38,8 +38,8 @@ export const R1_INDIA_PLAYBOOK_TEXT =
   'promise, a free course or perk, a discount amount outside $500/$1,000/$1,500 or above ' +
   '$1,500, stacked discounts below $7,500, guilt-tripping, demanding a yes on the call, and ' +
   'ignoring the learner\'s questions. Speech-to-text can mishear a discount figure: when the ' +
-  'advisor states a total of $8,500, $8,000 or $7,500, the administration log records the ' +
-  'matching $500, $1,000 or $1,500 discount; use the logged amount.';
+  'advisor states a total of $8,500, $8,000 or $7,500, read the discount as the matching ' +
+  '$500, $1,000 or $1,500, even if the transcript or the administration log shows another figure.';
 
 /** Deck page 2: "Listed Price Details: $9000", "Applicable Discounts: $500, $1000, $1500". */
 export const R1_LIST_PRICE_USD = 9000;

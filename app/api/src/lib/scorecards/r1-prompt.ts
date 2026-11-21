@@ -155,7 +155,9 @@ const INDIA_BULLET =
   'no-cost EMI, monthly instalments, 0% interest or a limited-time offer that uses the ' +
   '$500/$1,000/$1,500 discounts; for "Urgency & close" such an offer is a prep-guide lever ' +
   'used without coercion, and for "Negotiation & discount discipline" a deck discount tied ' +
-  'to EMI or to a limited-time offer is tied to a payment plan or an urgency lever.';
+  'to EMI or to a limited-time offer is tied to a payment plan or an urgency lever. ' +
+  'A discount is tied only when the advisor makes it part of the EMI or the limited-time offer. ' +
+  'An unconditional discount is not tied just because EMI is also mentioned.';
 
 export function buildR1ScorerPrompt(input: BuildR1ScorerPromptInput): string {
   const metricBlocks = input.metrics.map(formatMetric).join('\n\n');

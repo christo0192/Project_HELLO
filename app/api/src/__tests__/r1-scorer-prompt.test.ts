@@ -43,7 +43,9 @@ describe('R1 scorer prompt', () => {
     '$500/$1,000/$1,500 discounts; for "Urgency & close" such an offer is a prep-guide ' +
     'lever used without coercion, and for "Negotiation & discount discipline" a deck ' +
     'discount tied to EMI or to a limited-time offer is tied to a payment plan or an ' +
-    'urgency lever.';
+    'urgency lever. A discount is tied only when the advisor makes it part of the EMI or ' +
+    'the limited-time offer. An unconditional discount is not tied just because EMI is also ' +
+    'mentioned.';
     const deckFacts = r1DeckFactsBlock({ R1_INDIA_PLAYBOOK: '0' });
     const defaultPrompt = build({ deckFacts });
     const off = build({ deckFacts, indiaPlaybook: false });

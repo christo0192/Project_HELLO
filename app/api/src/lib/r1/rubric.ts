@@ -36,6 +36,9 @@ export const R1_RUBRIC_VERSION = 'r1-rubric-2026-10.2';
 /**
  * The scoring provenance `prompt_template_version` for every R1 assessment. It is
  * deliberately NOT `SCORING_PROMPT_TEMPLATE_VERSION` (prompts.ts:9 stays unchanged).
+ * The India playbook prompt variant keeps this version. Stored `versions.deck_facts` and audit
+ * `deck_facts_version` distinguish it (r1-deck-facts-2026-11.1) from the previous variant
+ * (r1-deck-facts-2026-10.1).
  */
 export const R1_SCORING_PROMPT_VERSION = 'r1-scoring-2026-10.1';
 

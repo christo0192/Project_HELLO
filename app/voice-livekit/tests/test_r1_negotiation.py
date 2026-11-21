@@ -3705,3 +3705,14 @@ class IndiaUrgencyTests(unittest.TestCase):
         state.india_playbook = False
         state.wait_said_turn = 8
         self.assertEqual(state.strong_blocked(9), "learner_waiting")
+
+
+class IndiaTimingReviewTests(unittest.TestCase):
+    def test_timing_requires_offer(self):
+        for enabled in (True, False):
+            text = "If you enrol today you can start with Monday's batch."
+            self.assertNotIn(neg.REASON_TIMING, neg.reasons_handled_in(text, playbook=enabled))
+        text = "If you enrol today you get the $1,500 discount."
+        self.assertIn(neg.REASON_TIMING, neg.reasons_handled_in(text, playbook=True))
+        self.assertIn(neg.REASON_TIMING, neg.reasons_handled_in(
+            "This discount is valid only for today.", playbook=True, prior_deck_discount=True))

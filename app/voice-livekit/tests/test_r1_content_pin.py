@@ -281,7 +281,8 @@ import r1_world
 #     Also the Dex prompts: prefixes, wrap-up note, end-intent system, after-aside context.
 # 48: pin the India money path and calmer instalment note.
 # 49: pin the time-limit, demand and guilt readers and the time-offer notes.
-PINNED_CONTENT_SHA256 = "f9e2a1891f02d7bf3a38e489d32571bbe91dcbca8dba88644fbd487240eb3d13"
+# 50: IND-REV review fixes: narrow the demand and India money-path readers.
+PINNED_CONTENT_SHA256 = "7d10f0b225cd3cf996600c2f62ee1b98a5858173ba2179dafa5caf7d8c56b501"
 
 CONTENT_MODULES = (
     "r1_text",
