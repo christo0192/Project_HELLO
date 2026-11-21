@@ -130,6 +130,7 @@ import { r1DeepSeekHealth } from '../lib/r1/deepseek-health.js';
 import { createReadyLimiter, type ReadyLimiter } from '../lib/r1/ready-limiter.js';
 import { runR1WorkerGate, type DispatchListerLike } from '../lib/r1/worker-gate.js';
 import { mintCandidateJoin } from '../lib/r1/candidate-join.js';
+import { provisionMarkedRoom } from '../lib/r1/marked-room.js';
 
 const log = createLogger('r1-candidate');
 
@@ -1218,27 +1219,15 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
 
   // ── POST /api/r1/exchange ──────────────────────────────────────────
 
-  /**
-   * Provision (or re-assert) the egress-free, `lane: r1`-marked room for an R1
-   * round session. True means the room is there; otherwise the refusal has been
-   * written: a provider failure is 503 `r1_room_unavailable` (the attempt stays
-   * retryable), anything else means the attempt is no longer joinable. An
-   * `adopted: true` answer (a concurrent exchange won the `created` -> `waiting`
-   * CAS, or the session was already `waiting`) is success.
-   */
-  async function provisionMarkedRoom(
+  /** Provision (or re-assert) the attempt's marked room (lib/r1/marked-room.ts); true when it is there, else the refusal is written. */
+  async function markedRoomReady(
     res: Response,
     session: { id: string; interview_round_id: string | null },
     endpoint: LiveKitEndpoint,
   ): Promise<boolean> {
-    const provisioned = await provisionRoom(session.id, 'existing_session', {
-      endpoint,
-      lane: 'r1',
-      interviewRoundId: session.interview_round_id,
-      ...(deps.rooms ? { rooms: roomsFor(endpoint) } : {}),
-    });
-    if (provisioned.ok) return true;
-    if (provisioned.code === 'provider_failed') {
+    const room = await provisionMarkedRoom(session, endpoint, { provisionRoom, ...(deps.rooms ? { rooms: roomsFor } : {}) });
+    if (room.ok) return true;
+    if (room.reason === 'provider_failed') {
       refuse(res, 503, 'r1_room_unavailable');
       return false;
     }
@@ -1355,7 +1344,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       }
       // The attempt stays `created` on a provider failure: nothing was consumed and
       // a retry converges.
-      if (!(await provisionMarkedRoom(res, session, endpoint))) return;
+      if (!(await markedRoomReady(res, session, endpoint))) return;
     } else {
       // Rejoin or retry of an attempt that already has a room.
       try {
@@ -1381,7 +1370,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
         // converges the marker and limits on an existing room; a lost
         // `created` -> `waiting` CAS is `adopted: true`, which is success).
         if (session.external_call_id === roomName) {
-          if (!(await provisionMarkedRoom(res, session, endpoint))) return;
+          if (!(await markedRoomReady(res, session, endpoint))) return;
         }
       }
     }
