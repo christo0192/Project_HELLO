@@ -25,9 +25,11 @@
  *     `lane: 'r1'`: the room is marked `lane: r1`, carries R1's limits and
  *     NEVER starts LiveKit egress, on the R1 SFU and on the Cloud fallback.
  *  4. The candidate token grants camera and microphone publishing ONLY, no
- *     data channel, no metadata updates, 10 minute TTL, and is signed with the
- *     secret of the endpoint `browserLiveKitEndpoint()` selected: the R1
- *     secret when `BROWSER_LIVEKIT_TARGET=r1`, otherwise the Cloud secret.
+ *     data channel (`canPublishData: false`), no metadata updates, 10 minute TTL,
+ *     and is signed with the secret of the endpoint `browserLiveKitEndpoint()`
+ *     selected: the R1 secret when `BROWSER_LIVEKIT_TARGET=r1`, otherwise the
+ *     Cloud secret. It is minted by `mintCandidateJoin` (lib/r1/candidate-join.ts)
+ *     with its default `browser` grant.
  *  5. Withdrawal is never gated by a kill switch, maintenance mode or the
  *     round's state: a candidate can always withdraw. A decline (the
  *     human-interview alternative, D14) is not gated by the kill switch either.
@@ -127,6 +129,7 @@ import {
 import { r1DeepSeekHealth } from '../lib/r1/deepseek-health.js';
 import { createReadyLimiter, type ReadyLimiter } from '../lib/r1/ready-limiter.js';
 import { runR1WorkerGate, type DispatchListerLike } from '../lib/r1/worker-gate.js';
+import { mintCandidateJoin } from '../lib/r1/candidate-join.js';
 
 const log = createLogger('r1-candidate');
 
@@ -135,8 +138,7 @@ const log = createLogger('r1-candidate');
 /** Unknown, expired and cancelled links are indistinguishable (invariant 1). */
 export const STABLE_LINK_ERROR = 'r1_link_invalid_or_expired';
 export const STABLE_ATTEMPT_ERROR = 'r1_attempt_invalid';
-/** Plan 7.10: LiveKit token expiry only bounds the initial connection. */
-export const CANDIDATE_TOKEN_TTL_SEC = 10 * 60;
+export { CANDIDATE_TOKEN_TTL_SEC } from '../lib/r1/candidate-join.js';
 /** The preflight token only has to survive one connection attempt. */
 export const PREFLIGHT_TOKEN_TTL_SEC = 30;
 /** Plan 4 step 5 / 3.3: the A/V check lasts at most 10 s; the room is cut at 12 s. */
@@ -1216,31 +1218,6 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
 
   // ── POST /api/r1/exchange ──────────────────────────────────────────
 
-  async function mintCandidateJoin(
-    endpoint: LiveKitEndpoint,
-    session: { id: string; candidate_id: string },
-    roomName: string,
-  ): Promise<{ jwt: string; expiresAt: string }> {
-    const token = accessTokenFor(endpoint, {
-      identity: `candidate-${session.candidate_id.slice(0, 8)}-${session.id.slice(0, 8)}`,
-      ttl: CANDIDATE_TOKEN_TTL_SEC,
-    });
-    // Camera and microphone only. SCREEN_SHARE is reserved for future rounds.
-    token.addGrant({
-      room: roomName,
-      roomJoin: true,
-      canPublish: true,
-      canPublishSources: [TrackSource.MICROPHONE, TrackSource.CAMERA],
-      canSubscribe: true,
-      canPublishData: false,
-      canUpdateOwnMetadata: false,
-    });
-    return {
-      jwt: await token.toJwt(),
-      expiresAt: new Date(now() + CANDIDATE_TOKEN_TTL_SEC * 1000).toISOString(),
-    };
-  }
-
   /**
    * Provision (or re-assert) the egress-free, `lane: r1`-marked room for an R1
    * round session. True means the room is there; otherwise the refusal has been
@@ -1438,7 +1415,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       }
     }
 
-    const join = await mintCandidateJoin(endpoint, session, roomName);
+    const join = await mintCandidateJoin(endpoint, session, roomName, { now });
     res.status(200).json({
       url: endpoint.url,
       livekit_token: join.jwt,
