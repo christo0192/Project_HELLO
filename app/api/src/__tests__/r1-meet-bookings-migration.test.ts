@@ -1497,3 +1497,87 @@ describe('migration 0142: SQL test wiring', () => {
     expect(assertions).not.toMatch(/whsec_/i);
   });
 });
+
+describe('migration 0142: docs (T5)', () => {
+  /** The text from `heading` up to the next heading of the same or a higher level. */
+  function section(doc: string, heading: string, level: number): string {
+    const start = doc.indexOf(`\n${heading}\n`);
+    expect(start, heading).toBeGreaterThan(-1);
+    const rest = doc.slice(start + heading.length + 2);
+    const next = rest.search(new RegExp(`\\n#{1,${level}} `));
+    return next === -1 ? rest : rest.slice(0, next);
+  }
+
+  it('docs/data-classification.md classifies both tables and every new column, after the 0141 section', () => {
+    const doc = read('docs/data-classification.md');
+    const heading = '### R1 Meet bookings (0142, M034)';
+    expect(doc.indexOf(heading)).toBeGreaterThan(doc.indexOf('### Ashby pipeline progress written by the webhook nudge (0141, M031 S4)'));
+    expect(doc.indexOf(heading)).toBeLessThan(doc.indexOf('## Classification summary'));
+    const text = section(doc, heading, 3);
+    expect(text).toContain(FILE);
+    for (const table of ['r1_meet_bookings', 'r1_meet_receipts']) expect(text).toContain(`screening_v2.${table}`);
+    const row = (column: string): string => {
+      const line = text.split('\n').find((l) => l.startsWith('| ') && l.split('|')[1]!.includes(`\`${column}\``));
+      expect(line, column).toBeDefined();
+      return line!;
+    };
+    expect(row('ticket_digest')).toContain('**Secret**');
+    expect(row('meet_url')).toContain('**Confidential**');
+    expect(row('ashby_scheduled_by_user_id')).toContain('**Confidential**');
+    expect(row('interview_round_consents.attested_by_external_id')).toContain('**Confidential**');
+    for (const column of [
+      'recall_bot_id',
+      'status',
+      'version',
+      'start_at',
+      'interview_rounds.channel',
+      'interview_round_consents.method',
+      'interview_round_consents.attested_at',
+      'interview_round_consents.india_location_attested',
+    ]) {
+      expect(row(column), column).toContain('| Internal |');
+    }
+    // Every column of both tables is named in the first cell of a classification row.
+    const columnsOf = (create: string): string[] =>
+      [...create.matchAll(/(?:\( |, )([a-z_]+) (?:uuid|text|integer|timestamptz|boolean)\b/g)].map((m) => m[1]!);
+    const classified = (table: string): Set<string> => {
+      const part = section(text, `#### \`screening_v2.${table}\``, 4);
+      const firstCells = part.split('\n').filter((l) => l.startsWith('| ')).map((l) => l.split('|')[1]!);
+      return new Set(firstCells.flatMap((cell) => [...cell.matchAll(/`([a-z_]+)`/g)].map((m) => m[1]!)));
+    };
+    const bookingColumns = columnsOf(bookings);
+    const receiptColumns = columnsOf(receipts);
+    expect(bookingColumns).toHaveLength(27);
+    expect(receiptColumns).toHaveLength(8);
+    for (const column of bookingColumns) expect(classified('r1_meet_bookings').has(column), column).toBe(true);
+    for (const column of receiptColumns) expect(classified('r1_meet_receipts').has(column), column).toBe(true);
+    // DSAR, the bot release, retention and the job payload rule.
+    expect(text).toContain('ON DELETE CASCADE');
+    expect(text).toContain('enqueue_r1_meet_bot_release');
+    expect(text).toContain("kind: 'bot_release'");
+    expect(text).toContain('r1_meet_prune_receipts');
+    expect(text).toMatch(/30 days/);
+    expect(text).toMatch(/less than 7 days/);
+    expect(text).toContain('scheduledByEmail');
+  });
+
+  it('docs/runbooks/r1-operations.md has the 0142 deploy note between the 0119 note and Scoring', () => {
+    const doc = read('docs/runbooks/r1-operations.md');
+    const heading = '### Deploying 0142 (M034 S02, Meet bookings, dark)';
+    expect(doc.indexOf(heading)).toBeGreaterThan(doc.indexOf('### Deploying 0119'));
+    expect(doc.indexOf(heading)).toBeLessThan(doc.indexOf('## Scoring, status effects and the override monitor'));
+    const text = section(doc, heading, 3);
+    expect(text).toContain('R1_MEET_ENABLED');
+    expect(text).toContain("status in ('created', 'waiting', 'in_progress')");
+    expect(text).toMatch(/14 days/);
+    expect(text).toMatch(/last 72 hours/);
+    expect(text).toContain('consent_missing');
+    expect(text).toContain('bot_release');
+    expect(text).toContain('r1-meet:bot-release:');
+    expect(text).toMatch(/forward-only/);
+    // Its SQL is read-only.
+    const sqlBlocks = [...text.matchAll(/```sql\n([\s\S]*?)```/g)].map((m) => m[1]!.replace(/--.*$/gm, ''));
+    expect(sqlBlocks.length).toBeGreaterThan(0);
+    for (const block of sqlBlocks) expect(block).not.toMatch(/\b(insert|update|delete|drop|alter|truncate)\b/i);
+  });
+});

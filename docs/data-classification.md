@@ -545,6 +545,91 @@ uses the same coverage rule, `ashby_progress_covered_links()`, so a link an eras
 link with no candidate left, or a link whose candidate has a restriction or erasure request is
 never nudged. No audit row: a webhook is not a person's action, and the nudge decides nothing.
 
+### R1 Meet bookings (0142, M034)
+
+`0142_r1_meet_bookings.sql` adds two tables, one column on `interview_rounds` and four columns on
+`interview_round_consents` for R1 over Google Meet: HR schedules the interview in Ashby with Dex
+as an interviewer, and Dex joins that Meet (D-M034-11). Both tables are service-role only (RLS
+on, no policy, no browser grant, no anon or authenticated EXECUTE on any of the ten RPCs). The
+migration is dark: nothing writes these tables until S03, S05 and S06 ship behind
+`R1_MEET_ENABLED` (default off).
+
+What is stored is PII-minimal: opaque Ashby and Recall ids, slot times, the canonical Meet URL,
+closed status and reason codes, counters, and the Ashby user id of the HR staff member who
+scheduled the interview. Nothing stores a candidate or staff name, an email, a phone number, a
+raw webhook body, header or signature, or a raw bridge ticket.
+
+#### `screening_v2.r1_meet_bookings`
+
+One row per Ashby interview event that has Dex as an interviewer.
+
+| Column | Classification | Notes |
+|--------|---------------|-------|
+| `id`, `candidate_id`, `round_id`, `session_id` | Internal | Opaque UUIDs. `candidate_id` and `round_id` cascade on delete; `session_id` is set NULL when its call session is deleted |
+| `ashby_interview_event_id` (unique), `ashby_schedule_id`, `ashby_application_id`, `ashby_interview_stage_id`, `ashby_interview_id` | Internal | Opaque Ashby ids, kept verbatim (UUID-shaped). They are needed to match the candidate through `ashby_application_links` and, in S09, to post Dex's feedback to Ashby |
+| `ashby_scheduled_by_user_id` | **Confidential** | The Ashby user id of the HR staff member who scheduled the interview (`scheduledBy`). It identifies a staff member through Ashby, not the candidate. It is kept as evidence of the HR-attested consent, and is never a service user |
+| `objective_profile`, `status`, `reason` | Internal | Closed codes: the profile (`r1_dex_sales`), the booking state (12 values) and why it is in that state (32 values) |
+| `version`, `key_attempt`, `ticket_arms` | Internal | Counters: the Recall bot generation and the Idempotency-Key attempt (`r1-meet-<event>-v<version>-k<key_attempt>`), and how many bridge tickets were armed for this bot generation |
+| `meet_url` | **Confidential** | The canonical `https://meet.google.com/xxx-xxxx-xxx` of the interview. It is a meeting access link: anyone holding it can ask to join. Never put it in a log line, an audit row or an answer to a browser role |
+| `recall_bot_id` | Internal | Opaque Recall bot id. On its own it grants nothing; only the Recall API key (`RECALL_API_KEY`, a **Secret** held by the API) acts on the bot |
+| `ticket_digest` | **Secret** | SHA-256 hex of the single-use bridge ticket. The raw ticket is never stored, and no RPC answer returns the digest |
+| `start_at`, `end_at`, `ashby_updated_at`, `ticket_not_before`, `ticket_expires_at`, `ticket_claimed_at`, `created_at`, `updated_at` | Internal | Slot, ticket-window and lifecycle timestamps |
+
+#### `screening_v2.r1_meet_receipts`
+
+One row per accepted webhook delivery from Recall (keyed by the Svix `webhook-id`) or from the
+Ashby interview-schedule webhook (keyed by the S01 `ashby-schedule:` key).
+
+| Column | Classification | Notes |
+|--------|---------------|-------|
+| `id`, `booking_id` | Internal | Opaque UUIDs; `booking_id` is set NULL when its booking is deleted |
+| `source`, `dedupe_key`, `event_type`, `outcome` | Internal | `recall` or `ashby`, the delivery id used for de-duplication, the webhook's event name and a closed outcome code |
+| `received_at`, `processed_at` | Internal | Timestamps |
+
+There is no body column and no metadata column. A receipt says only that a delivery arrived and
+what became of it.
+
+#### Columns added to existing tables
+
+| Table / column | Classification | Notes |
+|----------------|---------------|-------|
+| `interview_rounds.channel` | Internal | `browser` (default, every existing round) or `meet`. It is set to `meet` only by the Meet round RPC, in the transaction that creates the round, and is locked after that |
+| `interview_round_consents.method` | Internal | `candidate_web` (default, every existing row and every row the browser consent page writes) or `hr_attested_ashby` |
+| `interview_round_consents.attested_by_external_id` | **Confidential** | `hr_attested_ashby` only: the Ashby `scheduledBy` user id of the HR attester. Like `ashby_scheduled_by_user_id`, it identifies a staff member and is kept as consent evidence |
+| `interview_round_consents.attested_at` | Internal | `hr_attested_ashby` only: when HR scheduled the interview in Ashby |
+| `interview_round_consents.india_location_attested` | Internal | `hr_attested_ashby` only: `true` means the same HR act attested that the candidate is in India. It records no address or location. NULL on `candidate_web` rows |
+
+An HR-attested consent row keeps the existing classification of `consents` and `proof`
+(**Confidential PII**). Its `proof` records the attester id, the attestation time, the India
+attestation and the Ashby event and schedule ids. It has no IP address and no user agent.
+
+**DSAR.** `r1_meet_bookings.candidate_id` and `round_id` are `ON DELETE CASCADE`. A DSAR delete
+of the candidate, which cascades to the candidate's rounds, therefore removes their bookings,
+and with them the Meet URL and the attester id. If a deleted booking still held a Recall bot,
+the AFTER DELETE trigger `enqueue_r1_meet_bot_release` queues one `r1-meet` job in the same
+transaction, so the bot is still released at Recall after an erasure. The job payload is
+`{kind: 'bot_release', recall_bot_id, booking_id}`, with dedup key
+`r1-meet:bot-release:<bot id>` and 10 attempts. Receipts follow a deleted booking with
+`booking_id` set NULL; they carry nothing personal. HR-attested consent rows follow the same
+withdrawal and erasure as browser rows: they cascade with the round. A booking that never
+matched a candidate (`unmatched_application`) has no candidate id, so no cascade reaches it. It
+holds only opaque Ashby ids, the slot, the Meet URL and the attester id, and nothing that names
+the candidate. Clearing stale unmatched bookings is left to the runtime slices (S06/S10).
+
+**Retention.** Receipts are kept for 30 days. `r1_meet_prune_receipts(p_older_than, p_limit,
+p_now)` deletes them in batches of at most 5000, and S06 calls it from an existing tick with
+`p_older_than = now - 30 days`. The function refuses a cutoff that would keep less than 7 days.
+It deletes only `recorded`, `processed`, `ignored` and `failed` receipts: an `enqueued` receipt
+stays until its work settles. Bookings live as long as their round: they cascade with it, and a
+terminal booking stays as the round's history. Consent rows follow the existing R1 consent
+retention (PENDING Legal, above).
+
+**Job payloads.** Every `r1-meet` job payload (the receipt outbox of `r1_meet_record_receipt`,
+the bot-release trigger, and the S03/S06 jobs) carries only ids, times and the canonical Meet
+URL. It never carries the Ashby `scheduledByEmail`, a name, an email, a raw webhook body or a
+signature. The receipt RPC caps a payload at 4096 bytes and requires a `kind`. S03 and S06 own
+the rest of this rule.
+
 ## Classification summary
 
 | Level | Count | Examples |

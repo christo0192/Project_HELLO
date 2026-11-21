@@ -503,6 +503,73 @@ restart, in the month of the restart), remove the duplicate attempt rows, and ap
 again. After 0119 is live, save the allocation once (see the
 launch checklist: `allocation_set_at` is NULL on the existing row) and re-enter
 the dashboard figure to re-stamp its baseline.
+
+### Deploying 0142 (M034 S02, Meet bookings, dark)
+
+0142 is the database half of R1 over Google Meet (HR schedules the interview in Ashby with Dex
+as an interviewer; Dex joins that Meet). It adds `r1_meet_bookings`, `r1_meet_receipts`,
+`interview_rounds.channel`, four HR-attestation columns on `interview_round_consents`, ten
+service-role RPCs and two trigger functions. Data classification:
+`docs/data-classification.md`, "R1 Meet bookings (0142, M034)".
+
+- **Additive and dark.** It changes no existing row: every new column has a constant default or
+  is NULL. It redeclares no existing function and re-prices nothing. Nothing calls the new
+  functions until S03, S05 and S06 ship behind `R1_MEET_ENABLED` (default off), and no queue is
+  registered. The browser consent flow is unchanged: its inserts read
+  `method = 'candidate_web'` with no attestation.
+- **Merge window.** Merging applies 0142 to production at once, because deploy-fly runs
+  `supabase db push` before any app deploy. 0142 could run while an R1 session is live, but merge
+  it like any migration: in the window of the merge and deploy gate above, with R1 paused. Right
+  before the merge, check that the live-R1 count is 0, using the query that also counts
+  `created` sessions:
+  `select count(*) from screening_v2.call_sessions where interview_round_id is not null and
+  status in ('created', 'waiting', 'in_progress');`
+- **Hold lifetime and the month-straddle overshoot (D8).** The Meet round RPC creates the round
+  through `r1_send_round` itself. The 65-minute Send hold, its `hold_month` and the month counter
+  are therefore exactly the browser path's. There is one difference. A Meet round expires at the
+  slot end plus a grace period (default 2 hours, allowed 15 minutes to 24 hours), at most 14 days
+  after the booking, instead of 72 hours after the Send. So a Meet hold can sit in
+  `outstanding_holds` for up to 14 days. A slot further away is booked as
+  `blocked/slot_too_far` with a `retry_after` time, and holds nothing until then. The
+  documented Mode A overshoot at month end ("A hold is charged to the month that booked it"
+  above) widens to match: from links sent in the last 72 hours of a month to Meet rounds created
+  in its last 14 days. The total across the months is unchanged. Re-linking a Meet round after
+  HR re-books keeps the hold in its original month, as a reissue does.
+- **Template release (D31).** An HR-attested consent row names the newest active `en-IN`
+  template at booking time. Releasing a new consent template version makes every outstanding
+  Meet round fail admission with `consent_missing`, exactly like browser rounds that consented to
+  the older notice. Recovery: HR schedules a new Dex event in Ashby. The Meet round RPC then
+  re-links the candidate's reusable Meet round and re-attests under the new template. Prefer to
+  release a template when no Meet round is outstanding.
+- **Owed bot releases and `bot_release` jobs (D18).** A terminal booking (`completed`,
+  `cancelled`, `failed`, `drained`) keeps its `recall_bot_id` until S06 confirms the Recall
+  DELETE or `leave_call` and calls `r1_meet_set_bot(..., 'release', ...)`. Deleting a booking
+  that still holds a bot queues one `r1-meet` job with payload kind `bot_release`. This includes
+  the DSAR cascade from the candidate or the round. The job's dedup key is
+  `r1-meet:bot-release:<bot id>` and it has 10 attempts. No `r1-meet` worker exists until S06.
+  While dark there are no bookings, so both counts below are 0:
+
+  ```sql
+  select count(*) from screening_v2.r1_meet_bookings
+   where recall_bot_id is not null
+     and status in ('completed', 'cancelled', 'failed', 'drained');   -- owed releases
+  select status, count(*) from screening_v2.job_queue
+   where name = 'r1-meet' group by 1;                                 -- r1-meet jobs
+  ```
+
+- **Check after the deploy (read-only).** While dark, expect:
+
+  ```sql
+  select count(*) from screening_v2.r1_meet_bookings;                             -- 0
+  select count(*) from screening_v2.r1_meet_receipts;                             -- 0
+  select channel, count(*) from screening_v2.interview_rounds group by 1;         -- browser only
+  select method, count(*) from screening_v2.interview_round_consents group by 1;  -- candidate_web only
+  ```
+
+- **Rollback.** None: 0142 is forward-only, and there is no rollback SQL. While dark, the objects
+  stay unused. Once S03, S05 and S06 are live, the switch is `R1_MEET_ENABLED=false`: S06 drains
+  the bots. Never drop the tables while a booking still holds a bot.
+
 ## Scoring, status effects and the override monitor
 
 Implemented in PR-5 (migration 0122). R1 sessions are scored by their own queue
