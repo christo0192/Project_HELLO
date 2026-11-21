@@ -2117,14 +2117,23 @@ describe('POST /api/r1/ready', () => {
     const secrets = await live();
     const response = await ready(secrets);
     expect(Object.keys(response.body)).toEqual(['ok']);
-    // The route file never grants data publishing: both tokens it mints stay data-less.
-    const source = readFileSync(
-      path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../routes/r1-candidate.ts'),
+    // Neither token the route serves grants data publishing. The preflight grant is the
+    // route file's only `addGrant`; the exchange token is minted by `mintCandidateJoin`
+    // (lib/r1/candidate-join.ts, M034 S04), which holds the other grant literal. Both files
+    // are read with comments stripped, so prose can neither satisfy nor trip the pin.
+    const code = (relative: string) => readFileSync(
+      path.resolve(path.dirname(fileURLToPath(import.meta.url)), relative),
       'utf8',
-    );
-    expect(source.match(/canPublishData:\s*false/g)).toHaveLength(2);
-    expect(source).not.toMatch(/canPublishData:\s*true/);
-    expect(source).not.toMatch(/canUpdateOwnMetadata:\s*true/);
+    )
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+    for (const [relative, grants] of [['../routes/r1-candidate.ts', 1], ['../lib/r1/candidate-join.ts', 1]] as const) {
+      const source = code(relative);
+      expect(source.match(/addGrant\(/g) ?? [], relative).toHaveLength(grants);
+      expect(source.match(/canPublishData:\s*false/g) ?? [], relative).toHaveLength(grants);
+      expect(source, relative).not.toMatch(/canPublishData:\s*true/);
+      expect(source, relative).not.toMatch(/canUpdateOwnMetadata:\s*true/);
+    }
     const again = await post('/exchange', { attempt_token: secrets.attempt_token, nonce: secrets.nonce });
     const cloud = cloudLiveKitEndpoint();
     const verified = await new TokenVerifier(cloud.apiKey, cloud.apiSecret).verify(again.body.livekit_token);

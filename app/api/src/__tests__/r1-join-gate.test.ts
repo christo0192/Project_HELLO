@@ -287,6 +287,9 @@ describe('runR1JoinGate', () => {
     expect(await runR1JoinGate(INPUT_R1, r1)).toBe('preparing');
     expect(r1.resolveGate).toHaveBeenCalledTimes(1);
     expect(r1.dispatches).not.toHaveBeenCalled();
+    // Fence 7 is NOT inside the composite (review S04-R3): no r1_worker_gate_missing log and no
+    // refusal verdict, only a silent `preparing`. Every caller must ask r1WorkerGateMissing first.
+    expect(r1.log.error).not.toHaveBeenCalled();
   });
 
   it('12b. the service\'s disabled answer proceeds on Cloud and defers on the R1 SFU (failClosed)', async () => {

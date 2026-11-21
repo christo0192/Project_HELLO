@@ -12,7 +12,10 @@
  *
  * `runR1JoinGate` is steps 2 and 3 as one composite. Callers (the browser exchange, and the
  * Meet exchange in S05) must use `runR1JoinGate`, never `runR1WorkerGate` alone: the bare
- * gate skips the interlock.
+ * gate skips the interlock. Step 1 is NOT inside it: each caller asks `r1WorkerGateMissing`
+ * itself, first. Skipped, a missing gate on the R1 SFU comes back from `runR1JoinGate` as a
+ * silent `preparing` (a 202 retry loop, no `r1_worker_gate_missing` log) instead of the
+ * caller's 503 `r1_unavailable`.
  *
  * No environment reads and no defaults: the caller passes the dependencies it resolved,
  * including its own logger, so every log line keeps the caller's component.
@@ -104,6 +107,10 @@ export async function sharedNameDispatchSafe(
  * means "answer 202 and let the candidate retry"; `proceed` means a worker is in (or
  * on its way into) the room. The worker gate is resolved only when the interlock
  * passes, and a throw from resolving it propagates.
+ *
+ * Fence 7 is not part of it: call `r1WorkerGateMissing` before provisioning anything, as
+ * the browser router does on both paths (inside `laneForNewWork` for a `created` attempt,
+ * explicitly for a `waiting` one).
  */
 export async function runR1JoinGate(
   input: { endpoint: LiveKitEndpoint; sessionId: string; roomName: string },

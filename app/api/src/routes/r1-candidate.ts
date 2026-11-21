@@ -25,11 +25,11 @@
  *     `lane: 'r1'`: the room is marked `lane: r1`, carries R1's limits and
  *     NEVER starts LiveKit egress, on the R1 SFU and on the Cloud fallback.
  *  4. The candidate token grants camera and microphone publishing ONLY, no
- *     data channel (`canPublishData: false`), no metadata updates, 10 minute TTL,
- *     and is signed with the secret of the endpoint `browserLiveKitEndpoint()`
- *     selected: the R1 secret when `BROWSER_LIVEKIT_TARGET=r1`, otherwise the
- *     Cloud secret. It is minted by `mintCandidateJoin` (lib/r1/candidate-join.ts)
- *     with its default `browser` grant.
+ *     data channel, no metadata updates, 10 minute TTL, and is signed with the
+ *     secret of the endpoint `browserLiveKitEndpoint()` selected: the R1
+ *     secret when `BROWSER_LIVEKIT_TARGET=r1`, otherwise the Cloud secret. It is
+ *     minted by `mintCandidateJoin` (lib/r1/candidate-join.ts) with its default
+ *     `browser` grant.
  *  5. Withdrawal is never gated by a kill switch, maintenance mode or the
  *     round's state: a candidate can always withdraw. A decline (the
  *     human-interview alternative, D14) is not gated by the kill switch either.
