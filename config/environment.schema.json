@@ -304,6 +304,8 @@
         "R1_INDIA_PLAYBOOK": { "requiredInProduction": false, "secret": false },
         "R1_CONCESSION_CONDITION": { "requiredInProduction": false, "secret": false },
         "R1_CONCESSION_FRAMES_V3": { "requiredInProduction": false, "secret": false },
+        "R1_CALL_ASK_STUDY_CATCHUP": { "requiredInProduction": false, "secret": false },
+        "R1_CONCESSION_SUBQUESTION": { "requiredInProduction": false, "secret": false },
         "R1_PERSONA_TIMELINE_V3": { "requiredInProduction": false, "secret": false },
         "R1_CLOSING_STATE": { "requiredInProduction": false, "secret": false },
         "R1_EARLY_CLOSE_ASIDE": { "requiredInProduction": false, "secret": false },

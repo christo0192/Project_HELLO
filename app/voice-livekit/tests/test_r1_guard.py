@@ -4722,3 +4722,19 @@ class EarlyReleaseTests(unittest.TestCase):
                         self.assertEqual(outputs[0], outputs[1])
                         self.assertEqual(guards[0].result, guards[1].result)
         self.assertGreater(early, 100)  # the property really exercised early releases
+
+
+class SubquestionConcessionTests(unittest.TestCase):
+    def test_question_resolution_and_other_concessions(self):
+        from unittest.mock import patch
+        advisor = "Does that settle that question for you?"
+        with patch.dict("os.environ", {"R1_CONCESSION_SUBQUESTION": "1"}):
+            self.assertNotIn("resolution_phrasing", rules_of("Yes, that settles it for me.", echo_ctx(advisor)))
+            for prompt, reply in (("Does that settle your concern?", "That settles it."),
+                                  ("Does that settle your worry?", "That settles it."),
+                                  (advisor, "I'm sold, that settles it."),
+                                  ("The projects are practical.", "That settles it.")):
+                with self.subTest(prompt=prompt, reply=reply):
+                    self.assertIn("resolution_phrasing", rules_of(reply, echo_ctx(prompt)))
+        with patch.dict("os.environ", {"R1_CONCESSION_SUBQUESTION": "0"}):
+            self.assertIn("resolution_phrasing", rules_of("That settles it.", echo_ctx(advisor)))

@@ -1674,3 +1674,32 @@ class StrongEvidenceV2Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StudyCatchupAskTests(unittest.TestCase):
+    def test_study_catchup_and_flag_off(self):
+        from unittest.mock import patch
+        cases = (
+            "If an evening is busy, could you protect the weekend and catch up on the recordings?",
+            "Could you catch up with the classes?",
+            "Could you catch up later on the material?",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                with patch.dict("os.environ", {"R1_CALL_ASK_STUDY_CATCHUP": "1"}):
+                    self.assertNotIn(AskKind.CALL, __import__("r1_commitment").ask_acts(text))
+                with patch.dict("os.environ", {"R1_CALL_ASK_STUDY_CATCHUP": "0"}):
+                    result = __import__("r1_commitment").ask_acts(text)
+                    self.assertEqual(AskKind.CALL in result, text == cases[0])
+
+    def test_real_calls_remain_asks(self):
+        from unittest.mock import patch
+        from r1_commitment import ask_acts
+        with patch.dict("os.environ", {"R1_CALL_ASK_STUDY_CATCHUP": "1"}):
+            for text in ("Shall we catch up on Thursday evening?",
+                         "Let's catch up tomorrow at eight.",
+                         "Could we catch up again on a quick call with your husband?",
+                         "Can we catch up on a call later this week?",
+                         "Would a quick catch-up call on Friday work?"):
+                with self.subTest(text=text):
+                    self.assertIn(AskKind.CALL, ask_acts(text))

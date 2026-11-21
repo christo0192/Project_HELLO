@@ -993,6 +993,23 @@ class Ask:
     phrase: str
 
 
+_STUDY_CATCHUP = re.compile(
+    r"\bcatch up(?:\s+later)?\s+(?:on|with)\s+"
+    r"(?:(?:the|your|our|any|missed)\s+)?"
+    r"(?:recordings?|classes|class|sessions?|materials?|lectures?|content|"
+    r"what you missed|coursework|lessons?|videos?)\b", re.IGNORECASE,
+)
+
+
+def _call_ask_text(sentence: str) -> str:
+    """Hide study catch-up phrases while retaining independent call proposals."""
+    if os.getenv("R1_CALL_ASK_STUDY_CATCHUP", "1").strip().lower() in (
+        "0", "off", "false", "no",
+    ):
+        return sentence
+    return _STUDY_CATCHUP.sub(" ", sentence)
+
+
 def ask_acts(text: object) -> dict[AskKind, Ask]:
     """Every kind of ask in the advisor's ``text``: an enrolment ask, a call ask, or both.
 
@@ -1009,7 +1026,8 @@ def ask_acts(text: object) -> dict[AskKind, Ask]:
             if phrase is not None:
                 found[AskKind.ENROL] = Ask(AskKind.ENROL, phrase)
         if AskKind.CALL not in found:
-            phrase = call_proposal_in(sentence) or production_call_ask_in(sentence)
+            call_text = _call_ask_text(sentence)
+            phrase = call_proposal_in(call_text) or production_call_ask_in(call_text)
             if phrase is not None:
                 found[AskKind.CALL] = Ask(AskKind.CALL, phrase)
     return found
