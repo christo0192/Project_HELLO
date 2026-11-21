@@ -12,7 +12,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -260,10 +260,34 @@ function sourceFiles(directory: string): string[] {
   });
 }
 
+/**
+ * M034: the vendor modules R1-over-Meet uses. They sit outside lib/r1 but are R1 code. The booking
+ * source is Ashby (D-M034-11), so there is no booking-vendor module.
+ */
+const meetVendorDirs = ['recall', 'google-meet'].map((name) => path.join(src, 'integrations', name));
+const meetVendorSources = meetVendorDirs.flatMap((directory) => sourceFiles(directory));
+/** Every Meet file: the vendor modules plus lib/r1/meet. */
+const meetSources = [...meetVendorSources, ...sourceFiles(path.join(src, 'lib', 'r1', 'meet'))];
+const MEET_CONFIG = path.join(src, 'lib', 'r1', 'meet', 'config.ts');
+
 const r1Sources = [
   path.join(src, 'routes', 'r1.ts'),
   path.join(src, 'routes', 'r1-candidate.ts'),
   ...sourceFiles(path.join(src, 'lib', 'r1')),
+  ...meetVendorSources,
+];
+
+/** The M034 Meet variables, declared in config/environment.schema.json (api): non-secrets, then credentials. */
+const MEET_ENV_NAMES = [
+  'R1_MEET_ENABLED',
+  'R1_MEET_BOT_NAME',
+  'R1_MEET_DAILY_BOT_CAP',
+  'R1_MEET_GOOGLE_LOGIN_GROUP_ID',
+  'R1_MEET_SERVICE_USER_ID',
+  'RECALL_BASE_URL',
+  'R1_MEET_ASHBY_DEX_USER_ID',
+  'RECALL_API_KEY',
+  'RECALL_WEBHOOK_SECRET',
 ];
 
 /** Strip comments so a fence cannot be satisfied (or tripped) by prose. */
@@ -276,6 +300,18 @@ function code(file: string): string {
 describe('R1 source fences', () => {
   it('finds the R1 sources', () => {
     expect(r1Sources.length).toBeGreaterThanOrEqual(8);
+  });
+
+  it('covers the M034 Meet files: lib/r1/meet and the Recall and Google Meet modules', () => {
+    // D-M034-11: Meet rounds are booked in Ashby; the booking-vendor module of the first plan is gone.
+    expect(existsSync(path.join(src, 'integrations', 'calen' + 'dly'))).toBe(false);
+    for (const directory of meetVendorDirs) {
+      expect(meetVendorSources.some((file) => file.startsWith(directory + path.sep)), directory).toBe(true);
+    }
+    for (const name of ['config.ts', 'profiles.ts']) {
+      expect(r1Sources, name).toContain(path.join(src, 'lib', 'r1', 'meet', name));
+    }
+    for (const file of meetSources) expect(r1Sources, file).toContain(file);
   });
 
   it('never reads or writes the legacy consent tables (fence 7)', () => {
@@ -315,7 +351,10 @@ describe('R1 source fences', () => {
     ];
     expect(phoneFiles.length).toBeGreaterThan(0);
     for (const file of phoneFiles) {
-      expect(readFileSync(file, 'utf8'), file).not.toMatch(/lib\/r1\/|routes\/r1|r1-candidate/);
+      // M034: nor the R1-over-Meet vendor modules.
+      expect(readFileSync(file, 'utf8'), file).not.toMatch(
+        /lib\/r1\/|routes\/r1|r1-candidate|integrations\/(?:recall|google-meet)/,
+      );
     }
   });
 
@@ -342,6 +381,9 @@ describe('R1 source fences', () => {
       // Owner decision 2026-11-20 (India sales playbook for the post-session scorer): declared
       // in config/environment.schema.json (api) and read ONLY by lib/r1/config.ts.
       'R1_INDIA_PLAYBOOK',
+      // M034 Meet surface, declared in config/environment.schema.json (api) and read ONLY by
+      // lib/r1/meet/config.ts (pinned by the next test).
+      ...MEET_ENV_NAMES,
     ]);
     for (const file of r1Sources) {
       const reads = code(file)
@@ -351,6 +393,47 @@ describe('R1 source fences', () => {
         if (name === 'WORKER_CONTEXT_SECRET' || declared.has(name)) continue;
         expect.fail(`${path.basename(file)} reads undeclared ${name}`);
       }
+    }
+  });
+
+  it('reads the Meet variables only in lib/r1/meet/config.ts, and the Meet vendor modules read no environment at all', () => {
+    const runtimeFiles = sourceFiles(src).filter((file) => !path.relative(src, file).split(path.sep).includes('__tests__'));
+    expect(runtimeFiles).toContain(MEET_CONFIG);
+    // A Meet-prefixed name read through process.env (dotted, bracketed or destructured) or through an
+    // env-source object named `source` or `env`.
+    const meetName = '((?:R1_MEET|RECALL)_[A-Z0-9_]+)';
+    const meetReads = [
+      new RegExp(`\\b(?:process\\.env|source|env)\\s*\\.\\s*${meetName}`, 'g'),
+      new RegExp(`\\b(?:process\\.env|source|env)\\s*\\[\\s*['"\`]${meetName}['"\`]\\s*\\]`, 'g'),
+      new RegExp(`\\{[^}]*\\b${meetName}\\b[^}]*\\}\\s*=\\s*(?:process\\.env|source|env)\\b`, 'g'),
+    ];
+    for (const file of runtimeFiles) {
+      if (file === MEET_CONFIG) continue;
+      const text = code(file);
+      for (const pattern of meetReads) {
+        expect([...text.matchAll(pattern)].map((match) => match[1]), path.relative(src, file)).toEqual([]);
+      }
+    }
+    // The one reader names every variable as a literal process.env read (env-contract visibility).
+    const configText = code(MEET_CONFIG);
+    for (const name of MEET_ENV_NAMES) expect(configText, name).toContain(`process.env.${name}`);
+    expect(configText).toContain('process.env.WEB_ORIGIN');
+
+    // The vendor modules take explicit settings: no process.env, no import.meta.env, no env-source map.
+    expect(meetVendorSources.length).toBeGreaterThanOrEqual(3);
+    for (const file of meetVendorSources) {
+      expect(code(file), path.relative(src, file)).not.toMatch(
+        /\bprocess\s*(?:\.\s*env\b|\[)|\bimport\s*\.\s*meta\s*\.\s*env\b|\b(?:source|env)\s*(?:\.\s*[A-Z]|\[\s*['"`][A-Z])/,
+      );
+    }
+  });
+
+  it('never hands Recall our LiveKit: no quoted livekit literal or agent_name in any Meet file (R8)', () => {
+    expect(meetSources.length).toBeGreaterThanOrEqual(5);
+    for (const file of meetSources) {
+      const text = code(file);
+      expect(text, path.relative(src, file)).not.toMatch(/['"`]livekit['"`]/i);
+      expect(text, path.relative(src, file)).not.toMatch(/agent_name/i);
     }
   });
 });
