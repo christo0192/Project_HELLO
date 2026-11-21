@@ -38,17 +38,28 @@ export interface R1CandidateJoinGrantSpec {
   readonly ttlSec: number;
 }
 
+/**
+ * A frozen preset whose source list is built on its first read, never at import. The router
+ * only ever touched `TrackSource` while serving a request, and existing tests import the
+ * router under a partial SDK mock that has no `TrackSource`, so reading it at import would
+ * break them. The list is built once, frozen, and the same array is returned on every read.
+ */
+function preset(sources: () => TrackSource[], ttlSec: number): R1CandidateJoinGrantSpec {
+  let built: readonly TrackSource[] | undefined;
+  return Object.freeze({
+    get sources(): readonly TrackSource[] {
+      if (built === undefined) built = Object.freeze(sources());
+      return built;
+    },
+    ttlSec,
+  });
+}
+
 /** Deep-frozen: the table, each spec and each source list. */
 export const R1_CANDIDATE_JOIN_GRANTS: Readonly<Record<R1CandidateJoinGrant, R1CandidateJoinGrantSpec>> =
   Object.freeze({
-    browser: Object.freeze({
-      sources: Object.freeze([TrackSource.MICROPHONE, TrackSource.CAMERA]),
-      ttlSec: CANDIDATE_TOKEN_TTL_SEC,
-    }),
-    meet_bridge: Object.freeze({
-      sources: Object.freeze([TrackSource.MICROPHONE]),
-      ttlSec: MEET_BRIDGE_TOKEN_TTL_SEC,
-    }),
+    browser: preset(() => [TrackSource.MICROPHONE, TrackSource.CAMERA], CANDIDATE_TOKEN_TTL_SEC),
+    meet_bridge: preset(() => [TrackSource.MICROPHONE], MEET_BRIDGE_TOKEN_TTL_SEC),
   });
 
 /**

@@ -10,8 +10,8 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
-import { TokenVerifier } from 'livekit-server-sdk';
+import { describe, expect, it, vi } from 'vitest';
+import { TokenVerifier, TrackSource } from 'livekit-server-sdk';
 import { cloudLiveKitEndpoint, type LiveKitEndpoint } from '../lib/livekit-endpoints.js';
 import {
   CANDIDATE_TOKEN_TTL_SEC,
@@ -165,6 +165,38 @@ describe('R1_CANDIDATE_JOIN_GRANTS and the TTL constants', () => {
     expect(R1_CANDIDATE_JOIN_GRANTS.browser.ttlSec).toBe(CANDIDATE_TOKEN_TTL_SEC);
     expect(R1_CANDIDATE_JOIN_GRANTS.meet_bridge.ttlSec).toBe(MEET_BRIDGE_TOKEN_TTL_SEC);
     expect(ROUTE_CANDIDATE_TOKEN_TTL_SEC).toBe(CANDIDATE_TOKEN_TTL_SEC);
+  });
+});
+
+describe('R1_CANDIDATE_JOIN_GRANTS reads TrackSource on use, never at import', () => {
+  it('loads under a partial SDK mock with no TrackSource, as the router did before the move', async () => {
+    // Several existing route tests import the router under such a mock; the router only ever
+    // touched TrackSource while serving a request, so the lib must not touch it at import.
+    vi.resetModules();
+    vi.doMock('livekit-server-sdk', () => ({
+      AccessToken: class {},
+      AgentDispatchClient: class {},
+      RoomServiceClient: class {},
+    }));
+    try {
+      const lib = await import('../lib/r1/candidate-join.js');
+      expect(Object.keys(lib.R1_CANDIDATE_JOIN_GRANTS).sort()).toEqual(['browser', 'meet_bridge']);
+      expect(lib.R1_CANDIDATE_JOIN_GRANTS.browser.ttlSec).toBe(600);
+      expect(lib.candidateJoinIdentity('meet_bridge', SESSION)).toBe('meet-30000000');
+      // The source list is the first thing that needs the enum.
+      expect(() => lib.R1_CANDIDATE_JOIN_GRANTS.browser.sources).toThrow();
+    } finally {
+      vi.doUnmock('livekit-server-sdk');
+      vi.resetModules();
+    }
+  });
+
+  it('builds each source list once and returns the same frozen array on every read', () => {
+    const browser = R1_CANDIDATE_JOIN_GRANTS.browser.sources;
+    expect(R1_CANDIDATE_JOIN_GRANTS.browser.sources).toBe(browser);
+    expect(Object.isFrozen(browser)).toBe(true);
+    expect([...browser]).toEqual([TrackSource.MICROPHONE, TrackSource.CAMERA]);
+    expect([...R1_CANDIDATE_JOIN_GRANTS.meet_bridge.sources]).toEqual([TrackSource.MICROPHONE]);
   });
 });
 
