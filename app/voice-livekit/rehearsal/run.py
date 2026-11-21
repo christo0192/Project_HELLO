@@ -66,6 +66,7 @@ from r1_personas import PERSONA_IDS
 EXIT_OK, EXIT_ERROR, EXIT_NO_KEY, EXIT_NO_BALANCE, EXIT_BUDGET, EXIT_STRICT = 0, 1, 2, 3, 4, 5
 ABORT_REASONS = frozenset({"insufficient_balance", "budget_exceeded"})
 LEVEL_ALIASES = {
+    "skilled-closer-india": "closer_india",
     "skilled-closer": "closer",
     "pushy-discounter": "pushy",
     "short-answers": "terse",

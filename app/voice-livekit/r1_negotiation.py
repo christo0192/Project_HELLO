@@ -34,6 +34,7 @@ Invariants (each has a test in ``tests/test_r1_negotiation.py``):
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, replace
 from typing import Any, Iterable
@@ -63,7 +64,8 @@ from r1_text import (
     parse_amount,
     split_sentences,
 )
-from r1_world import PRICE_USD
+from r1_tracker import _TIME_LIMIT, parse_discounts, time_limited_offer_in
+from r1_world import NET_PRICES_USD, PRICE_USD
 
 # A turn longer than this is read from its end: closing proposals come last, and a hostile
 # or runaway transcript cannot make the detectors slow.
@@ -1684,6 +1686,8 @@ _HANDLED_TIMING = _compile(
     r"\btake your time\b",
     r"\b(?:weekend|evening) batch\b",
 )
+# Owner 2026-11-20: limited-time offers address timing under the India playbook.
+_HANDLED_TIMING_PLAYBOOK = (_TIME_LIMIT,)
 _HANDLED_MONEY = _compile(
     r"\binstal+ments?\b",
     r"\bemi\b",
@@ -2123,7 +2127,10 @@ def asks_decider(text: object) -> bool:
     return False
 
 
-def reasons_handled_in(text: object, decision_maker: str = "") -> frozenset[str]:
+def reasons_handled_in(
+    text: object, decision_maker: str = "", *, playbook: bool = False,
+    prior_deck_discount: bool = False,
+) -> frozenset[str]:
     """The stall reasons the advisor's ``text`` speaks to (it must still follow the reason)."""
     folded = _tail(text).lower()
     found: set[str] = set()
@@ -2131,7 +2138,9 @@ def reasons_handled_in(text: object, decision_maker: str = "") -> frozenset[str]
     dm_pattern = re.compile(r"\b(?:" + own + _DM_WORDS + r")\b")
     verb_pattern = re.compile(r"\b" + _HANDLED_DM_VERB + r"\w*\b")
     for sentence in split_sentences(folded):
-        if any(pattern.search(sentence) for pattern in _HANDLED_TIMING):
+        if (any(pattern.search(sentence) for pattern in _HANDLED_TIMING)
+                or (playbook and time_limited_offer_in(
+                    sentence, prior_deck_discount=prior_deck_discount))):
             found.add(REASON_TIMING)
         for pattern in _HANDLED_MONEY:
             match = pattern.search(sentence)
@@ -3178,7 +3187,11 @@ def parse_price_offers(
     off the price ``stated_price_usd`` reads (L5), as before.
     """
     if v2:
-        return _parse_price_offers_v2(text, own_amounts, require_cue=require_cue, base_usd=base_usd)
+        offers = _parse_price_offers_v2(
+            text, own_amounts, require_cue=require_cue, base_usd=base_usd
+        )
+        base = stated_price_usd(text, v2=True) or base_usd or PRICE_USD
+        return _reconcile_price_offers(text, offers, base)
     own = frozenset({ANCHOR_USD, *own_amounts})
     offers: dict[int, bool] = {}
     base = stated_price_usd(text) or PRICE_USD
@@ -3198,7 +3211,39 @@ def parse_price_offers(
                         base_usd=base,
                     )
                 )
-    return sorted(offers.items(), reverse=True)
+    return _reconcile_price_offers(text, sorted(offers.items(), reverse=True), base)
+
+
+def _india_playbook_on() -> bool:
+    return os.getenv("R1_INDIA_PLAYBOOK", "1").strip().lower() not in (
+        "0", "off", "false", "no"
+    )
+
+
+def _total_reconcile_on() -> bool:
+    return os.getenv("R1_DISCOUNT_TOTAL_RECONCILE", "1").strip().lower() not in (
+        "0", "off", "false", "no"
+    )
+
+
+def _reconcile_price_offers(
+    text: object, offers: list[tuple[int, bool]], base: int
+) -> list[tuple[int, bool]]:
+    if not _total_reconcile_on():
+        return offers
+    if len(offers) < 2 or not any(net in NET_PRICES_USD for net, _ in offers):
+        return offers
+    reconciled = [m for m in parse_discounts(_tail(text), reconcile=True)
+                  if m.heard_usd is not None]
+    if len(reconciled) != 1:
+        return offers
+    mention = reconciled[0]
+    total = PRICE_USD - mention.usd
+    if not any(net == total for net, _ in offers):
+        return offers
+    phantom = base - mention.heard_usd
+    return [(net, conditional) for net, conditional in offers
+            if net != phantom or net == total]
 
 
 def _parse_price_offers_v2(
@@ -3917,6 +3962,10 @@ _INSTALMENT_TERM = re.compile(
     r"costs?|parts))\b",
     re.IGNORECASE,
 )
+_INSTALMENT_TERM_PLAYBOOK = re.compile(
+    r"\b(?:(?:zero|no|0\s*%?)[- ]?(?:percent\s+)?interest(?!\s+in\b)|"
+    r"interest[- ]free)\b", re.I
+)
 _INSTALMENT_OFFER = re.compile(
     r"\b(?:can|could|will|'ll|offer\w*|have|has|give|provide\w*|allow\w*|available|option|"
     r"tied up|opt|choose|let)\b",
@@ -4023,13 +4072,17 @@ def _offer_terms(text: object) -> tuple[frozenset[str], bool]:
                 ),
                 None,
             )
+            playbook_term = False
+            if term is None and _india_playbook_on():
+                term = _INSTALMENT_TERM_PLAYBOOK.search(clause)
+                playbook_term = term is not None
             if (
                 term is not None
                 and _INSTALMENT_OFFER.search(clause) is not None
                 and _offered_statement(clause, term.start())
             ):
                 found.add(TERM_INSTALMENTS)
-                monthly = monthly or _MONTHLY_TERM.search(clause) is not None
+                monthly = monthly or playbook_term or _MONTHLY_TERM.search(clause) is not None
             extra = _FREE_EXTRA_TERM.search(clause)
             if (
                 extra is not None
@@ -4317,8 +4370,11 @@ class Negotiation:
 
     def __init__(
         self, decision_maker: str, *, max_stall_rounds: int = MAX_STALL_ROUNDS,
-        timeline_v3: bool = False,
+        timeline_v3: bool = False, india_playbook: bool | None = None,
     ) -> None:
+        self.india_playbook = _india_playbook_on() if india_playbook is None else india_playbook
+        # Set by the engine only under the India playbook.
+        self.time_offer_turn: int | None = None
         self.decision_maker = decision_maker
         self.timeline_v3 = timeline_v3
         self.condition_named: list[dict[str, Any]] = []
@@ -4537,9 +4593,12 @@ class Negotiation:
                 self.refusals += 1
             if self.figure_challenged_turn is None and challenges_her_figure(text):
                 self.figure_challenged_turn = turn  # L3: "Who told you that?"
+        prior_deck_discount = any(item.net_usd in NET_PRICES_USD for item in self.offers)
         self.offers.extend(offers)
         newly: set[str] = set()
-        addressed = reasons_handled_in(text, self.decision_maker)
+        addressed = reasons_handled_in(
+            text, self.decision_maker, playbook=self.india_playbook,
+            prior_deck_discount=prior_deck_discount)
         if REASON_DECISION_MAKER in addressed:
             self.decider_handled_turn = turn
         early = self.pre_window_decline_turn
@@ -4927,11 +4986,14 @@ class Negotiation:
         husband before anything moves forward" and "waiting feels more realistic" got "Okay, let's
         do it, I'll pay the deposit today" in the live sweep.  STRONG is for a learner who has no
         decider left to consult, is not waiting and did not turn a call down.
+        Owner 2026-11-20: a later time-limited deck offer can answer a prior wait.
         """
         if self.call_declined():
             return "call_declined"
         waited = self.wait_said_turn
-        if waited is not None and 0 <= turn - waited <= WAIT_RECENT_TURNS:
+        if (waited is not None and 0 <= turn - waited <= WAIT_RECENT_TURNS
+                and not (self.india_playbook and self.time_offer_turn is not None
+                         and self.time_offer_turn > waited)):
             return "learner_waiting"
         if self.decider_unresolved():
             return "decider_unresolved"

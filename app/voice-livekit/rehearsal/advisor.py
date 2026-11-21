@@ -29,7 +29,7 @@ from r1_world import AUDIENCE_ADVISOR, facts_for
 from rehearsal.flags import CLOSER_REASSURANCE, on
 
 ADVISOR_LEVELS = ("strong", "average", "weak", "pushy", "terse")
-EXTRA_LEVELS = ("closer",)
+EXTRA_LEVELS = ("closer", "closer_india")
 KNOWN_LEVELS = ADVISOR_LEVELS + EXTRA_LEVELS
 INTENTS = (
     "greet",
@@ -119,6 +119,25 @@ _LEVEL_BEHAVIOUR = {
         "what would help them decide."
     ),
 }
+_LEVEL_BEHAVIOUR["closer_india"] = (
+    _LEVEL_BEHAVIOUR["closer"]
+    .replace("You are an excellent closer.",
+             "You are an excellent closer who sells the IK India way.")
+    .replace(
+        "Invent no instalments, monthly amounts, refunds, guarantees, deadlines or seat counts.",
+        "When money comes up, offer no-cost EMI through partner banks at zero percent interest "
+        "and give the monthly figure: with the $1500 discount the fee is $7500, about $625 a "
+        "month over twelve months. Invent no refunds, guarantees, free extras, seat counts or "
+        "discount amounts other than $500, $1000 and $1500.",
+    )
+    .replace(
+        "From 13:00, once concerns are answered, ask whether she would like to enrol today and "
+        "offer the enrolment link and payment plan details now on the call.",
+        "From 13:00, once concerns are answered, make a one-day offer: the $1500 discount is "
+        "hers if she enrols today and is gone from tomorrow. Then ask whether she would like "
+        "to enrol today and offer the enrolment link and EMI details now on the call.",
+    )
+)
 # Iteration 3 (H4).  The terse simulator answered a learner's goodbye with 'Sure.' / 'Okay.' /
 # 'Mm-hmm.' twelve turns in a row, and the learner said goodbye nine times: a loop the simulator made.
 # After two hollow turns in a row (four words or fewer, no question) that follow a learner closer, the
@@ -283,7 +302,7 @@ def deck_brief() -> str:
 
 def _closer_behaviour(level: str) -> str:
     behaviour = _LEVEL_BEHAVIOUR[level]
-    if level == "closer" and on(CLOSER_REASSURANCE):
+    if level in ("closer", "closer_india") and on(CLOSER_REASSURANCE):
         behaviour = behaviour.replace(
             "Reassure with career support and mock interviews; nobody can guarantee a job.",
             "Reassure with the deck's proven track record of alumni success and success stories, "

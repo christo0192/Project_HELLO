@@ -8,12 +8,38 @@
  * coercive or contradicts the deck. This block is shown to the SCORER only. It is never
  * given to the learner model.
  *
+ * The owner decision of 2026-11-20 adds code-owned India playbook scorer guidance,
+ * not a deck fact; it is gated by R1_INDIA_PLAYBOOK.
+ *
  * Every number below is copied from the deck; do not add a fact the deck does not state.
  */
 
 import { createHash } from 'node:crypto';
+import { r1IndiaPlaybookEnabled } from './config.js';
+
+export { r1IndiaPlaybookEnabled };
 
 export const R1_DECK_FACTS_VERSION = 'r1-deck-facts-2026-10.1';
+export const R1_DECK_FACTS_VERSION_INDIA = 'r1-deck-facts-2026-11.1';
+
+/** Audit version: 2026-11.1 when the India playbook is on. */
+export function r1DeckFactsVersion(source: NodeJS.ProcessEnv = process.env): string {
+  return r1IndiaPlaybookEnabled(source) ? R1_DECK_FACTS_VERSION_INDIA : R1_DECK_FACTS_VERSION;
+}
+
+/** Code-owned playbook guidance, not a deck fact. */
+export const R1_INDIA_PLAYBOOK_TEXT =
+  'IK INDIA SALES PLAYBOOK (owner decision 2026-11-20): advisors may offer no-cost EMI, ' +
+  'monthly instalments, 0% interest, splitting the fee and a per-month figure; these are ' +
+  'legitimate payment plans, never invented terms and never pressure. A limited-time offer ' +
+  'or deadline (today only, early-bird, this cohort) that uses a $500, $1,000 or $1,500 ' +
+  'discount is legitimate urgency creation and counts as a prep-guide urgency lever; it is ' +
+  'never coercive. Still violations: a guaranteed job or placement, a refund or money-back ' +
+  'promise, a free course or perk, a discount amount outside $500/$1,000/$1,500 or above ' +
+  '$1,500, stacked discounts below $7,500, guilt-tripping, demanding a yes on the call, and ' +
+  'ignoring the learner\'s questions. Speech-to-text can mishear a discount figure: when the ' +
+  'advisor states a total of $8,500, $8,000 or $7,500, read the discount as the matching ' +
+  '$500, $1,000 or $1,500, even if the transcript or the administration log shows another figure.';
 
 /** Deck page 2: "Listed Price Details: $9000", "Applicable Discounts: $500, $1000, $1500". */
 export const R1_LIST_PRICE_USD = 9000;
@@ -62,14 +88,20 @@ export const R1_DECK_UNSTATED_TEXT =
   'of a job or refund, or an invented freebie is a violation.';
 
 /** The block embedded in the scorer prompt. */
-export function r1DeckFactsBlock(): string {
+export function r1DeckFactsBlockFor(indiaPlaybook: boolean): string {
   return [
     ...R1_DECK_FACTS_TEXT.map((fact) => `- ${fact}`),
     '',
     R1_DECK_UNSTATED_TEXT,
+    ...(indiaPlaybook ? ['', R1_INDIA_PLAYBOOK_TEXT] : []),
   ].join('\n');
 }
 
-export function r1DeckFactsSha(): string {
-  return createHash('sha256').update(r1DeckFactsBlock()).digest('hex');
+/** Flag-aware wrapper for the scorer prompt block. */
+export function r1DeckFactsBlock(source: NodeJS.ProcessEnv = process.env): string {
+  return r1DeckFactsBlockFor(r1IndiaPlaybookEnabled(source));
+}
+
+export function r1DeckFactsSha(source: NodeJS.ProcessEnv = process.env): string {
+  return createHash('sha256').update(r1DeckFactsBlock(source)).digest('hex');
 }

@@ -8895,6 +8895,131 @@ class NoCommitLedgerTests(unittest.TestCase):
         self.assertIn("before you agree", question_spec(AskKind.ENROL).brief)  # flag off
 
 
+class IndiaPlaybookEngineTests(unittest.TestCase):
+    def test_old_instalment_note_when_off(self):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_INDIA_PLAYBOOK": "0"}):
+            session = Session(engine())
+            session.say(OPENER, 20)
+            note = session.say(MONTHLY_EMI, 40).reminder
+            self.assertIn(P2.OFFER_TERMS_INSTALMENTS, note)
+            self.assertNotIn(P2.OFFER_TERMS_INSTALMENTS_V2, note)
+
+    def test_judge_prompt_flag(self):
+        for enabled in ("1", "0"):
+            with mock.patch.dict(r1_roleplay.os.environ, {"R1_INDIA_PLAYBOOK": enabled}):
+                eng = engine()
+                eng._invented_v2 = True
+                messages = eng.judge_messages("We offer EMI.", "")
+                self.assertEqual("Under the IK India sales playbook" in messages[0]["content"],
+                                 enabled == "1")
+
+
+class TimeOfferEngineTests(unittest.TestCase):
+    OFFER = "I can give you $1,500 off if you enrol today; the offer ends tonight."
+
+    @mock.patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "1"})
+    def test_open_ready_and_limit(self):
+        session = Session(engine())
+        session.say(OPENER, 20)
+        plan = session.say(self.OFFER, 40)
+        self.assertIn(P2.TIME_OFFER_OPEN_NOTE, plan.reminder)
+        self.assertNotIn(P2.TIME_OFFER_READY_NOTE, plan.reminder)
+        self.assertTrue(r1_roleplay._adds_pressure(self.OFFER, playbook=True))
+        self.assertEqual(session.eng.negotiation.time_offer_turn,
+                         session.eng.tracker.last_time_offer_turn)
+        with mock.patch.object(r1_roleplay, "strong_gaps", return_value=()):
+            plan = session.say(self.OFFER, 60)
+            self.assertIn(P2.TIME_OFFER_READY_NOTE, plan.reminder)
+            plan = session.say(self.OFFER, 80)
+            self.assertNotIn(P2.TIME_OFFER_READY_NOTE, plan.reminder or "")
+            self.assertNotIn(P2.TIME_OFFER_OPEN_NOTE, plan.reminder or "")
+
+    def test_flag_off(self):
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_INDIA_PLAYBOOK": "0"}):
+            session = Session(engine())
+            session.say(OPENER, 20)
+            plan = session.say("This discount is valid only for today.", 40)
+            self.assertTrue(session.eng.tracker.coercive_urgency)
+            self.assertNotIn(P2.TIME_OFFER_OPEN_NOTE, plan.reminder or "")
+
+    def test_timing_skip_tracks_offer_and_flag(self):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled), mock.patch.dict(
+                r1_roleplay.os.environ, {"R1_INDIA_PLAYBOOK": "1" if enabled else "0"}
+            ), mock.patch.object(r1_roleplay.RolePlayEngine, "_reasons_owned_by_f4",
+                                 return_value=frozenset()):
+                session = Session(engine())
+                session.say(OPENER, 20)
+                self.assertNotIn(NEG.REASON_TIMING, session.eng._stall_skip())
+                plan = session.say(self.OFFER, 40)
+                self.assertEqual(NEG.REASON_TIMING in session.eng._stall_skip(), enabled)
+                if not enabled:
+                    self.assertNotIn(P2.TIME_OFFER_OPEN_NOTE, plan.reminder or "")
+                    self.assertNotIn(P2.TIME_OFFER_READY_NOTE, plan.reminder or "")
+                    self.assertNotIn("time_offer_notes", session.eng.admin_log()["voice"])
+
+    @mock.patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "1"})
+    def test_capped_offer_stays_open(self):
+        session = Session(engine())
+        session.say(OPENER, 20)
+        session.say("You must decide now.", 30)
+        with mock.patch.object(r1_roleplay, "strong_gaps", return_value=("blocked",)), \
+                mock.patch.object(session.eng.negotiation, "decider_unresolved",
+                                  return_value=False):
+            plan = session.say(self.OFFER, 40)
+        self.assertIn(P2.TIME_OFFER_OPEN_NOTE, plan.reminder)
+        self.assertNotIn(P2.TIME_OFFER_READY_NOTE, plan.reminder)
+
+    @mock.patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "1"})
+    def test_capped_offer_ready_when_no_gaps(self):
+        session = Session(engine())
+        session.say(OPENER, 20)
+        with mock.patch.object(r1_roleplay, "strong_gaps", return_value=()), \
+                mock.patch.object(session.eng.negotiation, "decider_unresolved",
+                                  return_value=False):
+            plan = session.say(self.OFFER, 40)
+        self.assertIn(P2.TIME_OFFER_READY_NOTE, plan.reminder)
+
+    @mock.patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "0"})
+    def test_capped_offer_when_playbook_is_off(self):
+        session = Session(engine())
+        session.say(OPENER, 20)
+        session.say("You must decide now.", 30)
+        plan = session.say(self.OFFER, 40)
+        self.assertNotIn(P2.TIME_OFFER_OPEN_NOTE, plan.reminder or "")
+        self.assertNotIn(P2.TIME_OFFER_READY_NOTE, plan.reminder or "")
+
+    def test_time_offer_is_not_a_back_off(self):
+        levers, _ = r1_roleplay.urgency_levers(self.OFFER, playbook=True)
+        self.assertIn("seasonal_discount", levers)
+        self.assertIn("seasonal_discount", r1_roleplay._PRESSING_LEVERS)
+
+    @mock.patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "1"})
+    def test_lost_reply_returns_note(self):
+        session = Session(engine())
+        session.say(OPENER, 20)
+        first = session.eng.plan_turn(self.OFFER, 40)
+        self.assertIn(P2.TIME_OFFER_OPEN_NOTE, first.reminder)
+        session.eng.reply_lost(first)
+        heard = session.eng.plan_turn("That offer is valid till Friday.", 44)
+        count = sum(note in (heard.reminder or "") for note in
+                    (P2.TIME_OFFER_OPEN_NOTE, P2.TIME_OFFER_READY_NOTE))
+        self.assertEqual(session.eng.admin_log()["voice"]["time_offer_notes"], count)
+
+    def test_scripted_plan_does_not_add_offer_note(self):
+        session, r = run_cooperative(72.5, script=strong_script())
+        session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+        with mock.patch.object(session.eng, "_offer_extra_notes",
+                               wraps=session.eng._offer_extra_notes) as notes:
+            plan = session.eng.plan_turn(self.OFFER + " " + ASK, r)
+        if plan.mode is TurnMode.SAY_ONLY:
+            notes.assert_not_called()
+            self.assertNotIn(P2.TIME_OFFER_OPEN_NOTE, plan.reminder or "")
+            self.assertNotIn(P2.TIME_OFFER_READY_NOTE, plan.reminder or "")
+        else:
+            self.fail("Expected a scripted commitment plan")
+
+
 class OfferNotesTests(unittest.TestCase):
     """SWEEP-5 (R1_LEARNER_VOICE_V2 texts, R1_OFFER_TERMS) and SWEEP-13 (R1_OFFER_REALISM)."""
 
@@ -8907,12 +9032,13 @@ class OfferNotesTests(unittest.TestCase):
         self.assertNotIn("pleasantly surprised", plan.reminder)
         self.assertNotIn("better than you expected", plan.reminder)
 
+    @mock.patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "1"})
     def test_an_offer_with_instalments_gets_one_reaction_to_the_terms(self):
         s = Session(engine())
         s.say(OPENER, 20)
         plan = s.say(MONTHLY_EMI, 40)
         self.assertIn(P2.OFFER_TERMS_HEADER, plan.reminder)
-        self.assertIn(P2.OFFER_TERMS_INSTALMENTS, plan.reminder)
+        self.assertIn(P2.OFFER_TERMS_INSTALMENTS_V2, plan.reminder)
         again = s.say("And yes, the monthly EMI option is available for you.", 60)
         self.assertNotIn(P2.OFFER_TERMS_HEADER, again.reminder or "")  # once per session
         self.assertEqual(s.eng.admin_log()["voice"]["offer_terms_counts"], {"instalments": 1})
@@ -9154,7 +9280,7 @@ class S2CoverageTests(unittest.TestCase):
         from r1_personas import deep_need_topics_in, resolve_persona
 
         notes = [
-            P2.OFFER_TERMS_HEADER, P2.OFFER_TERMS_INSTALMENTS, P2.OFFER_TERMS_FREE_EXTRA,
+            P2.OFFER_TERMS_HEADER, P2.OFFER_TERMS_INSTALMENTS_V2, P2.OFFER_TERMS_FREE_EXTRA,
             P2.OFFER_TERMS_IN_PARTS,
             P2.NEW_OFFER_NOTE_V2, P2.NEW_OFFER_ABOVE_ASK_NOTE, P2.OFFER_ON_TABLE_NOTE_V2,
             P2.OFFER_MET_NOTE_V2, P2.IMPLAUSIBLE_PRICE_NOTE, P2.IMPLAUSIBLE_FREE_NOTE,
@@ -9382,16 +9508,17 @@ class S2ReviewFixTests(unittest.TestCase):
         self.assertEqual(only._preempted_label("F3"), "")
 
     @mock.patch.dict(r1_roleplay.os.environ, {"R1_COACH_AFTER_INROLE": "0"})  # Simulation diagnosis 3: the release before
+    @mock.patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "1"})
     def test_s2r6c_a_lost_reply_gives_its_s2_notes_back(self):
         """S2R-6: the heard reply after a lost one carries the notes nobody heard, counted once."""
         s = Session(engine())
         s.say(OPENER, 20)
         first = s.eng.plan_turn("I can do $8,000 and you can pay it in monthly EMI.", 40)
-        self.assertIn(P2.OFFER_TERMS_INSTALMENTS, first.reminder)
+        self.assertIn(P2.OFFER_TERMS_INSTALMENTS_V2, first.reminder)
         s.eng.reply_lost(first)
         heard = s.eng.plan_turn("That offer is valid till Friday.", 44)
         self.assertIn("split_replan", heard.reasons)
-        self.assertIn(P2.OFFER_TERMS_INSTALMENTS, heard.reminder)
+        self.assertIn(P2.OFFER_TERMS_INSTALMENTS_V2, heard.reminder)
         self.assertEqual(s.eng.admin_log()["voice"]["offer_terms_counts"], {"instalments": 1})
         low = Session(engine())
         low.say(OPENER, 20)
@@ -9436,7 +9563,7 @@ class S2ReviewFixTests(unittest.TestCase):
         s.say(OPENER, 20)
         plan = s.say("You can split the payment into two halves.", 40)
         self.assertIn(P2.OFFER_TERMS_IN_PARTS, plan.reminder)
-        self.assertNotIn(P2.OFFER_TERMS_INSTALMENTS, plan.reminder)
+        self.assertNotIn(P2.OFFER_TERMS_INSTALMENTS_V2, plan.reminder)
         self.assertNotIn("each month", plan.reminder)
 
     @s2p_off
@@ -16211,3 +16338,17 @@ class SpeculativeCopyTest(unittest.TestCase):
             timings.append(time.perf_counter() - start)
         print(f"speculative_copy median: {statistics.median(timings) * 1000:.3f} ms",
               file=sys.stderr)
+
+
+class DiscountTotalReconcileEngineTests(unittest.TestCase):
+    def test_flag_latches_and_prompt(self):
+        for value in ("0", "1"):
+            with mock.patch.dict(os.environ, {"R1_DISCOUNT_TOTAL_RECONCILE": value,
+                                               "R1_INVENTED_OFFER_V2": "1"}):
+                eng = engine(seed="reconcile")
+                with mock.patch.dict(os.environ, {"R1_DISCOUNT_TOTAL_RECONCILE": "0"}):
+                    self.assertEqual(eng._total_reconcile, value == "1")
+                    self.assertEqual(eng.tracker.total_reconcile, value == "1")
+                    prompt = eng.judge_messages("hi", "hi")[0]["content"]
+                    self.assertEqual("If the candidate states a total of $8500" in prompt,
+                                     value == "1")

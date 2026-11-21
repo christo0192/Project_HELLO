@@ -1,9 +1,19 @@
 import { describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
-import { getR1Config } from '../lib/r1/config.js';
+import { getR1Config, r1IndiaPlaybookEnabled } from '../lib/r1/config.js';
 import { createApp } from '../app.js';
 
 describe('R1 lazy configuration', () => {
+  it('defaults the India playbook on and accepts explicit off values without throwing', () => {
+    for (const value of [undefined, '', '1']) {
+      expect(r1IndiaPlaybookEnabled({ R1_INDIA_PLAYBOOK: value })).toBe(true);
+    }
+    for (const value of ['0', ' Off ', 'NO', 'false']) {
+      expect(r1IndiaPlaybookEnabled({ R1_INDIA_PLAYBOOK: value })).toBe(false);
+    }
+    expect(() => r1IndiaPlaybookEnabled({ R1_INDIA_PLAYBOOK: 123 } as unknown as NodeJS.ProcessEnv))
+      .not.toThrow();
+  });
   it('never throws and disables invalid values', () => {
     const spy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     expect(getR1Config({ R1_ENABLED: 'definitely' } as NodeJS.ProcessEnv)).toMatchObject({ enabled: false, status: 'invalid' });

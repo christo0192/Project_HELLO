@@ -647,3 +647,16 @@ describe('scoreOneR1Run in isolation', () => {
     expect(result.repaired).toBe(false);
   });
 });
+
+describe('India playbook scorer input', () => {
+  it('passes the rule to inference only when enabled', async () => {
+    for (const enabled of [true, undefined]) {
+      const seen: string[] = [];
+      await scoreR1Transcript({
+        infer: async (prompt) => { seen.push(prompt); return modelAnswer(rows, allScores(3)); },
+        runs: 1,
+      }, { ...input(), deckFacts: 'facts', indiaPlaybook: enabled });
+      expect(seen[0]!.includes('- Apply the IK INDIA SALES PLAYBOOK')).toBe(enabled === true);
+    }
+  });
+});

@@ -16,6 +16,9 @@ import {
   r1ScorecardMatchesRubric,
 } from '../lib/r1/rubric.js';
 import {
+  R1_INDIA_PLAYBOOK_TEXT,
+  r1IndiaPlaybookEnabled,
+  r1DeckFactsVersion,
   R1_DECK_FACTS_TEXT,
   R1_DECK_FACTS_VERSION,
   R1_DISCOUNT_LADDER_USD,
@@ -164,6 +167,27 @@ describe('R1 rubric derivation (plan 6.1 + prep deck)', () => {
 });
 
 describe('R1 deck facts (owner decision: the deck is the only product source)', () => {
+  it('defaults to India guidance and honours all flag values', () => {
+    const block = r1DeckFactsBlock({});
+    for (const text of [R1_INDIA_PLAYBOOK_TEXT, 'no-cost EMI', '0% interest', 'limited-time offer']) {
+      expect(block).toContain(text);
+    }
+    expect(block.endsWith(R1_INDIA_PLAYBOOK_TEXT)).toBe(true);
+    expect(block).toContain(
+      'even if the transcript or the administration log shows another figure.',
+    );
+    for (const value of ['0', 'off', 'false', 'no', ' OFF ', 'No']) {
+      expect(r1DeckFactsBlock({ R1_INDIA_PLAYBOOK: value })).not.toContain('PLAYBOOK');
+    }
+    for (const value of ['1', 'on', '', 'yes', 'true', 'junk']) {
+      expect(r1IndiaPlaybookEnabled({ R1_INDIA_PLAYBOOK: value })).toBe(true);
+    }
+    expect(() => r1IndiaPlaybookEnabled()).not.toThrow();
+    expect(r1IndiaPlaybookEnabled({ R1_INDIA_PLAYBOOK: 42 } as unknown as NodeJS.ProcessEnv)).toBe(true);
+    expect(r1DeckFactsVersion({})).toBe('r1-deck-facts-2026-11.1');
+    expect(r1DeckFactsVersion({ R1_INDIA_PLAYBOOK: '0' })).toBe('r1-deck-facts-2026-10.1');
+  });
+
   it('copies the deck facts and flags what the deck does not state', () => {
     const block = r1DeckFactsBlock();
     for (const fact of [
@@ -205,7 +229,11 @@ describe('R1 provenance and pins', () => {
     expect(R1_RUBRIC_VERSION).toBe('r1-rubric-2026-10.2');
     expect(R1_DECK_FACTS_VERSION).toBe('r1-deck-facts-2026-10.1');
     expect(r1RubricSha()).toBe('b761b69cd498ea2d737bd669fc5a627ad9c82561bc19d0093ab60a928029605a');
-    expect(r1DeckFactsSha()).toBe('58709110831e5a54f373d864403b1d8fcb124cb237cc9bd155784bb2f66f45f5');
+    expect(r1DeckFactsSha({ R1_INDIA_PLAYBOOK: '0' })).toBe('58709110831e5a54f373d864403b1d8fcb124cb237cc9bd155784bb2f66f45f5');
+    // This pin covers the India playbook text.
+    expect(r1DeckFactsSha({})).toBe(
+      '9154a5716fb723254c9960487914cf460fce888a6bf65630244cbc6a2ef31493',
+    );
   });
 });
 

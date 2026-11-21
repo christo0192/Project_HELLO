@@ -46,7 +46,7 @@ import hashlib
 import os
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Mapping
 
@@ -79,7 +79,7 @@ from r1_text import (
     split_sentences,
     word_count,
 )
-from r1_world import DISCOUNTS_USD, PRICE_USD, URGENCY_LEVER_IDS, claims_guarantee
+from r1_world import DISCOUNTS_USD, NET_PRICES_USD, PRICE_USD, URGENCY_LEVER_IDS, claims_guarantee
 
 SENTINEL_PREFIX = "CANDIDATE"
 
@@ -645,6 +645,75 @@ _COERCIVE = re.compile(
     + r"|\b(?:available|valid|open|good) (?:for |until |till )?(?:today|tonight) only\b",
     re.IGNORECASE,
 )
+# Owner 2026-11-20, R1_INDIA_PLAYBOOK: urgency creation with a deck discount is a closing move,
+# not coercion.
+_TIME_LIMIT = re.compile(
+    r"\b(?:today only|tonight only|one[- ]day (?:only|offer|deal|discount|sale)|"
+    r"early[- ]?bird)\b"
+    r"|\b(?:just|only) for (?:today|tonight)" + _DAY_ENDS +
+    r"|\b(?:just|only) for (?:one day|24 hours)\b(?!\s+(?:a|per|each|every|in)\b)"
+    r"|\b(?:only (?:for |until |till )?|(?:available|valid|open|good) only "
+    r"(?:for |until |till )?)(?:today|tonight)" + _DAY_ENDS +
+    r"|\b(?:available|valid|open|good) (?:for |until |till )?(?:today|tonight) only\b"
+    r"|\b(?:offer|discount|price|pricing|deal)\b"
+    r"(?:(?!\b(?:that|which|who|includes?|covers?|comes? with|has|have|with)\b)"
+    r"[^.?!;]){0,40}?\b"
+    r"(?:ends?|expires?|closes?|is gone|will be gone|is over|is not available|isn't available|"
+    r"won't be available|will not be available|goes back|goes up|will go up|"
+    r"(?:is |are |stays? |remains? )?(?:valid|available|open|good|on) "
+    r"(?:only )?(?:until|till|through|for|by)|lasts? (?:until|till|through|only))"
+    r"\b[^.?!;]{0,25}?\b"
+    r"(?:today|tonight|tomorrow|this week|(?:at )?midnight|"
+    r"(?:mon|tues|wednes|thurs|fri|satur|sun)day|(?:the )?end of (?:the |this )?(?:day|week))\b"
+    r"|\bfrom tomorrow\b[^.?!;]{0,40}?\b"
+    r"(?:not available|unavailable|gone|back to|goes back|go back|full price|ends|no longer)\b"
+    r"|\bif you(?: are)?(?: don't| do not)? (?:enrol+|enroll|sign|join|register|decide|commit)"
+    r"\w*(?: up)?\b[^.?!;]{0,30}?\b(?:today|tonight|this week|by (?:the end of )?"
+    r"(?:today|tonight|tomorrow|(?:mon|tues|wednes|thurs|fri|satur|sun)day|"
+    r"the weekend|this week))\b(?!'s)"
+    r"|\b(?:hold|keep|reserve|lock)\b[^.?!;]{0,30}?\b(?:offer|discount|price|deal)\b"
+    r"[^.?!;]{0,25}?\b(?:until|till|through)\b[^.?!;]{0,15}?\b"
+    r"(?:today|tonight|tomorrow|this week|(?:at )?midnight|"
+    r"(?:mon|tues|wednes|thurs|fri|satur|sun)day|(?:the )?end of (?:the |this )?(?:day|week))\b"
+    r"|\bthis (?:cohort|batch)(?:'s| only)\b[^.?!;]{0,30}?\b(?:offer|discount|price|deal)\b"
+    r"|\b(?:offer|discount|price|deal) (?:is )?(?:only )?for this (?:cohort|batch)\b"
+    r"|\boffer expires? (?:tonight|today|tomorrow)\b"
+    r"|\bprice (?:goes|will go) up (?:tomorrow|tonight|today)\b"
+    r"|\blast chance (?:for|to get|to grab|to avail)\b[^.?!;]{0,30}?\b"
+    r"(?:offer|discount|price|deal)\b", re.IGNORECASE,
+)
+_DEMAND = re.compile(
+    r"\b(?:now or never|no second chance)\b"
+    r"|\bmust (?:decide|sign|enrol+\w*|commit|pay) "
+    r"(?:right now|now|on this call)\b"
+    r"|\bmust (?:decide|sign|enrol+\w*|commit|pay) (?:today|tonight)\b"
+    r"(?!\s+to (?:get|grab|claim|avail|lock in|keep)\b"
+    r"(?:\s+\S+){0,5}\s+(?:offer|discount|deal|price|\$\s*\d))"
+    r"|\b(?:if you don't|if you do not|unless you) "
+    r"(?:sign|enrol+|decide|commit|pay)\w*(?: up)? "
+    r"(?:right now|now|on this call|before we hang up)\b"
+    r"|\b(?:i|we) need (?:your|a) (?:decision|yes|answer|commitment)(?: right)? "
+    r"(?:now|today|on this call|before we hang up)\b"
+    r"|\b(?:have|need|must|got) to (?:decide|say yes|commit|sign|enrol+\w*|pay)\b"
+    r"[^.?!;]{0,15}?\b(?:on this call|right now|now|before (?:we|you) hang up)\b", re.I,
+)
+_DEMAND_BARE = re.compile(
+    r"\blast chance\b|\byou(?:'ll| will) (?:lose|miss) (?:out|your)\b", re.I,
+)
+_GUILT = re.compile(
+    r"\byou(?:'ll| will| would|'d)? regret\b|\b(?:don't|do not) let me down\b"
+    r"|\bi (?:really )?thought you were serious\b"
+    r"|\b(?:you(?:'ll| will| would|'d)?|you're going to|you are going to|don't|do not) "
+    r"(?:get |be |end up |stay |fall )?left behind\b"
+    r"|\beveryone else\b[^.?!;]{0,30}?\b(?:signed|enrol+\w*|joined)\b"
+    r"|\byour (?:family|parents|husband|wife|father|mother) "
+    r"(?:expects?|is expecting|are expecting)\b"
+    r"|\bi(?:'ve| have) spent (?:a lot of|so much) time on you\b"
+    r"|\bwhat will your (?:family|parents|husband|wife|father|mother) think\b", re.I,
+)
+_OFFER_NOUN = re.compile(r"\b(?:offer|discount|deal|price|pricing|early[- ]?bird)\b", re.I)
+_OFFER_WORD = re.compile(_OFFER_NOUN.pattern + r"|\$\s?\d", re.I)
+
 # L6 (mock call aa166f09, turn 84): "if you wanted to see that later, then you will have to pay
 # $13000".  A price later is coercive only as a threat or a comparison (review fix): "more" or
 # "higher" about the price (never "nothing more" / "no extra", nor a plan's surcharge), or "have
@@ -772,6 +841,7 @@ class DiscountMention:
     usd: int
     conditional: bool
     sentence_index: int
+    heard_usd: int | None = None
 
 
 def _amount_usd(digits: str, thousands: str | None) -> int | None:
@@ -798,7 +868,9 @@ def _declined(folded: str, match: re.Match[str], *, verb_in_match: bool) -> bool
     return bool(_ASK_ECHO.search(before)) and has_refusal(folded[match.end() :])
 
 
-def parse_discounts(text: object, *, v3: bool | None = None) -> list[DiscountMention]:
+def parse_discounts(
+    text: object, *, v3: bool | None = None, reconcile: bool | None = None
+) -> list[DiscountMention]:
     """Dollar discounts the candidate OFFERS, parsed deterministically.
 
     Covers "$500 off", "a discount of $1,000", "discounts of $500, $1000 and $1500",
@@ -810,16 +882,26 @@ def parse_discounts(text: object, *, v3: bool | None = None) -> list[DiscountMen
     "1500 dollars", "1500 usd", "$1.5k", "fifteen hundred dollars", "ten percent"), so it
     does not matter how speech-to-text writes a number.  A refusal is not an offer: see
     ``_declined``.
+
+    R1_DISCOUNT_TOTAL_RECONCILE implements the owner decision of 2026-11-20: a
+    stated deck total resolves one adjacent misheard discount.
     """
+    if reconcile is None:
+        reconcile = os.getenv("R1_DISCOUNT_TOTAL_RECONCILE", "1").strip().lower() not in (
+            "0", "off", "false", "no"
+        )
     if v3 is None:
         v3 = os.getenv("R1_DISCOUNT_READ_V3", "1").strip().lower() not in (
             "0", "off", "false", "no"
         )
     sentences = split_sentences(text)
     mentions: list[DiscountMention] = []
+    origins: dict[int, tuple[set[int], set[int]]] = {}
     for index, sentence in enumerate(sentences):
         folded = canonical_amounts(sentence)
         amounts: list[int] = []
+        explicit: set[int] = set()
+        derived: set[int] = set()
         for pattern in (_DISC_BEFORE, _DISC_VERB, _NET_OFFER):
             for match in pattern.finditer(folded):
                 value = _amount_usd(match.group(1), match.group(2))
@@ -832,9 +914,12 @@ def parse_discounts(text: object, *, v3: bool | None = None) -> list[DiscountMen
                 if _declined(folded, match, verb_in_match=pattern is not _DISC_BEFORE):
                     continue
                 amounts.append(value)
+                (derived if pattern is _NET_OFFER else explicit).add(value)
         for match in _DISC_LIST.finditer(folded):
             if not _declined(folded, match, verb_in_match=False):
-                amounts.extend(dollar_amounts(match.group(1)))
+                values = dollar_amounts(match.group(1))
+                amounts.extend(values)
+                explicit.update(values)
         if v3:
             mixed_list = re.compile(
                 r"\b(?:discounts?|reductions?|rebates?)\s+(?:of|worth)\s+"
@@ -843,11 +928,15 @@ def parse_discounts(text: object, *, v3: bool | None = None) -> list[DiscountMen
             )
             for match in mixed_list.finditer(folded):
                 if not _declined(folded, match, verb_in_match=False):
-                    amounts.extend(int(n.replace(",", "")) for n in
-                                   re.findall(r"\d+(?:,\d{3})*", match.group(1)))
+                    values = [int(n.replace(",", "")) for n in
+                              re.findall(r"\d+(?:,\d{3})*", match.group(1))]
+                    amounts.extend(values)
+                    explicit.update(values)
         for match in _DISC_PERCENT.finditer(folded):
             if not _declined(folded, match, verb_in_match=False):
-                amounts.append(int(round(PRICE_USD * float(match.group(1)) / 100)))
+                value = int(round(PRICE_USD * float(match.group(1)) / 100))
+                amounts.append(value)
+                explicit.add(value)
         if not amounts:
             continue
         conditional = bool(_CONDITIONAL.search(folded))
@@ -864,29 +953,138 @@ def parse_discounts(text: object, *, v3: bool | None = None) -> list[DiscountMen
                     following,
                 )
             )
+        origins[index] = (explicit, derived)
         for value in sorted(set(amounts)):
             mentions.append(DiscountMention(value, conditional, index))
-    return mentions
+    if not reconcile:
+        return mentions
+    # Prefer a stated deck discount over a nearby net-offer approximation.
+    mentions = [m for m in mentions if not (
+        m.usd not in DISCOUNTS_USD and m.usd in origins[m.sentence_index][1]
+        and m.usd not in origins[m.sentence_index][0]
+        and PRICE_USD - m.usd >= min(NET_PRICES_USD)
+        and any(abs(m.usd - d) <= 500 for d in
+                origins[m.sentence_index][0] & set(DISCOUNTS_USD))
+    )]
+    nondeck = [m for m in mentions if m.usd not in DISCOUNTS_USD]
+    if (len(nondeck) == 1 and nondeck[0].usd in origins[nondeck[0].sentence_index][0]
+            and not origins[nondeck[0].sentence_index][0].intersection(DISCOUNTS_USD)):
+        totals: list[tuple[int, int, bool]] = []
+        for index, sentence in enumerate(sentences):
+            folded = canonical_amounts(sentence)
+            conditional = bool(_CONDITIONAL.search(folded))
+            seen: set[int] = set()
+            for match in re.finditer(r"\$\s*(\d[\d,]*)", folded):
+                value = int(match.group(1).replace(",", ""))
+                before = clause_before(folded, match.start())
+                total_cue = re.search(
+                    r"\b(?:total|comes? (?:down )?to|brings? it (?:down )?to|"
+                    r"you (?:pay|will pay|would pay)|you(?:'ll|'d) pay|"
+                    r"final (?:price|fee|amount)|net|"
+                    r"(?:fee|price|cost|amount) (?:becomes|is now|will be|would be)|"
+                    r"(?:i|we) can do it (?:for|at)|mak(?:es|ing) (?:it|the total)|"
+                    r"for (?:just|only))\b", before, re.I)
+                historical = re.search(
+                    r"\b(?:normally|usually|typically|others?|people|everyone|"
+                    r"last (?:year|batch|cohort|time)|used to|originally|list price|"
+                    r"was|were|paid)\b", before, re.I)
+                if (value in NET_PRICES_USD and value not in seen and total_cue
+                        and not historical
+                        and not _declined(folded, match, verb_in_match=False)):
+                    totals.append((value, index, conditional))
+                    seen.add(value)
+        distinct = {total for total, _, _ in totals}
+        if len(distinct) == 1:
+            old = nondeck[0]
+            nearby = [(index, cond) for _, index, cond in totals
+                      if abs(index - old.sentence_index) <= 1]
+            if nearby:
+                new = DiscountMention(PRICE_USD - next(iter(distinct)),
+                                      old.conditional or any(c for _, c in nearby),
+                                      old.sentence_index, old.usd)
+                mentions = [new if m is old else m for m in mentions]
+    dedup: dict[tuple[int, int], DiscountMention] = {}
+    for mention in mentions:
+        key = (mention.sentence_index, mention.usd)
+        if key not in dedup or mention.heard_usd is not None:
+            dedup[key] = mention
+    return [dedup[key] for key in sorted(dedup)]
 
 
-def urgency_levers(text: object) -> tuple[frozenset[str], bool]:
+def urgency_levers(text: object, *, playbook: bool | None = None) -> tuple[frozenset[str], bool]:
     """Deck urgency levers named in non-question sentences, and whether any is coercive."""
+    if playbook is None:
+        playbook = os.getenv("R1_INDIA_PLAYBOOK", "1").strip().lower() not in (
+            "0", "off", "false", "no"
+        )
     levers: set[str] = set()
     coercive = False
     for sentence in split_sentences(text):
-        if _COERCIVE.search(sentence) or _later_price_threat(sentence):
-            coercive = True
+        if playbook:
+            sentence = fold(sentence)
+            limited = bool(_TIME_LIMIT.search(sentence))
+            demand = any(not negated_before(sentence, m.start())
+                         for m in _DEMAND.finditer(sentence))
+            guilt = any(not negated_before(sentence, m.start())
+                        for m in _GUILT.finditer(sentence))
+            bare = any(not negated_before(sentence, m.start())
+                       for m in _DEMAND_BARE.finditer(sentence))
+            if (demand or guilt
+                    or (bare and not _OFFER_WORD.search(sentence))
+                    or _later_price_threat(sentence)
+                    or (limited and any(n > PRICE_USD for n in
+                                        dollar_amounts(canonical_amounts(sentence))))):
+                coercive = True
+        else:
+            if _COERCIVE.search(sentence) or _later_price_threat(sentence):
+                coercive = True
         if is_question_like(sentence):
             continue
+        if playbook and limited and _OFFER_WORD.search(sentence):
+            levers.add("seasonal_discount")
         for lever, pattern in URGENCY_RES.items():
             if pattern.search(sentence):
                 levers.add(lever)
     return frozenset(levers), coercive
 
 
+def time_limited_offer_in(
+    text: object, *, prior_deck_discount: bool = False, reconcile: bool | None = None
+) -> bool:
+    """Owner 2026-11-20 (R1_INDIA_PLAYBOOK): a deadline tied to a deck discount or net price.
+
+    Off-deck discounts do not count. A prior deck discount lets an offer noun
+    refer back to that discount without repeating its amount.
+    """
+    sentences = [fold(s) for s in split_sentences(text)
+                 if not is_question_like(s) and _TIME_LIMIT.search(fold(s))]
+    if not sentences:
+        return False
+    if urgency_levers(text, playbook=True)[1]:
+        return False
+    parsed = {m.usd for m in parse_discounts(text, reconcile=reconcile)}
+    if parsed - set(DISCOUNTS_USD):
+        return False
+    figures = {n for s in sentences for n in dollar_amounts(canonical_amounts(s))}
+    return bool(parsed & set(DISCOUNTS_USD) or figures & (set(DISCOUNTS_USD) | set(NET_PRICES_USD))
+                or (prior_deck_discount and any(_OFFER_NOUN.search(s) for s in sentences)))
+
+
+def _waives_only_interest(folded: str, match: re.Match) -> bool:
+    clause = clause_before(folded, match.start()) + match.group() + clause_after(
+        folded, match.end())
+    return bool(
+        re.search(r"\bwaiv(?:e|ed|es) (?:the )?interest\b|"
+                  r"\binterest (?:is|will be|gets|can be) waived\b", clause, re.I)
+        and not re.search(r"\b(?:fees?|registration|admission|enrol+ment|charges?|"
+                          r"tuition)\b", clause, re.I)
+    )
+
+
 def invented_offer_in(
     text: object, *, v2: bool = False, perk_history: bool | None = None,
-    discount_v3: bool | None = None,
+    discount_v3: bool | None = None, reconcile: bool | None = None,
+    india_playbook: bool | None = None,
 ) -> bool:
     """A free extra, a guarantee, or a discount outside the deck's $500/$1000/$1500 set.
 
@@ -895,6 +1093,10 @@ def invented_offer_in(
     with a negator earlier in its clause is ignored.  Flagging them would cap a candidate
     for saying exactly what the deck wants said (S0-B: 24% of advisor turns had one).
     """
+    if india_playbook is None:
+        india_playbook = os.getenv("R1_INDIA_PLAYBOOK", "1").strip().lower() not in (
+            "0", "off", "false", "no"
+        )
     if perk_history is None:
         perk_history = os.getenv("R1_PERK_HISTORY", "1").strip().lower() not in (
             "0", "off", "false", "no"
@@ -903,6 +1105,9 @@ def invented_offer_in(
         folded = fold(sentence)
         if not v2:
             for match in _INVENTED.finditer(folded):
+                if (india_playbook and re.fullmatch(r"waiv(?:e|ed|es)", match.group(), re.I)
+                        and _waives_only_interest(folded, match)):
+                    continue
                 if not negated_before(folded, match.start()):
                     return True
         else:
@@ -923,6 +1128,9 @@ def invented_offer_in(
             for match in _FREE_CHARGE.finditer(folded):
                 before = clause_before(folded, match.start())
                 after = clause_after(folded, match.end())
+                if (india_playbook and re.search(
+                        r"\b(?:emis?|e\.m\.i|instal+ments?|interest)\b", before + after, re.I)):
+                    continue
                 if (not negated_before(folded, match.start())
                         and not _PERK_COMPARISON.search(before)
                         and not _PERK_LACKS.search(after)
@@ -931,6 +1139,9 @@ def invented_offer_in(
                             r"\b(?:extra|additional|bonus)\b", before, re.I))):
                     return True
             for match in _INVENTED_ALWAYS.finditer(folded):
+                if (india_playbook and re.fullmatch(r"waiv(?:e|ed|es)", match.group(), re.I)
+                        and _waives_only_interest(folded, match)):
+                    continue
                 if not negated_before(folded, match.start()):
                     return True
             for match in _FREE_PERK.finditer(folded):
@@ -965,7 +1176,7 @@ def invented_offer_in(
         return True
     return any(
         mention.usd not in DISCOUNTS_USD or mention.usd > DISCOUNT_CAP_USD
-        for mention in parse_discounts(text, v3=discount_v3)
+        for mention in parse_discounts(text, v3=discount_v3, reconcile=reconcile)
     )
 
 
@@ -2014,7 +2225,8 @@ def neutralise_candidate_text(text: object, sentinel: str) -> str:
 
 
 def build_judge_messages(
-    candidate_text: object, learner_last: object, *, seed: str, turn: int, v2: bool = False
+    candidate_text: object, learner_last: object, *, seed: str, turn: int, v2: bool = False,
+    reconcile: bool = False, playbook: bool = False
 ) -> list[dict[str, str]]:
     """Messages for the shadow judge.  JSON is requested in the prompt, not by a flag."""
     sentinel = sentinel_for(seed, turn)
@@ -2045,6 +2257,19 @@ def build_judge_messages(
             "promise, or a guaranteed job, placement or salary. The deck discounts, a payment "
             "plan, comparing the course with free online courses, and saying no guarantee is "
             "possible are NOT invented offers."
+        )
+    if v2 and reconcile:
+        system += (
+            " If the candidate states a total of $8500, $8000 or $7500, read the discount "
+            "as $500, $1000 or $1500 respectively, whatever discount figure is written "
+            "(speech-to-text often mishears it)."
+        )
+    if v2 and playbook:
+        system += (
+            " Under the IK India sales playbook these are also NOT invented offers: no-cost EMI, "
+            "monthly instalments, 0% or zero interest, interest-free payment, splitting the fee, "
+            "a monthly figure, and a limited-time offer (today only, early-bird, this cohort) "
+            "that uses $500, $1000 or $1500; such a limited-time offer is an urgency_lever."
         )
     user = (
         f"Learner's last line: {neutralise_candidate_text(learner_last, sentinel)}\n"
@@ -2138,6 +2363,7 @@ class TrackerObservation:
     value_statement: bool
     invented_offer: bool
     injection: bool
+    time_offer: bool = False
 
 
 # Narrow readers for payment options and past learner outcomes.
@@ -2169,6 +2395,48 @@ _PLAN_SPECIFICS = re.compile(
     r"|(?:zero|no|0\s*%)\s*interest|interest[- ]free|"
     r"(?:\$?\d[\d,]*(?:\s*dollars?)?\s*(?:a|per)\s*month))\b", re.I
 )
+# Owner 2026-11-20 (R1_INDIA_PLAYBOOK): India payment paths.
+_INDIA_PLAN = re.compile(
+    r"\b(?:no[- ]cost emis?|emis?|e\.m\.i|equated monthly instal+ments?|"
+    r"monthly instal+ments?|instal+ments?(?: (?:plans?|options?))?|"
+    r"(?:zero|no|0\s*%?)\s*(?:percent\s+)?interest(?!\s+in\b)|interest[- ]free|"
+    r"pay(?:ing)?(?: it)? (?:monthly|every month|per month|each month)|monthly payments?|"
+    r"(?:split(?:ting)?|spread(?:ing)?) (?:the|your) (?:fee|payments?|cost|amount)\b"
+    r"(?!\s+(?:with|between)\b)|"
+    r"\$?\d[\d,]*(?:\s*dollars?)?\s*(?:a|per|each|every)\s+month|financing options?)\b",
+    re.I,
+)
+# A payment path followed immediately by a negated copula is not offered.
+_INDIA_PLAN_NEGATED_AFTER = re.compile(
+    r"\s*(?:(?:options?|plans?|facilit(?:y|ies))\s+)?"
+    r"(?:(?:is|are|was|were)\s+(?:not|no longer|unavailable)\b|"
+    r"(?:isn't|aren't|wasn't|weren't)\b)", re.I,
+)
+# Existing personal debt is not an offer of a course payment path.
+_INDIA_PLAN_OWN_DEBT_BEFORE = re.compile(
+    r"\b(?:your|my|her|his|their)\s+(?:\w+\s+){0,2}?"
+    r"(?:loans?|car|home|house|mortgage|phone|existing|current|other|ongoing)\s+$", re.I,
+)
+
+
+def _india_plan_offered(folded: str) -> bool:
+    return any(
+        not negated_before(folded, match.start())
+        and not _INDIA_PLAN_NEGATED_AFTER.match(folded[match.end():])
+        and not _INDIA_PLAN_OWN_DEBT_BEFORE.search(clause_before(folded, match.start()))
+        and (not re.search(r"\b(?:a|per|each|every)\s+month\b", match.group()) or (
+            re.search(r"\b(?:pay\w*|payments?|emis?|instal+ments?|comes to|"
+                      r"works out to|fee|cost|price|total|plan|just|only|which is|"
+                      r"that's|that is)\b", folded, re.I)
+            and not re.search(r"\b(?:earn\w*|salar(?:y|ies)|mak(?:e|es|ing)(?!\s+it\b)|package|"
+                              r"ctc|income|stipend|take[- ]home|"
+                              r"(?:get|gets|getting) paid)\b",
+                              clause_before(folded, match.start())
+                              + clause_after(folded, match.end()), re.I)))
+        for match in _INDIA_PLAN.finditer(folded)
+    )
+
+
 _OUTCOME_SPECIFICS = re.compile(
     r"\b(?:every|everyone|all of|all our|each one of|without exception|"
     r"hundreds? of|\d[\d,]*(?:\.\d+)?\s*(?:%|percent|k\b|alumni|graduates|students)|"
@@ -2182,6 +2450,14 @@ _NET_RESULT = re.compile(
 )
 
 
+_INTEGRITY_CUE = re.compile(
+    r"\b(?:refund\w*|money[- ]back|guarantee\w*|promise\w*|assure\w*|placed|"
+    r"placements?|hired|jobs?|salar(?:y|ies)|(?<!interest[- ])free|complimentary|"
+    r"bonus|scholarships?|waiv\w*|laptops?|certificates?|risk[- ]free|no risk|"
+    r"rupees?|paisa|penny)\b|\b(?:give|return|hand|pay|send|get)\b"
+    r"(?:\s+\w+){0,3}\s+back\b(?!\s+to\s+(?:you|u)\b)", re.I)
+
+
 class CoverageTracker:
     """Shadow coverage state for one role-play (see the module docstring)."""
 
@@ -2189,6 +2465,7 @@ class CoverageTracker:
         self, persona: RenderedPersona, *, seed: str = "", invented_v2: bool = False,
         discipline_v2: bool = False, perk_history: bool = True,
         discount_read_v3: bool = True, strong_v2: bool | None = None,
+        total_reconcile: bool | None = None, india_playbook: bool | None = None,
     ) -> None:
         self.persona = persona
         self.seed = seed
@@ -2196,6 +2473,21 @@ class CoverageTracker:
         self.discipline_v2 = discipline_v2
         self.perk_history = perk_history
         self.discount_read_v3 = discount_read_v3
+        self.total_reconcile = total_reconcile if total_reconcile is not None else (
+            os.getenv("R1_DISCOUNT_TOTAL_RECONCILE", "1").strip().lower()
+            not in ("0", "off", "false", "no")
+        )
+        self.india_playbook = india_playbook if india_playbook is not None else (
+            os.getenv("R1_INDIA_PLAYBOOK", "1").strip().lower()
+            not in ("0", "off", "false", "no")
+        )
+        self._india_plan_turns: set[int] = set()
+        self.time_offer_turns: set[int] = set()
+        self.last_time_offer_turn: int | None = None
+        self._reconciled_turns: set[int] = set()
+        self._integrity_cue_turns: set[int] = set()
+        self._reconcile_explained: dict[int, set[int]] = {}
+        self._rule_invented_turns: set[int] = set()
         self.strong_v2 = strong_v2 if strong_v2 is not None else (
             os.getenv("R1_STRONG_EVIDENCE_V2", "1").strip().lower()
             not in ("0", "off", "false", "no")
@@ -2232,10 +2524,17 @@ class CoverageTracker:
         """Run the deterministic fast path on one candidate turn."""
         self.turn = turn if turn is not None else self.turn + 1
         update = self.gate.observe_candidate_turn(text, self.turn)
-        for sentence in split_sentences(text):
+        plan_this_turn = False
+        plan_sentences: set[int] = set()
+        sentences = split_sentences(text)
+        if _INTEGRITY_CUE.search(fold(text)):
+            self._integrity_cue_turns.add(self.turn)
+        for sentence_index, sentence in enumerate(sentences):
             canonical = canonical_amounts(expand_shorthand_amounts(sentence))
             discount_amounts = {
-                mention.usd for mention in parse_discounts(sentence, v3=self.discount_read_v3)
+                mention.usd for mention in parse_discounts(
+                    sentence, v3=self.discount_read_v3, reconcile=self.total_reconcile
+                )
             }
             self.fee_named |= any(
                 amount in {PRICE_USD, *(PRICE_USD - d for d in DISCOUNTS_USD)}
@@ -2249,9 +2548,23 @@ class CoverageTracker:
             matches = list(plan_pattern.finditer(folded))
             if re.search(r"\b(?:payment|discount|fee|price|cost)\b", sentence, re.I):
                 matches += list(PAYMENT_CHOICE_PATTERN.finditer(folded))
-            if (not (self.strong_v2 and _PLAN_SPECIFICS.search(folded))
+            if (not (not self.india_playbook and self.strong_v2
+                     and _PLAN_SPECIFICS.search(folded))
                     and any(not negated_before(folded, match.start()) for match in matches)):
                 self.payment_plan_named = True
+                plan_this_turn = True
+                plan_sentences.add(sentence_index)
+                if self.payment_plan_turn is None:
+                    self.payment_plan_turn = self.turn
+            if self.india_playbook and (
+                not is_question_like(sentence) or re.search(
+                    r"\b(?:would you like|shall i|can i (?:set|send|put)|do you want me to)\b",
+                    sentence, re.I)
+            ) and _india_plan_offered(folded):
+                self.payment_plan_named = True
+                plan_this_turn = True
+                plan_sentences.add(sentence_index)
+                self._india_plan_turns.add(self.turn)
                 if self.payment_plan_turn is None:
                     self.payment_plan_turn = self.turn
             for match in OUTCOME_PATTERN.finditer(folded):
@@ -2261,14 +2574,45 @@ class CoverageTracker:
         self.guarantee_claimed |= claims_guarantee(text)
         self._turn_had_question[self.turn] = update.question
         value_index = _first_value_sentence(text)
-        discounts = parse_discounts(text, v3=self.discount_read_v3)
+        discounts = parse_discounts(
+            text, v3=self.discount_read_v3, reconcile=self.total_reconcile
+        )
+        reverse_candidate = self.total_reconcile and any(
+            _NET_OFFER.search(canonical_amounts(sentence)) for sentence in split_sentences(text)
+        )
+        if (any(m.heard_usd is not None for m in discounts) or
+                (reverse_candidate and discounts != parse_discounts(
+                    text, v3=self.discount_read_v3, reconcile=False))):
+            self._reconciled_turns.add(self.turn)
+            previous = parse_discounts(text, v3=self.discount_read_v3, reconcile=False)
+            self._reconcile_explained[self.turn] = (
+                {m.heard_usd for m in discounts if m.heard_usd is not None}
+                | ({m.usd for m in previous} - {m.usd for m in discounts})
+            )
         if discount_question_open:
-            discounts = [DiscountMention(m.usd, True, m.sentence_index) for m in discounts]
+            discounts = [replace(m, conditional=True) for m in discounts]
+        if self.india_playbook and plan_this_turn:
+            def plan_applies(m: DiscountMention) -> bool:
+                sentence = sentences[m.sentence_index]
+                unconditional = re.search(
+                    r"\b(?:no strings|no conditions|regardless|either way|anyway|"
+                    r"whatever you (?:choose|decide|pick)|unconditional(?:ly)?)\b",
+                    sentence, re.I)
+                backref = re.match(
+                    r"\s*(?:with (?:it|that|this)|on (?:it|that|the emi)|for that)\b",
+                    sentence, re.I)
+                return not unconditional and (m.sentence_index in plan_sentences or (
+                    backref is not None and m.sentence_index - 1 in plan_sentences))
+
+            discounts = [replace(m, conditional=True) if plan_applies(m) else m
+                         for m in discounts]
         if self.discipline_v2:
             sentences = split_sentences(canonical_amounts(expand_shorthand_amounts(text)))
             previous_amounts: list[tuple[int, int, int]] = []
             for index, sentence in enumerate(sentences):
-                offered = {m.usd for m in parse_discounts(sentence, v3=self.discount_read_v3)}
+                offered = {m.usd for m in parse_discounts(
+                    sentence, v3=self.discount_read_v3, reconcile=self.total_reconcile
+                )}
                 figures = [(m.start(), m.end(), int(m.group(1).replace(",", "")))
                            for m in re.finditer(r"\$\s*(\d[\d,]*)", sentence)]
                 deck_list = {500, 1000, 1500}.issubset({v for _, _, v in figures})
@@ -2308,18 +2652,31 @@ class CoverageTracker:
                     "usd": mention.usd,
                     "conditional": mention.conditional,
                     "value_before": value_before,
+                    **({"heard_usd": mention.heard_usd}
+                       if mention.heard_usd is not None else {}),
                 }
             )
         if value_index is not None and self.first_value_turn is None:
             self.first_value_turn = self.turn
         value_statement = value_index is not None
-        levers, coercive = urgency_levers(text)
+        levers, coercive = urgency_levers(text, playbook=self.india_playbook)
         self.levers |= levers
         self.coercive_urgency = self.coercive_urgency or coercive
         invented = invented_offer_in(
             text, v2=self.invented_v2, perk_history=self.perk_history,
-            discount_v3=self.discount_read_v3,
+            discount_v3=self.discount_read_v3, reconcile=self.total_reconcile,
+            india_playbook=self.india_playbook,
         )
+        time_offer = False
+        if self.india_playbook:
+            prior = any(item["usd"] in DISCOUNTS_USD for item in self.discount_log
+                        if item["turn"] != self.turn)
+            time_offer = (time_limited_offer_in(text, prior_deck_discount=prior,
+                                               reconcile=self.total_reconcile)
+                          and not invented and self.turn not in self._stacked_turns)
+            if time_offer:
+                self.time_offer_turns.add(self.turn)
+                self.last_time_offer_turn = self.turn
         if self.invented_v2 and not invented and (
             re.search(r"\bfree\b|\bat no (?:extra |additional )?(?:cost|charge)\b",
                       fold(text), re.I)
@@ -2329,6 +2686,7 @@ class CoverageTracker:
             self._perk_shape_turns.add(self.turn)
         if self.invented_v2 and invented:
             self._rule_invented = True
+            self._rule_invented_turns.add(self.turn)
         self.invented_offer = self.invented_offer or invented
         injection = detect_injection(text)
         if injection:
@@ -2342,6 +2700,7 @@ class CoverageTracker:
             value_statement=value_statement,
             invented_offer=invented,
             injection=injection,
+            time_offer=time_offer,
         )
 
     def note_learner_text(
@@ -2351,6 +2710,9 @@ class CoverageTracker:
         return self.gate.note_learner_text(
             text, turn if turn is not None else self.turn, echoed=echoed
         )
+
+    def _playbook_judge_exempt(self, turn: int) -> bool:
+        return turn in self._india_plan_turns or turn in self.time_offer_turns
 
     def apply_judge(self, result: JudgeResult | None, judged_turn: int) -> bool:
         """Merge a validated judge result for ``judged_turn``; None changes nothing."""
@@ -2372,11 +2734,23 @@ class CoverageTracker:
             current = self.family_quality.get(family)
             self.family_quality[family] = value if current is None else max(current, value)
         if self.invented_v2:
-            if result.invented_offer:
+            amount = result.discount_offered_usd
+            safe_amount = amount is None or amount in DISCOUNTS_USD
+            explained = (
+                self.total_reconcile and judged_turn in self._reconciled_turns
+                and (safe_amount or amount in self._reconcile_explained.get(judged_turn, set()))
+            ) or (
+                self.india_playbook and self._playbook_judge_exempt(judged_turn) and safe_amount
+            )
+            judge_invented = result.invented_offer and not (
+                explained and judged_turn not in self._rule_invented_turns
+                and judged_turn not in self._integrity_cue_turns
+            )
+            if judge_invented:
                 self.judge_invented_turns += 1
             self.invented_offer = self.invented_offer or (
                 self.judge_invented_turns >= 2
-                or (result.invented_offer and judged_turn not in self._perk_shape_turns)
+                or (judge_invented and judged_turn not in self._perk_shape_turns)
                 or (self.judge_invented_turns >= 1 and self._rule_invented)
             )
         else:
@@ -2438,7 +2812,8 @@ class CoverageTracker:
             fee_named=self.fee_named,
             money_path=self.payment_plan_named or (
                 bool(self.discount_log) and self.discount_ok and not self.invented_offer
-                and any(item["turn"] not in self._specific_plan_turns for item in self.discount_log)
+                and (self.india_playbook or any(
+                    item["turn"] not in self._specific_plan_turns for item in self.discount_log))
                 and all(item["usd"] in DISCOUNTS_USD for item in self.discount_log)
             ),
             reassurance=(self._outcome_seen or bool(self.levers & {

@@ -313,6 +313,20 @@ _ADVISOR_GOODBYE = re.compile(
 )
 
 
+_SIGNOFF_TIME = (
+    r"(?:\d{1,2}(?::\d{2})?(?:\s*(?:am|pm))?|"
+    r"one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|noon|midnight)"
+)
+_ADVISOR_TIMED_GOODBYE = re.compile(
+    r"\b(?:see you (?:(?:both|all) )?(?:then|soon|tomorrow|tonight|later|at "
+    + _SIGNOFF_TIME + r"|on (?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))"
+    r"|(?:speak|talk) (?:(?:to|with) you )?(?:then|soon|tomorrow|tonight|later|at "
+    + _SIGNOFF_TIME + r")|catch you (?:then|soon|tomorrow|later)"
+    r"|until (?:then|tomorrow|" + _SIGNOFF_TIME + r")(?: then)?)\b(?=\s*[.!]?$)",
+    re.IGNORECASE,
+)
+
+
 def _candidate_said_goodbye(record: Mapping[str, Any]) -> bool:
     """Whether the candidate's last role-play turn (in role, as the advisor) said goodbye."""
     turns = [
@@ -321,7 +335,13 @@ def _candidate_said_goodbye(record: Mapping[str, Any]) -> bool:
     ]
     if not turns:
         return False
-    return bool(_ADVISOR_GOODBYE.search(str(turns[-1].get("text") or "")))
+    text = str(turns[-1].get("text") or "")
+    if _ADVISOR_GOODBYE.search(text):
+        return True
+    return any(
+        not sentence.rstrip().endswith("?") and _ADVISOR_TIMED_GOODBYE.search(sentence)
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", text)
+    )
 
 
 def _roleplay_end(

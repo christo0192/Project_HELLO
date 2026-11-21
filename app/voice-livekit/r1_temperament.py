@@ -45,7 +45,8 @@ DEFAULT_SIGNALS = ("N-SIG-PLAN",)
 
 CARD_LINE_PREFIX = "How you are as a buyer: "
 # Unbanked goal mismatch, payment method, discount and uncategorized objections are excluded;
-# there is no instalment plan, and the counter already covers discounts.
+# instalments (EMI) are offered under R1_INDIA_PLAYBOOK and are not a banked objection;
+# the counter already covers discounts.
 TEMPERAMENTS: tuple[Temperament, ...] = (
     Temperament(
         "deep_evaluator", "Deep evaluator", 0.40, ((2, 0.35), (3, 0.35), (4, 0.30)),

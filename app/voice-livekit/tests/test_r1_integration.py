@@ -6326,3 +6326,16 @@ class TestDiagnosis5IcebreakerWiring(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("hiring team", spoken)
         self.assertTrue(spoken.startswith("You mentioned leading a small team"), spoken)
+
+
+class DiscountTotalEventTests(unittest.TestCase):
+    def test_reconciled_amount_in_event(self):
+        from r1_tracker import CoverageTracker
+        tracker = CoverageTracker(resolve_persona("p1_career_switcher", variant="v1"),
+                                  total_reconcile=True)
+        tracker.observe_candidate_turn(
+            "We can take a 100 dollar discount, so your total is 8500 dollars.", 1)
+        rows = fidelity_events({"tracker": tracker.admin_view()}, {})
+        event = next(row for row in rows if row["event_type"] == "discount_detected")
+        self.assertEqual(event["payload"]["amount_usd"], 500)
+        self.assertEqual(event["payload"]["heard_usd"], 100)

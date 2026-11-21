@@ -636,6 +636,14 @@ OFFER_TERMS_INSTALMENTS = (
     "you may ask what it would come to each month; do not say why monthly would help, and do not "
     "call it affordable or workable before you hear that figure."
 )
+# Owner 2026-11-20 (R1_INDIA_PLAYBOOK): a normal payment option.
+OFFER_TERMS_INSTALMENTS_V2 = (
+    "They offered EMI or monthly instalments, a normal way to pay for a course. React in a few "
+    "words; you may sound relieved, and if they named no monthly figure, you may ask what it "
+    "would come to each month. Do not say why monthly would help, do not doubt it or ask who "
+    "provides it, and do not repeat its terms back as a fact."
+)
+
 # Review S2R-8: a split that is not monthly ("two halves", "half now and half later") gets no
 # monthly wording, which would hand her a course fact the advisor never said (D-M032-7).
 OFFER_TERMS_IN_PARTS = (
@@ -647,6 +655,19 @@ OFFER_TERMS_FREE_EXTRA = (
     "They added something for free. Acknowledge it briefly or ask one short question about it; do "
     "not repeat its details back as a fact."
 )
+# Owner 2026-11-20, R1_INDIA_PLAYBOOK: a limited-time deck offer is normal urgency; she never
+# rejects it as a deadline. The F4 objection and N-TIMING texts are unchanged.
+TIME_OFFER_OPEN_NOTE = (
+    "- The advisor's discount is for a limited time. That is a normal, fair offer: do not call it "
+    "pressure, and never say you won't decide because of a deadline or an offer ending. You may "
+    "say it is tempting, then ask about the one thing that is still unclear to you."
+)
+TIME_OFFER_READY_NOTE = (
+    "- The advisor's discount is for a limited time, and your questions have been answered. "
+    "A time-limited offer like this makes it easier for you to decide now: you may say so in your "
+    "own words. Do not agree to enrol or pay unless a system note gives you the exact words."
+)
+
 # SWEEP-13: a price far below anything she expected, or the course for free, gets a careful
 # buyer's surprise (the owner probed both: "a big drop, so it does catch my attention", and a
 # cost-management worry at $500).  On that turn only, at most twice a call.

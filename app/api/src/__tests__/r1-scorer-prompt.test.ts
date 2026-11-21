@@ -21,7 +21,7 @@ import { cleanLogRows, interviewRows, r1Scorecard } from './support/r1-scorer.js
 
 const SENTINEL = 'f'.repeat(18);
 
-function build(overrides: { rows?: ReturnType<typeof interviewRows>; logRows?: ReturnType<typeof cleanLogRows> } = {}) {
+function build(overrides: { rows?: ReturnType<typeof interviewRows>; logRows?: ReturnType<typeof cleanLogRows>; indiaPlaybook?: boolean; deckFacts?: string } = {}) {
   const turns = maskR1Turns(toR1Turns(overrides.rows ?? interviewRows()), "Ava O'Neil");
   const log = parseR1AdministrationLog(overrides.logRows ?? cleanLogRows());
   return buildR1ScorerPrompt({
@@ -30,12 +30,34 @@ function build(overrides: { rows?: ReturnType<typeof interviewRows>; logRows?: R
     turns,
     log,
     stats: computeTranscriptStats(turns),
-    deckFacts: r1DeckFactsBlock(),
+    deckFacts: overrides.deckFacts ?? r1DeckFactsBlock(),
+    indiaPlaybook: overrides.indiaPlaybook,
     sentinel: SENTINEL,
   });
 }
 
 describe('R1 scorer prompt', () => {
+  it('adds only the exact India playbook rule when enabled', () => {
+    const bullet = '- Apply the IK INDIA SALES PLAYBOOK in the prep-guide facts: never lower a score for ' +
+    'no-cost EMI, monthly instalments, 0% interest or a limited-time offer that uses the ' +
+    '$500/$1,000/$1,500 discounts; for "Urgency & close" such an offer is a prep-guide ' +
+    'lever used without coercion, and for "Negotiation & discount discipline" a deck ' +
+    'discount tied to EMI or to a limited-time offer is tied to a payment plan or an ' +
+    'urgency lever. A discount is tied only when the advisor makes it part of the EMI or ' +
+    'the limited-time offer. An unconditional discount is not tied just because EMI is also ' +
+    'mentioned.';
+    const deckFacts = r1DeckFactsBlock({ R1_INDIA_PLAYBOOK: '0' });
+    const defaultPrompt = build({ deckFacts });
+    const off = build({ deckFacts, indiaPlaybook: false });
+    const on = build({ deckFacts, indiaPlaybook: true });
+    expect(defaultPrompt).toBe(off);
+    expect(defaultPrompt.split('RULES:')[1]).not.toContain('IK INDIA SALES PLAYBOOK');
+    expect(on).toContain(bullet + '\n');
+    expect(on.indexOf(bullet)).toBeGreaterThan(on.indexOf('- Count the metric'));
+    expect(on.indexOf(bullet)).toBeLessThan(on.indexOf('- "rationale" must cite specifics'));
+    expect(on.replace(bullet + '\n', '')).toBe(off);
+  });
+
   it('labels the learner as simulated and never evidence, and the candidate as the advisor', () => {
     const prompt = build();
     expect(prompt).toContain('Learner (simulated by the AI; never evidence): Hello? Yes, this is Meera speaking.');

@@ -20,3 +20,15 @@ export function getR1Config(source: NodeJS.ProcessEnv = process.env): R1Config {
   report(reason);
   return { enabled: false, status: 'invalid', reason };
 }
+
+const R1_INDIA_PLAYBOOK_OFF = new Set(['0', 'off', 'false', 'no']);
+
+/**
+ * Owner decision 2026-11-20: the R1 post-session scorer follows the IK India sales playbook.
+ * On when unset, blank or any value other than 0/off/false/no (trimmed, any case).
+ * Never throws; read lazily, never by env.ts.
+ */
+export function r1IndiaPlaybookEnabled(source: NodeJS.ProcessEnv = process.env): boolean {
+  const raw: unknown = source === process.env ? process.env.R1_INDIA_PLAYBOOK : source?.R1_INDIA_PLAYBOOK;
+  return typeof raw !== 'string' || !R1_INDIA_PLAYBOOK_OFF.has(raw.trim().toLowerCase());
+}

@@ -2665,3 +2665,21 @@ def tearDownModule():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AdvisorSignoffTests(unittest.TestCase):
+    def test_signoffs_and_questions(self):
+        from rehearsal.full_metrics import _candidate_said_goodbye, _roleplay_end
+        yes = ("The $500 reduction lasts today. See you at seven.", "Thanks. Speak tomorrow.",
+               "See you both then.", "See you all on Friday.", "Talk tonight.", "Talk soon.",
+               "Speak then.", "Catch you tomorrow.", "Until seven then.",
+               "Talk with you later.", "Speak to you at eight.")
+        no = ("Shall we speak tomorrow?", "Can I see you at the demo?",
+              "I'll see you through the course.", "We can talk to you about the fees.")
+        for expected, cases in ((True, yes), (False, no)):
+            for text in cases:
+                with self.subTest(text=text):
+                    record = {"stop_reason": "farewell_exit", "roleplay_seconds": 766.0,
+                              "candidate_turns": [{"act": "advisor_turn", "phase": "roleplay", "text": text}]}
+                    self.assertEqual(_candidate_said_goodbye(record), expected)
+                    self.assertEqual(_roleplay_end(record, ["roleplay"])["ok"], expected)

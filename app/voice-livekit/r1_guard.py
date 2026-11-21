@@ -2444,6 +2444,7 @@ def _price_accepted(sentence: str, ctx: GuardContext) -> bool:
     return any(
         not negated_before(folded, match.start())
         and _DOUBT_FRAME.search(clause_before(folded, match.start())) is None
+        and not _concession_frames_v3(folded, match)
         and (os.getenv("R1_CONCESSION_CONDITION", "1").strip().lower()
              in ("0", "off", "false", "no")
              or _CONDITION_FRAME.search(clause_before(folded, match.start())) is None)
@@ -2498,7 +2499,10 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
     level = classify_learner_commitment(sentence)
     if level > ctx.commitment_cap:
         hits.append(_hit(COMMITMENT, f"level_{level.name.lower()}", sentence))
-    if has_concession(sentence):
+    if has_concession(sentence) and (
+        os.getenv("R1_CONCESSION_SUBQUESTION", "1").strip().lower() in ("0", "off", "false", "no")
+        or not _subquestion_settled(sentence, ctx.advisor_said)
+    ):
         hits.append(_hit(CONCESSION, "resolution_phrasing", sentence))
     question = is_question_like(sentence)
     card = _CARD_AMOUNTS_V2 if ctx.probe_first else _CARD_AMOUNTS
@@ -4201,6 +4205,57 @@ _CONDITION_FRAME = re.compile(
 )
 
 
+_DOUBT_FRAME_V3 = re.compile(
+    r"\b(?:(?:want|need|have|like|got) to feel (?:sure|certain|confident|comfortable)"
+    r"|i'?d (?:want|like) to (?:feel|know|see))\b", re.IGNORECASE,
+)
+_CONDITION_FRAME_V3 = re.compile(
+    r"\b(?:if|once|as long as|provided(?: that)?|unless|until|only if)\s+"
+    r"(?:i'm|i am|i feel|i felt|i was|i were|we're|we are)\s+"
+    r"(?:(?:really|fully|truly|completely)\s+)?(?:convinced|sure|certain|confident)\b",
+    re.IGNORECASE,
+)
+
+
+def _concession_frames_v3(folded: str, match: re.Match) -> bool:
+    """Recognize frames starting before the match, including a matched state word."""
+    if os.getenv("R1_CONCESSION_FRAMES_V3", "1").strip().lower() in (
+        "0", "off", "false", "no",
+    ):
+        return False
+    before = clause_before(folded, match.start())
+    # A state word such as "convinced" can itself be the concession match.
+    clause = before + match.group()
+    return any(
+        frame.start() < len(before)
+        for pattern in (_DOUBT_FRAME_V3, _CONDITION_FRAME_V3)
+        for frame in pattern.finditer(clause)
+    )
+
+
+_SUBQUESTION_REPLY = re.compile(
+    r"that (?:resolves|settles|addresses)|(?:resolves|addresses) my question", re.IGNORECASE,
+)
+_SUBQUESTION_ASK = re.compile(
+    r"\b(?:settle|answer|resolve|address|clear(?:s|ed)? up)s?\s+"
+    r"(?:that question|your question|the question|that one)\b", re.IGNORECASE,
+)
+
+
+def _subquestion_settled(sentence: str, advisor_said: tuple[str, ...]) -> bool:
+    """A factual question was settled, with no other concession in the reply."""
+    if not advisor_said or not _SUBQUESTION_REPLY.search(sentence):
+        return False
+    pattern = _CONCESSION_V2 if concession_read_v2() else _CONCESSION
+    if any(_SUBQUESTION_REPLY.fullmatch(match.group()) is None
+           for match in pattern.finditer(fold(sentence))):
+        return False
+    return any(
+        is_question_like(part) and _SUBQUESTION_ASK.search(part) is not None
+        for part in split_sentences(advisor_said[-1])
+    )
+
+
 def has_concession(text: object) -> bool:
     """True when ``text`` expresses resolution, acceptance or "you've convinced me".
 
@@ -4218,6 +4273,7 @@ def has_concession(text: object) -> bool:
     return any(
         not negated_before(folded, match.start())
         and _DOUBT_FRAME.search(clause_before(folded, match.start())) is None
+        and not _concession_frames_v3(folded, match)
         and (os.getenv("R1_CONCESSION_CONDITION", "1").strip().lower()
              in ("0", "off", "false", "no")
              or _CONDITION_FRAME.search(clause_before(folded, match.start())) is None)

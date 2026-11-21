@@ -279,7 +279,10 @@ import r1_world
 # 46: L-OPEN-HI, the hello without the hearing question (R1_OPENING_NO_HEARING_CHECK).
 # 47: Dex, the male interviewer, in the spoken lines (R1_INTERVIEWER_DEX, DEX_LINES).
 #     Also the Dex prompts: prefixes, wrap-up note, end-intent system, after-aside context.
-PINNED_CONTENT_SHA256 = "8dc0c3f6604e9b552e5e6ce3a4e5255c70a5d21f99a512daa83ab9fc6b5f9d19"
+# 48: pin the India money path and calmer instalment note.
+# 49: pin the time-limit, demand and guilt readers and the time-offer notes.
+# 50: IND-REV review fixes: narrow the demand and India money-path readers.
+PINNED_CONTENT_SHA256 = "7d10f0b225cd3cf996600c2f62ee1b98a5858173ba2179dafa5caf7d8c56b501"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -347,6 +350,10 @@ def _imports(path: Path) -> set[str]:
 
 
 class PinTests(unittest.TestCase):
+    def test_time_limit_manifest(self):
+        self.assertEqual(r1_content.manifest()["tracker"]["time_limit_pattern"],
+                         r1_tracker._TIME_LIMIT.pattern)
+
     def test_the_content_sha_is_pinned(self):
         self.assertEqual(
             r1_content.CONTENT_SHA256,
@@ -467,6 +474,9 @@ class PinTests(unittest.TestCase):
             (r1_prompts, "COACH_RESUME_NOTE", "- x"),
             (r1_prompts, "OFFER_ON_TABLE_NOTE_V2", "- {amount}"),
             (r1_prompts, "OFFER_TERMS_INSTALMENTS", "x"),
+            (r1_prompts, "OFFER_TERMS_INSTALMENTS_V2", "x"),
+            (r1_prompts, "TIME_OFFER_OPEN_NOTE", "x"),
+            (r1_prompts, "TIME_OFFER_READY_NOTE", "x"),
             (r1_prompts, "OFFER_TERMS_IN_PARTS", "x"),
             (r1_prompts, "IMPLAUSIBLE_FREE_NOTE", "- x"),
             (r1_prompts, "NOT_TODAY_RESERVED_NOTE", "- x"),
@@ -1075,6 +1085,11 @@ class FinalReviewRoundOnePinTests(unittest.TestCase):
         self.assertEqual(
             manifest["tracker"],
             {
+                "time_limit_pattern": r1_tracker._TIME_LIMIT.pattern,
+                "demand_pattern": r1_tracker._DEMAND.pattern,
+                "demand_bare_pattern": r1_tracker._DEMAND_BARE.pattern,
+                "guilt_pattern": r1_tracker._GUILT.pattern,
+                "offer_word_pattern": r1_tracker._OFFER_WORD.pattern,
                 "max_deep_offers": r1_tracker.MAX_DEEP_OFFERS,
                 "max_deep_misses": r1_tracker.MAX_DEEP_MISSES,
             },
@@ -1125,6 +1140,13 @@ class FinalReviewRoundOnePinTests(unittest.TestCase):
         finally:
             r1_commitment.UPGRADE_LINE = upgrade_line
         self.assertEqual(r1_content.content_sha256(), base)
+
+
+class IndiaPlanPinTests(unittest.TestCase):
+    def test_plan_pattern_is_in_manifest(self):
+        import r1_tracker
+        self.assertEqual(r1_content.manifest()["commitment"]["india_plan_pattern"],
+                         r1_tracker._INDIA_PLAN.pattern)
 
 
 if __name__ == "__main__":

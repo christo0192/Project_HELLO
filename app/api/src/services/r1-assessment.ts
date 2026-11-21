@@ -52,7 +52,9 @@ import { loadActiveRoleScorecard } from '../lib/scorecards/store.js';
 import { SCORE_MAX, type RoleScorecardVersion } from '../lib/scorecards/contracts.js';
 import { ScorecardValidationError } from '../lib/scorecards/domain.js';
 import { parseR1AdministrationLog, type R1AdminLogRow } from '../lib/r1/admin-log.js';
-import { R1_DECK_FACTS_VERSION, r1DeckFactsBlock } from '../lib/r1/deck-facts.js';
+import {
+  r1DeckFactsBlockFor, r1DeckFactsVersion, r1IndiaPlaybookEnabled,
+} from '../lib/r1/deck-facts.js';
 import { createR1Infer, r1ScoringModel } from '../lib/r1/deepseek-runner.js';
 import { parseEvidenceRef } from '../lib/r1/evidence.js';
 import {
@@ -233,11 +235,12 @@ function buildAuditMeta(
   gate: { passed: boolean; failures: readonly string[] },
   outcome: string,
   extra: { runsAgree?: boolean } = {},
+  deckFactsVersion?: string,
 ): AuditMeta {
   return {
     scorer_version: R1_SCORING_PROMPT_VERSION,
     rubric_version: R1_RUBRIC_VERSION,
-    deck_facts_version: R1_DECK_FACTS_VERSION,
+    deck_facts_version: deckFactsVersion ?? r1DeckFactsVersion(),
     model: r1ScoringModel(),
     outcome,
     thresholds: {
@@ -349,7 +352,7 @@ function buildPlaceholderPayload(input: PlaceholderInput): Record<string, unknow
         versions: {
           scorer: R1_SCORING_PROMPT_VERSION,
           rubric: R1_RUBRIC_VERSION,
-          deck_facts: R1_DECK_FACTS_VERSION,
+          deck_facts: r1DeckFactsVersion(),
         },
       },
     },
@@ -420,7 +423,7 @@ function buildScoredPayload(input: ScoredPayloadInput): Record<string, unknown> 
         versions: {
           scorer: R1_SCORING_PROMPT_VERSION,
           rubric: R1_RUBRIC_VERSION,
-          deck_facts: R1_DECK_FACTS_VERSION,
+          deck_facts: r1DeckFactsVersion(),
           model: r1ScoringModel(),
         },
       },
@@ -588,6 +591,7 @@ export async function runR1Assessment(
         gateFailures: ['no_candidate_speech'], now: now(),
       });
     }
+    const indiaPlaybook = r1IndiaPlaybookEnabled();
     const outcome = await scoreR1Transcript(
       { infer: options.infer ?? createR1Infer(), sentinel: options.sentinel },
       {
@@ -596,7 +600,8 @@ export async function runR1Assessment(
         turns: loaded.turns,
         log: loaded.log,
         stats,
-        deckFacts: r1DeckFactsBlock(),
+        deckFacts: r1DeckFactsBlockFor(indiaPlaybook),
+        indiaPlaybook,
         thresholds: settings.thresholds,
       },
     );
@@ -738,6 +743,10 @@ async function adoptStored(args: {
 }): Promise<R1AssessmentResult> {
   const { stored } = args;
   const r1 = rawR1(stored.raw);
+  const versions = r1.versions;
+  const deckFacts = versions && typeof versions === 'object'
+    ? (versions as Record<string, unknown>).deck_facts
+    : undefined;
   const recommendation = recommendationOf(stored.recommendation);
   const valid = r1.valid === true;
   const overall = stored.overall_score === null ? null : Number(stored.overall_score);
@@ -753,6 +762,8 @@ async function adoptStored(args: {
       args.settings.updatedAt,
       { passed: valid, failures: [] },
       'reused',
+      {},
+      typeof deckFacts === 'string' && deckFacts.trim() ? deckFacts : undefined,
     ),
     now: args.now(),
   });

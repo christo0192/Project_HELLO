@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
+
+import r1_tracker
 
 from r1_commitment import AskKind, Level, grade
 from r1_personas import resolve_persona
@@ -351,6 +355,7 @@ class UrgencyAndOfferTests(unittest.TestCase):
         levers, _ = urgency_levers("Do you know about the application deadline?")
         self.assertEqual(levers, frozenset())
 
+    @patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "0"})
     def test_coercive_pressure_is_flagged(self):
         for text in (
             "This is your last chance, the price goes up tomorrow.",
@@ -549,6 +554,7 @@ class TrackerTests(unittest.TestCase):
     def tracker(self) -> CoverageTracker:
         return CoverageTracker(PERSONA, seed="seed")
 
+    @patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "0"})
     def test_observe_runs_the_gate_and_the_deterministic_extractors(self):
         t = self.tracker()
         obs = t.observe_candidate_turn(
@@ -644,6 +650,7 @@ class TrackerTests(unittest.TestCase):
         self.assertTrue(evidence.discount_ok)
         self.assertEqual(grade(evidence), Level.MEDIUM)
 
+    @patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "0"})
     def test_coercive_urgency_is_not_a_legitimate_lever(self):
         t = self.tracker()
         t.observe_candidate_turn("We have limited enrollment spots, last chance, only today!", 1)
@@ -2081,6 +2088,7 @@ class WrapOfferAnswerTests(unittest.TestCase):
 class CoerciveS03Tests(unittest.TestCase):
     """Mock call aa166f09 (L6): a deadline of today and a higher price later are coercive."""
 
+    @patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "0"})
     def test_only_for_today_and_pay_more_later_are_coercive(self):
         for text in (
             "You can speak to your partner, but this discount is available only for today.",
@@ -2117,6 +2125,7 @@ class CoerciveS03Tests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(urgency_levers(text)[1])
 
+    @patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "0"})
     def test_the_seasonal_lever_said_honestly_keeps_its_credit(self):
         text = "This seasonal discount ends Friday; if you join later you will need to pay $9,000."
         self.assertIn("seasonal_discount", urgency_levers(text)[0])
@@ -2126,6 +2135,7 @@ class CoerciveS03Tests(unittest.TestCase):
         self.assertFalse(evidence.pressured)
         self.assertTrue(evidence.urgency_lever)
 
+    @patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "0"})
     def test_a_higher_price_later_said_as_a_comparison_is_coercive(self):
         for text in (
             "Later it will cost more.",
@@ -2519,31 +2529,35 @@ class StrongEvidenceReadersTests(unittest.TestCase):
         self.assertFalse(evidence.reassurance)
 
     def test_unrelated_plans_and_negation(self):
-        for text in ("What are your plans after the course?", "Plan your week around it.",
-                     "We don't have a payment plan.", "We don\u2019t have a payment plan.",
-                     "How do you plan to pay for it?",
-                     "Do you have plans to pay for it yourself?",
-                     "Is this part of your career plan?",
-                     "You could split the cost with your husband."):
-            with self.subTest(text=text):
+        for enabled in ("0", "1"):
+            with self.subTest(enabled=enabled), patch.dict(
+                    "os.environ", {"R1_INDIA_PLAYBOOK": enabled}):
+                for text in ("What are your plans after the course?", "Plan your week around it.",
+                             "We don't have a payment plan.", "We don\u2019t have a payment plan.",
+                             "How do you plan to pay for it?",
+                             "Do you have plans to pay for it yourself?",
+                             "Is this part of your career plan?",
+                             "You could split the cost with your husband."):
+                    with self.subTest(text=text):
+                        tracker = CoverageTracker(PERSONA)
+                        tracker.observe_candidate_turn(text)
+                        self.assertFalse(tracker.payment_plan_named)
                 tracker = CoverageTracker(PERSONA)
-                tracker.observe_candidate_turn(text)
-                self.assertFalse(tracker.payment_plan_named)
-        tracker = CoverageTracker(PERSONA)
-        tracker.observe_candidate_turn("$500 off if you enrol this week.")
-        self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).fee_named)
-        tracker.observe_candidate_turn("Our alumni are great people.")
-        tracker.observe_candidate_turn("Our graduates got really confused by data at first.")
-        self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).reassurance)
-        for text in ("Many of our graduates got hired within the year.",
-                     "Our alumni got new jobs after it."):
-            with self.subTest(text=text):
+                tracker.observe_candidate_turn("$500 off if you enrol this week.")
+                self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).fee_named)
+                tracker.observe_candidate_turn("Our alumni are great people.")
+                tracker.observe_candidate_turn(
+                    "Our graduates got really confused by data at first.")
+                self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).reassurance)
+                for text in ("Many of our graduates got hired within the year.",
+                             "Our alumni got new jobs after it."):
+                    with self.subTest(text=text):
+                        tracker = CoverageTracker(PERSONA)
+                        tracker.observe_candidate_turn(text)
+                        self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).reassurance)
                 tracker = CoverageTracker(PERSONA)
-                tracker.observe_candidate_turn(text)
-                self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).reassurance)
-        tracker = CoverageTracker(PERSONA)
-        tracker.observe_candidate_turn("We can split the fee into two payments.")
-        self.assertFalse(tracker.payment_plan_named)
+                tracker.observe_candidate_turn("We can split the fee into two payments.")
+                self.assertEqual(tracker.payment_plan_named, enabled == "1")
 
     def test_deck_discount_after_value_is_a_money_path(self):
         for amount, expected in ((500, True), (750, False)):
@@ -2607,26 +2621,32 @@ class ProofOneTrackerTests(unittest.TestCase):
 
 class ReviewEvidenceTests(unittest.TestCase):
     def test_money_and_outcomes(self):
-        for text in ("You can pay monthly, about $750 a month over twelve months, no interest.",
-                     "You can split the payment into twelve monthly instalments of 750 dollars.",
-                     "We have a payment plan, $750 a month with zero interest."):
+        with patch.dict("os.environ", {"R1_INDIA_PLAYBOOK": "0"}):
+            for text in ("You can pay monthly, about $750 a month over twelve months, "
+                         "no interest.",
+                         "You can split the payment into twelve monthly instalments of "
+                         "750 dollars.",
+                         "We have a payment plan, $750 a month with zero interest."):
+                tracker = CoverageTracker(PERSONA)
+                tracker.observe_candidate_turn(text)
+                self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).money_path, text)
+            for text in ("The discount depends on the payment plan you choose.",
+                         "There are a few payment plans, and I can send you the details."):
+                tracker = CoverageTracker(PERSONA)
+                tracker.observe_candidate_turn(text)
+                self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).money_path, text)
+            for text in ("Our alumni moved into data analyst roles, 95 percent of them "
+                         "within three months.",
+                         "95 percent of our alumni landed jobs at top tech companies within "
+                         "three months, with salaries over 150k.",
+                         "Every one of our graduates got a job."):
+                tracker = CoverageTracker(PERSONA)
+                tracker.observe_candidate_turn(text)
+                self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).reassurance, text)
             tracker = CoverageTracker(PERSONA)
-            tracker.observe_candidate_turn(text)
-            self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).money_path, text)
-        for text in ("The discount depends on the payment plan you choose.",
-                     "There are a few payment plans, and I can send you the details."):
-            tracker = CoverageTracker(PERSONA)
-            tracker.observe_candidate_turn(text)
-            self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).money_path, text)
-        for text in ("Our alumni moved into data analyst roles, 95 percent of them within three months.",
-                     "95 percent of our alumni landed jobs at top tech companies within three months, with salaries over 150k.",
-                     "Every one of our graduates got a job."):
-            tracker = CoverageTracker(PERSONA)
-            tracker.observe_candidate_turn(text)
-            self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).reassurance, text)
-        tracker = CoverageTracker(PERSONA)
-        tracker.observe_candidate_turn("Many of our alumni switched into analyst roles after the course.")
-        self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).reassurance)
+            tracker.observe_candidate_turn(
+                "Many of our alumni switched into analyst roles after the course.")
+            self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).reassurance)
 
     def test_invented_and_judge(self):
         for text in ("You will definitely get a job after this.", "You'll surely land a role.",
@@ -2723,3 +2743,470 @@ class ReviewEvidenceTests(unittest.TestCase):
                                              discount_question_open=True)
         self.assertTrue(obs.discounts[0].conditional)
         self.assertTrue(tracker.discount_ok)
+
+
+class ReconcileWorkTests(unittest.TestCase):
+    def test_repeated_prices_do_not_scan_totals(self):
+        text = "the price is $8,500 but i can do $7,500 " * 300
+        counts = []
+        for reconcile in (False, True):
+            with patch.object(r1_tracker, "_declined", wraps=r1_tracker._declined) as declined:
+                parse_discounts(text, reconcile=reconcile)
+                counts.append(declined.call_count)
+        self.assertEqual(counts[1], counts[0])
+
+    def test_repeated_misheard_discount_scans_each_total_once(self):
+        sentence = "we give a discount of $100 and the total is $8,500 "
+        counts = []
+        for reconcile in (False, True):
+            with patch.object(r1_tracker, "_declined", wraps=r1_tracker._declined) as declined:
+                result = parse_discounts(sentence * 300, reconcile=reconcile)
+                counts.append(declined.call_count)
+        self.assertLessEqual(counts[1] - counts[0], 2)
+        self.assertEqual(result, parse_discounts(sentence, reconcile=True))
+        self.assertEqual([(m.usd, m.heard_usd) for m in result], [(500, 100)])
+
+
+class ReconcileTotalTests(unittest.TestCase):
+    def test_reconcile_and_integrity(self):
+        from unittest.mock import patch
+        import os
+        cases = [
+            ("We can take a 100 dollar discount, so your total is 8500 dollars.", 500, 100),
+            ("We can take a hundred dollar discount, so your total is eight thousand "
+             "five hundred dollars.", 500, 100),
+            ("There is a $200 discount. That makes the total $8,000.", 1000, 200),
+            ("I can give you $100 off, so I can do it for $8,500.", 500, 100),
+            ("Ten percent off, so the total is $8,000.", 1000, 900),
+        ]
+        with patch.dict(os.environ, {"R1_DISCOUNT_TOTAL_RECONCILE": "1"}):
+            for text, amount, heard in cases:
+                with self.subTest(text=text):
+                    mentions = parse_discounts(text)
+                    self.assertEqual([(m.usd, m.heard_usd) for m in mentions], [(amount, heard)])
+                    self.assertFalse(invented_offer_in(text, v2=True))
+            self.assertEqual([m.usd for m in parse_discounts(
+                "$1,500 off, I can do it for $7,600.")], [1500])
+            for text in ("$2,000 off, so the total is $6,000.", "$100 off.",
+                         "$700 off and $300 off, total $8,000.",
+                         "We can do $100 off, but I can't make the total $8,500."):
+                self.assertTrue(invented_offer_in(text, v2=True), text)
+            for text, expected in (
+                ("I can do it for $6,000, or $8,500 with the standard discount.", [3000]),
+                ("I can do it for $8,600. Your total is $8,500.", [400]),
+                ("$100 off, or I can do it for $6,000, total $8,500.", [100, 3000]),
+            ):
+                with self.subTest(text=text):
+                    self.assertEqual([m.usd for m in parse_discounts(text)], expected)
+                    self.assertTrue(invented_offer_in(text, v2=True))
+            self.assertEqual(parse_discounts(cases[0][0], reconcile=False)[0].usd, 100)
+        with patch.dict(os.environ, {"R1_DISCOUNT_TOTAL_RECONCILE": "0"}):
+            self.assertEqual(parse_discounts(cases[0][0])[0].usd, 100)
+            self.assertEqual([m.usd for m in parse_discounts(
+                "$1,500 off, I can do it for $7,600.")], [1400, 1500])
+
+    def test_tracker_and_prompt(self):
+        tracker = CoverageTracker(PERSONA, invented_v2=True, total_reconcile=True)
+        tracker.observe_candidate_turn(
+            "We can take a 100 dollar discount, so your total is 8500 dollars.")
+        self.assertEqual(tracker.discount_log[0]["heard_usd"], 100)
+        self.assertFalse(tracker.invented_offer)
+        tracker.observe_candidate_turn("$500 off.")
+        self.assertNotIn("heard_usd", tracker.discount_log[1])
+        sentence = "If the candidate states a total of $8500"
+        self.assertIn(sentence, build_judge_messages("", "", seed="x", turn=1,
+                                                     v2=True, reconcile=True)[0]["content"])
+        self.assertNotIn(sentence, build_judge_messages("", "", seed="x", turn=1,
+                                                        v2=True)[0]["content"])
+
+    def test_previous_judge_prompt_and_tracker_when_off(self):
+        from unittest.mock import patch
+
+        args = ("", "")
+        kwargs = {"seed": "x", "turn": 1, "v2": False}
+        self.assertEqual(build_judge_messages(*args, reconcile=True, **kwargs),
+                         build_judge_messages(*args, **kwargs))
+        text = "We can take a 100 dollar discount, so your total is 8500 dollars."
+        explicit = CoverageTracker(PERSONA, invented_v2=True, total_reconcile=False)
+        with patch.dict("os.environ", {"R1_DISCOUNT_TOTAL_RECONCILE": "0"}):
+            default = CoverageTracker(PERSONA, invented_v2=True)
+            explicit.observe_candidate_turn(text)
+            default.observe_candidate_turn(text)
+        self.assertEqual(explicit.admin_view(), default.admin_view())
+        offer = default.admin_view()["discounts"]["offers"][0]
+        self.assertEqual(offer["usd"], 100)
+        self.assertNotIn("heard_usd", offer)
+
+    def test_judge_and_admin(self):
+        text = "We can take a 100 dollar discount, so your total is 8500 dollars."
+        verdict = JudgeResult(invented_offer=True)
+        for enabled in (True, False):
+            tracker = CoverageTracker(PERSONA, invented_v2=True, total_reconcile=enabled)
+            tracker.observe_candidate_turn(text, 1, discount_question_open=True)
+            offer = tracker.admin_view()["discounts"]["offers"][0]
+            self.assertEqual(offer.get("heard_usd"), 100 if enabled else None)
+            tracker.apply_judge(verdict, 1)
+            self.assertEqual(tracker.judge_invented_turns, 0 if enabled else 1)
+            self.assertEqual(tracker.invented_offer, not enabled)
+        tracker = CoverageTracker(PERSONA, invented_v2=True, total_reconcile=True)
+        tracker.observe_candidate_turn("Our mentors provide feedback.", 1)
+        tracker.apply_judge(verdict, 1)
+        self.assertTrue(tracker.invented_offer)
+        self.assertEqual(tracker.judge_invented_turns, 1)
+
+
+@patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "1", "R1_DISCOUNT_TOTAL_RECONCILE": "1"})
+class IndiaReviewRegressionTests(unittest.TestCase):
+    def test_salary_is_not_a_payment(self):
+        for enabled in (True, False):
+            for text in (
+                "Analysts earn $3,000 a month after graduating.",
+                "You could make $2,500 a month as an analyst.",
+                "Freshers get paid about $1,000 a month.",
+                "Your package could be $3,000 per month.",
+            ):
+                with self.subTest(enabled=enabled, text=text):
+                    tracker = CoverageTracker(PERSONA, india_playbook=enabled)
+                    tracker.observe_candidate_turn(text)
+                    self.assertFalse(tracker.payment_plan_named)
+
+    def test_net_result_monthly_payment(self):
+        tracker = CoverageTracker(PERSONA, india_playbook=True)
+        tracker.observe_candidate_turn(
+            "With the $1,500 discount the fee is $7,500, making it about $625 a month.")
+        self.assertTrue(tracker.payment_plan_named)
+
+    def test_zero_percent_interest_remains_a_plan(self):
+        for enabled in (True, False):
+            tracker = CoverageTracker(PERSONA, india_playbook=enabled, total_reconcile=False)
+            tracker.observe_candidate_turn("We offer 0% interest.")
+            self.assertEqual(tracker.payment_plan_named, enabled)
+
+    def test_plan_must_apply_to_discount(self):
+        for enabled in (True, False):
+            for text in (
+                "I offer $1,500 off, no strings. We also have no-cost EMI.",
+                "I offer $1,000 off regardless, and we have EMI too.",
+            ):
+                tracker = CoverageTracker(PERSONA, india_playbook=enabled)
+                tracker.observe_candidate_turn(text)
+                self.assertFalse(tracker.discount_log[0]["conditional"], text)
+
+    def test_plan_discount_is_conditional(self):
+        for enabled in (True, False):
+            for text in ("We have no-cost EMI. With it you get $500 off.",
+                         "With EMI we give $500 off, total $8,500."):
+                with self.subTest(enabled=enabled, text=text):
+                    tracker = CoverageTracker(PERSONA, india_playbook=enabled)
+                    tracker.observe_candidate_turn(text)
+                    self.assertEqual(tracker.discount_log[0]["conditional"], enabled)
+
+    def test_reconcile_does_not_hide_other_offers(self):
+        for enabled in (True, False):
+            for text, amounts in (
+                ("If you enrol I offer $3,000 off. Normally people pay $8,500.", {3000}),
+                ("I offer $1,500 off and another $700 off, total $7,500.", {700, 1500}),
+                ("Last year people paid $8,000. I offer $200 off.", {200}),
+            ):
+                with self.subTest(enabled=enabled, text=text):
+                    mentions = parse_discounts(text, reconcile=enabled)
+                    self.assertEqual({m.usd for m in mentions}, amounts)
+                    self.assertTrue(all(m.heard_usd is None for m in mentions))
+
+    def test_reconcile_higher_heard_amount(self):
+        text = "I offer $2,000 off, so your total is $8,500."
+        self.assertEqual([(m.usd, m.heard_usd) for m in parse_discounts(text, reconcile=True)],
+                         [(500, 2000)])
+        mentions = parse_discounts(text, reconcile=False)
+        self.assertEqual({m.usd for m in mentions}, {2000})
+        self.assertTrue(all(m.heard_usd is None for m in mentions))
+
+    def test_owner_reconciled_judge_amount(self):
+        text = "We can take a 100 dollar discount, so your total is 8500 dollars."
+        for enabled in (True, False):
+            tracker = CoverageTracker(PERSONA, invented_v2=True, india_playbook=enabled,
+                                      total_reconcile=enabled)
+            tracker.observe_candidate_turn(text, 1)
+            tracker.apply_judge(JudgeResult(invented_offer=True, discount_offered_usd=100), 1)
+            self.assertEqual(tracker.invented_offer, not enabled)
+            self.assertEqual(tracker.commitment_evidence(AskKind.ENROL).pressured, not enabled)
+
+    def test_get_back_to_you_is_not_a_refund(self):
+        for text, invented in (
+            ("We have no-cost EMI. I'll get back to you with the EMI details.", False),
+            ("We have no-cost EMI, and you can get your money back if it does not work out.",
+             True),
+        ):
+            with self.subTest(text=text):
+                tracker = CoverageTracker(PERSONA, invented_v2=True, india_playbook=True,
+                                          total_reconcile=True)
+                tracker.observe_candidate_turn(text, 1)
+                tracker.apply_judge(JudgeResult(invented_offer=True), 1)
+                self.assertEqual(tracker.invented_offer, invented)
+                self.assertEqual(tracker.commitment_evidence(AskKind.ENROL).pressured, invented)
+
+    def test_judge_integrity_and_amount(self):
+        for enabled in (True, False):
+            for text, amount in (
+                ("We offer EMI and return every rupee if you are not placed.", None),
+                ("Today only, $1,500 off, and we return every rupee if not placed.", None),
+                ("Today only, $1,500 off.", 2000),
+                ("A $100 discount makes the total $8,500.", 3000),
+            ):
+                with self.subTest(enabled=enabled, text=text):
+                    tracker = CoverageTracker(PERSONA, invented_v2=True, discipline_v2=True,
+                                              india_playbook=enabled, total_reconcile=enabled)
+                    tracker.observe_candidate_turn(text, 1)
+                    tracker.apply_judge(JudgeResult(invented_offer=True,
+                                                    discount_offered_usd=amount), 1)
+                    self.assertTrue(tracker.invented_offer)
+                    self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).pressured)
+
+    def test_waiving_other_fees(self):
+        for enabled in (True, False):
+            for v2 in (True, False):
+                for text in ("We waive the interest and the admission fee for you.",
+                             "We will waive the registration fee and the interest."):
+                    self.assertTrue(invented_offer_in(text, v2=v2, india_playbook=enabled))
+
+    def test_timing_lever_requires_offer(self):
+        text = "If you enrol today you can start with Monday's batch."
+        for enabled in (True, False):
+            self.assertNotIn("seasonal_discount", urgency_levers(text, playbook=enabled)[0])
+        self.assertIn("seasonal_discount", urgency_levers(
+            "If you enrol today you get the $1,500 discount.", playbook=True)[0])
+
+    def test_offer_does_not_excuse_demands(self):
+        for enabled in (True, False):
+            for text in ("You must decide today, or the $1,500 discount is gone.",
+                         "You'll lose your seat and $1,500 discount if you don't sign right now.",
+                         "You must decide now."):
+                self.assertTrue(urgency_levers(text, playbook=enabled)[1], text)
+        self.assertFalse(urgency_levers(
+            "You must enrol today to get the $1,500 discount.", playbook=True)[1])
+
+
+class IndiaMoneyPathTests(unittest.TestCase):
+    @patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "1"})
+    def test_money_paths_and_probes(self):
+        for text, expected in (
+            ("You could split the cost with your husband.", False),
+            ("You could split the cost between you and your husband.", False),
+            ("EMI is not available for this course.", False),
+            ("The EMI option isn't available right now.", False),
+            ("Instalments are not possible, sorry.", False),
+            ("You mentioned your car loan EMI.", False),
+            ("Your existing EMIs must be a lot to handle.", False),
+            ("We offer an EMI option so that you don't have to pay it all at once.", True),
+            ("We can split the fee into two payments.", True),
+            ("You can pay your fee in EMIs.", True),
+            ("We have a no-cost EMI option, so you can pay monthly at zero percent "
+             "interest.", True),
+            ("You can split the fee into twelve monthly instalments of 625 dollars.", True),
+            ("With our bank partners it is 0% interest EMI.", True),
+            ("We don't have EMI right now.", False),
+            ("Do you need an EMI?", False),
+            ("Would you like me to set up the EMI for you?", True),
+            ("We start a new cohort every month.", False),
+            ("You said you study 20 hours a month.", False),
+            ("We have no interest in data.", False),
+            ("You can pay monthly, about $750 a month over twelve months, no interest.", True),
+            ("You can split the payment into twelve monthly instalments of 750 dollars.", True),
+            ("We have a payment plan, $750 a month with zero interest.", True),
+        ):
+            with self.subTest(text=text):
+                tracker = CoverageTracker(PERSONA, invented_v2=True, discipline_v2=True)
+                tracker.observe_candidate_turn(text)
+                evidence = tracker.commitment_evidence(AskKind.ENROL)
+                self.assertEqual(evidence.money_path, expected)
+                self.assertEqual(tracker.payment_plan_named, expected)
+                self.assertFalse(tracker.invented_offer)
+                self.assertFalse(evidence.pressured)
+
+    @patch.dict(os.environ, {"R1_INDIA_PLAYBOOK": "1"})
+    def test_invented_and_conditional(self):
+        self.assertFalse(invented_offer_in("We waive the interest on the EMI.", v2=False))
+        self.assertTrue(invented_offer_in(
+            "We waive the interest on the EMI.", v2=False, india_playbook=False))
+        self.assertTrue(invented_offer_in("We waive the fee for you.", v2=False))
+        for text in ("We offer EMI at no extra cost.", "We waive the interest on the EMI."):
+            self.assertFalse(invented_offer_in(text, v2=True))
+            self.assertTrue(invented_offer_in(text, v2=True, india_playbook=False))
+        for text in ("We give a free laptop at no extra cost.", "We waive the fee for you."):
+            self.assertTrue(invented_offer_in(text, v2=True))
+        for enabled in ("1", "0"):
+            with patch.dict("os.environ", {"R1_INDIA_PLAYBOOK": enabled}):
+                tracker = CoverageTracker(PERSONA, invented_v2=True, discipline_v2=True)
+                tracker.observe_candidate_turn(
+                    "I can give you $1,500 off, and you can pay it in EMIs.")
+                self.assertEqual(tracker.discount_log[0]["conditional"], enabled == "1")
+
+    def test_judge_prompt_and_exemption(self):
+        phrase = "Under the IK India sales playbook"
+        for v2, playbook in ((True, True), (False, True), (True, False)):
+            prompt = build_judge_messages("", "", seed="x", turn=1, v2=v2, playbook=playbook)
+            self.assertEqual(phrase in prompt[0]["content"], v2 and playbook)
+        for enabled in (True, False):
+            tracker = CoverageTracker(PERSONA, invented_v2=True, india_playbook=enabled)
+            tracker.observe_candidate_turn("We offer EMI.", 1)
+            tracker.apply_judge(JudgeResult(invented_offer=True), 1)
+            self.assertEqual(tracker.invented_offer, not enabled)
+            self.assertEqual(tracker.judge_invented_turns, int(not enabled))
+
+
+class UrgencyCreationTests(unittest.TestCase):
+    def test_no_deadline_is_fast(self):
+        from r1_tracker import time_limited_offer_in
+
+        # A turn with no deadline returns before the discount reader runs.
+        text = "the price is $8,500 but i can do $7,500 " * 500
+        start = time.perf_counter()
+        self.assertFalse(time_limited_offer_in(text))
+        self.assertLess(time.perf_counter() - start, 1.0)
+
+    def test_original_observation_with_playbook(self):
+        tracker = CoverageTracker(PERSONA, india_playbook=True)
+        obs = tracker.observe_candidate_turn(
+            f"{H1_PROBE} Our curriculum covers python. I can give you $500 off if you enrol "
+            "today. We have limited enrollment spots.", 1)
+        self.assertEqual(obs.levers, {"limited_spots", "seasonal_discount"})
+        self.assertTrue(obs.time_offer)
+
+    def test_honest_existing_examples(self):
+        for text in (
+            "Are you available today?", "You can pay later, you will not have to pay upfront.",
+            "Later on you can pay in instalments.",
+            "Pay $1,000 now and later you pay $700 a month.",
+            "Later it will cost you nothing extra, there are no hidden fees.",
+            "You can decide later, you will pay the same 9000.",
+            "If you want to upgrade later, you would have to pay $500 extra for the career module.",
+            "Our support team is available only now and then on weekends.",
+            "Our office is open only until today 6 pm, but you can call tomorrow.",
+            "The scholarship is there only for today and tomorrow.",
+            "Later it will cost you nothing more.",
+            "This seasonal discount ends Friday; if you join later you will need to pay $9,000.",
+            "The discount is for this batch only. Later you will have to pay the full price.",
+            "Later you will have to pay the full price.",
+            "You can pay the rest later, it costs $500 more in total for the EMI plan.",
+            "If you pay later in EMIs, it costs a little more because of the interest.",
+            "If you add it later, it costs $300 more for the mentoring module.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(urgency_levers(text, playbook=True)[1])
+
+    def test_reassurances_and_coercive_phrases(self):
+        for text in ("You don't have to decide now, take your time.",
+                     "You do not need to decide on this call.",
+                     "There is no need to commit right now.",
+                     "It's not now or never, the next cohort is fine too.",
+                     "Nobody gets left behind in our cohorts, mentors check in weekly.",
+                     "No one is left behind here.", "I don't think you'll regret it."):
+            with self.subTest(text=text):
+                self.assertFalse(urgency_levers(text, playbook=True)[1])
+        for text in ("you will be left behind if you wait", "Don't get left behind.",
+                     "You'd regret missing it."):
+            with self.subTest(text=text):
+                self.assertTrue(urgency_levers(text, playbook=True)[1])
+
+    def test_unrelated_availability_is_not_a_deadline(self):
+        from r1_tracker import time_limited_offer_in
+        for text in ("The price includes live sessions available every Friday.",
+                     "The price covers mentoring that is available on Friday.",
+                     "The deal includes recordings that are available until the end of the week.",
+                     "If you join today's session you will see the dashboard.",
+                     "Classes are only for one day a week.",
+                     "The scholarship is there only for today and tomorrow."):
+            with self.subTest(text=text):
+                self.assertFalse(urgency_levers(text, playbook=True)[0])
+                self.assertFalse(time_limited_offer_in(text, prior_deck_discount=True))
+
+    def test_more_offer_deadlines(self):
+        from r1_tracker import time_limited_offer_in
+        for text in ("This discount is valid only for today.",
+                     "The offer is valid only until tonight.",
+                     "The discount is only for today.", "This offer is valid until Friday.",
+                     "This offer is not available from tomorrow.",
+                     "From tomorrow the price goes back to $9,000.",
+                     "I can hold the $1,000 discount for you until Friday."):
+            with self.subTest(text=text):
+                self.assertIn("seasonal_discount", urgency_levers(text, playbook=True)[0])
+                self.assertTrue(time_limited_offer_in(text, prior_deck_discount=True))
+
+    def test_deck_deadlines_and_pressure(self):
+        from r1_tracker import time_limited_offer_in
+
+        for text in (
+            "One day only: enrol today and you get $1,500 off; from tomorrow the offer is gone.",
+            "The $1,000 early-bird offer ends Friday.",
+            "If you are enrolling in the program today, you get the $1,500 discount.",
+            "Today only you can have it at $7,500.",
+        ):
+            with self.subTest(text=text):
+                levers, pressure = urgency_levers(text, playbook=True)
+                self.assertFalse(pressure)
+                self.assertIn("seasonal_discount", levers)
+                self.assertTrue(time_limited_offer_in(text))
+                tracker = CoverageTracker(PERSONA, india_playbook=True)
+                tracker.observe_candidate_turn(text, 1)
+                self.assertFalse(tracker.commitment_evidence(AskKind.ENROL).pressured)
+                off = CoverageTracker(PERSONA, india_playbook=False)
+                off.observe_candidate_turn(text, 1)
+                self.assertFalse(off.time_offer_turns)
+        text = "This discount is valid only for today."
+        self.assertFalse(time_limited_offer_in(text))
+        self.assertTrue(time_limited_offer_in(text, prior_deck_discount=True))
+        tracker = CoverageTracker(PERSONA, invented_v2=True, discipline_v2=True,
+                                  india_playbook=True)
+        tracker.observe_candidate_turn("I can give you $1,000 off the fee.", 1)
+        obs = tracker.observe_candidate_turn(text, 2)
+        self.assertTrue(obs.time_offer)
+        self.assertEqual(tracker.last_time_offer_turn, 2)
+
+    def test_coercion_and_invented_discount(self):
+        for text in (
+            "I need your decision right now.", "You have to decide on this call.",
+            "Now or never.", "If you walk away today, you'll regret it.",
+            "I really thought you were serious about your career.",
+            "Everyone else in your position has already signed up.",
+            "Decide now or later you will have to pay $13000.",
+            "You must decide today or you'll lose out.",
+            "Today only, otherwise it will be $13,000.",
+            "We have limited enrollment spots, last chance, only today!",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(urgency_levers(text, playbook=True)[1])
+                tracker = CoverageTracker(PERSONA, india_playbook=True)
+                obs = tracker.observe_candidate_turn(text, 1)
+                self.assertTrue(tracker.commitment_evidence(AskKind.ENROL).pressured)
+                self.assertFalse(obs.time_offer)
+        self.assertFalse(urgency_levers(
+            "You'll miss out on the $1,500 discount if you don't enrol today.",
+            playbook=True)[1])
+        tracker = CoverageTracker(PERSONA, invented_v2=True, discipline_v2=True,
+                                  india_playbook=True)
+        obs = tracker.observe_candidate_turn("Today only, $2,000 off.", 1)
+        self.assertTrue(tracker.invented_offer)
+        self.assertFalse(obs.time_offer)
+
+    def test_judge_exemption_and_flag_off(self):
+        text = "Today only, $1,500 off."
+        for enabled in (True, False):
+            tracker = CoverageTracker(PERSONA, invented_v2=True, india_playbook=enabled)
+            tracker.observe_candidate_turn(text, 1)
+            tracker.apply_judge(JudgeResult(invented_offer=True), 1)
+            self.assertEqual(tracker.invented_offer, not enabled)
+            self.assertEqual(tracker.judge_invented_turns, int(not enabled))
+            self.assertEqual(bool(tracker.time_offer_turns), enabled)
+        tracker = CoverageTracker(PERSONA, invented_v2=True, india_playbook=False)
+        obs = tracker.observe_candidate_turn("This discount is valid only for today.", 1)
+        self.assertTrue(obs.coercive)
+        self.assertFalse(obs.time_offer)
+
+    def test_offer_deadline_and_bare_demand(self):
+        for text in ("The offer is valid only until tonight.",
+                     "The discount is only for today."):
+            levers, coercive = urgency_levers(text, playbook=True)
+            self.assertFalse(coercive)
+            self.assertIn("seasonal_discount", levers)
+        self.assertTrue(urgency_levers(
+            "We have limited enrollment spots, last chance, only today!", playbook=True)[1])

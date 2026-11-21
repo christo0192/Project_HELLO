@@ -16,12 +16,13 @@ the ``ready_button`` event, ``advisor_turn``, ``end_request``, ``end_decline``, 
 ``repeat_request``, ``backchannel``, ``transition_other``, ``wrapup_other`` and ``tactic``.
 
 Selection: ``parse_scenarios("strong,early-end")``; ``synthetic`` is every scenario of this module,
-``closer`` the skilled closer, ``wrapup`` both wrap-up runs, ``price`` both price runs,
-``early`` both early ends.  The manual library (``rehearsal.manual``) adds ``manual-M01`` ..
-``manual-M10``, ``manual-mix`` and the groups ``manual-replay``, ``manual`` and ``default`` (the
-manual scenarios, then the synthetic ones).  The adaptability scenarios (``rehearsal.adapt``) add
-the group ``adapt``, and ``default+adapt`` is ``default`` plus ``adapt``.  ``all`` stays the
-synthetic scenarios.
+``closer`` the skilled closers, ``india`` the India closer, ``wrapup`` both wrap-up runs,
+``price`` both price runs, ``early`` both early ends.  The manual library
+(``rehearsal.manual``) adds ``manual-M01`` .. ``manual-M10``, ``manual-mix`` and the groups
+``manual-replay``, ``manual`` and ``default`` (the manual scenarios, then the synthetic ones).
+The adaptability scenarios (``rehearsal.adapt``) add the group ``adapt``, and ``default+adapt``
+is ``default`` plus ``adapt``.  ``all`` stays the synthetic scenarios (``skilled-closer-india``
+is opt-in: by name or through ``india`` / ``closer``).
 """
 from __future__ import annotations
 
@@ -365,6 +366,16 @@ _add(
 )
 
 SCENARIO_NAMES = tuple(SCENARIOS)  # the synthetic edge scenarios (the manual library adds more)
+# Opt-in by name or the india and closer groups, so default live sweeps do not grow.
+_add(
+    Scenario(
+        "skilled-closer-india",
+        "A skilled closer selling the IK India way: discovery first, answers every concern, "
+        "offers no-cost EMI and a one-day $1,500 offer, then asks her to enrol.",
+        level="closer_india", style="strong", tags=("happy_path", "closer", "india_playbook"),
+        transition=(READY,), wrapup=(WRAP_DONE,),
+    )
+)
 GROUPS = {
     "all": SCENARIO_NAMES,
     "synthetic": SCENARIO_NAMES,
@@ -373,7 +384,8 @@ GROUPS = {
     "early": ("early-end", "early-end-late"),
     "abuse": ("abuse-once",),
     "pushy": ("pushy-discounter",),
-    "closer": ("skilled-closer",),
+    "closer": ("skilled-closer", "skilled-closer-india"),
+    "india": ("skilled-closer-india",),
     "button": ("button-mid-brief",),
 }
 

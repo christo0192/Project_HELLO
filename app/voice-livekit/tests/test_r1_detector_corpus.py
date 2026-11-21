@@ -612,6 +612,8 @@ class HostileTextTests(unittest.TestCase):
         ("we will call you back " * 900, "repeated call phrases"),
         ("i can send you the details " * 700, "repeated e-mail offers"),
         ("the price is $8,500 but i can do $7,500 " * 500, "repeated prices"),
+        ("we give a discount of $100 and the total is $8,500 " * 500,
+         "a misheard discount next to a total, repeated"),
         ("so, um, " * 3000 + "bye", "filler then a farewell"),
         ("$" + "9" * 30000, "one very long number"),
         ("," * 30000 + " ok?", "commas"),

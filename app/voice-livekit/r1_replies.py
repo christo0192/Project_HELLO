@@ -556,6 +556,8 @@ def fidelity_events(
                 "amount_usd": offer.get("usd"),
                 "conditional": offer.get("conditional"),
                 "value_before": offer.get("value_before"),
+                **({"heard_usd": offer["heard_usd"]}
+                   if offer.get("heard_usd") is not None else {}),
             },
         )
     for trip in guard_trips:

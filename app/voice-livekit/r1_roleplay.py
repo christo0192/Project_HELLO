@@ -326,6 +326,7 @@ from r1_prompts import (
     OFFER_TERMS_HEADER,
     OFFER_TERMS_IN_PARTS,
     OFFER_TERMS_INSTALMENTS,
+    OFFER_TERMS_INSTALMENTS_V2,
     PRESSURE_EASED_NOTE,
     PRESSURE_EASED_NOTE_V2,
     PRICE_MET_NOTE,
@@ -333,6 +334,8 @@ from r1_prompts import (
     PUSH_REACT_NOTE,
     PUSH_REACT_NOTE_V2,
     RESOLVED_NOTE,
+    TIME_OFFER_OPEN_NOTE,
+    TIME_OFFER_READY_NOTE,
     UPGRADE_CONDITION_NOTE,
     ROLE_CONFUSION_EXAMPLES,
     ROLE_CONFUSION_NOTE,
@@ -1311,6 +1314,12 @@ FLAG_PERSONA_TIMELINE_V3 = "R1_PERSONA_TIMELINE_V3"
 FLAG_PERK_HISTORY = "R1_PERK_HISTORY"
 # PROOF-1: recognize explicit discount lists as offers; 0 restores the previous reader.
 FLAG_DISCOUNT_READ_V3 = "R1_DISCOUNT_READ_V3"
+# Owner 2026-11-20: a discount next to a stated deck total reads as that deck discount; 0
+# restores the previous reader.
+FLAG_DISCOUNT_TOTAL_RECONCILE = "R1_DISCOUNT_TOTAL_RECONCILE"
+# Owner 2026-11-20 (IK India playbook): EMI, instalments and 0% interest are a money path; 0
+# restores the previous readers.
+FLAG_INDIA_PLAYBOOK = "R1_INDIA_PLAYBOOK"
 # PROOF-1: exclude learner conditions from concessions; 0 restores the previous reader.
 FLAG_CONCESSION_CONDITION = "R1_CONCESSION_CONDITION"
 
@@ -1370,9 +1379,13 @@ CURIOSITY_CUTOFF_BEFORE_CUE_SEC = 120
 LATE_CHECKIN_SEC = 840
 
 
-def _adds_pressure(text: str) -> bool:
+# Owner 2026-11-20, R1_INDIA_PLAYBOOK: at most two time-offer notes a call.
+TIME_OFFER_NOTE_LIMIT = 2
+
+
+def _adds_pressure(text: str, *, playbook: bool | None = None) -> bool:
     """D3-LRN-ACK1: the advisor's turn adds urgency (a lever, a coercive line, a later price)."""
-    levers, coercive = urgency_levers(text)
+    levers, coercive = urgency_levers(text, playbook=playbook)
     return bool(levers) or coercive or any(
         later_price_threat(sentence) for sentence in split_sentences(text)
     )
@@ -1483,6 +1496,8 @@ _FLAG_READS = {
     FLAG_MOVE_CONDITION: lambda: os.getenv("R1_MOVE_CONDITION"),
     FLAG_PERK_HISTORY: lambda: os.getenv("R1_PERK_HISTORY"),
     FLAG_DISCOUNT_READ_V3: lambda: os.getenv("R1_DISCOUNT_READ_V3"),
+    FLAG_DISCOUNT_TOTAL_RECONCILE: lambda: os.getenv("R1_DISCOUNT_TOTAL_RECONCILE"),
+    FLAG_INDIA_PLAYBOOK: lambda: os.getenv("R1_INDIA_PLAYBOOK"),
     FLAG_CONCESSION_CONDITION: lambda: os.getenv("R1_CONCESSION_CONDITION"),
     FLAG_PERSONA_TIMELINE_V3: lambda: os.getenv("R1_PERSONA_TIMELINE_V3"),
 }
@@ -1817,6 +1832,10 @@ class RolePlayEngine:
         self._move_condition = flag_on(FLAG_MOVE_CONDITION)
         self._perk_history = flag_on(FLAG_PERK_HISTORY)
         self._discount_read_v3 = flag_on(FLAG_DISCOUNT_READ_V3)
+        self._total_reconcile = flag_on(FLAG_DISCOUNT_TOTAL_RECONCILE)
+        self._india_playbook = flag_on(FLAG_INDIA_PLAYBOOK)
+        self._turn_time_offer = False
+        self._time_offer_notes = 0
         self._concession_condition = flag_on(FLAG_CONCESSION_CONDITION)
         self._condition_planned: list[dict[str, Any]] = []
         self._upgrade_condition_used = False
@@ -1841,6 +1860,8 @@ class RolePlayEngine:
             persona, seed=self.seed, invented_v2=self._invented_v2,
             discipline_v2=self._discipline_v2, perk_history=self._perk_history,
             discount_read_v3=self._discount_read_v3, strong_v2=self._strong_v2,
+            total_reconcile=self._total_reconcile,
+            india_playbook=self._india_playbook,
         )
         self.tracker.families_planned = families
         self.ledger = GuardLedger()
@@ -1918,8 +1939,10 @@ class RolePlayEngine:
         # on record.  ``_notes`` are this turn's situation notes for the reminder, and
         # ``_new_offer_usd`` the price an advisor turn added (the only "pleasant surprise" turn).
         self.negotiation = (
-            Negotiation(persona.decision_maker, max_stall_rounds=persona.temperament.stall_rounds)
-            if persona.temperament is not None else Negotiation(persona.decision_maker)
+            Negotiation(persona.decision_maker, max_stall_rounds=persona.temperament.stall_rounds,
+                        india_playbook=self._india_playbook)
+            if persona.temperament is not None
+            else Negotiation(persona.decision_maker, india_playbook=self._india_playbook)
         )
         self._notes: list[str] = []
         self._price_notes: list[str] = []
@@ -2850,6 +2873,7 @@ class RolePlayEngine:
             self.negotiation.rise_open_turn,
             self._price_reflexes,
             self._price_first_turns,
+            self._time_offer_notes,
         )
         resumed, self._after_coach = self._after_coach, False
         if break_kind == "ai":
@@ -2933,6 +2957,9 @@ class RolePlayEngine:
                 self._buying_signals and self._discount_question_turn == turn - 1
             ),
         )
+        self._turn_time_offer = self._india_playbook and obs.time_offer
+        if self._india_playbook:
+            self.negotiation.time_offer_turn = self.tracker.last_time_offer_turn
         known = (len(self._advisor_amounts), len(self._answered))
         # D3-LRN-PRICE1 (R1_FOREIGN_PRICE): a price in rupees is a price named, and no dollar
         # reader takes "fifteen thousand rupees" for $15,000.
@@ -4889,7 +4916,7 @@ class RolePlayEngine:
         if offers_something(text):
             kinds.add(RESPOND_OFFER)
         if backs_off(text):
-            levers, coercive = urgency_levers(text)
+            levers, coercive = urgency_levers(text, playbook=self._india_playbook)
             if not coercive and not levers & _PRESSING_LEVERS:
                 kinds.add(RESPOND_BACK_OFF)
         if asks_her_directly(text) and not negotiated.checkin and not challenges_learner(text):
@@ -4938,7 +4965,8 @@ class RolePlayEngine:
                         and self.turn - self._pressure_turn <= EASED_PRESSURE_TURNS
                     )
                 ) and not (
-                    RESPOND_QUESTION in kinds or "?" in reading or _adds_pressure(reading)
+                    RESPOND_QUESTION in kinds or "?" in reading
+                    or _adds_pressure(reading, playbook=self._india_playbook)
                 )
             else:
                 eased = (
@@ -5046,7 +5074,9 @@ class RolePlayEngine:
         if terms:
             clauses = {
                 TERM_INSTALMENTS: (
-                    OFFER_TERMS_INSTALMENTS if self._turn_terms_monthly else OFFER_TERMS_IN_PARTS
+                    (OFFER_TERMS_INSTALMENTS_V2 if self._india_playbook
+                     else OFFER_TERMS_INSTALMENTS)
+                    if self._turn_terms_monthly else OFFER_TERMS_IN_PARTS
                 ),
                 TERM_FREE_EXTRA: OFFER_TERMS_FREE_EXTRA,
             }
@@ -5054,9 +5084,16 @@ class RolePlayEngine:
             for term in terms:
                 self._terms_used.add(term)
                 self._terms_counts[term] = self._terms_counts.get(term, 0) + 1
+        if self._turn_time_offer and self._time_offer_notes < TIME_OFFER_NOTE_LIMIT:
+            gaps = set(strong_gaps(self._evidence(AskKind.ENROL)))
+            ready = not gaps
+            ready = ready and not self.negotiation.decider_unresolved()
+            notes.append(TIME_OFFER_READY_NOTE if ready else TIME_OFFER_OPEN_NOTE)
+            self._time_offer_notes += 1
         self._implausible_note = ""
         self._turn_terms = ()
         self._turn_terms_monthly = False
+        self._turn_time_offer = False
         return tuple(notes)
 
     def _give_back_s2(self, undo: tuple[Any, ...]) -> None:
@@ -5079,6 +5116,7 @@ class RolePlayEngine:
             rise_open,
             reflexes,
             price_first,
+            time_offer_notes,
         ) = undo
         self._after_coach = self._after_coach or after_coach
         # M032 S2P (review S2P-R4/R5): the dodge the lost half counted, the conflict it raised (a
@@ -5088,6 +5126,7 @@ class RolePlayEngine:
         self.negotiation.rise_open_turn = rise_open
         self._price_reflexes = reflexes
         self._price_first_turns = price_first
+        self._time_offer_notes = time_offer_notes
         self._implausible_count = count
         self._implausible_turn = turn
         self._terms_used = set(used)
@@ -6054,8 +6093,11 @@ class RolePlayEngine:
         The F4 pair's own reasons (see above), and the money stall once the price stopped being the
         worry: the $7,000 was met, or the learner called the cost the lesser worry ("The cost is
         still the sticking point for me" after "my worry is more about time than money").
+        A time-limited deck offer also suppresses the timing reason.
         """
         skip = set(self._reasons_owned_by_f4())
+        if self._india_playbook and self.tracker.last_time_offer_turn is not None:
+            skip.add(REASON_TIMING)
         if (self.negotiation.money_is_settled()
                 or (self.scheduler.families_planned is not None
                     and "F1" not in self.scheduler.families_planned)):
@@ -7914,7 +7956,8 @@ class RolePlayEngine:
             learner_last,
             seed=self.seed,
             turn=self.turn if turn is None else turn,
-            v2=self._invented_v2,
+            v2=self._invented_v2, reconcile=self._total_reconcile,
+            playbook=self._india_playbook,
         )
 
     def apply_judge(self, raw: Any, judged_turn: int) -> bool:
@@ -8130,6 +8173,7 @@ class RolePlayEngine:
                 "no_commit_notes": self._no_commit_notes,
                 "volunteered_timing_stalls": self._volunteered_timing,
                 "offer_terms_counts": dict(sorted(self._terms_counts.items())),
+                **({"time_offer_notes": self._time_offer_notes} if self._india_playbook else {}),
                 "ack_turn_notes": self._ack_turn_notes,
                 "soft_tic_trims": self._soft_tic_trims,
                 "implausible_offer_count": self._implausible_count,

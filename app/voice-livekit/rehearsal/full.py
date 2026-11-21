@@ -28,7 +28,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Mapping
 
 from rehearsal import HARNESS_VERSION, flags, flow_judge, vloop
-from rehearsal.call import _plan_summary, _suppressed_why, git_sha
+from rehearsal.call import _plan_summary, _suppressed_why, git_sha, integrity_summary
 from rehearsal.candidate import CandidateSim, ScenarioAdvisor, View, heard_since
 from rehearsal.llm import (
     BudgetExceeded,
@@ -193,6 +193,7 @@ async def run_full_call(spec: FullCallSpec, deps: FullDeps) -> dict[str, Any]:
         "events": [],
         "phase_trace": [],
         "admin_log": {},
+        "integrity": {},
         "admin_events": [],
         "session_facts": None,
         "guard_trips": [],
@@ -775,6 +776,7 @@ def _collect(rt: Runtime, interview: Any, writer: Any, record: dict[str, Any], l
     record["header"]["persona_variant"] = getattr(interview.persona, "variant_id", record["header"]["persona_variant"])
     if engine is not None:
         record["admin_log"] = engine.admin_log(final=True, r_end=float(machine.roleplay_elapsed))
+    record["integrity"] = integrity_summary(record["admin_log"], record.get("exchanges", []))
     record["guard_trips"] = [dict(trip) for trip in getattr(interview, "_guard_trips", [])]
     record["rows"] = transcript_rows(rt, writer)
     record["phase_trace"] = [

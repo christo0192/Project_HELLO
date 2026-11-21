@@ -4373,6 +4373,93 @@ class ProofOneConcessionTests(unittest.TestCase):
             self.assertTrue(has_concession("I can make time if I know it is worth it."))
 
 
+
+class ConcessionFramesV3Tests(unittest.TestCase):
+    DOUBT = "I want to feel sure it's worth it before paying."
+    CONDITION = "I can handle the fee, but only if I'm convinced it's the right step."
+
+    def test_doubt_and_conditions(self):
+        from unittest.mock import patch
+
+        texts = (
+            self.DOUBT,
+            self.CONDITION,
+            "I need to feel confident it's worth it before I decide.",
+            "I have to feel certain it's worth it first.",
+            "I'd want to feel it's worth it before I pay.",
+            "I'd like to know it's worth it before I pay.",
+            "I can proceed once I'm certain it's worth it.",
+            "I can proceed as long as I feel convinced it's right.",
+            "I won't proceed unless I'm convinced it's right.",
+            "I will wait until I'm convinced it's right.",
+        )
+        with patch.dict("os.environ", {"R1_CONCESSION_FRAMES_V3": "1"}):
+            for text in texts:
+                with self.subTest(text=text):
+                    self.assertFalse(has_concession(text))
+
+    def test_real_concessions(self):
+        from unittest.mock import patch
+
+        texts = (
+            "You've convinced me, let's do it.",
+            "I'm convinced.",
+            "I'm sure it's worth it.",
+            "Okay, that settles it, I'm on board.",
+            "That's worth every penny.",
+            "If you put it that way, I'm sold.",
+            "I feel sure it's worth it.",
+        )
+        with patch.dict("os.environ", {"R1_CONCESSION_FRAMES_V3": "1"}):
+            for text in texts:
+                with self.subTest(text=text):
+                    self.assertTrue(has_concession(text))
+
+    def test_flag_off_restores_detection(self):
+        from unittest.mock import patch
+
+        with patch.dict("os.environ", {"R1_CONCESSION_FRAMES_V3": "0"}):
+            for text in (self.DOUBT, self.CONDITION):
+                with self.subTest(text=text):
+                    self.assertTrue(has_concession(text))
+
+    def test_guard_honours_flag(self):
+        from unittest.mock import patch
+
+        for value, expected in (("1", False), ("0", True)):
+            with self.subTest(value=value):
+                with patch.dict("os.environ", {"R1_CONCESSION_FRAMES_V3": value}):
+                    rules = {hit.rule for hit in check_sentence(self.DOUBT, ctx())}
+                    self.assertEqual("resolution_phrasing" in rules, expected)
+
+
+    def test_price_acceptance_honours_flag(self):
+        from unittest.mock import patch
+
+        texts = (
+            "I want to feel sure I'll take the price.",
+            "Only if I'm convinced I'll take the price.",
+        )
+        for value, expected in (("1", False), ("0", True)):
+            with patch.dict("os.environ", {"R1_CONCESSION_FRAMES_V3": value}):
+                for text in texts:
+                    with self.subTest(value=value, text=text):
+                        self.assertEqual(r1_guard._price_accepted(text, ctx(price_memory=True)),
+                                         expected)
+
+    def test_environment_contract(self):
+        import json
+        from unittest.mock import patch
+
+        with patch.dict("os.environ", {"R1_CONCESSION_FRAMES_V3": "1"}):
+            schema = json.loads((HERE.parents[1] / "config" / "environment.schema.json")
+                                .read_text(encoding="utf-8"))
+            self.assertIn("R1_CONCESSION_FRAMES_V3",
+                          schema["components"]["voice-livekit"]["variables"])
+            self.assertIn("R1_CONCESSION_FRAMES_V3=1",
+                          (HERE / ".env.example").read_text(encoding="utf-8"))
+
+
 class EarlyReleaseTests(unittest.TestCase):
     def test_existing_split_strips_partial_sentence_trailing_space(self):
         guard = StreamGuard(ctx("opening"))
@@ -4635,3 +4722,19 @@ class EarlyReleaseTests(unittest.TestCase):
                         self.assertEqual(outputs[0], outputs[1])
                         self.assertEqual(guards[0].result, guards[1].result)
         self.assertGreater(early, 100)  # the property really exercised early releases
+
+
+class SubquestionConcessionTests(unittest.TestCase):
+    def test_question_resolution_and_other_concessions(self):
+        from unittest.mock import patch
+        advisor = "Does that settle that question for you?"
+        with patch.dict("os.environ", {"R1_CONCESSION_SUBQUESTION": "1"}):
+            self.assertNotIn("resolution_phrasing", rules_of("Yes, that settles it for me.", echo_ctx(advisor)))
+            for prompt, reply in (("Does that settle your concern?", "That settles it."),
+                                  ("Does that settle your worry?", "That settles it."),
+                                  (advisor, "I'm sold, that settles it."),
+                                  ("The projects are practical.", "That settles it.")):
+                with self.subTest(prompt=prompt, reply=reply):
+                    self.assertIn("resolution_phrasing", rules_of(reply, echo_ctx(prompt)))
+        with patch.dict("os.environ", {"R1_CONCESSION_SUBQUESTION": "0"}):
+            self.assertIn("resolution_phrasing", rules_of("That settles it.", echo_ctx(advisor)))
