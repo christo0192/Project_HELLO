@@ -26,6 +26,14 @@
 --   §10 r1_meet_create_round_from_ashby: the R1 round (through r1_send_round, channel meet), the
 --      HR-attested consent and the booking for one Ashby event, in one transaction; re-links a
 --      reusable Meet round after HR re-books. Never creates a call_sessions row.
+--   §11 r1_meet_reschedule_booking: a new slot or Meet link for a booking that holds no bot; moves
+--      the round's bounded expiry with it.
+--   §12 r1_meet_cancel_booking: cancels the booking ONLY; the round, its consent and the candidate
+--      are never touched.
+--   §13 r1_meet_set_bot: the Recall bot of a booking (attach, rotate_key, replace, release),
+--      compare-and-set on the bot generation (version) and the Idempotency-Key attempt.
+--   §14 r1_meet_transition_booking: the runtime status moves of S06, compare-and-set on the status.
+--   §15 r1_meet_bind_session: binds the admitted call session of the round to an in-call booking.
 --   §90 RLS on (no policy) and service-role-only privileges.
 --
 -- PII-minimal: ids, times, statuses, the canonical Meet URL and the Ashby user id of the HR
@@ -795,6 +803,502 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------------------------
+-- §11. r1_meet_reschedule_booking: a new slot or Meet link for a booking that holds no bot.
+-- ---------------------------------------------------------------------------------------------
+-- S06 calls this when Ashby moves the time or the Meet link of an event whose booking has a round.
+-- A booking that still holds a bot is refused (bot_attached): S06 deletes the bot at Recall, calls
+-- r1_meet_set_bot('replace') (a new bot generation), reschedules with that generation, then
+-- creates the next bot: the one path of the S01 hand-off. A dispatched bot (joining, a human
+-- present, in call) holds the slot (booking_dispatched). The first refusal wins:
+--   invalid_request (+field: meet_url, slot, grace, now) | not_found | booking_terminal |
+--   version_conflict (the bot generation moved) | stale_update (an older Ashby updatedAt) |
+--   booking_dispatched | bot_attached | no_round (a round-less booking retries through the create
+--   RPC) | not_allowed | in_past | slot_too_far (+retry_after; nothing changes, S06 marks the
+--   booking blocked/slot_too_far) | round_not_live (the round is not an invited or in-progress
+--   Meet round, or it has lapsed).
+-- Writes: the round's expiry (slot end + grace, at most 14 days ahead, and it may also shorten), its
+-- version and updated_at; the booking's slot, Meet link and Ashby updatedAt, back to
+-- pending/eligible. The booking version (the bot generation) is NOT bumped here. The round has not
+-- lapsed, so its hold still counts and stays in its month: no capacity re-check, as for a re-link.
+-- Never reissues the round link; no call_sessions row; time only from p_now.
+--
+-- Lock order: the booking row, then settings, the round's hold month (taken exactly as the round
+-- transitions take it), then the round: the admission order, after one booking.
+create or replace function screening_v2.r1_meet_reschedule_booking(
+  p_booking_id uuid,
+  p_expected_version integer,
+  p_start_at timestamptz,
+  p_end_at timestamptz,
+  p_meet_url text,
+  p_ashby_updated_at timestamptz,
+  p_expiry_grace_sec integer default 7200,
+  p_now timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_booking screening_v2.r1_meet_bookings%rowtype;
+  v_expires timestamptz;
+  v_hold_minutes numeric;
+  v_hold_month date;
+  v_uncounted boolean;
+  v_round screening_v2.interview_rounds%rowtype;
+begin
+  -- Validation (the create RPC's rules). Nothing is locked or written.
+  if p_meet_url is null or p_meet_url !~ '^https://meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}$' then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'meet_url');
+  end if;
+  if p_start_at is null or p_end_at is null or p_end_at <= p_start_at
+     or p_end_at > p_start_at + interval '24 hours' then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'slot');
+  end if;
+  if p_expiry_grace_sec is null or p_expiry_grace_sec not between 900 and 86400 then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'grace');
+  end if;
+  if p_now is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'now');
+  end if;
+
+  select * into v_booking
+    from screening_v2.r1_meet_bookings b
+   where b.id = p_booking_id
+   for update;
+  if not found then
+    return jsonb_build_object('status', 'not_found');
+  end if;
+  if v_booking.status in ('completed', 'cancelled', 'failed', 'drained') then
+    return jsonb_build_object('status', 'booking_terminal', 'booking_id', v_booking.id,
+                              'booking_status', v_booking.status, 'reason', v_booking.reason);
+  end if;
+  if v_booking.version is distinct from p_expected_version then
+    return jsonb_build_object('status', 'version_conflict', 'booking_id', v_booking.id,
+                              'version', v_booking.version, 'key_attempt', v_booking.key_attempt);
+  end if;
+  if p_ashby_updated_at < v_booking.ashby_updated_at then
+    return jsonb_build_object('status', 'stale_update', 'booking_id', v_booking.id);
+  end if;
+  if v_booking.status in ('bot_joining', 'human_present', 'in_call') then
+    return jsonb_build_object('status', 'booking_dispatched', 'booking_id', v_booking.id,
+                              'booking_status', v_booking.status);
+  end if;
+  if v_booking.recall_bot_id is not null then
+    return jsonb_build_object('status', 'bot_attached', 'booking_id', v_booking.id,
+                              'version', v_booking.version, 'key_attempt', v_booking.key_attempt);
+  end if;
+  if v_booking.round_id is null then
+    return jsonb_build_object('status', 'no_round', 'booking_id', v_booking.id,
+                              'booking_status', v_booking.status, 'reason', v_booking.reason);
+  end if;
+  if v_booking.status not in ('pending', 'blocked') then
+    return jsonb_build_object('status', 'not_allowed', 'booking_id', v_booking.id,
+                              'booking_status', v_booking.status);
+  end if;
+  if p_start_at <= p_now then
+    return jsonb_build_object('status', 'in_past', 'booking_id', v_booking.id);
+  end if;
+  v_expires := p_end_at + make_interval(secs => p_expiry_grace_sec);
+  if v_expires > p_now + interval '14 days' then
+    return jsonb_build_object('status', 'slot_too_far', 'booking_id', v_booking.id,
+                              'retry_after', v_expires - interval '14 days');
+  end if;
+
+  -- The round, in the admission order: settings, the round's hold month, the round.
+  perform 1 from screening_v2.r1_settings where singleton for update;
+  select r.held_minutes, r.hold_month, r.charged_attempt_number > r.attempts_counted
+    into v_hold_minutes, v_hold_month, v_uncounted
+    from screening_v2.interview_rounds r
+   where r.id = v_booking.round_id;
+  if v_hold_month is not null and (v_hold_minutes > 0 or v_uncounted) then
+    perform 1 from screening_v2.r1_budget_month where month_start = v_hold_month for update;
+  end if;
+  select * into v_round
+    from screening_v2.interview_rounds r
+   where r.id = v_booking.round_id
+   for update;
+  -- Live: the claim RPC's definition (an invited or in-progress Meet round that has not lapsed).
+  if not found
+     or v_round.channel <> 'meet'
+     or v_round.status not in ('invited', 'in_progress')
+     or v_round.expires_at <= p_now then
+    return jsonb_build_object('status', 'round_not_live', 'booking_id', v_booking.id,
+                              'round_id', v_booking.round_id);
+  end if;
+
+  update screening_v2.interview_rounds
+     set expires_at = v_expires, version = version + 1, updated_at = p_now
+   where id = v_round.id;
+  -- pending and blocked hold no ticket (chk_r1_meet_bookings_ticket); the clear keeps it so.
+  update screening_v2.r1_meet_bookings
+     set start_at = p_start_at,
+         end_at = p_end_at,
+         meet_url = p_meet_url,
+         ashby_updated_at = greatest(ashby_updated_at, p_ashby_updated_at),
+         ticket_digest = null,
+         ticket_not_before = null,
+         ticket_expires_at = null,
+         ticket_claimed_at = null,
+         status = 'pending',
+         reason = 'eligible',
+         updated_at = p_now
+   where id = v_booking.id
+  returning * into v_booking;
+  return jsonb_build_object('status', 'ok', 'booking_id', v_booking.id,
+                            'round_expires_at', v_expires, 'version', v_booking.version,
+                            'key_attempt', v_booking.key_attempt);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------------------------
+-- §12. r1_meet_cancel_booking: the booking is cancelled; nothing else is touched.
+-- ---------------------------------------------------------------------------------------------
+-- Ashby cancelled the schedule, Dex was removed, the event is gone, or HR cancelled the round in
+-- our app. Writes the booking row ONLY (status, reason, an unclaimed ticket, updated_at): the
+-- round, its consent rows, attempts, sessions, scores and the candidate stay exactly as they were
+-- (owner rule: never delete or rewrite candidate data), which is what lets a re-booking re-link
+-- the round (§10). A claimed ticket stays as evidence. The bot is NOT released here: the answer
+-- says which bot S06 must remove, and whether it was dispatched (Recall DELETE until then,
+-- leave_call afterwards); S06 confirms with r1_meet_set_bot('release'). The first refusal wins:
+--   invalid_reason | invalid_request (+field now) | not_found | already_cancelled (+recall_bot_id)
+--   | booking_terminal | ok (+previous_status, recall_bot_id, bot_dispatched).
+create or replace function screening_v2.r1_meet_cancel_booking(
+  p_booking_id uuid,
+  p_reason text,
+  p_now timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_booking screening_v2.r1_meet_bookings%rowtype;
+begin
+  if p_reason is null
+     or p_reason not in ('cancelled', 'dex_absent', 'event_removed', 'round_cancelled') then
+    return jsonb_build_object('status', 'invalid_reason');
+  end if;
+  if p_now is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'now');
+  end if;
+
+  select * into v_booking
+    from screening_v2.r1_meet_bookings b
+   where b.id = p_booking_id
+   for update;
+  if not found then
+    return jsonb_build_object('status', 'not_found');
+  end if;
+  if v_booking.status = 'cancelled' then
+    return jsonb_build_object('status', 'already_cancelled', 'booking_id', v_booking.id,
+                              'reason', v_booking.reason, 'recall_bot_id', v_booking.recall_bot_id);
+  end if;
+  if v_booking.status in ('completed', 'failed', 'drained') then
+    return jsonb_build_object('status', 'booking_terminal', 'booking_id', v_booking.id,
+                              'booking_status', v_booking.status, 'reason', v_booking.reason);
+  end if;
+
+  update screening_v2.r1_meet_bookings
+     set status = 'cancelled',
+         reason = p_reason,
+         ticket_digest = case when ticket_claimed_at is null then null else ticket_digest end,
+         ticket_not_before = case when ticket_claimed_at is null then null else ticket_not_before end,
+         ticket_expires_at = case when ticket_claimed_at is null then null else ticket_expires_at end,
+         updated_at = p_now
+   where id = v_booking.id;
+  return jsonb_build_object(
+    'status', 'ok', 'booking_id', v_booking.id, 'previous_status', v_booking.status,
+    'recall_bot_id', v_booking.recall_bot_id,
+    'bot_dispatched', v_booking.status in ('bot_joining', 'human_present', 'in_call'));
+end;
+$$;
+
+-- ---------------------------------------------------------------------------------------------
+-- §13. r1_meet_set_bot: the Recall bot of a booking, compare-and-set on its generation.
+-- ---------------------------------------------------------------------------------------------
+-- The Idempotency-Key of a Recall create is r1-meet-<event>-v<version>-k<key_attempt> (S01). Every
+-- action compares BOTH counters with what S06 read (version_conflict otherwise), so a stale worker
+-- never attaches, rotates, replaces or releases across a generation change. Actions:
+--   attach     a created bot on a pending booking -> bot_scheduled. duplicate (the same bot again)
+--              | bot_conflict (another bot already attached) | not_allowed (not pending) | in_past
+--              (the slot has ended) | round_not_live | bot_in_use (the bot is on another booking).
+--   rotate_key Recall asked for a new key (it caches 4xx/5xx answers for 1 h): key_attempt + 1, on a
+--              pending booking only (no bot attached) | key_attempts_exhausted at 20.
+--   replace    the bot was deleted at Recall before it was dispatched (a time or link change):
+--              a new generation, version + 1, key_attempt 0, no bot, no ticket (and a fresh ticket
+--              arm budget), back to pending | not_allowed (not bot_scheduled) | version_exhausted
+--              at 50.
+--   release    S06 confirmed the Recall DELETE / leave_call of a terminal booking's bot: the bot
+--              id is cleared (no longer an owed release) | not_allowed (not terminal) | duplicate
+--              (already released).
+-- invalid_action | invalid_request (+field now, recall_bot_id) | not_found come first. Every answer
+-- after the booking is read carries the booking's current version, key_attempt and status.
+-- p_recall_bot_id is read by attach only. Locks the booking row only; reads the round.
+create or replace function screening_v2.r1_meet_set_bot(
+  p_booking_id uuid,
+  p_action text,
+  p_expected_version integer,
+  p_expected_key_attempt integer,
+  p_recall_bot_id uuid default null,
+  p_now timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_booking screening_v2.r1_meet_bookings%rowtype;
+  v_round screening_v2.interview_rounds%rowtype;
+  v_answer text;
+begin
+  if p_action is null or p_action not in ('attach', 'rotate_key', 'replace', 'release') then
+    return jsonb_build_object('status', 'invalid_action');
+  end if;
+  if p_now is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'now');
+  end if;
+  if p_action = 'attach' and p_recall_bot_id is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'recall_bot_id');
+  end if;
+
+  select * into v_booking
+    from screening_v2.r1_meet_bookings b
+   where b.id = p_booking_id
+   for update;
+  if not found then
+    return jsonb_build_object('status', 'not_found');
+  end if;
+
+  if v_booking.version is distinct from p_expected_version
+     or v_booking.key_attempt is distinct from p_expected_key_attempt then
+    v_answer := 'version_conflict';
+  elsif p_action = 'attach' then
+    if v_booking.status = 'bot_scheduled' and v_booking.recall_bot_id = p_recall_bot_id then
+      v_answer := 'duplicate';
+    elsif v_booking.status = 'bot_scheduled' then
+      v_answer := 'bot_conflict';
+    elsif v_booking.status <> 'pending' then
+      v_answer := 'not_allowed';
+    elsif p_now >= v_booking.end_at then
+      v_answer := 'in_past';
+    else
+      select * into v_round
+        from screening_v2.interview_rounds r
+       where r.id = v_booking.round_id;
+      if not found
+         or v_round.channel <> 'meet'
+         or v_round.status not in ('invited', 'in_progress')
+         or v_round.expires_at <= p_now then
+        v_answer := 'round_not_live';
+      elsif exists (select 1 from screening_v2.r1_meet_bookings o
+                     where o.recall_bot_id = p_recall_bot_id and o.id <> v_booking.id) then
+        v_answer := 'bot_in_use';
+      else
+        update screening_v2.r1_meet_bookings
+           set recall_bot_id = p_recall_bot_id,
+               status = 'bot_scheduled',
+               reason = 'eligible',
+               updated_at = p_now
+         where id = v_booking.id
+        returning * into v_booking;
+        v_answer := 'ok';
+      end if;
+    end if;
+  elsif p_action = 'rotate_key' then
+    if v_booking.status <> 'pending' then
+      v_answer := 'not_allowed';
+    elsif v_booking.key_attempt >= 20 then
+      v_answer := 'key_attempts_exhausted';
+    else
+      update screening_v2.r1_meet_bookings
+         set key_attempt = key_attempt + 1,
+             updated_at = p_now
+       where id = v_booking.id
+      returning * into v_booking;
+      v_answer := 'ok';
+    end if;
+  elsif p_action = 'replace' then
+    if v_booking.status <> 'bot_scheduled' then
+      v_answer := 'not_allowed';
+    elsif v_booking.version >= 50 then
+      v_answer := 'version_exhausted';
+    else
+      update screening_v2.r1_meet_bookings
+         set recall_bot_id = null,
+             version = version + 1,
+             key_attempt = 0,
+             ticket_digest = null,
+             ticket_not_before = null,
+             ticket_expires_at = null,
+             ticket_claimed_at = null,
+             ticket_arms = 0,
+             status = 'pending',
+             reason = 'eligible',
+             updated_at = p_now
+       where id = v_booking.id
+      returning * into v_booking;
+      v_answer := 'ok';
+    end if;
+  else
+    if v_booking.status not in ('completed', 'cancelled', 'failed', 'drained') then
+      v_answer := 'not_allowed';
+    elsif v_booking.recall_bot_id is null then
+      v_answer := 'duplicate';
+    else
+      update screening_v2.r1_meet_bookings
+         set recall_bot_id = null,
+             updated_at = p_now
+       where id = v_booking.id
+      returning * into v_booking;
+      v_answer := 'ok';
+    end if;
+  end if;
+
+  return jsonb_build_object('status', v_answer, 'booking_id', v_booking.id,
+                            'version', v_booking.version, 'key_attempt', v_booking.key_attempt,
+                            'booking_status', v_booking.status);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------------------------
+-- §14. r1_meet_transition_booking: the runtime status moves, compare-and-set on the status.
+-- ---------------------------------------------------------------------------------------------
+-- The moves S06 makes from Recall and Ashby signals; every other move has its own RPC (create,
+-- reschedule, cancel, set_bot, the ticket claim). The matrix (from -> to):
+--   bot_scheduled -> bot_joining                     (Recall dispatched the bot)
+--   bot_scheduled | bot_joining -> human_present     (a non-bot participant joined)
+--   in_call -> completed                             (the attempt settled)
+--   pending | blocked -> blocked                     (unschedule but keep, the daily bot cap, ...)
+--   pending | blocked | unmatched_application | unmapped_scheduler | bot_scheduled |
+--   bot_joining | human_present | in_call -> failed | drained
+-- not_found | invalid_request (+field now) | status_conflict (+current: the booking moved first) |
+-- invalid_transition. The reason is checked ONLY by the table's status/reason pairing: a reason the
+-- target does not accept raises 23514 (a programming error, not a runtime answer). A move to a
+-- terminal status clears an unclaimed ticket; the bot stays until S06 confirms its release.
+create or replace function screening_v2.r1_meet_transition_booking(
+  p_booking_id uuid,
+  p_from_status text,
+  p_to_status text,
+  p_reason text,
+  p_now timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_booking screening_v2.r1_meet_bookings%rowtype;
+  v_terminal boolean;
+begin
+  if p_now is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'now');
+  end if;
+
+  select * into v_booking
+    from screening_v2.r1_meet_bookings b
+   where b.id = p_booking_id
+   for update;
+  if not found then
+    return jsonb_build_object('status', 'not_found');
+  end if;
+  if v_booking.status is distinct from p_from_status then
+    return jsonb_build_object('status', 'status_conflict', 'booking_id', v_booking.id,
+                              'current', v_booking.status);
+  end if;
+  -- `is not true`: a NULL target is an invalid transition, never a write.
+  if ((p_from_status = 'bot_scheduled' and p_to_status = 'bot_joining')
+      or (p_from_status in ('bot_scheduled', 'bot_joining') and p_to_status = 'human_present')
+      or (p_from_status = 'in_call' and p_to_status = 'completed')
+      or (p_from_status in ('pending', 'blocked') and p_to_status = 'blocked')
+      or (p_from_status in ('pending', 'blocked', 'unmatched_application', 'unmapped_scheduler',
+                            'bot_scheduled', 'bot_joining', 'human_present', 'in_call')
+          and p_to_status in ('failed', 'drained'))) is not true then
+    return jsonb_build_object('status', 'invalid_transition', 'booking_id', v_booking.id,
+                              'from_status', p_from_status, 'to_status', p_to_status);
+  end if;
+
+  v_terminal := p_to_status in ('completed', 'failed', 'drained');
+  update screening_v2.r1_meet_bookings
+     set status = p_to_status,
+         reason = p_reason,
+         ticket_digest = case when v_terminal and ticket_claimed_at is null then null
+                              else ticket_digest end,
+         ticket_not_before = case when v_terminal and ticket_claimed_at is null then null
+                                  else ticket_not_before end,
+         ticket_expires_at = case when v_terminal and ticket_claimed_at is null then null
+                                  else ticket_expires_at end,
+         updated_at = p_now
+   where id = v_booking.id;
+  return jsonb_build_object('status', 'ok', 'booking_id', v_booking.id,
+                            'previous_status', v_booking.status, 'booking_status', p_to_status,
+                            'reason', p_reason, 'recall_bot_id', v_booking.recall_bot_id);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------------------------
+-- §15. r1_meet_bind_session: the admitted call session of an in-call booking.
+-- ---------------------------------------------------------------------------------------------
+-- S05 claims the ticket (the booking moves to in_call), admits the attempt through the unchanged
+-- r1_admit_attempt, then binds the session it got. The session must belong to the booking's
+-- round; a later session of the same round (a restart) re-binds and the answer names the previous
+-- one. not_found | invalid_request (+field now) | not_in_call | session_mismatch (unknown session,
+-- or another round's) | duplicate | ok (+previous_session_id). Locks the booking row only; reads
+-- the session; writes session_id and updated_at.
+create or replace function screening_v2.r1_meet_bind_session(
+  p_booking_id uuid,
+  p_session_id uuid,
+  p_now timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_booking screening_v2.r1_meet_bookings%rowtype;
+  v_session_round uuid;
+begin
+  if p_now is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'now');
+  end if;
+
+  select * into v_booking
+    from screening_v2.r1_meet_bookings b
+   where b.id = p_booking_id
+   for update;
+  if not found then
+    return jsonb_build_object('status', 'not_found');
+  end if;
+  if v_booking.status <> 'in_call' then
+    return jsonb_build_object('status', 'not_in_call', 'booking_id', v_booking.id,
+                              'booking_status', v_booking.status);
+  end if;
+  select s.interview_round_id into v_session_round
+    from screening_v2.call_sessions s
+   where s.id = p_session_id;
+  if v_session_round is null or v_session_round is distinct from v_booking.round_id then
+    return jsonb_build_object('status', 'session_mismatch', 'booking_id', v_booking.id);
+  end if;
+  if v_booking.session_id = p_session_id then
+    return jsonb_build_object('status', 'duplicate', 'booking_id', v_booking.id,
+                              'session_id', v_booking.session_id);
+  end if;
+
+  update screening_v2.r1_meet_bookings
+     set session_id = p_session_id,
+         updated_at = p_now
+   where id = v_booking.id;
+  return jsonb_build_object('status', 'ok', 'booking_id', v_booking.id,
+                            'session_id', p_session_id,
+                            'previous_session_id', v_booking.session_id);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------------------------
 -- §90. Row level security and privileges.
 -- ---------------------------------------------------------------------------------------------
 -- RLS on, no policy: staff never read these tables directly; the API (service role) authorizes in
@@ -829,5 +1333,58 @@ comment on function screening_v2.r1_meet_create_round_from_ashby(uuid, text, tex
   'booking_terminal | stale_update | unmatched_application | unmapped_scheduler | blocked (+reason, '
   'retry_after for slot_too_far) | in_past | invalid_request (+field). Writes no call_sessions. '
   'Service-role only.';
+
+revoke all on function screening_v2.r1_meet_reschedule_booking(uuid, integer, timestamptz, timestamptz, text, timestamptz, integer, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.r1_meet_reschedule_booking(uuid, integer, timestamptz, timestamptz, text, timestamptz, integer, timestamptz)
+  to service_role;
+comment on function screening_v2.r1_meet_reschedule_booking(uuid, integer, timestamptz, timestamptz, text, timestamptz, integer, timestamptz) is
+  'M034: a new slot or Meet link for a booking with a round and no bot (S06 deletes and replaces a '
+  'bot first): moves the round expiry to slot end + grace (at most 14 days ahead), back to '
+  'pending/eligible; the bot generation is not bumped. Answers ok | invalid_request (+field) | '
+  'not_found | booking_terminal | version_conflict | stale_update | booking_dispatched | '
+  'bot_attached | no_round | not_allowed | in_past | slot_too_far (+retry_after) | round_not_live. '
+  'Service-role only.';
+
+revoke all on function screening_v2.r1_meet_cancel_booking(uuid, text, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.r1_meet_cancel_booking(uuid, text, timestamptz)
+  to service_role;
+comment on function screening_v2.r1_meet_cancel_booking(uuid, text, timestamptz) is
+  'M034: cancels a booking (reason cancelled | dex_absent | event_removed | round_cancelled) and '
+  'writes nothing but the booking row: the round, its consent and the candidate are untouched. '
+  'Answers ok (+previous_status, recall_bot_id, bot_dispatched) | already_cancelled | '
+  'booking_terminal | not_found | invalid_reason | invalid_request. Service-role only.';
+
+revoke all on function screening_v2.r1_meet_set_bot(uuid, text, integer, integer, uuid, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.r1_meet_set_bot(uuid, text, integer, integer, uuid, timestamptz)
+  to service_role;
+comment on function screening_v2.r1_meet_set_bot(uuid, text, integer, integer, uuid, timestamptz) is
+  'M034: the Recall bot of a booking, compare-and-set on (version, key_attempt): attach | '
+  'rotate_key (at most 20) | replace (a new generation, at most 50) | release (a terminal '
+  'booking''s bot confirmed removed). Answers ok | duplicate | bot_conflict | bot_in_use | '
+  'not_allowed | in_past | round_not_live | key_attempts_exhausted | version_exhausted | '
+  'version_conflict | not_found | invalid_action | invalid_request, with the current version, '
+  'key_attempt and status. Service-role only.';
+
+revoke all on function screening_v2.r1_meet_transition_booking(uuid, text, text, text, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.r1_meet_transition_booking(uuid, text, text, text, timestamptz)
+  to service_role;
+comment on function screening_v2.r1_meet_transition_booking(uuid, text, text, text, timestamptz) is
+  'M034: the runtime status moves of a booking (bot_joining, human_present, completed, blocked, '
+  'failed, drained), compare-and-set on the current status; the reason is checked by the '
+  'status/reason pairing CHECK (23514). Answers ok | status_conflict (+current) | '
+  'invalid_transition | not_found | invalid_request. Service-role only.';
+
+revoke all on function screening_v2.r1_meet_bind_session(uuid, uuid, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.r1_meet_bind_session(uuid, uuid, timestamptz)
+  to service_role;
+comment on function screening_v2.r1_meet_bind_session(uuid, uuid, timestamptz) is
+  'M034: binds a call session of the booking''s round to an in-call booking (a restart re-binds). '
+  'Answers ok (+previous_session_id) | duplicate | not_in_call | session_mismatch | not_found | '
+  'invalid_request. Service-role only.';
 
 notify pgrst, 'reload schema';

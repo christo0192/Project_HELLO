@@ -721,6 +721,330 @@ describe('migration 0142: r1_meet_create_round_from_ashby (T2)', () => {
   });
 });
 
+describe('migration 0142: the booking lifecycle RPCs (T3)', () => {
+  const RPCS = [
+    {
+      name: 'r1_meet_reschedule_booking',
+      section: '-- §11. ',
+      args: 'p_booking_id uuid, p_expected_version integer, p_start_at timestamptz, p_end_at timestamptz, '
+        + 'p_meet_url text, p_ashby_updated_at timestamptz, p_expiry_grace_sec integer default 7200, '
+        + 'p_now timestamptz default now()',
+      sig: 'uuid, integer, timestamptz, timestamptz, text, timestamptz, integer, timestamptz',
+      statuses: [
+        'ok', 'invalid_request', 'not_found', 'booking_terminal', 'version_conflict', 'stale_update',
+        'booking_dispatched', 'bot_attached', 'no_round', 'not_allowed', 'in_past', 'slot_too_far',
+        'round_not_live',
+      ],
+    },
+    {
+      name: 'r1_meet_cancel_booking',
+      section: '-- §12. ',
+      args: 'p_booking_id uuid, p_reason text, p_now timestamptz default now()',
+      sig: 'uuid, text, timestamptz',
+      statuses: ['ok', 'invalid_reason', 'invalid_request', 'not_found', 'already_cancelled', 'booking_terminal'],
+    },
+    {
+      name: 'r1_meet_set_bot',
+      section: '-- §13. ',
+      args: 'p_booking_id uuid, p_action text, p_expected_version integer, p_expected_key_attempt integer, '
+        + 'p_recall_bot_id uuid default null, p_now timestamptz default now()',
+      sig: 'uuid, text, integer, integer, uuid, timestamptz',
+      statuses: [
+        'ok', 'invalid_action', 'invalid_request', 'not_found', 'version_conflict', 'duplicate',
+        'bot_conflict', 'not_allowed', 'in_past', 'round_not_live', 'bot_in_use',
+        'key_attempts_exhausted', 'version_exhausted',
+      ],
+    },
+    {
+      name: 'r1_meet_transition_booking',
+      section: '-- §14. ',
+      args: 'p_booking_id uuid, p_from_status text, p_to_status text, p_reason text, p_now timestamptz default now()',
+      sig: 'uuid, text, text, text, timestamptz',
+      statuses: ['ok', 'invalid_request', 'not_found', 'status_conflict', 'invalid_transition'],
+    },
+    {
+      name: 'r1_meet_bind_session',
+      section: '-- §15. ',
+      args: 'p_booking_id uuid, p_session_id uuid, p_now timestamptz default now()',
+      sig: 'uuid, uuid, timestamptz',
+      statuses: ['ok', 'invalid_request', 'not_found', 'not_in_call', 'session_mismatch', 'duplicate'],
+    },
+  ] as const;
+
+  /** The plpgsql body of an RPC (after `as $$`), comments stripped, whitespace collapsed. */
+  const bodyOf = (name: string): string => {
+    const fn = functionBody(name);
+    return fn.slice(fn.indexOf(' as $$') + ' as $$'.length);
+  };
+  const BOOKING_LOCK = 'from screening_v2.r1_meet_bookings b where b.id = p_booking_id for update;';
+  const families = pairingFamilies();
+  const familyOf = (status: string) => families.find((f) => f.statuses.includes(status))!.reasons;
+
+  it('sits in sections §11 to §15, in order, between §10 and §90', () => {
+    let last = sql.indexOf('-- §10. ');
+    expect(last).toBeGreaterThan(-1);
+    for (const rpc of RPCS) {
+      expect(sql.split(rpc.section).length - 1, rpc.section).toBe(1);
+      const at = sql.indexOf(rpc.section);
+      expect(at, rpc.section).toBeGreaterThan(last);
+      const fnAt = sql.indexOf(`create or replace function screening_v2.${rpc.name}(`);
+      expect(fnAt, rpc.name).toBeGreaterThan(at);
+      last = fnAt;
+    }
+    expect(sql.indexOf('-- §90. ')).toBeGreaterThan(last);
+  });
+
+  it('has the planned argument lists, returns jsonb, and is security definer with a pinned search_path', () => {
+    for (const rpc of RPCS) {
+      expect(code, rpc.name).toContain(
+        `create or replace function screening_v2.${rpc.name}( ${rpc.args} ) `
+        + 'returns jsonb language plpgsql security definer set search_path = pg_catalog, screening_v2 as $$',
+      );
+      const params = /\( (p_[\s\S]*?) \) returns jsonb/.exec(functionBody(rpc.name))![1]!
+        .split(', ').map((p) => p.split(' ')[1]);
+      expect(params.join(', '), rpc.name).toBe(rpc.sig);
+      expect(sql.split(`create or replace function screening_v2.${rpc.name}(`), rpc.name).toHaveLength(2);
+    }
+  });
+
+  it('is service-role only and documented', () => {
+    for (const rpc of RPCS) {
+      expect(code, rpc.name).toContain(`revoke all on function screening_v2.${rpc.name}(${rpc.sig}) from public, anon, authenticated;`);
+      expect(code, rpc.name).toContain(`grant execute on function screening_v2.${rpc.name}(${rpc.sig}) to service_role;`);
+      expect(code, rpc.name).toContain(`comment on function screening_v2.${rpc.name}(${rpc.sig}) is`);
+      expect(lc, rpc.name).not.toMatch(new RegExp(`grant [a-z ,]+ on function screening_v2\\.${rpc.name}\\([^)]*\\) to (?!service_role;)`));
+    }
+  });
+
+  it('answers a closed set of statuses each', () => {
+    for (const rpc of RPCS) {
+      const body = bodyOf(rpc.name);
+      const answered = new Set([
+        ...[...body.matchAll(/'status', '([a-z_]+)'/g)].map((m) => m[1]!),
+        ...[...body.matchAll(/v_answer := '([a-z_]+)';/g)].map((m) => m[1]!),
+      ]);
+      expect([...answered].sort(), rpc.name).toEqual([...rpc.statuses].sort());
+      // The only computed status is set_bot's v_answer, assigned from the literals above.
+      const computed = [...body.matchAll(/'status', (?!')([a-z_]+)/g)].map((m) => m[1]);
+      expect(computed, rpc.name).toEqual(rpc.name === 'r1_meet_set_bot' ? ['v_answer'] : []);
+    }
+  });
+
+  it('reads no clock, has no exception handler, writes no session, audit row or job, and returns no digest', () => {
+    for (const rpc of RPCS) {
+      const bodyLc = bodyOf(rpc.name).toLowerCase();
+      expect(bodyLc, rpc.name).not.toMatch(/\bnow\s*\(|\bcurrent_timestamp\b|\bclock_timestamp\s*\(|\bstatement_timestamp\s*\(/);
+      expect(bodyLc, rpc.name).not.toMatch(/\bwhen others\b|\bexception\s+when\b/);
+      expect(bodyLc, rpc.name).not.toMatch(/\b(insert into|delete from)\b/);
+      expect(bodyLc, rpc.name).not.toMatch(/update screening_v2\.(call_sessions|audit_events|job_queue|interview_round_consents|candidates|r1_budget_month)\b/);
+      expect(bodyLc, rpc.name).not.toMatch(/r1_transition_round|link_token_digest|r1_send_round|r1_admit_attempt/);
+      const builds = [...bodyLc.matchAll(/jsonb_build_object\(/g)].map((m) => bodyLc.slice(m.index!, bodyLc.indexOf(';', m.index!)));
+      expect(builds.length, rpc.name).toBeGreaterThan(2);
+      // Values only (string literals blanked): a field code such as 'meet_url' names, never carries.
+      for (const b of builds) expect(b.replace(/'[^']*'/g, "''"), rpc.name).not.toMatch(/digest|token|meet_url|scheduled_by/);
+    }
+  });
+
+  it('locks its one booking row first; only the reschedule goes on to settings, the hold month and the round', () => {
+    for (const rpc of RPCS) {
+      const body = bodyOf(rpc.name);
+      expect(body.split(BOOKING_LOCK), rpc.name).toHaveLength(2);
+      const firstLock = body.indexOf(' for update');
+      expect(firstLock, rpc.name).toBe(body.indexOf(BOOKING_LOCK) + BOOKING_LOCK.length - ' for update;'.length);
+      if (rpc.name === 'r1_meet_reschedule_booking') continue;
+      expect(body.toLowerCase().match(/\bfor update\b/g), rpc.name).toHaveLength(1);
+      expect(body, rpc.name).not.toMatch(/r1_settings|r1_budget_month/);
+    }
+    const body = bodyOf('r1_meet_reschedule_booking');
+    const order = [
+      BOOKING_LOCK,
+      'perform 1 from screening_v2.r1_settings where singleton for update;',
+      'perform 1 from screening_v2.r1_budget_month where month_start = v_hold_month for update;',
+      'from screening_v2.interview_rounds r where r.id = v_booking.round_id for update;',
+      'update screening_v2.interview_rounds set',
+      'update screening_v2.r1_meet_bookings set',
+    ];
+    let last = -1;
+    for (const step of order) {
+      expect(body.split(step).length - 1, step).toBe(1);
+      expect(body.indexOf(step), step).toBeGreaterThan(last);
+      last = body.indexOf(step);
+    }
+    expect(body.toLowerCase().match(/\bfor update\b/g)).toHaveLength(4);
+    // The hold month is taken exactly when the round transitions would take it.
+    expect(body).toContain('if v_hold_month is not null and (v_hold_minutes > 0 or v_uncounted) then');
+    expect(body).toContain('select r.held_minutes, r.hold_month, r.charged_attempt_number > r.attempts_counted into v_hold_minutes, v_hold_month, v_uncounted');
+  });
+
+  it('cancel writes the booking row and nothing else', () => {
+    const body = bodyOf('r1_meet_cancel_booking');
+    const tables = new Set([...body.matchAll(/screening_v2\.([a-z0-9_]+)/g)].map((m) => m[1]));
+    expect([...tables]).toEqual(['r1_meet_bookings']);
+    expect(body.match(/\bupdate screening_v2\.r1_meet_bookings set\b/g)).toHaveLength(1);
+    expect(body).not.toMatch(/\bperform\b|\binsert\b|\bdelete\b|\btruncate\b/);
+    expect(body).not.toMatch(/update screening_v2\.(interview_rounds|interview_round_consents)\b/);
+    // Its reasons are exactly the cancelled family of the pairing CHECK.
+    const reasons = quoted(/p_reason not in \(([^)]*)\)/.exec(body)![1]!);
+    expect(reasons).toEqual(familyOf('cancelled'));
+    expect(body).toContain("set status = 'cancelled', reason = p_reason,");
+    // An unclaimed ticket goes; a claimed one stays as evidence.
+    for (const col of ['ticket_digest', 'ticket_not_before', 'ticket_expires_at']) {
+      expect(body).toContain(`${col} = case when ticket_claimed_at is null then null else ${col} end`);
+    }
+    expect(body).not.toMatch(/ticket_claimed_at = /);
+    expect(body).toContain("'bot_dispatched', v_booking.status in ('bot_joining', 'human_present', 'in_call')");
+    expect(body).toContain("if v_booking.status = 'cancelled' then return jsonb_build_object('status', 'already_cancelled'");
+  });
+
+  it('reschedules with the create RPC\'s input rules, in the planned refusal order, and moves only the expiry of the round', () => {
+    const body = bodyOf('r1_meet_reschedule_booking');
+    const fields = [...body.matchAll(/'status', 'invalid_request', 'field', '([a-z_]+)'/g)].map((m) => m[1]);
+    expect(fields).toEqual(['meet_url', 'slot', 'grace', 'now']);
+    const create = bodyOf('r1_meet_create_round_from_ashby');
+    for (const rule of [
+      "p_meet_url is null or p_meet_url !~ '^https://meet\\.google\\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}$'",
+      "p_start_at is null or p_end_at is null or p_end_at <= p_start_at or p_end_at > p_start_at + interval '24 hours'",
+      'p_expiry_grace_sec is null or p_expiry_grace_sec not between 900 and 86400',
+      'v_expires := p_end_at + make_interval(secs => p_expiry_grace_sec);',
+      "if v_expires > p_now + interval '14 days' then",
+    ]) {
+      expect(body, rule).toContain(rule);
+      expect(create, rule).toContain(rule);
+    }
+    const refusals = [
+      "'invalid_request', 'field', 'now'", BOOKING_LOCK, "'status', 'not_found'", "'status', 'booking_terminal'",
+      "'status', 'version_conflict'", "'status', 'stale_update'", "'status', 'booking_dispatched'",
+      "'status', 'bot_attached'", "'status', 'no_round'", "'status', 'not_allowed'", "'status', 'in_past'",
+      "'status', 'slot_too_far'", 'r1_settings where singleton for update', "'status', 'round_not_live'",
+      "'status', 'ok'",
+    ];
+    let last = -1;
+    for (const step of refusals) {
+      expect(body.indexOf(step), step).toBeGreaterThan(last);
+      last = body.indexOf(step);
+    }
+    expect(body).toContain('if v_booking.version is distinct from p_expected_version then');
+    expect(body).toContain('if p_ashby_updated_at < v_booking.ashby_updated_at then');
+    expect(body).toContain("if v_booking.status in ('bot_joining', 'human_present', 'in_call') then");
+    expect(body).toContain("if v_booking.status not in ('pending', 'blocked') then");
+    expect(body).toContain("'retry_after', v_expires - interval '14 days'");
+    // Live = the claim RPC's definition: an invited or in-progress Meet round that has not lapsed.
+    expect(body).toContain(
+      "if not found or v_round.channel <> 'meet' or v_round.status not in ('invited', 'in_progress') or v_round.expires_at <= p_now then",
+    );
+    expect(body).toContain('update screening_v2.interview_rounds set expires_at = v_expires, version = version + 1, updated_at = p_now where id = v_round.id;');
+    // The booking keeps its bot generation; it goes back to pending/eligible with the new slot.
+    const start = body.indexOf('update screening_v2.r1_meet_bookings set');
+    const update = body.slice(start, body.indexOf(';', start));
+    expect(update).not.toMatch(/\bversion\b|\bkey_attempt\b|\bround_id\b|\bcandidate_id\b|\brecall_bot_id\b/);
+    for (const set of [
+      'start_at = p_start_at', 'end_at = p_end_at', 'meet_url = p_meet_url',
+      'ashby_updated_at = greatest(ashby_updated_at, p_ashby_updated_at)', "status = 'pending'", "reason = 'eligible'",
+      'updated_at = p_now',
+    ]) {
+      expect(update, set).toContain(set);
+    }
+    expect(familyOf('pending')).toContain('eligible');
+  });
+
+  it('sets the bot by compare-and-set on both counters, within the caps of 20 keys and 50 generations', () => {
+    const body = bodyOf('r1_meet_set_bot');
+    expect(quoted(/p_action not in \(([^)]*)\)/.exec(body)![1]!)).toEqual(['attach', 'rotate_key', 'replace', 'release']);
+    expect(body).toContain(
+      'if v_booking.version is distinct from p_expected_version or v_booking.key_attempt is distinct from p_expected_key_attempt then v_answer := \'version_conflict\';',
+    );
+    // The compare-and-set is the first decision after the lock, for every action.
+    expect(body.indexOf("v_answer := 'version_conflict'")).toBeLessThan(body.indexOf("elsif p_action = 'attach' then"));
+    expect(body).toContain("elsif v_booking.key_attempt >= 20 then v_answer := 'key_attempts_exhausted';");
+    expect(body).toContain("elsif v_booking.version >= 50 then v_answer := 'version_exhausted';");
+    // The table caps are the same numbers.
+    expect(bookings).toContain('check (version between 0 and 50)');
+    expect(bookings).toContain('check (key_attempt between 0 and 20)');
+    expect(body).toContain('set key_attempt = key_attempt + 1, updated_at = p_now');
+    expect(body).toContain(
+      'set recall_bot_id = null, version = version + 1, key_attempt = 0, ticket_digest = null, ticket_not_before = null, '
+      + "ticket_expires_at = null, ticket_claimed_at = null, ticket_arms = 0, status = 'pending', reason = 'eligible', updated_at = p_now",
+    );
+    expect(body).toContain("set recall_bot_id = p_recall_bot_id, status = 'bot_scheduled', reason = 'eligible', updated_at = p_now");
+    expect(body).toContain('set recall_bot_id = null, updated_at = p_now');
+    // version is bumped only by replace; key_attempt only by rotate_key (and reset by replace).
+    expect(body.match(/version = version \+ 1/g)).toHaveLength(1);
+    expect(body.match(/key_attempt = key_attempt \+ 1/g)).toHaveLength(1);
+    // Every status it writes pairs with eligible.
+    for (const status of [...body.matchAll(/status = '([a-z_]+)', reason = '([a-z_]+)'/g)].map((m) => [m[1]!, m[2]!])) {
+      expect(familyOf(status[0]!), status.join('/')).toContain(status[1]);
+    }
+    // attach: pending only, before the slot ends, on a live Meet round, a bot no other booking holds.
+    expect(body).toContain("elsif v_booking.status <> 'pending' then v_answer := 'not_allowed'; elsif p_now >= v_booking.end_at then v_answer := 'in_past';");
+    expect(body).toContain(
+      "if not found or v_round.channel <> 'meet' or v_round.status not in ('invited', 'in_progress') or v_round.expires_at <= p_now then v_answer := 'round_not_live';",
+    );
+    expect(body).toContain('where o.recall_bot_id = p_recall_bot_id and o.id <> v_booking.id) then v_answer := \'bot_in_use\';');
+    // release: terminal bookings only.
+    expect(body).toContain(`if v_booking.status not in (${TERMINAL.map((s) => `'${s}'`).join(', ')}) then v_answer := 'not_allowed';`);
+  });
+
+  it('transitions exactly along the planned matrix and leaves the reason to the pairing CHECK', () => {
+    const body = bodyOf('r1_meet_transition_booking');
+    const start = body.indexOf('if ((p_from_status');
+    const matrix = body.slice(start, body.indexOf(' is not true then', start));
+    expect(start).toBeGreaterThan(-1);
+    const list = (s: string) => (s.startsWith('= ') ? [s.slice(3, -1)] : quoted(s));
+    const edges = new Set<string>();
+    for (const m of matrix.matchAll(/\(p_from_status (= '[a-z_]+'|in \([^)]*\)) and p_to_status (= '[a-z_]+'|in \([^)]*\))\)/g)) {
+      for (const from of list(m[1]!)) for (const to of list(m[2]!)) edges.add(`${from}->${to}`);
+    }
+    const toTerminal = ['pending', 'blocked', 'unmatched_application', 'unmapped_scheduler', ...ACTIVE.slice(1)]
+      .flatMap((from) => [`${from}->failed`, `${from}->drained`]);
+    expect([...edges].sort()).toEqual([
+      'bot_scheduled->bot_joining', 'bot_scheduled->human_present', 'bot_joining->human_present',
+      'in_call->completed', 'pending->blocked', 'blocked->blocked', ...toTerminal,
+    ].sort());
+    expect(edges.size).toBe(22);
+    // Never from a terminal status; never into a status another RPC owns.
+    for (const edge of edges) {
+      const [from, to] = edge.split('->');
+      expect(TERMINAL, edge).not.toContain(from);
+      expect(['pending', 'unmatched_application', 'unmapped_scheduler', 'bot_scheduled', 'in_call', 'cancelled'], edge).not.toContain(to);
+      expect(familyOf(to!).length, edge).toBeGreaterThan(0);
+    }
+    expect(body).toContain('if v_booking.status is distinct from p_from_status then');
+    expect(body).toContain("v_terminal := p_to_status in ('completed', 'failed', 'drained');");
+    expect(body).toContain('set status = p_to_status, reason = p_reason,');
+    for (const col of ['ticket_digest', 'ticket_not_before', 'ticket_expires_at']) {
+      expect(body).toContain(`${col} = case when v_terminal and ticket_claimed_at is null then null else ${col} end`);
+    }
+    // The reason is never checked in code: the table's pairing CHECK is the one source of truth.
+    expect(body).not.toMatch(/p_reason (not )?in \(/);
+  });
+
+  it('binds only a session of the booking\'s own round to an in-call booking', () => {
+    const body = bodyOf('r1_meet_bind_session');
+    expect(body).toContain("if v_booking.status <> 'in_call' then return jsonb_build_object('status', 'not_in_call'");
+    expect(body).toContain('select s.interview_round_id into v_session_round from screening_v2.call_sessions s where s.id = p_session_id;');
+    expect(body).toContain('if v_session_round is null or v_session_round is distinct from v_booking.round_id then');
+    expect(body).toContain('set session_id = p_session_id, updated_at = p_now where id = v_booking.id;');
+    expect(body).toContain("'previous_session_id', v_booking.session_id");
+    expect(body.indexOf("'status', 'not_in_call'")).toBeLessThan(body.indexOf("'status', 'session_mismatch'"));
+    expect(body.indexOf("'status', 'session_mismatch'")).toBeLessThan(body.indexOf("'status', 'duplicate'"));
+  });
+
+  it('is exercised by the SQL suite, and the T2 re-link cancels through r1_meet_cancel_booking', () => {
+    const suite = read('app/supabase/tests/r1_meet_bookings_assert.sql');
+    for (const rpc of RPCS) expect(suite, rpc.name).toContain(`screening_v2.${rpc.name}(`);
+    for (const section of ['-- T3-A. ', '-- T3-B. ', '-- T3-C. ', '-- T3-D. ', '-- T3-E. ', '-- T3-F. ']) {
+      expect(suite.split(section).length - 1, section).toBe(1);
+    }
+    expect(suite.indexOf('-- T3-A. ')).toBeGreaterThan(suite.indexOf('-- T2-H. '));
+    // No fixture shortcut for a cancel is left anywhere.
+    expect(suite).not.toMatch(/set status = 'cancelled'/);
+    expect(suite).not.toMatch(/T3 replaces/);
+    const relink = suite.slice(suite.indexOf('-- T2-G. '), suite.indexOf('-- T2-H. '));
+    expect(relink.match(/screening_v2\.r1_meet_cancel_booking\(/g)).toHaveLength(2);
+    expect(relink).toContain('_r1_meet_tests.round_state(r_id) = st_before');
+  });
+});
+
 describe('migration 0142: SQL test wiring', () => {
   it('runs the assertions from supabase-test.sh and triggers supabase-ci on the helper', () => {
     const script = read('scripts/test-r1-meet.sh');
