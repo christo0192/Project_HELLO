@@ -1,5 +1,5 @@
-import { existsSync, readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { relative, resolve } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../supabase', () => ({ supabase: { auth: { getSession: vi.fn() } } }));
@@ -8,6 +8,7 @@ import {
   parseAttempt,
   parseConsentTemplate,
   parseExchange,
+  parseMeetExchange,
   parsePreflight,
   parseStatus,
   R1_CONTRACT,
@@ -20,6 +21,7 @@ import {
   type R1RouteContract,
   type R1RouteName,
 } from './r1-api';
+import { R1_MEET_EXCHANGE_ERROR_CODES } from './r1-meet';
 
 /**
  * The web side of the R1 wire contract (plan section 8.3), reconciled with PR-3's
@@ -41,6 +43,8 @@ import {
 
 const LINK = 'a'.repeat(64);
 const NONCE = 'n'.repeat(32);
+const TICKET = 'meet-ticket-not-a-secret_0123456789ABCDEFxy';
+const RESUME = 'resume-not-a-secret';
 const NAMES = Object.keys(R1_ROUTES) as R1RouteName[];
 
 // ── Layer 1: the client sends what the contract declares ──────────────────────
@@ -104,6 +108,15 @@ const FULL_RESPONSES: Record<R1RouteName, unknown> = {
     attempt_id: 's',
   },
   ready: { ok: true },
+  // Every declared field at once (a real 200 has no resume token and a real 202 no room token).
+  meetExchange: {
+    status: 'ready',
+    url: 'wss://lk.invalid',
+    livekit_token: 'token',
+    expires_at: '2026-10-07T00:10:00Z',
+    retry_after_sec: 3,
+    resume_token: RESUME,
+  },
 };
 
 interface Invocation {
@@ -134,6 +147,10 @@ const INVOCATIONS: Record<R1RouteName, Invocation[]> = {
   ],
   exchange: [{ label: 'exchange', run: () => r1Api.exchange('attempt', NONCE) }],
   ready: [{ label: 'ready', run: () => r1Api.ready('attempt', NONCE) }],
+  meetExchange: [
+    { label: 'first call', run: () => r1Api.meetExchange(TICKET, null) },
+    { label: 'retry after a 202', run: () => r1Api.meetExchange(TICKET, RESUME) },
+  ],
 };
 
 describe('r1-api sends what R1_CONTRACT declares', () => {
@@ -162,6 +179,8 @@ describe('r1-api sends what R1_CONTRACT declares', () => {
         expect(url.endsWith(contract.path)).toBe(true);
         expect(url).not.toContain('?');
         expect(url).not.toContain(LINK);
+        expect(url).not.toContain(TICKET);
+        expect(url).not.toContain(RESUME);
         const keys = Object.keys(JSON.parse(String(init.body)) as object);
         for (const field of contract.request) {
           expect(keys, `${name} sends ${field}`).toContain(field);
@@ -192,6 +211,7 @@ const PARSERS: Partial<Record<R1RouteName, Parser>> = {
   preflight: parsePreflight,
   attempts: parseAttempt,
   exchange: parseExchange,
+  meetExchange: parseMeetExchange,
 };
 
 describe('the parse functions read exactly the declared response fields', () => {
@@ -323,8 +343,10 @@ function successResponses(operation: string[]): string[] {
  * lands; the pending allowance simply stops being used.
  *
  *   ready: "I'm ready" during the role-play briefing (R1-Q: the server relays it to the worker).
+ *   meetExchange: the Meet bridge's ticket exchange (M034 S05 serves it; the bridge page makes no
+ *     call without a ticket, and nothing mints one until S05/S06 ship).
  */
-const PENDING_ON_SERVER: ReadonlySet<R1RouteName> = new Set<R1RouteName>(['ready']);
+const PENDING_ON_SERVER: ReadonlySet<R1RouteName> = new Set<R1RouteName>(['ready', 'meetExchange']);
 
 type PendingFields = Readonly<Partial<Record<R1RouteName, readonly string[]>>>;
 
@@ -477,6 +499,54 @@ const CANDIDATE_SPEC = (() => {
   return from > -1 && to > from ? REAL_SPEC.slice(from, to) : '';
 })();
 
+/**
+ * The Meet exchange is served by its own router (M034 S05), not r1-candidate.ts, so its codes are
+ * looked for in every non-test source under app/api/src.
+ */
+const API_SOURCE_ROOT = resolve(process.cwd(), '..', 'api', 'src');
+
+/** Every non-test `.ts` file under `dir` (no `__tests__` folder, no `*.test.ts`). */
+function apiSourceFiles(dir: string = API_SOURCE_ROOT): string[] {
+  if (!existsSync(dir)) return [];
+  const files: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = resolve(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name !== '__tests__' && entry.name !== 'node_modules') files.push(...apiSourceFiles(path));
+    } else if (entry.name.endsWith('.ts') && !entry.name.endsWith('.test.ts')) {
+      files.push(path);
+    }
+  }
+  return files;
+}
+
+/** The `/api/r1/meet/exchange` path block of a spec plus the schemas it references, or null. */
+function meetExchangeDoc(specText: string): string | null {
+  const spec = splitLines(specText);
+  const block = nested(nested(spec, 'paths', 0) ?? [], R1_ROUTES.meetExchange, 2);
+  return block ? closure(spec, block) : null;
+}
+
+/**
+ * Every Meet exchange code the page tells apart that a spec documenting the route does not name
+ * there, or that no API source quotes. Nothing while the spec does not document the route.
+ */
+function meetCodeProblems(specText: string, sources: readonly string[]): string[] {
+  const doc = meetExchangeDoc(specText);
+  if (doc === null) return [];
+  const problems: string[] = [];
+  for (const code of R1_MEET_EXCHANGE_ERROR_CODES) {
+    if (!new RegExp(`\\b${code}\\b`).test(doc)) {
+      problems.push(`${R1_ROUTES.meetExchange}: the spec does not name ${code}`);
+    }
+    const quoted = new RegExp(`(['"\`])${code}\\1`);
+    if (!sources.some((source) => quoted.test(source))) {
+      problems.push(`${code}: no app/api/src source answers it`);
+    }
+  }
+  return problems;
+}
+
 /** The pending codes `source` answers (quotes) that `spec` does not name. */
 function pendingCodesUndocumented(source: string, spec: string): string[] {
   return R1_PENDING_SERVER_ERROR_CODES.filter(
@@ -547,6 +617,75 @@ describe('the error codes the web acts on are the ones the server answers', () =
     const named = (code: string, text: string) => new RegExp(`\\b${code}\\b`).test(text);
     expect(named('round_expired', '409: round_expired, round_not_admissible')).toBe(true);
     expect(named('round_expired', '409: round_expired_early')).toBe(false);
+  });
+
+  it('names and answers every Meet exchange code the page tells apart, the moment the spec documents the route', () => {
+    // Pending on the server (M034 S05): while the spec does not document the route, this pins the
+    // seven codes of contract section 4; once it does, each must be named for the route and
+    // quoted by some API source, or a renamed code would turn a precise tile into the generic one.
+    expect([...R1_MEET_EXCHANGE_ERROR_CODES].sort()).toEqual([
+      'invalid_request',
+      'meet_disabled',
+      'round_not_live',
+      'ticket_already_claimed',
+      'ticket_expired',
+      'ticket_not_yet_valid',
+      'ticket_unknown',
+    ]);
+    if (meetExchangeDoc(REAL_SPEC) === null) return;
+    const sources = apiSourceFiles().map((file) => readFileSync(file, 'utf8'));
+    expect(meetCodeProblems(REAL_SPEC, sources)).toEqual([]);
+  });
+
+  it('walks only the non-test API sources for the Meet exchange codes', () => {
+    const files = apiSourceFiles().map((file) => relative(API_SOURCE_ROOT, file).replace(/\\/g, '/'));
+    expect(files).toContain('routes/r1-candidate.ts');
+    expect(files.filter((file) => /\.test\.ts$|(^|\/)__tests__\//.test(file))).toEqual([]);
+    expect(files.every((file) => file.endsWith('.ts'))).toBe(true);
+  });
+
+  it('would notice a Meet exchange code the documented route does not name or no source answers', () => {
+    const codes = [...R1_MEET_EXCHANGE_ERROR_CODES];
+    const spec = (named: readonly string[], elsewhere: readonly string[] = []) =>
+      [
+        'openapi: 3.0.3',
+        'paths:',
+        '  /api/r1/exchange:',
+        '    post:',
+        `      description: 'refusals: ${elsewhere.join(', ')}'`,
+        '  /api/r1/meet/exchange:',
+        '    post:',
+        '      responses:',
+        "        '409':",
+        `          description: 'refusals: ${named.join(', ')}'`,
+        '  /api/health:',
+        '    get: {}',
+        '',
+      ].join('\n');
+    const answering = [codes.map((code) => `refuse(res, 409, '${code}');`).join('\n')];
+    // Undocumented route: nothing to check yet, whatever the sources say.
+    expect(meetCodeProblems('openapi: 3.0.3\npaths:\n  /api/health:\n    get: {}\n', [])).toEqual([]);
+    expect(meetCodeProblems(spec(codes), answering)).toEqual([]);
+    // Double quotes and template literals answer a code too.
+    expect(meetCodeProblems(spec(codes), [codes.map((code) => `"${code}" \`${code}\``).join(' ')]))
+      .toEqual([]);
+    expect(meetCodeProblems(spec(without(codes, 'ticket_expired')), answering)).toEqual([
+      '/api/r1/meet/exchange: the spec does not name ticket_expired',
+    ]);
+    // Named only on another route is not named for this one.
+    expect(meetCodeProblems(spec(without(codes, 'round_not_live'), ['round_not_live']), answering))
+      .toEqual(['/api/r1/meet/exchange: the spec does not name round_not_live']);
+    // A longer name is not the code.
+    expect(
+      meetCodeProblems(spec([...without(codes, 'ticket_unknown'), 'ticket_unknown_v2']), answering),
+    ).toEqual(['/api/r1/meet/exchange: the spec does not name ticket_unknown']);
+    const unanswered = [answering[0].replace("'meet_disabled'", "'meet_off'")];
+    expect(meetCodeProblems(spec(codes), unanswered)).toEqual([
+      'meet_disabled: no app/api/src source answers it',
+    ]);
+    expect(meetCodeProblems(spec(codes), ['ticket_unknown_v2', "'ticket_unknown_v2'"])).toHaveLength(
+      codes.length,
+    );
   });
 
   it('declares no field the spec does not document (the attempts `lead` was one)', () => {
@@ -751,8 +890,30 @@ describe('the contract checker', () => {
     ]);
   });
 
-  it('keeps the pending allowance to the one route that is awaiting the server', () => {
-    expect([...PENDING_ON_SERVER]).toEqual(['ready']);
+  it('lets the Meet exchange be undocumented while the server has not shipped it, and checks it once documented', () => {
+    const undocumented = syntheticSpec((name, parts) => {
+      if (name === 'meetExchange') parts.documented = false;
+    });
+    expect(contractProblems(undocumented)).toEqual([
+      'POST /api/r1/meet/exchange: path is not documented',
+    ]);
+    expect(contractProblems(undocumented, PENDING_ON_SERVER)).toEqual([]);
+    const noResume = syntheticSpec((name, parts) => {
+      if (name === 'meetExchange') parts.request = without(parts.request, 'resume_token');
+    });
+    expect(contractProblems(noResume, PENDING_ON_SERVER)).toEqual([
+      'POST /api/r1/meet/exchange: request lacks optional resume_token',
+    ]);
+    const noResumeInAnswer = syntheticSpec((name, parts) => {
+      if (name === 'meetExchange') parts.response = without(parts.response, 'resume_token');
+    });
+    expect(contractProblems(noResumeInAnswer, PENDING_ON_SERVER)).toEqual([
+      'POST /api/r1/meet/exchange: response lacks optional resume_token',
+    ]);
+  });
+
+  it('keeps the pending allowance to the routes awaiting the server', () => {
+    expect([...PENDING_ON_SERVER]).toEqual(['ready', 'meetExchange']);
   });
 
   it('lets an optional field the server has not shipped yet be undocumented, and nothing else', () => {

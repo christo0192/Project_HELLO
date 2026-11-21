@@ -12,11 +12,12 @@
  * fields are snake_case, like every other route.
  *
  * Invariants:
- *   - The link token and the attempt token travel in the JSON body, never in a
- *     URL, a header or a log line.
- *   - Requests are credential-free: the R1 routes authenticate by link token,
- *     so the recruiter's Supabase bearer must never be attached (a recruiter
- *     previewing a link in the same browser would otherwise leak it).
+ *   - The link token, the attempt token, the Meet bridge ticket and its resume
+ *     token travel in the JSON body, never in a URL, a header or a log line.
+ *   - Requests are credential-free: the R1 routes authenticate by link token
+ *     (or, for the Meet bridge, by its ticket), so the recruiter's Supabase
+ *     bearer must never be attached (a recruiter previewing a link in the same
+ *     browser would otherwise leak it).
  *   - Responses are validated and normalised here. A response that does not
  *     have the expected shape fails closed as `r1_malformed_response`; the
  *     pages never see raw server JSON.
@@ -34,6 +35,7 @@ export const R1_ROUTES = Object.freeze({
   attempts: '/api/r1/attempts',
   exchange: '/api/r1/exchange',
   ready: '/api/r1/ready',
+  meetExchange: '/api/r1/meet/exchange',
 });
 
 /**
@@ -160,6 +162,22 @@ export const R1_CONTRACT: Readonly<Record<R1RouteName, R1RouteContract>> = Objec
     requestOptional: [],
     response: [],
     responseOptional: [],
+  }),
+  // The Meet bridge page (M034 S07; `.gsd/milestones/M034/contracts/meet-contracts.md` sections 4
+  // and 9, decision D-S07-10). The Recall bot's Output Media opens `/candidate/r1/meet#t=<ticket>`;
+  // the page trades the ticket for a room token. `ticket` goes on every call. The ticket is
+  // single-use (the server claims it BEFORE admission), so a retry after a 202 presents the
+  // `resume_token` that 202 carried instead of claiming again; a 202 without one is malformed.
+  // The 200 uses the browser exchange's own names. Nothing about the candidate is declared or
+  // read: room and identity are inside the token, the lead name comes only from the interviewer's
+  // `leadname` attribute, the course facts are static and the timer is the role-play clock.
+  // Pending on the server until M034 S05 (the contract test allows the path to be undocumented
+  // until the spec documents it, then checks it like every other route).
+  meetExchange: route('meetExchange', {
+    request: ['ticket'],
+    requestOptional: ['resume_token'],
+    response: ['url', 'livekit_token'],
+    responseOptional: ['status', 'retry_after_sec', 'resume_token', 'expires_at'],
   }),
 });
 
@@ -311,6 +329,27 @@ export interface R1RoomGrant {
 
 /** `POST /api/r1/exchange`: 200 with a room token, or 202 while the worker boots. */
 export type R1ExchangeResult = R1RoomGrant | { status: 'preparing' };
+
+/** `POST /api/r1/meet/exchange` 200: the room token for the Meet bridge, and nothing else. */
+export interface R1MeetRoomGrant {
+  status: 'ready';
+  url: string;
+  livekit_token: string;
+  expires_at: string | null;
+}
+
+/**
+ * `POST /api/r1/meet/exchange` 202 while the worker boots. `resume_token` continues the SAME
+ * claimed ticket on the next call (the ticket alone would be refused as already claimed).
+ */
+export interface R1MeetPreparing {
+  status: 'preparing';
+  resume_token: string;
+  /** The server's hint in whole seconds (0..600), or null when it gave none or an odd one. */
+  retry_after_sec: number | null;
+}
+
+export type R1MeetExchangeResult = R1MeetRoomGrant | R1MeetPreparing;
 
 export type R1ErrorKind =
   | 'busy'
@@ -557,6 +596,36 @@ export function parseExchange(data: unknown): R1ExchangeResult {
   };
 }
 
+/** The 202's `retry_after_sec`: a whole number of seconds from 0 to 600, else null. */
+function retryAfterSeconds(value: unknown): number | null {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 600
+    ? value
+    : null;
+}
+
+/**
+ * The Meet bridge exchange. A 202 (`status: 'preparing'`) must carry `resume_token`, or the page
+ * could only retry with the claimed ticket; a 200 must carry the room URL and token. Only the
+ * declared fields are copied: anything else the server adds (a name, a session id) never
+ * reaches the page.
+ */
+export function parseMeetExchange(data: unknown): R1MeetExchangeResult {
+  const body = requireRecord(data);
+  if (body.status === 'preparing') {
+    return {
+      status: 'preparing',
+      resume_token: requireString(body.resume_token),
+      retry_after_sec: retryAfterSeconds(body.retry_after_sec),
+    };
+  }
+  return {
+    status: 'ready',
+    url: requireString(body.url),
+    livekit_token: requireString(body.livekit_token),
+    expires_at: optionalString(body.expires_at),
+  };
+}
+
 const call = (name: R1RouteName, body: Json): Promise<unknown> =>
   send(R1_CONTRACT[name].method, R1_CONTRACT[name].path, body);
 
@@ -609,6 +678,18 @@ export const r1Api = {
   ready: async (attemptToken: string, nonce: string): Promise<void> => {
     await call('ready', { attempt_token: attemptToken, nonce });
   },
+
+  /**
+   * Trade the Meet bridge ticket for a room token. `resumeToken` is sent only on a retry after a
+   * 202 that supplied one. The bounded retry schedule lives in `r1-meet.ts` (`runMeetExchange`).
+   */
+  meetExchange: async (ticket: string, resumeToken: string | null): Promise<R1MeetExchangeResult> =>
+    parseMeetExchange(
+      await call('meetExchange', {
+        ticket,
+        ...(resumeToken ? { resume_token: resumeToken } : {}),
+      }),
+    ),
 };
 
 /**

@@ -1,5 +1,6 @@
 /**
- * Where the R1 link token and the rejoin nonce live in the browser.
+ * Where the R1 link token, the rejoin nonce and the Meet bridge ticket live in
+ * the browser.
  *
  * Invariants:
  *   - The link token is read from the URL FRAGMENT only, kept in memory by the
@@ -17,6 +18,12 @@
  *     first link's nonce. Capturing a different link's token discards the
  *     stale entry. Only 64 of the token's 256 digest bits are stored, so the
  *     entry names the link without revealing it.
+ *   - The Meet bridge ticket (`/candidate/r1/meet#t=<ticket>`, M034 S07) is read
+ *     from the URL FRAGMENT only, and the address bar is reset to the bare Meet
+ *     path at once, before the ticket is even validated, whatever the fragment
+ *     held. The caller keeps it in memory only: it is never stored (no
+ *     `sessionStorage`, no nonce entry), never put in a URL and never logged.
+ *     Capturing it never reads, writes or clears the link nonce.
  */
 
 import { sha256Hex } from './r1-digest';
@@ -30,11 +37,22 @@ const NONCE_RE = /^[A-Za-z0-9_-]{16,128}$/;
 const DIGEST_RE = /^[a-f0-9]{16}$/;
 const DIGEST_LENGTH = 16;
 
+/**
+ * Meet bridge tickets are opaque base64url strings (the server mints 32 random bytes, 43
+ * characters); accept that alphabet with some room either side.
+ */
+const MEET_TICKET_RE = /^[A-Za-z0-9_-]{32,128}$/;
+
 export const R1_PATH = '/candidate/r1';
+export const R1_MEET_PATH = '/candidate/r1/meet';
 export const R1_NONCE_STORAGE_KEY = 'r1.attempt.nonce';
 
 export function isLinkToken(value: string): boolean {
   return LINK_TOKEN_RE.test(value);
+}
+
+export function isMeetTicket(value: string): boolean {
+  return MEET_TICKET_RE.test(value);
 }
 
 export function isNonce(value: string): boolean {
@@ -107,6 +125,23 @@ export function captureLinkToken(win: Window = window): string | null {
   const stored = readRaw();
   if (stored !== null && parseEntry(stored)?.l !== linkDigest(value)) clearNonce();
   return value;
+}
+
+/**
+ * Read and strip the Meet bridge ticket from `#t=<ticket>`. Returns null when the fragment is
+ * missing, has no `t`, or holds a ticket of the wrong shape. The address bar is reset to the
+ * bare Meet path in every case, BEFORE validation. Storage is never touched.
+ */
+export function captureMeetTicket(win: Window = window): string | null {
+  const raw = win.location.hash.slice(1);
+  let value = '';
+  try {
+    value = raw ? (new URLSearchParams(raw).get('t') ?? '') : '';
+  } catch {
+    value = '';
+  }
+  win.history.replaceState(null, '', R1_MEET_PATH);
+  return isMeetTicket(value) ? value : null;
 }
 
 /** The rejoin nonce stored for THIS link, or null. */
