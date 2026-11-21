@@ -128,9 +128,10 @@ import {
 } from '../lib/r1/consent-items.js';
 import { r1DeepSeekHealth } from '../lib/r1/deepseek-health.js';
 import { createReadyLimiter, type ReadyLimiter } from '../lib/r1/ready-limiter.js';
-import { runR1WorkerGate, type DispatchListerLike } from '../lib/r1/worker-gate.js';
+import type { DispatchListerLike } from '../lib/r1/worker-gate.js';
 import { mintCandidateJoin } from '../lib/r1/candidate-join.js';
 import { provisionMarkedRoom } from '../lib/r1/marked-room.js';
+import { r1WorkerGateMissing, runR1JoinGate, type R1JoinGateDeps } from '../lib/r1/join-gate.js';
 
 const log = createLogger('r1-candidate');
 
@@ -356,6 +357,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
   const schedule = deps.schedule ?? defaultSchedule;
   const readyLimiter = deps.readyLimiter ?? createReadyLimiter();
   const readyTimeoutMs = deps.readyRelayTimeoutMs ?? READY_RELAY_TIMEOUT_MS;
+  const joinGateDeps: R1JoinGateDeps = { db, now, resolveGate, dispatches: dispatchesFor, requireMachineAgentName, log };
 
   // Tokens, nonces and consent state must never be cached by a proxy or browser.
   router.use((_req, res, next) => {
@@ -466,37 +468,6 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
     }
   }
 
-  /**
-   * M019 interlock at dispatch time, not only when the limit is saved. With
-   * BROWSER_REQUIRE_MACHINE_AGENT_NAME off, an R1 dispatch may go to the SHARED agent name, which
-   * is safe only while this is the one live R1 session: with another live, LiveKit could hand
-   * this session's job to a machine leased to the other interview, whose release would then stop
-   * it mid-call. So, flag off on the self-hosted target, dispatch only when no OTHER R1 session
-   * is live (0131's live predicate). At limit 1 admission already guarantees that, so today's
-   * behaviour is unchanged; after a misordered rollback (flag off while several were admitted,
-   * or the limit still above 1) every join but one defers instead. An unreadable answer defers
-   * too. Cloud, and the flag on (per-machine names enforced by the gate), skip the read.
-   */
-  async function sharedNameDispatchSafe(endpoint: LiveKitEndpoint, sessionId: string): Promise<boolean> {
-    if (endpoint.target !== 'r1' || requireMachineAgentName()) return true;
-    try {
-      const others = await db
-        .from('call_sessions')
-        .select('id')
-        .not('interview_round_id', 'is', null)
-        .in('status', ['created', 'waiting', 'in_progress'])
-        .neq('id', sessionId)
-        .limit(1);
-      if (!others.error && Array.isArray(others.data) && others.data.length === 0) return true;
-      log.error('unknown_event', {
-        error_category: others.error ? 'r1_live_count_unreadable' : 'r1_concurrency_needs_machine_names',
-      });
-    } catch {
-      log.error('unknown_event', { error_category: 'r1_live_count_unreadable' });
-    }
-    return false;
-  }
-
   /** New-work gate: maintenance blocks new joins (503); a read failure fails closed. */
   async function maintenanceClear(res: Response): Promise<boolean> {
     const state = await readMaintenance();
@@ -547,30 +518,11 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       refuse(res, 503, 'r1_unavailable');
       return null;
     }
-    if (r1GateMissing(endpoint)) {
+    if (r1WorkerGateMissing(endpoint, joinGateDeps)) {
       refuse(res, 503, 'r1_unavailable');
       return null;
     }
     return endpoint;
-  }
-
-  /**
-   * Fence 7 on the R1 SFU. Nothing auto-dispatches there, so with no worker gate
-   * (orchestration off, `BROWSER_AGENT_NAME` empty or malformed) a candidate token
-   * would be minted for a room no interviewer will ever join. True means "refuse
-   * with 503 r1_unavailable", and it must be asked BEFORE anything is provisioned.
-   * Cloud is never affected: its unnamed worker auto-dispatches (legacy behaviour).
-   * A gate that cannot even be built counts as missing.
-   */
-  function r1GateMissing(endpoint: LiveKitEndpoint): boolean {
-    if (endpoint.target !== 'r1') return false;
-    try {
-      if (resolveGate() !== null) return false;
-    } catch {
-      /* unbuildable gate: fail closed below */
-    }
-    log.error('unknown_event', { error_category: 'r1_worker_gate_missing' });
-    return true;
   }
 
   // ── POST /api/r1/status ────────────────────────────────────────────
@@ -1355,7 +1307,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       }
       if (session.status === 'waiting') {
         // Fence 7, BEFORE anything is provisioned: no gate on the R1 SFU, no token.
-        if (r1GateMissing(endpoint)) {
+        if (r1WorkerGateMissing(endpoint, joinGateDeps)) {
           refuse(res, 503, 'r1_unavailable');
           return;
         }
@@ -1376,16 +1328,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
     }
 
     if (session.status !== 'in_progress') {
-      const gate = !(await sharedNameDispatchSafe(endpoint, session.id)) ? 'preparing' : await runR1WorkerGate({
-        gate: resolveGate(),
-        sessionId: session.id,
-        roomName,
-        dispatches: () => dispatchesFor(endpoint),
-        now,
-        // The R1 SFU has no unnamed worker to auto-dispatch: a null gate or a
-        // `disabled` verdict defers instead of minting a token (fence 7).
-        failClosed: endpoint.target === 'r1',
-      });
+      const gate = await runR1JoinGate({ endpoint, sessionId: session.id, roomName }, joinGateDeps);
       if (gate === 'preparing') {
         res.setHeader('Retry-After', String(PREPARING_RETRY_AFTER_SEC));
         res.status(202).json({ status: 'preparing', retry_after_sec: PREPARING_RETRY_AFTER_SEC });
