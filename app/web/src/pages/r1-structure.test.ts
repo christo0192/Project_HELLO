@@ -38,6 +38,7 @@ const R1_FILES = [
   ...walk('src/lib/r1'),
   ...walk('src/components/candidate-r1'),
   'src/pages/R1JoinPage.tsx',
+  'src/pages/R1MeetBridgePage.tsx',
 ].filter((file) => /\.(ts|tsx)$/.test(file) && !/\.test\.(ts|tsx)$/.test(file));
 
 const R1_TSX = R1_FILES.filter((file) => file.endsWith('.tsx'));
@@ -46,6 +47,7 @@ describe('R1 is a separate surface from the legacy candidate join', () => {
   it('finds the R1 sources it is guarding', () => {
     expect(R1_FILES.length).toBeGreaterThanOrEqual(15);
     expect(R1_FILES).toContain('src/pages/R1JoinPage.tsx');
+    expect(R1_FILES).toContain('src/pages/R1MeetBridgePage.tsx');
     expect(R1_FILES).toContain('src/lib/r1/r1-api.ts');
   });
 
@@ -71,6 +73,16 @@ describe('R1 is a separate surface from the legacy candidate join', () => {
     expect(app).toContain('path="/candidate/r1"');
     expect(app).toContain('path="/candidate/join"');
     expect(app).toMatch(/lazyPage\(\(\) => import\('\.\/pages\/R1JoinPage'\), 'R1JoinPage'\)/);
+  });
+
+  it('routes the Meet bridge as its own public, lazy page beside the candidate page', () => {
+    const app = read('src/App.tsx');
+    expect(app).toContain('path="/candidate/r1/meet"');
+    expect(app).toMatch(
+      /lazyPage\(\(\) => import\('\.\/pages\/R1MeetBridgePage'\), 'R1MeetBridgePage'\)/,
+    );
+    // Public like /candidate/r1: the route sits before the protected recruiter routes.
+    expect(app.indexOf('path="/candidate/r1/meet"')).toBeLessThan(app.indexOf('<ProtectedRoute />'));
   });
 });
 
@@ -307,5 +319,85 @@ describe('R1 styling stays inside the candidate palette', () => {
   it('mirrors only the local preview, never the video that is published', () => {
     const css = read('src/styles/candidate-r1.css');
     expect(css).toMatch(/\.r1-selfview video \{[^}]*scaleX\(-1\)/);
+  });
+});
+
+describe('the Meet bridge is audio-only and narrow', () => {
+  // M034 S07: the page the Recall bot loads as the AI interviewer's camera tile. Everyone in the
+  // meeting sees it, it runs in a headless Chrome with no CSP, and it holds a single-use ticket.
+  const R1_MEET_FILES = [
+    'src/lib/r1/r1-meet.ts',
+    'src/lib/r1/r1-meet-room.ts',
+    'src/pages/R1MeetBridgePage.tsx',
+    'src/components/candidate-r1/R1MeetTile.tsx',
+    'src/components/candidate-r1/r1-meet-copy.ts',
+  ];
+  const codeOf = (file: string): string =>
+    read(file).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const PAGE = 'src/pages/R1MeetBridgePage.tsx';
+
+  it('guards files that exist, and every one of them is also under the R1 guards above', () => {
+    for (const file of R1_MEET_FILES) expect(R1_FILES, file).toContain(file);
+  });
+
+  it('never asks for a camera or builds a video track', () => {
+    const video = /createLocalVideoTrack|LocalVideoTrack|VideoCapture|Track\.Source\.Camera|getUserMedia\(\{\s*video/;
+    for (const file of R1_MEET_FILES) {
+      expect(read(file), `${file} has a camera path`).not.toMatch(video);
+    }
+  });
+
+  it('loads nothing from a third party: no URL literal, no injected script or stylesheet', () => {
+    for (const file of R1_MEET_FILES) {
+      const source = read(file);
+      expect(source, `${file} has a URL literal`).not.toMatch(/https?:\/\//);
+      expect(source, `${file} injects a script`).not.toMatch(/createElement\(\s*['"]script/);
+      expect(source, `${file} adds a link element`).not.toMatch(/<link\b/);
+    }
+  });
+
+  it("has no source for the candidate's name: the tile is seen by everyone in the meeting", () => {
+    for (const file of R1_MEET_FILES) {
+      expect(codeOf(file), `${file} reads a person's name`).not.toMatch(
+        /candidate_?name|display_?name|full_?name/i,
+      );
+    }
+  });
+
+  it('calls the ticket exchange and no other R1 route', () => {
+    const page = codeOf(PAGE);
+    expect(page).toContain('r1Api.meetExchange(');
+    expect([...new Set([...page.matchAll(/\br1Api\.(\w+)/g)].map((match) => match[1]))]).toEqual([
+      'meetExchange',
+    ]);
+    expect(page).not.toMatch(
+      /r1Api\.status\(|consentTemplate\(|submitConsent\(|withdrawConsent\(|preflight\(|createAttempt\(|r1Api\.exchange\(|r1Api\.ready\(/,
+    );
+    for (const file of R1_MEET_FILES) {
+      if (file === PAGE) continue;
+      expect(codeOf(file), `${file} calls the API`).not.toMatch(/\br1Api\./);
+    }
+  });
+
+  it('publishes the meeting audio as the microphone with DTX off, trusting only the agent', () => {
+    const room = read('src/lib/r1/r1-meet-room.ts');
+    expect(room).toContain('Track.Source.Microphone');
+    expect(room).toContain('dtx: false');
+    expect(room).toContain('isAgentParticipant');
+    expect(room).toContain('trustedSignals');
+    expect(room).not.toMatch(/\.attributes\b/);
+  });
+
+  it('keeps the bridge off the browser controller and the browser page', () => {
+    const page = read(PAGE);
+    expect(page, 'the bridge imports the browser room').not.toMatch(/\/r1-room['"]/);
+    expect(page).not.toMatch(/R1JoinPage|r1-media['"]|captureLinkToken|readNonce|saveNonce|clearNonce/);
+    expect(page).toContain("from '../lib/r1/r1-meet-room'");
+  });
+
+  it('declares a no-referrer policy and gives the tile no control to press', () => {
+    expect(read(PAGE)).toMatch(/<meta name="referrer" content="no-referrer" \/>/);
+    const tile = codeOf('src/components/candidate-r1/R1MeetTile.tsx');
+    expect(tile).not.toMatch(/<(button|a|input|select|textarea)\b|onClick|tabIndex|R1ReadyButton|R1ConsentExit/);
   });
 });

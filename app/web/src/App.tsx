@@ -60,6 +60,9 @@ const CandidateScreeningEndedPage = lazyPage(
 // The R1 candidate page also carries the LiveKit SDK, so it is lazy for the same
 // reason; it is a separate route and never shares code paths with the legacy join.
 const R1JoinPage = lazyPage(() => import('./pages/R1JoinPage'), 'R1JoinPage');
+// The Meet bridge (M034): loaded by the Recall bot's Output Media as the AI interviewer's camera
+// tile; public, audio-only, and lazy for the same LiveKit reason.
+const R1MeetBridgePage = lazyPage(() => import('./pages/R1MeetBridgePage'), 'R1MeetBridgePage');
 const ScreeningPage = lazyPage(() => import('./pages/ScreeningPage'), 'ScreeningPage');
 const CandidateDetailPage = lazyPage(
   () => import('./pages/CandidateDetailPage'),
@@ -147,6 +150,14 @@ export default function App() {
           element={
             <Suspense fallback={<LoadingPanel />}>
               <R1JoinPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/candidate/r1/meet"
+          element={
+            <Suspense fallback={<LoadingPanel />}>
+              <R1MeetBridgePage />
             </Suspense>
           }
         />

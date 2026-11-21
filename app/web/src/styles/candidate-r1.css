@@ -208,3 +208,24 @@
 @media (forced-colors: active) {
   .r1-phase, .r1-notice__body, .r1-secondary-cta { background: Canvas; border: 1px solid CanvasText; }
 }
+
+/* Meet bridge tile (M034 S07): the AI interviewer's camera tile in a Google Meet call, drawn by
+   the Recall bot's Output Media. Everyone in the meeting reads it, so it carries only the
+   interview's state, and nothing on it is interactive. One column by default (it fits a 390px
+   phone without sideways scroll); two columns from 860x480, sized for the 1280x720 output-media
+   viewport: the stage on the left, the scenario card on the right while the role-play is on. */
+.r1-meet-tile { display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; gap: 16px; width: min(100%, 1180px); margin: 24px auto 0; }
+.r1-meet-tile__stage { display: flex; flex-direction: column; align-items: center; gap: 12px; margin: 0 auto; padding: 28px 20px; text-align: center; }
+.r1-meet-tile__stage .candidate-eyebrow { margin: 0; }
+.r1-meet-tile__title { margin: 0; font-size: 24px; font-weight: 600; letter-spacing: -.01em; line-height: 32px; overflow-wrap: anywhere; }
+.r1-meet-tile__body { max-width: 520px; margin: 0; font-size: 15px; }
+.r1-meet-tile .r1-scenario { margin: 0 auto; }
+@media (min-width: 860px) and (min-height: 480px) {
+  .r1-meet-tile { grid-template-columns: minmax(0, 1fr) minmax(300px, 400px); align-items: center; margin-top: 20px; }
+  .r1-meet-tile__stage { width: 100%; min-height: min(560px, calc(100vh - 150px)); justify-content: center; padding: 32px; }
+  /* Outside the role-play the stage is alone: it takes the whole row rather than half of it. */
+  .r1-meet-tile__stage:only-child { grid-column: 1 / -1; }
+  .r1-meet-tile__title { font-size: 30px; line-height: 38px; }
+  .r1-meet-tile .r1-phase__label { font-size: 18px; }
+  .r1-meet-tile .r1-scenario { width: 100%; }
+}
