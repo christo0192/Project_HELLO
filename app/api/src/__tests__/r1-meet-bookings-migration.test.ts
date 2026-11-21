@@ -499,6 +499,228 @@ describe('migration 0142: the bot release trigger and privileges', () => {
   });
 });
 
+describe('migration 0142: r1_meet_create_round_from_ashby (T2)', () => {
+  const NAME = 'r1_meet_create_round_from_ashby';
+  const SIG = 'uuid, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, timestamptz, uuid, text, integer, timestamptz';
+  const fn = functionBody(NAME);
+  /** The plpgsql body only (after `as $$`), comments stripped, whitespace collapsed. */
+  const body = fn.slice(fn.indexOf(' as $$') + ' as $$'.length);
+  const bodyLc = body.toLowerCase();
+  /** The raw function text with its comments, for the copied-predicate marker. */
+  const rawStart = sql.indexOf(`create or replace function screening_v2.${NAME}(`);
+  const raw = sql.slice(rawStart, sql.indexOf('$$;', rawStart));
+
+  it('sits in its own §10 section between §5 and §90', () => {
+    expect(sql.split('-- §10. ').length - 1).toBe(1);
+    expect(sql.indexOf('-- §10. ')).toBeGreaterThan(sql.indexOf('-- §5. '));
+    expect(sql.indexOf('-- §10. ')).toBeLessThan(sql.indexOf('-- §90. '));
+    expect(rawStart).toBeGreaterThan(sql.indexOf('-- §10. '));
+    expect(rawStart).toBeLessThan(sql.indexOf('-- §90. '));
+  });
+
+  it('has the planned argument list, returns jsonb, and is security definer with a pinned search_path', () => {
+    expect(code).toContain(
+      `create or replace function screening_v2.${NAME}( `
+      + 'p_ashby_interview_event_id uuid, p_ashby_schedule_id text, p_ashby_application_id text, '
+      + 'p_ashby_interview_stage_id text, p_ashby_interview_id text, p_ashby_scheduled_by_user_id text, '
+      + 'p_attested_at timestamptz, p_ashby_updated_at timestamptz, p_meet_url text, p_start_at timestamptz, '
+      + "p_end_at timestamptz, p_created_by uuid, p_objective_profile text default 'r1_dex_sales', "
+      + 'p_expiry_grace_sec integer default 7200, p_now timestamptz default now() ) '
+      + 'returns jsonb language plpgsql security definer set search_path = pg_catalog, screening_v2 as $$',
+    );
+    // The grant signature lists the same types in the same order.
+    const params = /\( (p_[\s\S]*?) \) returns jsonb/.exec(fn)![1]!
+      .split(', ').map((p) => p.split(' ')[1]);
+    expect(params.join(', ')).toBe(SIG);
+  });
+
+  it('is service-role only and documented', () => {
+    expect(code).toContain(`revoke all on function screening_v2.${NAME}(${SIG}) from public, anon, authenticated;`);
+    expect(code).toContain(`grant execute on function screening_v2.${NAME}(${SIG}) to service_role;`);
+    expect(code).toContain(`comment on function screening_v2.${NAME}(${SIG}) is`);
+    expect(lc).not.toMatch(new RegExp(`grant [a-z ,]+ on function screening_v2\\.${NAME}\\([^)]*\\) to (?!service_role;)`));
+  });
+
+  it('validates every input with a closed field code, in order, before any lock or write', () => {
+    const fields = [...body.matchAll(/'status', 'invalid_request', 'field', '([a-z_]+)'/g)].map((m) => m[1]);
+    expect(fields).toEqual([
+      'event_id', 'schedule_id', 'application_id', 'stage_id', 'interview_id', 'attester',
+      'meet_url', 'slot', 'attested_at', 'profile', 'grace', 'now',
+    ]);
+    const lastInvalid = body.lastIndexOf("'invalid_request'");
+    expect(lastInvalid).toBeLessThan(body.indexOf("'in_past'"));
+    expect(body.indexOf("'in_past'")).toBeLessThan(body.indexOf('pg_advisory_xact_lock('));
+    // The same shapes as the table CHECKs and the S01 contracts.
+    expect(body).toContain(`c_uuid constant text := '${UUID_RE}';`);
+    const tableUrl = /constraint chk_r1_meet_bookings_meet_url check \( meet_url ~ '([^']+)' \)/.exec(bookings)![1]!;
+    expect(body).toContain(`p_meet_url !~ '${tableUrl}'`);
+    expect(quoted(/p_objective_profile not in \(([^)]*)\)/.exec(body)![1]!)).toEqual([...R1_MEET_PROFILE_IDS]);
+    expect(body).toContain("p_end_at <= p_start_at or p_end_at > p_start_at + interval '24 hours'");
+    expect(body).toContain("p_attested_at is null or p_attested_at > p_now + interval '5 minutes'");
+    expect(body).toContain('p_expiry_grace_sec not between 900 and 86400');
+    expect(body).toContain('if p_start_at <= p_now then return jsonb_build_object(\'status\', \'in_past\'); end if;');
+  });
+
+  it('locks the event first, then (through r1_send_round) settings and month, then the hold month and the round', () => {
+    const order = [
+      "perform pg_advisory_xact_lock(hashtextextended('r1_meet_booking:' || p_ashby_interview_event_id::text, 0));",
+      'from screening_v2.r1_meet_bookings b where b.ashby_interview_event_id = p_ashby_interview_event_id for update;',
+      'v_send := screening_v2.r1_send_round(',
+      'perform 1 from screening_v2.r1_budget_month where month_start = v_hold_month for update;',
+      'select * into v_round from screening_v2.interview_rounds where id = v_live_id for update;',
+    ];
+    let last = -1;
+    for (const step of order) {
+      expect(body.split(step).length - 1, step).toBeGreaterThanOrEqual(1);
+      expect(body.indexOf(step), step).toBeGreaterThan(last);
+      last = body.indexOf(step);
+    }
+    // Exactly one booking row lock (the event's own), two hold-month locks (held, uncounted), one round lock.
+    expect(bodyLc.match(/\bfor update\b/g)).toHaveLength(4);
+    expect(bodyLc.match(/r1_meet_bookings b where b\.ashby_interview_event_id = p_ashby_interview_event_id for update/g)).toHaveLength(1);
+  });
+
+  it('answers the replay rules of an existing booking before matching anything', () => {
+    const terminal = body.indexOf("v_booking.status in ('completed', 'cancelled', 'failed', 'drained')");
+    const exists = body.indexOf("'status', 'exists'");
+    const stale = body.indexOf('if p_ashby_updated_at < v_booking.ashby_updated_at then');
+    const match = body.indexOf('from screening_v2.ashby_application_links l');
+    expect(terminal).toBeGreaterThan(-1);
+    expect(exists).toBeGreaterThan(terminal);
+    expect(stale).toBeGreaterThan(exists);
+    expect(match).toBeGreaterThan(stale);
+  });
+
+  it('matches the candidate by the Ashby application link only, and requires created_by in auth.users', () => {
+    expect(body).toContain("where l.provider = 'ashby' and l.external_application_id = p_ashby_application_id;");
+    expect(bodyLc).not.toMatch(/\bemail\b/);
+    expect(body).toContain('if not exists (select 1 from auth.users u where u.id = p_created_by) then');
+    // p_created_by is only null-checked, looked up in auth.users and handed to r1_send_round.
+    expect(body.match(/p_created_by/g)).toHaveLength(3);
+    expect(body).toContain('if p_created_by is null then');
+    expect(body).toContain('v_send := screening_v2.r1_send_round( v_candidate_id, v_role_id, p_created_by,');
+  });
+
+  it('bounds the expiry at 14 days and never reissues the round link', () => {
+    expect(body).toContain('v_expires := p_end_at + make_interval(secs => p_expiry_grace_sec);');
+    expect(body).toContain("if v_expires > p_now + interval '14 days' then v_retry_after := v_expires - interval '14 days';");
+    expect(bodyLc).not.toContain('r1_transition_round');
+    expect(bodyLc).not.toContain('link_token_digest');
+  });
+
+  it('creates the round through r1_send_round with a digest whose preimage is never kept, then sets channel meet', () => {
+    expect(body).toContain(
+      "encode(sha256(convert_to('r1-meet-unusable:' || gen_random_uuid()::text || ':' || gen_random_uuid()::text, 'UTF8')), 'hex'), "
+      + 'v_candidate_status, v_expires, p_now);',
+    );
+    expect(body).toContain("update screening_v2.interview_rounds set channel = 'meet' where id = v_round_id;");
+    // The channel flips before the consent row exists (the channel lock allows it only then).
+    expect(body.indexOf("set channel = 'meet'")).toBeLessThan(body.indexOf('insert into screening_v2.interview_round_consents'));
+    expect(body).toContain(
+      "raise exception 'r1_meet_create_round_from_ashby: unexpected answer from r1_send_round' using errcode = 'P0001';",
+    );
+  });
+
+  it('reads the newest active notice with admission\'s exact predicate, for en-IN and for a re-linked round\'s audience', () => {
+    const admission = readFileSync(path.join(migrations, '0131_r1_concurrent_sessions.sql'), 'utf8');
+    const newest = '(select max(x.version) from screening_v2.interview_round_consent_templates x where x.is_active)';
+    expect(admission).toContain(`t.is_active and t.version=${newest}`);
+    expect(body).toContain(`where t.is_active and t.version = ${newest} and t.locale = 'en-IN';`);
+    expect(body).toContain(`where t.is_active and t.version = ${newest} and t.locale = v_round.consent_locale;`);
+    expect(body.match(/jsonb_array_length\(v_template\.required_consents\) = 0/g)).toHaveLength(2);
+  });
+
+  it('copies the two phone checks of r1_send_round (0128) character for character into the re-link', () => {
+    const src = readFileSync(path.join(migrations, '0128_r1_twenty_minute_roleplay.sql'), 'utf8').replace(/\r\n/g, '\n');
+    const sendStart = src.indexOf('create or replace function screening_v2.r1_send_round(');
+    const send = src.slice(sendStart, src.indexOf('$$;', sendStart));
+    const checks = [...send.matchAll(/^\s*if (exists \(.*\)) then return jsonb_build_object\('status','(phone_engagement_active|phone_assessment_pending)'\); end if;$/gm)]
+      .map((m) => ({ predicate: m[1]!, code: m[2]! }));
+    expect(checks.map((c) => c.code)).toEqual(['phone_engagement_active', 'phone_assessment_pending']);
+    const marker = '-- copied from r1_send_round (0128)\n';
+    expect(raw.split(marker)).toHaveLength(2);
+    let rest = raw.slice(raw.indexOf(marker) + marker.length);
+    for (const check of checks) {
+      const stmt = `if ${check.predicate} then`;
+      rest = rest.trimStart();
+      expect(rest.startsWith(stmt), check.code).toBe(true);
+      rest = rest.slice(stmt.length).trimStart();
+      expect(rest.startsWith(`v_reason := '${check.code}';`), check.code).toBe(true);
+      rest = rest.slice(rest.indexOf('end if;') + 'end if;'.length);
+    }
+    // The copied text reads r1_send_round's parameter name; the block binds it to the matched candidate.
+    expect(body).toContain('declare p_candidate_id constant uuid := v_candidate_id; begin');
+  });
+
+  it('re-links only a reusable live Meet round and supersedes its live consent like the browser flow', () => {
+    for (const condition of [
+      'v_round.id is null',
+      "v_round.channel <> 'meet'",
+      "v_round.status not in ('invited', 'in_progress')",
+      'v_round.expires_at <= p_now',
+      'v_round.starts_used >= 3',
+      'v_round.attempts_counted >= v_round.attempts_allowed',
+      "s.interview_round_id = v_round.id and s.status in ('created', 'waiting', 'in_progress')",
+      "b.round_id = v_round.id and b.status not in ('completed', 'cancelled', 'failed', 'drained')",
+    ]) {
+      expect(body, condition).toContain(condition);
+    }
+    expect(body).toContain('update screening_v2.interview_rounds set expires_at = v_expires, version = version + 1, updated_at = p_now where id = v_round.id;');
+    expect(body).toContain(
+      "update screening_v2.interview_round_consents set withdrawn_at = p_now, proof = coalesce(proof, '{}'::jsonb) "
+      + "|| jsonb_build_object('decision', 'superseded', 'superseded_at', p_now) where round_id = v_round.id and withdrawn_at is null;",
+    );
+    // The hold is never moved: no budget-month write in the re-link.
+    expect(bodyLc).not.toMatch(/update screening_v2\.r1_budget_month/);
+  });
+
+  it('writes the HR-attested consent with the Ashby scheduler as the attester, never created_by', () => {
+    const start = body.indexOf('insert into screening_v2.interview_round_consents');
+    const insert = body.slice(start, body.indexOf(';', start));
+    expect(insert).toContain(
+      '(round_id, template_id, consents, proof, granted_at, method, attested_by_external_id, attested_at, india_location_attested)',
+    );
+    expect(insert).toContain('values (v_round_id, v_template.id, v_template.required_consents,');
+    expect(insert).toContain("'decision', 'granted', 'method', 'hr_attested_ashby', 'captured_at', p_now,");
+    expect(insert).toContain("'attested_by_external_id', p_ashby_scheduled_by_user_id,");
+    expect(insert).toContain("'india_location_attested', true, 'source', 'ashby_interview_schedule',");
+    expect(insert).toContain("p_now, 'hr_attested_ashby', p_ashby_scheduled_by_user_id, p_attested_at, true)");
+    expect(insert).not.toContain('p_created_by');
+    expect(insert).not.toMatch(/ip_prefix|user_agent|email|name'/);
+    expect(R1_MEET_CONSENT_MODES).toContain('hr_attested_ashby');
+  });
+
+  it('pairs every status and reason it writes with the booking CHECKs', () => {
+    const families = pairingFamilies();
+    const familyOf = (status: string) => families.find((f) => f.statuses.includes(status))!.reasons;
+    const pairs = [...body.matchAll(/v_status := '([a-z_]+)'; v_reason := '([a-z_]+)';/g)].map((m) => [m[1]!, m[2]!] as const);
+    expect(pairs.length).toBeGreaterThanOrEqual(9);
+    for (const [status, reason] of pairs) expect(familyOf(status), `${status}/${reason}`).toContain(reason);
+    // r1_send_round refusals map 1:1 onto blocked reasons.
+    const refusals = quoted(/if v_code in \(([^)]*)\) then v_status := 'blocked'; v_reason := v_code;/.exec(body)![1]!);
+    expect(refusals).toEqual([
+      'disabled', 'paused', 'candidate_ineligible', 'role_not_configured',
+      'phone_engagement_active', 'phone_assessment_pending', 'capacity_exhausted',
+    ]);
+    for (const reason of refusals) expect(familyOf('blocked'), reason).toContain(reason);
+    // The re-link's own refusals keep status blocked.
+    const relinkStart = body.indexOf("v_status := 'blocked'; v_reason := 'round_active';");
+    const relink = body.slice(relinkStart, body.indexOf('update screening_v2.interview_rounds set expires_at = v_expires', relinkStart));
+    const relinkReasons = [...relink.matchAll(/v_reason := '([a-z_]+)';/g)].map((m) => m[1]!);
+    expect(relinkReasons).toEqual(['round_active', 'phone_engagement_active', 'phone_assessment_pending', 'consent_template_unavailable']);
+    for (const reason of relinkReasons) expect(familyOf('blocked'), reason).toContain(reason);
+  });
+
+  it('never writes a call session, an audit row or a job, never reads the clock, and never returns a digest', () => {
+    expect(bodyLc).not.toMatch(/insert into screening_v2\.(call_sessions|audit_events|job_queue)\b/);
+    expect(bodyLc).not.toMatch(/\bnow\s*\(|\bcurrent_timestamp\b|\bclock_timestamp\s*\(|\bstatement_timestamp\s*\(/);
+    expect(bodyLc).not.toMatch(/\bwhen others\b|\bexception\s+when\b/);
+    const builds = [...bodyLc.matchAll(/jsonb_build_object\(/g)].map((m) => bodyLc.slice(m.index!, bodyLc.indexOf(';', m.index!)));
+    expect(builds.length).toBeGreaterThan(10);
+    for (const b of builds) expect(b).not.toMatch(/digest|token|unusable/);
+  });
+});
+
 describe('migration 0142: SQL test wiring', () => {
   it('runs the assertions from supabase-test.sh and triggers supabase-ci on the helper', () => {
     const script = read('scripts/test-r1-meet.sh');

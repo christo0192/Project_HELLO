@@ -885,6 +885,673 @@ begin
 end;
 $$;
 
+-- =============================================================================================
+-- T2. r1_meet_create_round_from_ashby: the round, the HR-attested consent and the booking.
+-- =============================================================================================
+-- Fixture numbers 100-199: candidate n is linked to Ashby application id(22, n), and event n books
+-- application n unless a call says otherwise. Every call passes p_now explicitly (default
+-- 2026-12-01 04:00 UTC). The default slot is 2026-12-02 10:30-11:15 UTC, so a default round
+-- expires at 13:15 (slot end + 7200 s). Table aliases are always `x`: no variable is named x.
+--
+-- The newest active consent release is made OURS for the rest of the run. Earlier suites leave
+-- active test releases behind (r1_foundation_assert: version '9002', en-IN, requiring nothing),
+-- which would turn every Meet round into blocked/consent_template_unavailable. 'zz-' sorts after
+-- every digit-led release in any collation, and the setup asserts that it is the newest.
+
+-- Calls the RPC as S06 would: defaults for event n, overridden by p_args (a JSON null is SQL NULL).
+create function _r1_meet_tests.create_round(p_n integer, p_args jsonb default '{}'::jsonb)
+returns jsonb language plpgsql as $$
+declare
+  a jsonb := jsonb_build_object(
+    'event_id', _r1_meet_tests.id(20, p_n),
+    'schedule_id', _r1_meet_tests.id(21, p_n)::text,
+    'application_id', _r1_meet_tests.id(22, p_n)::text,
+    'stage_id', _r1_meet_tests.id(23, p_n)::text,
+    'interview_id', _r1_meet_tests.id(24, p_n)::text,
+    'attester', _r1_meet_tests.id(25, 1)::text,
+    'attested_at', '2026-11-30T09:00:00+00:00',
+    'updated_at', '2026-11-30T09:00:05+00:00',
+    'meet_url', 'https://meet.google.com/abc-defg-hij',
+    'start_at', '2026-12-02T10:30:00+00:00',
+    'end_at', '2026-12-02T11:15:00+00:00',
+    'created_by', _r1_meet_tests.id(1, 1),
+    'profile', 'r1_dex_sales',
+    'grace', 7200,
+    'now', '2026-12-01T04:00:00+00:00') || p_args;
+begin
+  return screening_v2.r1_meet_create_round_from_ashby(
+    (a ->> 'event_id')::uuid, a ->> 'schedule_id', a ->> 'application_id', a ->> 'stage_id',
+    a ->> 'interview_id', a ->> 'attester', (a ->> 'attested_at')::timestamptz,
+    (a ->> 'updated_at')::timestamptz, a ->> 'meet_url', (a ->> 'start_at')::timestamptz,
+    (a ->> 'end_at')::timestamptz, (a ->> 'created_by')::uuid, a ->> 'profile',
+    (a ->> 'grace')::integer, (a ->> 'now')::timestamptz);
+end;
+$$;
+
+-- Runs create_round(p_n) under one more active consent release (newer than ours) inside a
+-- subtransaction that is ALWAYS rolled back, so the release and every write of the call vanish
+-- (releases are immutable and could not be removed otherwise). Returns the call's answer. A real
+-- error (including a failed assertion) is re-raised, never mistaken for the sentinel.
+create function _r1_meet_tests.create_round_under_release(p_n integer, p_version text,
+                                                          p_locale text, p_required jsonb)
+returns jsonb language plpgsql as $$
+declare
+  v_res jsonb;
+  v_done boolean := false;
+begin
+  begin
+    insert into screening_v2.interview_round_consent_templates
+      (version, locale, title, body_md, required_consents, is_active)
+    values (p_version, p_locale, 'R1 Meet assertion newer notice', 'fixture', p_required, true);
+    perform _r1_meet_tests.assert('T2 fixture release ' || p_version || ' (' || p_locale
+                                  || ') is the newest active release',
+      (select max(x.version) = p_version
+         from screening_v2.interview_round_consent_templates x where x.is_active));
+    v_res := _r1_meet_tests.create_round(p_n);
+    v_done := true;
+    raise exception 'r1 meet rollback sentinel' using errcode = 'P0001';
+  exception when sqlstate 'P0001' then
+    if not v_done then
+      raise;
+    end if;
+  end;
+  return v_res;
+end;
+$$;
+
+-- Every call session of one round (counted per round: earlier suites may leave live sessions).
+create function _r1_meet_tests.sessions_of(p_round uuid) returns integer
+language sql stable as $$
+  select count(*)::integer from screening_v2.call_sessions x where x.interview_round_id = p_round
+$$;
+
+-- The minutes reserved in one budget month (0 when the month row does not exist yet).
+create function _r1_meet_tests.reserved(p_month date) returns numeric
+language sql stable as $$
+  select coalesce(sum(x.minutes_reserved), 0) from screening_v2.r1_budget_month x
+   where x.month_start = p_month
+$$;
+
+-- T2-A. Setup, the happy path, idempotent replay, and admission accepting the HR-attested row.
+do $$
+declare
+  p_now constant timestamptz := '2026-12-01 04:00:00+00';
+  hr1 constant text := _r1_meet_tests.id(25, 1)::text;
+  tpl constant uuid := _r1_meet_tests.id(3, 2);
+  c uuid;
+  res jsonb;
+  again jsonb;
+  b screening_v2.r1_meet_bookings%rowtype;
+  r screening_v2.interview_rounds%rowtype;
+  k screening_v2.interview_round_consents%rowtype;
+  reserved_before numeric;
+  r_adm uuid;
+  r_wd uuid;
+begin
+  -- A second auth user: the R1_MEET_SERVICE_USER_ID fallback of T2-B.
+  insert into auth.users (id, email)
+  values (_r1_meet_tests.id(1, 2), 'r1-meet-assert-2@example.test')
+  on conflict (id) do nothing;
+  insert into screening_v2.interview_round_consent_templates
+    (id, version, locale, title, body_md, required_consents, is_active)
+  values (tpl, 'zz-meet-assert-current', 'en-IN', 'R1 Meet assertion current notice', 'fixture',
+          '["ai_interview", "video_audio_recording", "ai_evaluation", "data_processing"]'::jsonb, true);
+  perform _r1_meet_tests.assert('T2 setup: our en-IN release is the newest active release',
+    (select max(x.version) = 'zz-meet-assert-current'
+       from screening_v2.interview_round_consent_templates x where x.is_active));
+  perform _r1_meet_tests.assert('T2 setup: id(1, 99) is not an auth user',
+    not exists (select 1 from auth.users x where x.id = _r1_meet_tests.id(1, 99)));
+
+  -- The happy path.
+  c := _r1_meet_tests.candidate(100);
+  reserved_before := _r1_meet_tests.reserved('2026-12-01');
+  res := _r1_meet_tests.create_round(100);
+  select * into b from screening_v2.r1_meet_bookings
+   where ashby_interview_event_id = _r1_meet_tests.id(20, 100);
+  select * into r from screening_v2.interview_rounds where id = b.round_id;
+  perform _r1_meet_tests.assert('T2-A a first eligible event answers created with the binding',
+    res ->> 'status' = 'created' and (res ->> 'booking_id')::uuid = b.id
+    and (res ->> 'round_id')::uuid = r.id and (res ->> 'candidate_id')::uuid = c
+    and res ->> 'booking_status' = 'pending' and res ->> 'reason' = 'eligible'
+    and (res ->> 'version')::integer = 0 and (res ->> 'key_attempt')::integer = 0
+    and (res ->> 'round_expires_at')::timestamptz = '2026-12-02 13:15:00+00'
+    and res ->> 'objective_profile' = 'r1_dex_sales', res::text);
+  perform _r1_meet_tests.assert(
+    'T2-A the booking is pending/eligible, generation 0, attested by the Ashby scheduler',
+    b.status = 'pending' and b.reason = 'eligible' and b.version = 0 and b.key_attempt = 0
+    and b.ticket_arms = 0 and b.candidate_id = c and b.round_id = r.id
+    and b.ashby_scheduled_by_user_id = hr1
+    and b.ashby_schedule_id = _r1_meet_tests.id(21, 100)::text
+    and b.ashby_application_id = _r1_meet_tests.id(22, 100)::text
+    and b.ashby_interview_stage_id = _r1_meet_tests.id(23, 100)::text
+    and b.ashby_interview_id = _r1_meet_tests.id(24, 100)::text
+    and b.ashby_updated_at = '2026-11-30 09:00:05+00' and b.objective_profile = 'r1_dex_sales'
+    and b.meet_url = 'https://meet.google.com/abc-defg-hij'
+    and b.start_at = '2026-12-02 10:30:00+00' and b.end_at = '2026-12-02 11:15:00+00'
+    and b.recall_bot_id is null and b.ticket_digest is null and b.session_id is null
+    and b.created_at = p_now and b.updated_at = p_now, to_jsonb(b)::text);
+  perform _r1_meet_tests.assert('T2-A the round is a Meet round created through r1_send_round',
+    r.channel = 'meet' and r.status = 'invited' and r.kind = 'sales_r1'
+    and r.role_id = _r1_meet_tests.id(2, 1) and r.candidate_id = c
+    and r.created_by = _r1_meet_tests.id(1, 1) and r.candidate_status_at_send = 'new'
+    and r.consent_locale = 'en-IN' and r.starts_used = 0 and r.version = 1
+    and r.link_token_digest ~ '^[a-f0-9]{64}$', to_jsonb(r)::text);
+  perform _r1_meet_tests.assert('T2-A the round holds 65 minutes in the month of p_now',
+    r.held_minutes = 65 and r.hold_month = '2026-12-01'
+    and _r1_meet_tests.reserved('2026-12-01') = reserved_before + 65,
+    format('held %s, month %s, reserved %s -> %s', r.held_minutes, r.hold_month, reserved_before,
+           _r1_meet_tests.reserved('2026-12-01')));
+  perform _r1_meet_tests.assert('T2-A the round expires exactly at slot end + 7200 s (bounded expiry)',
+    r.expires_at = '2026-12-02 11:15:00+00'::timestamptz + interval '7200 seconds',
+    r.expires_at::text);
+
+  perform _r1_meet_tests.assert('T2-A the round has exactly one consent row, and it is live',
+    (select count(*) = 1 and bool_and(x.withdrawn_at is null)
+       from screening_v2.interview_round_consents x where x.round_id = r.id));
+  select * into k from screening_v2.interview_round_consents x where x.round_id = r.id;
+  perform _r1_meet_tests.assert(
+    'T2-A the consent is HR-attested by the Ashby scheduler, never by the round creator',
+    k.method = 'hr_attested_ashby' and k.attested_by_external_id = hr1
+    and k.attested_by_external_id <> r.created_by::text
+    and k.attested_at = '2026-11-30 09:00:00+00' and k.india_location_attested
+    and k.granted_at = p_now, to_jsonb(k)::text);
+  perform _r1_meet_tests.assert('T2-A the consent covers the newest active en-IN release',
+    k.template_id = tpl
+    and k.consents = (select x.required_consents
+                        from screening_v2.interview_round_consent_templates x where x.id = tpl));
+  perform _r1_meet_tests.assert(
+    'T2-A the consent proof carries the attestation evidence and nothing personal',
+    k.proof ?& array['decision', 'method', 'captured_at', 'template_version', 'locale',
+                     'attested_by_external_id', 'attested_at', 'india_location_attested',
+                     'source', 'ashby_interview_event_id', 'ashby_schedule_id']
+    and (select count(*) = 11 from jsonb_object_keys(k.proof) as x(key))
+    and k.proof ->> 'decision' = 'granted' and k.proof ->> 'method' = 'hr_attested_ashby'
+    and (k.proof ->> 'captured_at')::timestamptz = p_now
+    and k.proof ->> 'template_version' = 'zz-meet-assert-current' and k.proof ->> 'locale' = 'en-IN'
+    and k.proof ->> 'attested_by_external_id' = hr1
+    and (k.proof ->> 'attested_at')::timestamptz = '2026-11-30 09:00:00+00'
+    and (k.proof ->> 'india_location_attested')::boolean
+    and k.proof ->> 'source' = 'ashby_interview_schedule'
+    and (k.proof ->> 'ashby_interview_event_id')::uuid = _r1_meet_tests.id(20, 100)
+    and k.proof ->> 'ashby_schedule_id' = _r1_meet_tests.id(21, 100)::text
+    and not (k.proof ?| array['ip_prefix', 'user_agent', 'name', 'email']), k.proof::text);
+  perform _r1_meet_tests.assert('T2-A creating the Meet round created no call session',
+    _r1_meet_tests.sessions_of(r.id) = 0);
+  perform _r1_meet_tests.assert('T2-A the answer carries no link, token or digest',
+    not exists (select 1 from jsonb_object_keys(res) as x(key) where x.key ~ '(link|token|digest)')
+    and position(r.link_token_digest in res::text) = 0, res::text);
+
+  -- Idempotent replay: the same event answers exists and writes nothing, even with other times.
+  again := _r1_meet_tests.create_round(100);
+  perform _r1_meet_tests.assert('T2-A an identical replay answers exists with the same binding',
+    again ->> 'status' = 'exists' and again ->> 'booking_id' = res ->> 'booking_id'
+    and again ->> 'round_id' = res ->> 'round_id' and again ->> 'candidate_id' = res ->> 'candidate_id'
+    and again ->> 'booking_status' = 'pending' and again ->> 'reason' = 'eligible'
+    and (again ->> 'version')::integer = 0 and (again ->> 'key_attempt')::integer = 0
+    and (again ->> 'round_expires_at')::timestamptz = r.expires_at, again::text);
+  again := _r1_meet_tests.create_round(100, jsonb_build_object(
+    'start_at', '2026-12-02T12:00:00+00:00', 'end_at', '2026-12-02T12:45:00+00:00',
+    'updated_at', '2026-11-30T10:00:00+00:00', 'now', '2026-12-01T05:00:00+00:00'));
+  perform _r1_meet_tests.assert('T2-A a replay with other times still answers exists',
+    again ->> 'status' = 'exists' and again ->> 'round_id' = res ->> 'round_id', again::text);
+  perform _r1_meet_tests.assert(
+    'T2-A the replays wrote nothing: one round, one consent, one booking, the same hold',
+    (select count(*) = 1 from screening_v2.interview_rounds x where x.candidate_id = c)
+    and (select count(*) = 1 from screening_v2.interview_round_consents x where x.round_id = r.id)
+    and (select count(*) = 1 from screening_v2.r1_meet_bookings x where x.candidate_id = c)
+    and _r1_meet_tests.reserved('2026-12-01') = reserved_before + 65
+    and (select x.start_at = b.start_at and x.end_at = b.end_at and x.updated_at = b.updated_at
+                and x.ashby_updated_at = b.ashby_updated_at
+           from screening_v2.r1_meet_bookings x where x.id = b.id)
+    and (select x.expires_at = r.expires_at and x.version = r.version
+           from screening_v2.interview_rounds x where x.id = r.id));
+
+  -- Admission accepts the HR-attested row UNCHANGED (D4). The answer must come from a check AFTER
+  -- the consent gate (earlier suites may leave live R1 sessions, so `ok` alone would be flaky),
+  -- and the same kind of round with its consent withdrawn must stop exactly at the gate.
+  perform _r1_meet_tests.candidate(101);
+  res := _r1_meet_tests.create_round(101);
+  r_adm := (res ->> 'round_id')::uuid;
+  again := screening_v2.r1_admit_attempt(r_adm, _r1_meet_tests.digest('nonce-101'),
+                                         '2026-12-02 10:31:00+00');
+  perform _r1_meet_tests.assert('T2-A admission passes the consent gate of a Meet round unchanged',
+    res ->> 'status' = 'created'
+    and again ->> 'status' in ('ok', 'r1_in_flight', 'round_live', 'cloud_capacity_exhausted',
+                               'capacity_exhausted'), again::text);
+  perform _r1_meet_tests.candidate(102);
+  res := _r1_meet_tests.create_round(102);
+  r_wd := (res ->> 'round_id')::uuid;
+  again := screening_v2.r1_withdraw_consent(r_wd, '{}'::jsonb, p_now);
+  perform _r1_meet_tests.assert('T2-A an HR-attested consent is withdrawn like any other',
+    res ->> 'status' = 'created' and again ->> 'status' = 'ok'
+    and (again ->> 'withdrawn')::integer = 1, again::text);
+  again := screening_v2.r1_admit_attempt(r_wd, _r1_meet_tests.digest('nonce-102'),
+                                         '2026-12-02 10:31:00+00');
+  perform _r1_meet_tests.assert(
+    'T2-A admission refuses a Meet round whose consent was withdrawn: consent_missing',
+    again ->> 'status' = 'consent_missing', again::text);
+  perform _r1_meet_tests.assert('T2-A the refused admission created no call session',
+    _r1_meet_tests.sessions_of(r_wd) = 0);
+end;
+$$;
+
+-- T2-B. created_by: the service-user fallback, an unknown user, none; the attester never changes.
+do $$
+declare
+  svc constant uuid := _r1_meet_tests.id(1, 2);
+  hr2 constant text := _r1_meet_tests.id(25, 2)::text;
+  c uuid;
+  res jsonb;
+  bid uuid;
+  b screening_v2.r1_meet_bookings%rowtype;
+begin
+  c := _r1_meet_tests.candidate(103);
+  res := _r1_meet_tests.create_round(103, jsonb_build_object('created_by', svc, 'attester', hr2));
+  perform _r1_meet_tests.assert(
+    'T2-B the service user creates the round and the Ashby scheduler is the attester',
+    res ->> 'status' = 'created'
+    and (select x.created_by = svc from screening_v2.interview_rounds x
+          where x.id = (res ->> 'round_id')::uuid)
+    and (select x.ashby_scheduled_by_user_id = hr2 from screening_v2.r1_meet_bookings x
+          where x.id = (res ->> 'booking_id')::uuid)
+    and (select x.attested_by_external_id = hr2 and x.attested_by_external_id <> svc::text
+                and x.proof ->> 'attested_by_external_id' = hr2
+           from screening_v2.interview_round_consents x
+          where x.round_id = (res ->> 'round_id')::uuid and x.withdrawn_at is null)
+    and _r1_meet_tests.sessions_of((res ->> 'round_id')::uuid) = 0, res::text);
+
+  c := _r1_meet_tests.candidate(104);
+  res := _r1_meet_tests.create_round(104, jsonb_build_object('created_by', _r1_meet_tests.id(1, 99)));
+  select * into b from screening_v2.r1_meet_bookings
+   where ashby_interview_event_id = _r1_meet_tests.id(20, 104);
+  bid := b.id;
+  perform _r1_meet_tests.assert(
+    'T2-B a created_by that is not an auth user: unmapped_scheduler/created_by_unknown, no round',
+    res ->> 'status' = 'unmapped_scheduler' and res ->> 'reason' = 'created_by_unknown'
+    and (res ->> 'booking_id')::uuid = bid
+    and b.status = 'unmapped_scheduler' and b.reason = 'created_by_unknown'
+    and b.candidate_id = c and b.round_id is null
+    and not exists (select 1 from screening_v2.interview_rounds x where x.candidate_id = c), res::text);
+  res := _r1_meet_tests.create_round(104, jsonb_build_object('created_by', null));
+  perform _r1_meet_tests.assert(
+    'T2-B no created_by: unmapped_scheduler/scheduler_unmapped on the same booking',
+    res ->> 'status' = 'unmapped_scheduler' and res ->> 'reason' = 'scheduler_unmapped'
+    and (res ->> 'booking_id')::uuid = bid
+    and (select x.reason = 'scheduler_unmapped' from screening_v2.r1_meet_bookings x where x.id = bid)
+    and not exists (select 1 from screening_v2.interview_rounds x where x.candidate_id = c), res::text);
+  res := _r1_meet_tests.create_round(104);
+  perform _r1_meet_tests.assert(
+    'T2-B once the scheduler maps, the replay creates the round on the same booking row',
+    res ->> 'status' = 'created' and (res ->> 'booking_id')::uuid = bid
+    and (select count(*) = 1 from screening_v2.r1_meet_bookings x
+          where x.ashby_interview_event_id = _r1_meet_tests.id(20, 104))
+    and (select x.round_id = (res ->> 'round_id')::uuid and x.status = 'pending'
+           from screening_v2.r1_meet_bookings x where x.id = bid), res::text);
+end;
+$$;
+
+-- T2-C. Candidate matching through ashby_application_links, and the out-of-order guard.
+do $$
+declare
+  res jsonb;
+  bid uuid;
+  b screening_v2.r1_meet_bookings%rowtype;
+begin
+  perform _r1_meet_tests.candidate(105, false);
+  res := _r1_meet_tests.create_round(105);
+  select * into b from screening_v2.r1_meet_bookings
+   where ashby_interview_event_id = _r1_meet_tests.id(20, 105);
+  bid := b.id;
+  perform _r1_meet_tests.assert(
+    'T2-C an application with no link: unmatched_application/application_unknown',
+    res ->> 'status' = 'unmatched_application' and res ->> 'reason' = 'application_unknown'
+    and (res ->> 'booking_id')::uuid = bid and b.status = 'unmatched_application'
+    and b.candidate_id is null and b.round_id is null, res::text);
+
+  insert into screening_v2.ashby_application_links (provider, external_application_id)
+  values ('ashby', _r1_meet_tests.id(22, 106)::text);
+  res := _r1_meet_tests.create_round(106);
+  perform _r1_meet_tests.assert('T2-C a link without a candidate: application_unknown',
+    res ->> 'status' = 'unmatched_application' and res ->> 'reason' = 'application_unknown', res::text);
+
+  perform _r1_meet_tests.candidate(107, true, 'withdrawn');
+  res := _r1_meet_tests.create_round(107);
+  perform _r1_meet_tests.assert(
+    'T2-C a terminal application link: unmatched_application/application_terminal, no candidate bound',
+    res ->> 'status' = 'unmatched_application' and res ->> 'reason' = 'application_terminal'
+    and (select x.candidate_id is null and x.round_id is null and x.reason = 'application_terminal'
+           from screening_v2.r1_meet_bookings x
+          where x.ashby_interview_event_id = _r1_meet_tests.id(20, 107))
+    and not exists (select 1 from screening_v2.interview_rounds x
+                     where x.candidate_id = _r1_meet_tests.id(10, 107)), res::text);
+
+  res := _r1_meet_tests.create_round(107, jsonb_build_object(
+    'updated_at', '2026-11-30T08:00:00+00:00', 'now', '2026-12-01T04:30:00+00:00'));
+  perform _r1_meet_tests.assert(
+    'T2-C an older Ashby updatedAt on a round-less booking: stale_update, nothing written',
+    res ->> 'status' = 'stale_update'
+    and (select x.updated_at = '2026-12-01 04:00:00+00' and x.ashby_updated_at = '2026-11-30 09:00:05+00'
+           from screening_v2.r1_meet_bookings x
+          where x.ashby_interview_event_id = _r1_meet_tests.id(20, 107)), res::text);
+
+  -- The import catches up and links the application: the replay creates on the same booking.
+  insert into screening_v2.ashby_application_links (provider, external_application_id, candidate_id)
+  values ('ashby', _r1_meet_tests.id(22, 105)::text, _r1_meet_tests.id(10, 105));
+  res := _r1_meet_tests.create_round(105);
+  perform _r1_meet_tests.assert('T2-C once the application links, the replay creates on the same booking',
+    res ->> 'status' = 'created' and (res ->> 'booking_id')::uuid = bid
+    and (res ->> 'candidate_id')::uuid = _r1_meet_tests.id(10, 105), res::text);
+end;
+$$;
+
+-- T2-D. The 14-day window, a started slot, and every invalid_request field.
+do $$
+declare
+  c uuid;
+  res jsonb;
+  bad record;
+  n_bookings integer;
+begin
+  c := _r1_meet_tests.candidate(108);
+  res := _r1_meet_tests.create_round(108, jsonb_build_object(
+    'start_at', '2026-12-16T10:00:00+00:00', 'end_at', '2026-12-16T10:45:00+00:00'));
+  perform _r1_meet_tests.assert(
+    'T2-D an expiry beyond 14 days: blocked/slot_too_far, retry_after = expiry - 14 days, no round',
+    res ->> 'status' = 'blocked' and res ->> 'reason' = 'slot_too_far'
+    and (res ->> 'retry_after')::timestamptz = '2026-12-16 12:45:00+00'::timestamptz - interval '14 days'
+    and (select x.status = 'blocked' and x.reason = 'slot_too_far' and x.candidate_id = c
+                and x.round_id is null
+           from screening_v2.r1_meet_bookings x
+          where x.ashby_interview_event_id = _r1_meet_tests.id(20, 108))
+    and not exists (select 1 from screening_v2.interview_rounds x where x.candidate_id = c), res::text);
+
+  c := _r1_meet_tests.candidate(109);
+  res := _r1_meet_tests.create_round(109, jsonb_build_object(
+    'start_at', '2026-12-15T01:00:00+00:00', 'end_at', '2026-12-15T02:00:00+00:00'));
+  perform _r1_meet_tests.assert('T2-D an expiry of exactly p_now + 14 days is inside the window',
+    res ->> 'status' = 'created'
+    and (select x.expires_at = '2026-12-15 04:00:00+00' from screening_v2.interview_rounds x
+          where x.id = (res ->> 'round_id')::uuid), res::text);
+
+  select count(*) into n_bookings from screening_v2.r1_meet_bookings;
+  res := _r1_meet_tests.create_round(110, jsonb_build_object(
+    'start_at', '2026-12-01T04:00:00+00:00', 'end_at', '2026-12-01T04:45:00+00:00'));
+  perform _r1_meet_tests.assert('T2-D a slot that starts at p_now: in_past, no booking',
+    res = jsonb_build_object('status', 'in_past')
+    and not exists (select 1 from screening_v2.r1_meet_bookings x
+                     where x.ashby_interview_event_id = _r1_meet_tests.id(20, 110)), res::text);
+
+  for bad in
+    select * from (values
+      ('event_id', jsonb_build_object('event_id', null)),
+      ('schedule_id', jsonb_build_object('schedule_id', 'schedule-1')),
+      ('schedule_id', jsonb_build_object('schedule_id', null)),
+      ('application_id', jsonb_build_object('application_id', 'application-1')),
+      ('application_id', jsonb_build_object('application_id', null)),
+      ('stage_id', jsonb_build_object('stage_id', 'stage-1')),
+      ('interview_id', jsonb_build_object('interview_id', 'interview-1')),
+      ('attester', jsonb_build_object('attester', 'hr-person-1')),
+      ('attester', jsonb_build_object('attester', null)),
+      ('meet_url', jsonb_build_object('meet_url', 'https://meet.google.com/ABC-DEFG-HIJ')),
+      ('meet_url', jsonb_build_object('meet_url', 'https://meet.google.com/abc-defg-hij?authuser=0')),
+      ('meet_url', jsonb_build_object('meet_url', null)),
+      ('slot', jsonb_build_object('end_at', '2026-12-02T10:30:00+00:00')),
+      ('slot', jsonb_build_object('end_at', '2026-12-03T10:31:00+00:00')),
+      ('slot', jsonb_build_object('start_at', null)),
+      ('attested_at', jsonb_build_object('attested_at', null)),
+      ('attested_at', jsonb_build_object('attested_at', '2026-12-01T04:05:01+00:00')),
+      ('profile', jsonb_build_object('profile', 'other')),
+      ('profile', jsonb_build_object('profile', null)),
+      ('grace', jsonb_build_object('grace', 899)),
+      ('grace', jsonb_build_object('grace', 86401)),
+      ('grace', jsonb_build_object('grace', null)),
+      ('now', jsonb_build_object('now', null))
+    ) as t(field, args)
+  loop
+    res := _r1_meet_tests.create_round(111, bad.args);
+    perform _r1_meet_tests.assert('T2-D invalid_request names the field ' || bad.field || ' for '
+                                  || bad.args::text,
+      res = jsonb_build_object('status', 'invalid_request', 'field', bad.field), res::text);
+  end loop;
+  perform _r1_meet_tests.assert('T2-D neither in_past nor any invalid_request wrote a booking',
+    (select count(*) from screening_v2.r1_meet_bookings) = n_bookings);
+end;
+$$;
+
+-- T2-E. r1_send_round's refusals become blocked/<code>; the blocked booking retries in place.
+do $$
+declare
+  c uuid;
+  res jsonb;
+  bid uuid;
+  b screening_v2.r1_meet_bookings%rowtype;
+begin
+  c := _r1_meet_tests.candidate(112);
+  update screening_v2.r1_settings set enabled = false where singleton;
+  res := _r1_meet_tests.create_round(112);
+  select * into b from screening_v2.r1_meet_bookings
+   where ashby_interview_event_id = _r1_meet_tests.id(20, 112);
+  bid := b.id;
+  perform _r1_meet_tests.assert('T2-E R1 disabled: blocked/disabled, candidate bound, no round',
+    res ->> 'status' = 'blocked' and res ->> 'reason' = 'disabled' and (res ->> 'booking_id')::uuid = bid
+    and b.status = 'blocked' and b.reason = 'disabled' and b.candidate_id = c and b.round_id is null
+    and not exists (select 1 from screening_v2.interview_rounds x where x.candidate_id = c), res::text);
+
+  update screening_v2.r1_settings set enabled = true, paused = true where singleton;
+  res := _r1_meet_tests.create_round(112);
+  perform _r1_meet_tests.assert('T2-E R1 paused: blocked/paused on the same booking',
+    res ->> 'status' = 'blocked' and res ->> 'reason' = 'paused'
+    and (res ->> 'booking_id')::uuid = bid, res::text);
+
+  update screening_v2.r1_settings set paused = false, monthly_cap_minutes = 65 where singleton;
+  perform _r1_meet_tests.assert('T2-E capacity fixture: an outstanding 65-minute hold exists',
+    exists (select 1 from screening_v2.interview_rounds x
+             where x.held_minutes > 0 and x.status in ('invited', 'in_progress')
+               and x.expires_at > '2026-12-01 04:00:00+00'));
+  res := _r1_meet_tests.create_round(112);
+  perform _r1_meet_tests.assert('T2-E a cap at 65 with a hold outstanding: blocked/capacity_exhausted',
+    res ->> 'status' = 'blocked' and res ->> 'reason' = 'capacity_exhausted'
+    and (res ->> 'booking_id')::uuid = bid, res::text);
+  update screening_v2.r1_settings set monthly_cap_minutes = 100000 where singleton;
+
+  update screening_v2.candidates set decision_use_blocked_at = '2026-12-01 03:00:00+00' where id = c;
+  res := _r1_meet_tests.create_round(112);
+  perform _r1_meet_tests.assert('T2-E a decision-use block: blocked/candidate_ineligible',
+    res ->> 'status' = 'blocked' and res ->> 'reason' = 'candidate_ineligible', res::text);
+  update screening_v2.candidates set decision_use_blocked_at = null where id = c;
+
+  update screening_v2.roles set interview_kind = null where id = _r1_meet_tests.id(2, 1);
+  res := _r1_meet_tests.create_round(112);
+  perform _r1_meet_tests.assert('T2-E no sales_r1 role: blocked/role_not_configured',
+    res ->> 'status' = 'blocked' and res ->> 'reason' = 'role_not_configured', res::text);
+  update screening_v2.roles set interview_kind = 'sales_r1' where id = _r1_meet_tests.id(2, 1);
+  insert into screening_v2.roles (id, title, interview_kind)
+  values (_r1_meet_tests.id(2, 2), 'R1 Meet assertion second role', 'sales_r1');
+  res := _r1_meet_tests.create_round(112);
+  perform _r1_meet_tests.assert('T2-E two sales_r1 roles: blocked/role_not_configured',
+    res ->> 'status' = 'blocked' and res ->> 'reason' = 'role_not_configured', res::text);
+  update screening_v2.roles set interview_kind = null where id = _r1_meet_tests.id(2, 2);
+
+  res := _r1_meet_tests.create_round(112);
+  perform _r1_meet_tests.assert('T2-E once fixed, the blocked booking retries to created in place',
+    res ->> 'status' = 'created' and (res ->> 'booking_id')::uuid = bid
+    and (select count(*) = 1 from screening_v2.interview_rounds x where x.candidate_id = c)
+    and (select count(*) = 1 from screening_v2.r1_meet_bookings x
+          where x.ashby_interview_event_id = _r1_meet_tests.id(20, 112)), res::text);
+end;
+$$;
+
+-- T2-F. No usable notice: the newest release lacks en-IN, or requires nothing (rolled back).
+do $$
+declare
+  res jsonb;
+begin
+  perform _r1_meet_tests.candidate(113);
+  res := _r1_meet_tests.create_round_under_release(113, 'zzz-meet-assert-newer', 'en-GB',
+                                                   '["ai_interview"]'::jsonb);
+  perform _r1_meet_tests.assert(
+    'T2-F the newest release has no en-IN notice: blocked/consent_template_unavailable',
+    res ->> 'status' = 'blocked' and res ->> 'reason' = 'consent_template_unavailable', res::text);
+  res := _r1_meet_tests.create_round_under_release(113, 'zzz-meet-assert-newer', 'en-IN', '[]'::jsonb);
+  perform _r1_meet_tests.assert(
+    'T2-F the newest en-IN notice requires nothing: blocked/consent_template_unavailable',
+    res ->> 'status' = 'blocked' and res ->> 'reason' = 'consent_template_unavailable', res::text);
+  perform _r1_meet_tests.assert('T2-F the rolled-back releases are gone and ours is the newest again',
+    (select max(x.version) = 'zz-meet-assert-current'
+       from screening_v2.interview_round_consent_templates x where x.is_active));
+  res := _r1_meet_tests.create_round(113);
+  perform _r1_meet_tests.assert('T2-F with the notice back, the same event creates its round',
+    res ->> 'status' = 'created', res::text);
+end;
+$$;
+
+-- T2-G. Re-link after HR cancels and re-books; a live booking or a browser round is never taken.
+do $$
+declare
+  p_now constant timestamptz := '2026-12-01 04:00:00+00';
+  hr1 constant text := _r1_meet_tests.id(25, 1)::text;
+  hr3 constant text := _r1_meet_tests.id(25, 3)::text;
+  c uuid;
+  res jsonb;
+  browser jsonb;
+  r_id uuid;
+  k1 uuid;
+  reserved_before numeric;
+  r_before screening_v2.interview_rounds%rowtype;
+  r_after screening_v2.interview_rounds%rowtype;
+  r_browser screening_v2.interview_rounds%rowtype;
+begin
+  -- E1 (event 120) creates the round, then HR cancels E1. T3 replaces this fixture update with
+  -- r1_meet_cancel_booking.
+  c := _r1_meet_tests.candidate(120);
+  res := _r1_meet_tests.create_round(120);
+  r_id := (res ->> 'round_id')::uuid;
+  select * into r_before from screening_v2.interview_rounds where id = r_id;
+  select x.id into k1 from screening_v2.interview_round_consents x
+   where x.round_id = r_id and x.withdrawn_at is null;
+  update screening_v2.r1_meet_bookings
+     set status = 'cancelled', reason = 'cancelled', updated_at = p_now
+   where ashby_interview_event_id = _r1_meet_tests.id(20, 120);
+
+  -- E2 (event 121): HR schedules a new Dex interview for the same application.
+  reserved_before := _r1_meet_tests.reserved('2026-12-01');
+  res := _r1_meet_tests.create_round(121, jsonb_build_object(
+    'application_id', _r1_meet_tests.id(22, 120)::text, 'attester', hr3,
+    'start_at', '2026-12-03T10:00:00+00:00', 'end_at', '2026-12-03T10:45:00+00:00',
+    'attested_at', '2026-12-01T03:00:00+00:00'));
+  select * into r_after from screening_v2.interview_rounds where id = r_id;
+  perform _r1_meet_tests.assert('T2-G a re-booking after a cancel re-links the same Meet round',
+    res ->> 'status' = 'relinked' and (res ->> 'round_id')::uuid = r_id
+    and (res ->> 'candidate_id')::uuid = c
+    and res ->> 'booking_status' = 'pending' and res ->> 'reason' = 'eligible'
+    and (res ->> 'version')::integer = 0 and (res ->> 'key_attempt')::integer = 0
+    and (res ->> 'round_expires_at')::timestamptz = '2026-12-03 12:45:00+00'
+    and (select x.status = 'pending' and x.round_id = r_id and x.ashby_scheduled_by_user_id = hr3
+           from screening_v2.r1_meet_bookings x
+          where x.ashby_interview_event_id = _r1_meet_tests.id(20, 121)), res::text);
+  perform _r1_meet_tests.assert(
+    'T2-G the re-link moves only the expiry and the version; the hold stays in its month',
+    r_after.expires_at = '2026-12-03 12:45:00+00' and r_after.version = r_before.version + 1
+    and r_after.updated_at = p_now and r_after.channel = 'meet' and r_after.status = 'invited'
+    and r_after.held_minutes = r_before.held_minutes and r_after.hold_month = r_before.hold_month
+    and r_after.link_token_digest = r_before.link_token_digest
+    and r_after.created_by = r_before.created_by
+    and _r1_meet_tests.reserved('2026-12-01') = reserved_before,
+    to_jsonb(r_after)::text);
+  perform _r1_meet_tests.assert(
+    'T2-G the old consent is superseded, not withdrawn, and no recording erase is queued',
+    (select x.withdrawn_at = p_now and x.proof ->> 'decision' = 'superseded'
+            and (x.proof ->> 'superseded_at')::timestamptz = p_now
+            and x.method = 'hr_attested_ashby' and x.attested_by_external_id = hr1
+       from screening_v2.interview_round_consents x where x.id = k1)
+    and not exists (select 1 from screening_v2.job_queue j
+                     where j.name = 'r1.recording.erase'
+                       and j.dedup_key in ('r1.recording.erase:' || k1::text)));
+  perform _r1_meet_tests.assert('T2-G the new live consent is attested by the re-booking scheduler',
+    (select count(*) = 2 from screening_v2.interview_round_consents x where x.round_id = r_id)
+    and (select x.attested_by_external_id = hr3 and x.attested_at = '2026-12-01 03:00:00+00'
+                and x.method = 'hr_attested_ashby' and x.template_id = _r1_meet_tests.id(3, 2)
+                and (x.proof ->> 'ashby_interview_event_id')::uuid = _r1_meet_tests.id(20, 121)
+           from screening_v2.interview_round_consents x
+          where x.round_id = r_id and x.withdrawn_at is null));
+  perform _r1_meet_tests.assert('T2-G the cancelled booking is left exactly as it was',
+    (select x.status = 'cancelled' and x.reason = 'cancelled' and x.round_id = r_id
+       from screening_v2.r1_meet_bookings x
+      where x.ashby_interview_event_id = _r1_meet_tests.id(20, 120)));
+  perform _r1_meet_tests.assert('T2-G the re-link created no call session',
+    _r1_meet_tests.sessions_of(r_id) = 0);
+
+  -- E3 (event 122) while E2 is live: the round already has a live booking.
+  res := _r1_meet_tests.create_round(122, jsonb_build_object(
+    'application_id', _r1_meet_tests.id(22, 120)::text,
+    'start_at', '2026-12-04T10:00:00+00:00', 'end_at', '2026-12-04T10:45:00+00:00'));
+  perform _r1_meet_tests.assert(
+    'T2-G a third event while the re-linked booking is live: blocked/round_active, round untouched',
+    res ->> 'status' = 'blocked' and res ->> 'reason' = 'round_active'
+    and (select x.status = 'blocked' and x.reason = 'round_active' and x.candidate_id = c
+                and x.round_id is null
+           from screening_v2.r1_meet_bookings x
+          where x.ashby_interview_event_id = _r1_meet_tests.id(20, 122))
+    and (select x.expires_at = r_after.expires_at and x.version = r_after.version
+           from screening_v2.interview_rounds x where x.id = r_id)
+    and (select count(*) = 1 from screening_v2.interview_round_consents x
+          where x.round_id = r_id and x.withdrawn_at is null), res::text);
+
+  -- A live BROWSER round is never taken over.
+  c := _r1_meet_tests.candidate(123);
+  browser := screening_v2.r1_send_round(c, _r1_meet_tests.id(2, 1), _r1_meet_tests.id(1, 1),
+                                        _r1_meet_tests.digest('link-123'), 'new',
+                                        '2026-12-04 04:00:00+00', p_now);
+  res := _r1_meet_tests.create_round(123);
+  select * into r_browser from screening_v2.interview_rounds where id = (browser ->> 'id')::uuid;
+  perform _r1_meet_tests.assert('T2-G a live browser round is never taken over: blocked/round_active',
+    browser ->> 'status' = 'ok' and res ->> 'status' = 'blocked' and res ->> 'reason' = 'round_active'
+    and r_browser.channel = 'browser' and r_browser.version = 1
+    and r_browser.expires_at = '2026-12-04 04:00:00+00'
+    and not exists (select 1 from screening_v2.interview_round_consents x
+                     where x.round_id = r_browser.id), res::text);
+
+  -- A lapsed Meet round (its hold no longer counts) is never revived by a re-booking.
+  c := _r1_meet_tests.candidate(124);
+  res := _r1_meet_tests.create_round(124);
+  r_id := (res ->> 'round_id')::uuid;
+  update screening_v2.r1_meet_bookings
+     set status = 'cancelled', reason = 'cancelled', updated_at = p_now
+   where ashby_interview_event_id = _r1_meet_tests.id(20, 124);
+  res := _r1_meet_tests.create_round(125, jsonb_build_object(
+    'application_id', _r1_meet_tests.id(22, 124)::text, 'now', '2026-12-02T14:00:00+00:00',
+    'start_at', '2026-12-03T10:00:00+00:00', 'end_at', '2026-12-03T10:45:00+00:00'));
+  perform _r1_meet_tests.assert('T2-G a lapsed Meet round is not re-linked: blocked/round_active',
+    res ->> 'status' = 'blocked' and res ->> 'reason' = 'round_active'
+    and (select x.expires_at = '2026-12-02 13:15:00+00' and x.version = 1
+           from screening_v2.interview_rounds x where x.id = r_id), res::text);
+end;
+$$;
+
+-- T2-H. Catalog posture of the RPC.
+do $$
+declare
+  fn constant text := 'screening_v2.r1_meet_create_round_from_ashby(uuid, text, text, text, text, text, '
+                      'timestamptz, timestamptz, text, timestamptz, timestamptz, uuid, text, integer, timestamptz)';
+  who text;
+begin
+  perform _r1_meet_tests.assert(
+    'T2-H r1_meet_create_round_from_ashby is security definer with search_path pg_catalog, screening_v2',
+    (select x.prosecdef and x.proconfig = array['search_path=pg_catalog, screening_v2']
+       from pg_proc x where x.oid = fn::regprocedure));
+  perform _r1_meet_tests.assert('T2-H r1_meet_create_round_from_ashby is executable by service_role only',
+    has_function_privilege('service_role', fn, 'execute')
+    and not has_function_privilege('anon', fn, 'execute')
+    and not has_function_privilege('authenticated', fn, 'execute')
+    and not has_function_privilege('public', fn, 'execute'));
+  foreach who in array array['anon', 'authenticated'] loop
+    perform _r1_meet_tests.raises_as(who, 'T2-H execute r1_meet_create_round_from_ashby',
+      'select screening_v2.r1_meet_create_round_from_ashby(null, null, null, null, null, null, '
+      'null, null, null, null, null, null)', '42501');
+  end loop;
+end;
+$$;
+
 do $$
 declare
   n integer;
