@@ -282,7 +282,8 @@ import r1_world
 # 48: pin the India money path and calmer instalment note.
 # 49: pin the time-limit, demand and guilt readers and the time-offer notes.
 # 50: IND-REV review fixes: narrow the demand and India money-path readers.
-PINNED_CONTENT_SHA256 = "7d10f0b225cd3cf996600c2f62ee1b98a5858173ba2179dafa5caf7d8c56b501"
+# 51: M034 S08 Meet line variants (r1_script.MEET_LINES).
+PINNED_CONTENT_SHA256 = "87b7fd8705b094846b88ddbcc07e2c239e8e84582a2b68a52aadd53a2b35dd71"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -913,6 +914,35 @@ class PinTests(unittest.TestCase):
             self.assertNotEqual(r1_content.content_sha256(), base)
         finally:
             r1_guard.FALLBACK_REPLY = original_fallback
+        self.assertEqual(r1_content.content_sha256(), base)
+
+    def test_the_manifest_covers_the_meet_lines(self):
+        # Revision 51 (M034 S08, R1_MEET_VOICE_ENABLED): the Google Meet variants and their map.
+        manifest = r1_content.manifest()
+        self.assertGreaterEqual(manifest["revision"], 51)
+        script = manifest["script"]
+        self.assertEqual(script["meet_lines"], dict(r1_script.MEET_LINES))
+        self.assertEqual(len(script["meet_lines"]), 8)
+        for meet_id in r1_script.MEET_LINES.values():
+            with self.subTest(line=meet_id):
+                self.assertEqual(script["lines"][meet_id], r1_script.LINES[meet_id])
+        base = r1_content.content_sha256()
+        for meet_id in r1_script.MEET_LINES.values():
+            original = r1_script.LINES[meet_id]
+            try:
+                r1_script.LINES[meet_id] = original + " "
+                self.assertNotEqual(r1_content.content_sha256(), base, meet_id)
+            finally:
+                r1_script.LINES[meet_id] = original
+            self.assertEqual(r1_content.content_sha256(), base, meet_id)
+        original_map = r1_script.MEET_LINES
+        try:
+            r1_script.MEET_LINES = {
+                key: value for key, value in original_map.items() if key != "L-CLOSE-SHORT"
+            }
+            self.assertNotEqual(r1_content.content_sha256(), base, "MEET_LINES")
+        finally:
+            r1_script.MEET_LINES = original_map
         self.assertEqual(r1_content.content_sha256(), base)
 
     def test_prompts_are_deterministic_across_calls(self):

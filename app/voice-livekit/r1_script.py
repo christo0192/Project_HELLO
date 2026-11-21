@@ -539,6 +539,56 @@ LINES: dict[str, str] = {
         "our side. This won't count against you, and the hiring team will send you a new "
         "link. Goodbye."
     ),
+    # M034 S08 (R1_MEET_VOICE_ENABLED, default off): the lines a Google Meet session speaks in
+    # place of eight browser lines (``MEET_LINES``, ``meet_line_id``).  The three openings add the
+    # recording disclosure; the other five drop the button, link and window wording, because a Meet
+    # candidate never sees our page.  The browser texts above are unchanged.
+    # M034 S08 (R1_MEET_VOICE_ENABLED): L-OPEN with the recording disclosure.
+    "L-OPEN-MEET": (
+        "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart, and "
+        "I'll be running your first-round interview for the Sales Program Advisor role. "
+        "Just so you know, this call is recorded. "
+        "It takes about thirty minutes. We'll spend a few minutes getting to know you, "
+        "then I'll switch into a sales role-play of up to twenty minutes where I play a "
+        "prospective learner, "
+        "and we'll finish with a couple of minutes for your questions. Let's start: could "
+        "you walk me through your background, especially any sales or customer-facing work "
+        "you've done?"
+    ),
+    # M034 S08 (R1_MEET_VOICE_ENABLED): L-OPEN-HELLO with the recording disclosure.
+    "L-OPEN-HELLO-MEET": (
+        "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart. Just so you "
+        "know, this call is recorded. Can you hear me okay?"
+    ),
+    # M034 S08 (R1_MEET_VOICE_ENABLED): L-OPEN-HI with the recording disclosure.
+    "L-OPEN-HI-MEET": (
+        "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart. Just so you "
+        "know, this call is recorded."
+    ),
+    # M034 S08 (R1_MEET_VOICE_ENABLED): L-TRANSITION-REASK-2 without the I'm ready button.
+    "L-TRANSITION-REASK-2-MEET": (
+        "I'm still here whenever you're ready. Just say 'ready', and she'll pick up."
+    ),
+    # M034 S08 (R1_MEET_VOICE_ENABLED): L-SYSTEM-STOP without the new link.
+    "L-SYSTEM-STOP-MEET": (
+        "I'm sorry, {first_name}, we need to stop here because of a technical problem on "
+        "our side. This won't count against you, and the hiring team will be in touch to "
+        "arrange a new time. Goodbye."
+    ),
+    # M034 S08 (R1_MEET_VOICE_ENABLED): L-CLOSE without the window.
+    "L-CLOSE-MEET": (
+        "Thank you for your time today, {first_name}. The hiring team will review your "
+        "interview and get back to you. You can leave the call now. Goodbye."
+    ),
+    # M034 S08 (R1_MEET_VOICE_ENABLED): L-CLOSE-SHORT without the window.
+    "L-CLOSE-SHORT-MEET": (
+        "Thank you for your time today, {first_name}. You can leave the call now. Goodbye."
+    ),
+    # M034 S08 (R1_MEET_VOICE_ENABLED): L-SIL-NOAUDIO names the Google Meet mute.
+    "L-SIL-NOAUDIO-MEET": (
+        "I can't hear anything from you yet. If you're speaking, please check that you're not "
+        "muted in Google Meet."
+    ),
     "L-FILLER": "Let me think about that for a second.",
     "L-FILLER-INTERVIEWER": "Let me think about that for a second.",
     "L-FILLER-LEARNER": "One second...",
@@ -628,6 +678,26 @@ AGENDA_W3_LINES = {
 }
 # D4-TRANS-PRESENT1 (``R1_TRANSITION_PRESENCE_V2``): the pickup bridge that hears the press.
 VARIETY_LINES = {"L-PICKUP-BRIDGE": "L-PICKUP-BRIDGE-2"}
+# M034 S08 (``R1_MEET_VOICE_ENABLED``, default off): the ids whose Meet text a Google Meet session
+# speaks.  Applied by the session after ``active_line_id``; markers, the warm-up, the cache and the
+# transcript keep the left-hand ids.  Keys and values are disjoint from the four maps above, so
+# ``active_line_id`` never remaps either side, and no value is itself a key.  Nothing mutates it.
+MEET_LINES: dict[str, str] = {
+    "L-OPEN": "L-OPEN-MEET",
+    "L-OPEN-HELLO": "L-OPEN-HELLO-MEET",
+    "L-OPEN-HI": "L-OPEN-HI-MEET",
+    "L-TRANSITION-REASK-2": "L-TRANSITION-REASK-2-MEET",
+    "L-SYSTEM-STOP": "L-SYSTEM-STOP-MEET",
+    "L-CLOSE": "L-CLOSE-MEET",
+    "L-CLOSE-SHORT": "L-CLOSE-SHORT-MEET",
+    "L-SIL-NOAUDIO": "L-SIL-NOAUDIO-MEET",
+}
+
+
+def meet_line_id(line_id: str) -> str:
+    """The id whose text a Google Meet session speaks for ``line_id``; applied by the session
+    after ``active_line_id``.  An id without a Meet variant is returned unchanged."""
+    return MEET_LINES.get(line_id, line_id)
 
 
 def brief_wording_v2_enabled() -> bool:

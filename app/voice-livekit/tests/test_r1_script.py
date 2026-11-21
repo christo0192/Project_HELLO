@@ -1,6 +1,9 @@
 """Unit tests for ``r1_script``: the plan 5.2 scripted lines and their rendering."""
 from __future__ import annotations
 
+import hashlib
+import itertools
+import json
 import os
 import re
 import sys
@@ -314,6 +317,32 @@ class UnknownNameTests(unittest.TestCase):
                 "I'm sorry, we need to stop here because of a technical problem on our side. "
                 "This won't count against you, and the hiring team will send you a new link. "
                 "Goodbye."
+            ),
+            # M034 S08 (R1_MEET_VOICE_ENABLED): the Google Meet variants that carry the name.
+            "L-OPEN-MEET": (
+                "Hi, I'm Dex, an AI interviewer from Interview Kickstart, and I'll be running your "
+                "first-round interview for the Sales Program Advisor role. Just so you know, this "
+                "call is recorded. It takes about thirty minutes."
+            ),
+            "L-OPEN-HELLO-MEET": (
+                "Hi, I'm Dex, an AI interviewer from Interview Kickstart. Just so you know, this "
+                "call is recorded. Can you hear me okay?"
+            ),
+            "L-OPEN-HI-MEET": (
+                "Hi, I'm Dex, an AI interviewer from Interview Kickstart. Just so you know, this "
+                "call is recorded."
+            ),
+            "L-SYSTEM-STOP-MEET": (
+                "I'm sorry, we need to stop here because of a technical problem on our side. "
+                "This won't count against you, and the hiring team will be in touch to arrange a "
+                "new time. Goodbye."
+            ),
+            "L-CLOSE-MEET": (
+                "Thank you for your time today. The hiring team will review your interview and "
+                "get back to you. You can leave the call now. Goodbye."
+            ),
+            "L-CLOSE-SHORT-MEET": (
+                "Thank you for your time today. You can leave the call now. Goodbye."
             ),
         }
         # Every line that carries the name slot is covered, so a new one cannot slip through.
@@ -845,3 +874,200 @@ class TestDiagnosis5Agenda(unittest.TestCase):
                 with mock.patch.dict(os.environ, {"R1_BRIEF_WORDING_V2": "0"}):
                     self.assertEqual(r1_script.active_line_id(line_id), line_id)
                     self.assertFalse(r1_script.agenda_w3_enabled())
+
+
+class TestMeetLines(unittest.TestCase):
+    """M034 S08 (``R1_MEET_VOICE_ENABLED``, default off): the Google Meet line variants.
+
+    Eight browser lines get a ``-MEET`` variant that a Meet session speaks (``MEET_LINES``, applied
+    after ``active_line_id``): the three openings add the recording disclosure (owner: "Dex still
+    discloses he is an AI and that the call is recorded"), and the other five drop the button, link
+    and window wording, because a Meet candidate never sees our page.  No browser text changes.
+    """
+
+    # sha256 of the canonical JSON of all 113 LINES on 5ec8b11a (content revision 50), before the
+    # Meet variants.  Recomputed below over LINES without the Meet ids: every browser text is byte
+    # for byte what it was.  A later revision that changes a browser line on purpose recomputes it
+    # with the same recipe.
+    PRE_MEET_LINES_DIGEST = "05b905726461fdf19b89143c66c991772b03e6dfd20f78fe4dfbeee84139acdb"
+    # Wording that assumes the candidate can see or operate our page (S08 plan section 2).
+    BANNED = re.compile(
+        r"\b(?:button|click|press|tap|link|refresh|reload|window|browser|tab|screen|page|"
+        r"selected)\b",
+        re.IGNORECASE,
+    )
+    ROUTING_FLAGS = (
+        "R1_TRANSITION_REPAIR", "R1_BRIEF_WORDING_V2", "R1_AGENDA_W3", "R1_TRANSITION_PRESENCE_V2",
+    )
+    OPENINGS = ("L-OPEN", "L-OPEN-HELLO", "L-OPEN-HI")
+    NOT_OPENINGS = (
+        "L-TRANSITION-REASK-2", "L-SYSTEM-STOP", "L-CLOSE", "L-CLOSE-SHORT", "L-SIL-NOAUDIO",
+    )
+    # What the default interviewer (Dex) says to a candidate called Asha: plan section 2, exactly.
+    DEX_OPENINGS = {
+        "L-OPEN-MEET": (
+            "Hi Asha, I'm Dex, an AI interviewer from Interview Kickstart, and I'll be running "
+            "your first-round interview for the Sales Program Advisor role. Just so you know, this "
+            "call is recorded. It takes about thirty minutes. We'll spend a few minutes getting to "
+            "know you, then I'll switch into a sales role-play of up to twenty minutes where I "
+            "play a prospective learner, and we'll finish with a couple of minutes for your "
+            "questions. Let's start: could you walk me through your background, especially any "
+            "sales or customer-facing work you've done?"
+        ),
+        "L-OPEN-HELLO-MEET": (
+            "Hi Asha, I'm Dex, an AI interviewer from Interview Kickstart. Just so you know, this "
+            "call is recorded. Can you hear me okay?"
+        ),
+        "L-OPEN-HI-MEET": (
+            "Hi Asha, I'm Dex, an AI interviewer from Interview Kickstart. Just so you know, this "
+            "call is recorded."
+        ),
+    }
+    # The other five, as written in LINES (persona-neutral or name-only).
+    OTHER_TEXTS = {
+        "L-TRANSITION-REASK-2-MEET": (
+            "I'm still here whenever you're ready. Just say 'ready', and she'll pick up."
+        ),
+        "L-SYSTEM-STOP-MEET": (
+            "I'm sorry, {first_name}, we need to stop here because of a technical problem on our "
+            "side. This won't count against you, and the hiring team will be in touch to arrange "
+            "a new time. Goodbye."
+        ),
+        "L-CLOSE-MEET": (
+            "Thank you for your time today, {first_name}. The hiring team will review your "
+            "interview and get back to you. You can leave the call now. Goodbye."
+        ),
+        "L-CLOSE-SHORT-MEET": (
+            "Thank you for your time today, {first_name}. You can leave the call now. Goodbye."
+        ),
+        "L-SIL-NOAUDIO-MEET": (
+            "I can't hear anything from you yet. If you're speaking, please check that you're not "
+            "muted in Google Meet."
+        ),
+    }
+
+    @staticmethod
+    def values() -> dict[str, str]:
+        rendered = resolve_persona("p1_career_switcher", variant="v1")
+        return {**rendered.line_values, "first_name": "Asha"}
+
+    @staticmethod
+    def persona_env(dex: str | None) -> dict[str, str]:
+        return {} if dex is None else {"R1_INTERVIEWER_DEX": dex}
+
+    def test_no_browser_text_changed(self):
+        meet_ids = set(r1_script.MEET_LINES.values())
+        browser = {key: text for key, text in LINES.items() if key not in meet_ids}
+        canonical = json.dumps(browser, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        self.assertEqual(
+            hashlib.sha256(canonical.encode()).hexdigest(), self.PRE_MEET_LINES_DIGEST
+        )
+
+    def test_the_map_names_eight_existing_lines_and_their_meet_ids(self):
+        meet = r1_script.MEET_LINES
+        self.assertEqual(set(meet), set(self.OPENINGS) | set(self.NOT_OPENINGS))
+        for key, value in meet.items():
+            with self.subTest(line=key):
+                self.assertIn(key, LINES)
+                self.assertIn(value, LINES)
+                self.assertEqual(value, key + "-MEET")
+                self.assertNotIn(value, meet)  # no chaining: a Meet id is never a key
+                self.assertNotEqual(LINES[value], LINES[key])
+        self.assertEqual(len(set(meet.values())), len(meet))
+
+    def test_the_map_is_disjoint_from_the_other_routing_maps(self):
+        touched = set(r1_script.MEET_LINES) | set(r1_script.MEET_LINES.values())
+        for name in ("ROLLBACK_LINES", "WORDING_LINES", "AGENDA_W3_LINES", "VARIETY_LINES"):
+            other = getattr(r1_script, name)
+            with self.subTest(other=name):
+                self.assertEqual(touched & (set(other) | set(other.values())), set())
+
+    def test_active_line_id_never_remaps_a_meet_key_or_id_under_any_flag_state(self):
+        touched = (*r1_script.MEET_LINES, *r1_script.MEET_LINES.values())
+        for states in itertools.product("01", repeat=len(self.ROUTING_FLAGS)):
+            with mock.patch.dict(os.environ, dict(zip(self.ROUTING_FLAGS, states)), clear=True):
+                for line_id in touched:
+                    with self.subTest(states=states, line=line_id):
+                        self.assertEqual(r1_script.active_line_id(line_id), line_id)
+
+    def test_meet_line_id_routes_only_the_eight_keys_and_never_chains(self):
+        for line_id in LINES:
+            with self.subTest(line=line_id):
+                routed = r1_script.meet_line_id(line_id)
+                expected = r1_script.MEET_LINES.get(line_id, line_id)
+                self.assertEqual(routed, expected)
+                self.assertEqual(r1_script.meet_line_id(routed), routed)
+        self.assertEqual(r1_script.meet_line_id("L-NOPE"), "L-NOPE")
+
+    def test_each_pair_has_the_same_placeholders_and_cacheability(self):
+        # So the warm-up's persist or candidate-free choice for a base id stays right for the
+        # text a Meet session speaks: a clip that carries the name is never kept on disk.
+        for dex in (None, "1", "0"):
+            with mock.patch.dict(os.environ, self.persona_env(dex), clear=True):
+                for key, value in r1_script.MEET_LINES.items():
+                    with self.subTest(dex=dex, line=key):
+                        self.assertEqual(placeholders(value), placeholders(key))
+                        self.assertEqual(is_candidate_free(value), is_candidate_free(key))
+                        self.assertEqual(
+                            value in CANDIDATE_FREE_LINES, key in CANDIDATE_FREE_LINES
+                        )
+                        self.assertEqual(value in NAME_FREE_LINES, key in NAME_FREE_LINES)
+
+    def test_no_meet_line_tells_the_candidate_to_press_open_or_close_anything(self):
+        values = self.values()
+        for dex in (None, "1", "0"):
+            with mock.patch.dict(os.environ, self.persona_env(dex), clear=True):
+                for line_id in LINES:
+                    with self.subTest(dex=dex, line=line_id):
+                        text = line(r1_script.meet_line_id(line_id), **values)
+                        self.assertIsNone(self.BANNED.search(text), text)
+                # Not vacuous: the five browser lines the Meet variants replace match today, and
+                # they are the only lines in the table that do.
+                matching = {i for i in LINES if self.BANNED.search(line(i, **values))}
+                self.assertEqual(matching, set(self.NOT_OPENINGS))
+
+    def test_the_meet_openings_disclose_the_ai_and_the_recording(self):
+        for dex, name in ((None, "Dex"), ("1", "Dex"), ("0", "Christy")):
+            with mock.patch.dict(os.environ, self.persona_env(dex), clear=True):
+                for key in self.OPENINGS:
+                    meet_id = r1_script.meet_line_id(key)
+                    with self.subTest(dex=dex, line=meet_id):
+                        for first_name in ("Asha", ""):
+                            text = line(meet_id, first_name=first_name)
+                            self.assertIn("AI interviewer", text)
+                            self.assertIn("this call is recorded", text)
+                            self.assertNotIn(
+                                "Christy" if name == "Dex" else "Dex", text
+                            )
+                        self.assertTrue(
+                            line(meet_id, first_name="Asha").startswith(f"Hi Asha, I'm {name}")
+                        )
+                        # The browser opening is unchanged: no recording sentence.
+                        self.assertNotIn("recorded", line(key, first_name="Asha"))
+                        # The disclosure is the only difference from the browser opening.
+                        self.assertEqual(
+                            LINES[meet_id].replace(" Just so you know, this call is recorded.", ""),
+                            LINES[key],
+                        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            for meet_id, expected in self.DEX_OPENINGS.items():
+                with self.subTest(line=meet_id):
+                    self.assertEqual(line(meet_id, first_name="Asha"), expected)
+                    self.assertIn(meet_id, r1_script.DEX_LINES)
+
+    def test_the_other_meet_texts_word_for_word(self):
+        for meet_id, expected in self.OTHER_TEXTS.items():
+            with self.subTest(line=meet_id):
+                self.assertEqual(LINES[meet_id], expected)
+                self.assertNotIn(meet_id, r1_script.DEX_LINES)  # persona-neutral
+        # The base lines' own rules carry over to their Meet variants.
+        reask = LINES["L-TRANSITION-REASK-2-MEET"]
+        self.assertIn("ready", reask)
+        self.assertTrue(is_candidate_free("L-TRANSITION-REASK-2-MEET"))
+        self.assertNotIn("let's begin", reask.lower())
+        self.assertEqual(LINES["L-CLOSE-MEET"].lower().count("hiring team"), 1)
+        self.assertNotIn("hiring team", LINES["L-CLOSE-SHORT-MEET"].lower())
+        noaudio = LINES["L-SIL-NOAUDIO-MEET"]
+        self.assertIn("L-SIL-NOAUDIO-MEET", NAME_FREE_LINES)
+        for banned in ("lost", "connection", "count", "still with me"):
+            self.assertNotIn(banned, noaudio)
