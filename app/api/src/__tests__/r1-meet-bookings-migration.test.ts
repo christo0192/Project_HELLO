@@ -1045,6 +1045,425 @@ describe('migration 0142: the booking lifecycle RPCs (T3)', () => {
   });
 });
 
+describe('migration 0142: the bridge ticket, receipts and prune RPCs (T4)', () => {
+  const RPCS = [
+    {
+      name: 'r1_meet_arm_ticket',
+      section: '-- §16. ',
+      args: 'p_booking_id uuid, p_ticket_digest text, p_not_before timestamptz, p_expires_at timestamptz, '
+        + 'p_now timestamptz default now()',
+      sig: 'uuid, text, timestamptz, timestamptz, timestamptz',
+      statuses: [
+        'ok', 'duplicate', 'invalid_ticket', 'invalid_request', 'invalid_window', 'not_found', 'not_armable',
+        'digest_in_use', 'ticket_arms_exhausted',
+      ],
+    },
+    {
+      name: 'r1_meet_claim_ticket',
+      section: '-- §17. ',
+      args: 'p_ticket_digest text, p_now timestamptz default now()',
+      sig: 'text, timestamptz',
+      statuses: [
+        'ok', 'invalid_ticket', 'invalid_request', 'ticket_unknown', 'ticket_already_claimed',
+        'booking_not_claimable', 'ticket_not_yet_valid', 'ticket_expired', 'round_not_live',
+      ],
+    },
+    {
+      name: 'r1_meet_record_receipt',
+      section: '-- §18. ',
+      args: 'p_source text, p_dedupe_key text, p_event_type text, p_booking_id uuid default null, '
+        + 'p_enqueue boolean default false, p_payload jsonb default null, p_scheduled_at timestamptz default null, '
+        + 'p_now timestamptz default now()',
+      sig: 'text, text, text, uuid, boolean, jsonb, timestamptz, timestamptz',
+      statuses: [
+        'inserted', 'duplicate', 'invalid_source', 'invalid_dedupe_key', 'invalid_event_type', 'invalid_request',
+        'invalid_payload', 'payload_too_large', 'invalid_scheduled_at',
+      ],
+    },
+    {
+      name: 'r1_meet_prune_receipts',
+      section: '-- §19. ',
+      args: 'p_older_than timestamptz, p_limit integer default 500, p_now timestamptz default now()',
+      sig: 'timestamptz, integer, timestamptz',
+      statuses: ['ok', 'invalid_request', 'retention_too_short'],
+    },
+  ] as const;
+
+  /** The plpgsql body of an RPC (after `as $$`), comments stripped, whitespace collapsed. */
+  const bodyOf = (name: string): string => {
+    const fn = functionBody(name);
+    return fn.slice(fn.indexOf(' as $$') + ' as $$'.length);
+  };
+  const ARMABLE = ['bot_scheduled', 'bot_joining', 'human_present', 'in_call'];
+  const armableList = ARMABLE.map((s) => `'${s}'`).join(', ');
+  const ROUND_LIVE =
+    "if not found or v_round.channel <> 'meet' or v_round.status not in ('invited', 'in_progress') or v_round.expires_at <= p_now then";
+  const families = pairingFamilies();
+  const familyOf = (status: string) => families.find((f) => f.statuses.includes(status))!.reasons;
+  const suite = read('app/supabase/tests/r1_meet_bookings_assert.sql');
+
+  it('sits in sections §16 to §19, in order, between §15 and §90', () => {
+    let last = sql.indexOf('-- §15. ');
+    expect(last).toBeGreaterThan(-1);
+    for (const rpc of RPCS) {
+      expect(sql.split(rpc.section).length - 1, rpc.section).toBe(1);
+      const at = sql.indexOf(rpc.section);
+      expect(at, rpc.section).toBeGreaterThan(last);
+      const fnAt = sql.indexOf(`create or replace function screening_v2.${rpc.name}(`);
+      expect(fnAt, rpc.name).toBeGreaterThan(at);
+      last = fnAt;
+    }
+    expect(sql.indexOf('-- §90. ')).toBeGreaterThan(last);
+    // The header lists the four new objects.
+    const header = sql.slice(0, sql.indexOf("set local lock_timeout = '10s';"));
+    for (const rpc of RPCS) expect(header, rpc.name).toContain(`${rpc.section.slice(3).trim().replace('.', '')} ${rpc.name}`);
+  });
+
+  it('has the planned argument lists, returns jsonb, and is security definer with a pinned search_path', () => {
+    for (const rpc of RPCS) {
+      expect(code, rpc.name).toContain(
+        `create or replace function screening_v2.${rpc.name}( ${rpc.args} ) `
+        + 'returns jsonb language plpgsql security definer set search_path = pg_catalog, screening_v2 as $$',
+      );
+      const params = /\( (p_[\s\S]*?) \) returns jsonb/.exec(functionBody(rpc.name))![1]!
+        .split(', ').map((p) => p.split(' ')[1]);
+      expect(params.join(', '), rpc.name).toBe(rpc.sig);
+      expect(sql.split(`create or replace function screening_v2.${rpc.name}(`), rpc.name).toHaveLength(2);
+    }
+  });
+
+  it('is service-role only and documented', () => {
+    for (const rpc of RPCS) {
+      expect(code, rpc.name).toContain(`revoke all on function screening_v2.${rpc.name}(${rpc.sig}) from public, anon, authenticated;`);
+      expect(code, rpc.name).toContain(`grant execute on function screening_v2.${rpc.name}(${rpc.sig}) to service_role;`);
+      expect(code, rpc.name).toContain(`comment on function screening_v2.${rpc.name}(${rpc.sig}) is`);
+      expect(lc, rpc.name).not.toMatch(new RegExp(`grant [a-z ,]+ on function screening_v2\\.${rpc.name}\\([^)]*\\) to (?!service_role;)`));
+    }
+  });
+
+  it('answers a closed set of statuses each', () => {
+    for (const rpc of RPCS) {
+      const body = bodyOf(rpc.name);
+      const answered = new Set([...body.matchAll(/'status', '([a-z_]+)'/g)].map((m) => m[1]!));
+      const computed = [...body.matchAll(/'status', (?!')([a-z_]+)/g)].map((m) => m[1]);
+      if (rpc.name === 'r1_meet_record_receipt') {
+        // The only computed status: inserted or duplicate, from the insert-or-noop.
+        expect(computed).toEqual(['case']);
+        expect(body).toContain("'status', case when v_created then 'inserted' else 'duplicate' end,");
+        answered.add('inserted');
+        answered.add('duplicate');
+      } else {
+        expect(computed, rpc.name).toEqual([]);
+      }
+      expect([...answered].sort(), rpc.name).toEqual([...rpc.statuses].sort());
+    }
+  });
+
+  it('reads no clock, catches nothing but the outbox race, writes no session, round or audit row, and returns no secret', () => {
+    for (const rpc of RPCS) {
+      const bodyLc = bodyOf(rpc.name).toLowerCase();
+      expect(bodyLc, rpc.name).not.toMatch(/\bnow\s*\(|\bcurrent_timestamp\b|\bclock_timestamp\s*\(|\bstatement_timestamp\s*\(/);
+      expect(bodyLc, rpc.name).not.toMatch(/\bwhen others\b/);
+      const handlers = bodyLc.match(/\bexception\s+when\b[^;]*?then/g) ?? [];
+      expect(handlers, rpc.name).toEqual(rpc.name === 'r1_meet_record_receipt' ? ['exception when unique_violation then'] : []);
+      expect(bodyLc, rpc.name).not.toMatch(/(insert into|update|delete from) screening_v2\.(call_sessions|audit_events|interview_rounds|interview_round_consents|candidates|r1_budget_month|r1_settings)\b/);
+      expect(bodyLc, rpc.name).not.toMatch(/r1_transition_round|link_token_digest|r1_send_round|r1_admit_attempt/);
+      const returns = [...bodyLc.matchAll(/return jsonb_build_object\(/g)].map((m) => bodyLc.slice(m.index!, bodyLc.indexOf(';', m.index!)));
+      expect(returns.length, rpc.name).toBeGreaterThan(1);
+      // Values only (string literals blanked): never a digest, a token, a link, the attester, the key or the payload.
+      for (const r of returns) {
+        expect(r.replace(/'[^']*'/g, "''"), rpc.name).not.toMatch(/digest|token|meet_url|scheduled_by|dedupe_key|payload/);
+      }
+    }
+  });
+
+  it('arms only a bot-holding booking, inside the slot, at most 5 times per generation, and never re-arms a spent digest', () => {
+    const body = bodyOf('r1_meet_arm_ticket');
+    const BOOKING_LOCK = 'from screening_v2.r1_meet_bookings b where b.id = p_booking_id for update;';
+    expect(body.split(BOOKING_LOCK)).toHaveLength(2);
+    expect(body.toLowerCase().match(/\bfor update\b/g)).toHaveLength(1);
+    expect(body).not.toMatch(/r1_settings|r1_budget_month|interview_rounds/);
+    // The digest shape is the table's.
+    const tableDigest = /constraint chk_r1_meet_bookings_ticket_digest check \( ticket_digest is null or ticket_digest ~ '([^']+)' \)/.exec(bookings)![1]!;
+    expect(body).toContain(`if p_ticket_digest is null or p_ticket_digest !~ '${tableDigest}' then`);
+    expect(body).toContain('if p_not_before is null or p_expires_at is null or p_not_before >= p_expires_at or p_expires_at <= p_now then');
+    expect(body).toContain(
+      "if p_not_before < v_booking.start_at - interval '15 minutes' or p_expires_at > v_booking.end_at + interval '30 minutes' then",
+    );
+    expect(body).toContain(`if v_booking.status not in (${armableList}) then return jsonb_build_object('status', 'not_armable'`);
+    // Every armable status may hold a ticket (chk_r1_meet_bookings_ticket).
+    const ticketStatuses = quoted(/or status in \(([^)]*)\)\) \)/.exec(block('constraint chk_r1_meet_bookings_ticket check (', 'create unique index'))![1]!);
+    for (const s of ARMABLE) expect(ticketStatuses, s).toContain(s);
+    // The arm budget is the table's cap.
+    expect(body).toContain("if v_booking.ticket_arms >= 5 then return jsonb_build_object('status', 'ticket_arms_exhausted'");
+    expect(bookings).toContain('check (ticket_arms between 0 and 5)');
+    // A spent digest is refused before the idempotent duplicate and before the budget.
+    const order = [
+      "'status', 'invalid_ticket'", "'status', 'invalid_request', 'field', 'now'", "'status', 'invalid_window')", BOOKING_LOCK,
+      "'status', 'not_found'", "'status', 'invalid_window', 'booking_id'", "'status', 'not_armable'",
+      'if v_booking.ticket_digest = p_ticket_digest then if v_booking.ticket_claimed_at is not null then return jsonb_build_object(\'status\', \'digest_in_use\'',
+      "'status', 'duplicate'", "'status', 'ticket_arms_exhausted'",
+      'where o.ticket_digest = p_ticket_digest and o.id <> v_booking.id) then return jsonb_build_object(\'status\', \'digest_in_use\'',
+      "'status', 'ok'",
+    ];
+    let last = -1;
+    for (const step of order) {
+      expect(body.indexOf(step), step).toBeGreaterThan(last);
+      last = body.indexOf(step);
+    }
+    expect(body).toContain('if v_booking.ticket_not_before = p_not_before and v_booking.ticket_expires_at = p_expires_at then');
+    // The write: the ticket and its window, unclaimed, one more arm; the status never moves.
+    const start = body.indexOf('update screening_v2.r1_meet_bookings set');
+    const update = body.slice(start, body.indexOf(';', start));
+    expect(update).toBe(
+      'update screening_v2.r1_meet_bookings set ticket_digest = p_ticket_digest, ticket_not_before = p_not_before, '
+      + 'ticket_expires_at = p_expires_at, ticket_claimed_at = null, ticket_arms = ticket_arms + 1, updated_at = p_now '
+      + 'where id = v_booking.id returning * into v_booking',
+    );
+    expect(body.match(/\bupdate screening_v2\./g)).toHaveLength(1);
+  });
+
+  it('claims a ticket once, under the row lock, inside its window, on a live Meet round, and answers the binding', () => {
+    const body = bodyOf('r1_meet_claim_ticket');
+    const CLAIM_LOCK = 'from screening_v2.r1_meet_bookings b where b.ticket_digest = p_ticket_digest for update;';
+    expect(body.split(CLAIM_LOCK)).toHaveLength(2);
+    expect(body.toLowerCase().match(/\bfor update\b/g)).toHaveLength(1);
+    expect(body).not.toMatch(/r1_settings|r1_budget_month/);
+    const order = [
+      "'status', 'invalid_ticket'", "'status', 'invalid_request', 'field', 'now'", CLAIM_LOCK, "'status', 'ticket_unknown'",
+      "if v_booking.ticket_claimed_at is not null then return jsonb_build_object('status', 'ticket_already_claimed', 'booking_id', v_booking.id);",
+      `if v_booking.status not in (${armableList}) then return jsonb_build_object('status', 'booking_not_claimable'`,
+      "if p_now < v_booking.ticket_not_before then return jsonb_build_object('status', 'ticket_not_yet_valid'",
+      "if p_now >= v_booking.ticket_expires_at then return jsonb_build_object('status', 'ticket_expired'",
+      ROUND_LIVE, "'status', 'round_not_live'", 'update screening_v2.r1_meet_bookings set', "'status', 'ok'",
+    ];
+    let last = -1;
+    for (const step of order) {
+      expect(body.indexOf(step), step).toBeGreaterThan(last);
+      last = body.indexOf(step);
+    }
+    // The same "live round" as the reschedule and the attach.
+    expect(bodyOf('r1_meet_reschedule_booking')).toContain(ROUND_LIVE);
+    // Single use: claimed at p_now, in_call (paired with eligible); only the booking row is written.
+    expect(body).toContain(
+      "set ticket_claimed_at = p_now, status = 'in_call', reason = 'eligible', updated_at = p_now where id = v_booking.id",
+    );
+    expect(familyOf('in_call')).toContain('eligible');
+    expect(body.match(/\bupdate screening_v2\./g)).toHaveLength(1);
+    expect(body).toContain('select * into v_round from screening_v2.interview_rounds r where r.id = v_booking.round_id;');
+    const ok = body.slice(body.indexOf("return jsonb_build_object('status', 'ok'"));
+    expect([...ok.slice(0, ok.indexOf(';')).matchAll(/'([a-z_]+)', v_booking\.([a-z_]+)/g)].map((m) => `${m[1]}=${m[2]}`)).toEqual([
+      'booking_id=id', 'round_id=round_id', 'candidate_id=candidate_id', 'objective_profile=objective_profile',
+      'ashby_interview_event_id=ashby_interview_event_id', 'session_id=session_id', 'start_at=start_at', 'end_at=end_at',
+    ]);
+  });
+
+  it('records a receipt with the table rules and runs the 0030 outbox into the one r1-meet queue', () => {
+    const rpc = RPCS.find((r) => r.name === 'r1_meet_record_receipt')!;
+    const body = bodyOf(rpc.name);
+    // The caller cannot name a queue, a dedup key or an attempt budget.
+    const names = rpc.args.split(', ').map((p) => p.split(' ')[0]);
+    expect(names).toEqual([
+      'p_source', 'p_dedupe_key', 'p_event_type', 'p_booking_id', 'p_enqueue', 'p_payload', 'p_scheduled_at', 'p_now',
+    ]);
+    expect(lc).not.toMatch(/function screening_v2\.r1_meet_record_receipt\([^)]*\b(p_queue\w*|p_dedup_key|p_max_attempts|p_name)\b/);
+    expect(body).not.toMatch(/\bp_queue\w*|\bp_dedup_key\b|\bp_max_attempts\b/);
+    // Validation = the table CHECKs (no 23514 reaches the caller).
+    expect(body).toContain("if p_source is null or p_source not in ('recall', 'ashby') then");
+    expect(receipts).toContain("check (source in ('recall', 'ashby'))");
+    const keyCheck = /char_length\(dedupe_key\) between 1 and (\d+) and dedupe_key ~ '([^']+)'/.exec(receipts)!;
+    expect(body).toContain(
+      `if p_dedupe_key is null or char_length(p_dedupe_key) not between 1 and ${keyCheck[1]} or p_dedupe_key !~ '${keyCheck[2]}' `
+      + "or (p_source = 'ashby') <> (p_dedupe_key like 'ashby-schedule:%') then",
+    );
+    expect(receipts).toContain("(source = 'ashby') = (dedupe_key like 'ashby-schedule:%')");
+    const eventRe = /constraint chk_r1_meet_receipts_event_type check \(event_type ~ '([^']+)'\)/.exec(receipts)![1]!;
+    expect(body).toContain(`if p_event_type is null or p_event_type !~ '${eventRe}' then`);
+    expect(body).toContain(
+      "or jsonb_typeof(p_payload) <> 'object' or jsonb_typeof(p_payload -> 'kind') is distinct from 'string' "
+      + "or (p_payload ->> 'kind') !~ '^[a-z][a-z0-9_]{0,39}$' then",
+    );
+    expect(body).toContain("if octet_length(p_payload::text) > 4096 then return jsonb_build_object('status', 'payload_too_large');");
+    expect(body).toContain("elsif p_payload is not null then return jsonb_build_object('status', 'invalid_payload');");
+    expect(body).toContain(
+      "if p_scheduled_at is not null and (not v_enqueue or p_scheduled_at < p_now - interval '1 hour' "
+      + "or p_scheduled_at > p_now + interval '30 days') then",
+    );
+    // An unknown booking is stored as NULL: looked up (key share, so it outlives the insert), never refused.
+    expect(body).toContain('select b.id into v_booking_id from screening_v2.r1_meet_bookings b where b.id = p_booking_id for key share;');
+    expect(body).not.toMatch(/'status', 'not_found'|booking_not_found/);
+    // Insert-or-report-duplicate, then the locked winner.
+    expect(body).toContain('on conflict (dedupe_key) do nothing returning id, outcome, booking_id into v_id, v_outcome, v_linked;');
+    expect(body).toContain('from screening_v2.r1_meet_receipts r where r.dedupe_key = p_dedupe_key for update; exit when found; end loop;');
+    expect(body).toContain("case when v_enqueue then 'enqueued' else 'recorded' end, p_now)");
+    // The outbox: settled outcomes, the live statuses of the 0009 partial index, one job named r1-meet.
+    const outcomes = quoted(/check \( outcome in \(([^)]*)\) \)/.exec(receipts)![1]!);
+    const settled = outcomes.filter((o) => !['recorded', 'enqueued'].includes(o));
+    expect(body).toContain(`if v_outcome in (${settled.map((o) => `'${o}'`).join(', ')}) then v_work_pending := true;`);
+    const live = /where dedup_key is not null and status in \(([^)]*)\)/.exec(
+      readFileSync(path.join(migrations, '0009_queue.sql'), 'utf8').replace(/\s+/g, ' '),
+    )![1]!;
+    expect(body).toContain(`and j.status in (${live})`);
+    const jobKey = "'r1-meet:receipt:' || v_id::text";
+    expect(body.split(jobKey)).toHaveLength(3);
+    expect(body.match(/insert into screening_v2\.job_queue\b/g)).toHaveLength(1);
+    expect(body).toContain(
+      'insert into screening_v2.job_queue (name, payload, status, dedup_key, attempts, max_attempts, priority, scheduled_at, created_at) '
+      + "values ('r1-meet', p_payload || jsonb_build_object('receipt_id', v_id, 'source', p_source), "
+      + `'pending', ${jobKey}, 0, 5, 0, coalesce(p_scheduled_at, p_now), p_now);`,
+    );
+    expect(body).toContain('exception when unique_violation then v_work_pending := true; end;');
+    // The re-drive runs while the receipt is enqueued; a recorded-only receipt asked for work becomes enqueued.
+    expect(body).toContain(
+      "if not v_created and v_enqueue and v_outcome = 'recorded' then update screening_v2.r1_meet_receipts set outcome = 'enqueued' where id = v_id",
+    );
+    expect(body.match(/\bupdate screening_v2\.r1_meet_receipts\b/g)).toHaveLength(1);
+    // Lock order: the booking, then the receipt.
+    expect(body.indexOf('for key share')).toBeLessThan(body.indexOf('insert into screening_v2.r1_meet_receipts'));
+  });
+
+  it('prunes only settled receipts older than the cutoff, in bounded batches, never under 7 days of retention', () => {
+    const body = bodyOf('r1_meet_prune_receipts');
+    const fields = [...body.matchAll(/'status', 'invalid_request', 'field', '([a-z_]+)'/g)].map((m) => m[1]);
+    expect(fields).toEqual(['now', 'older_than', 'limit']);
+    expect(body).toContain('if p_limit is null or p_limit not between 1 and 5000 then');
+    expect(body).toContain("if p_older_than > p_now - interval '7 days' then return jsonb_build_object('status', 'retention_too_short');");
+    expect(body).toContain(
+      'delete from screening_v2.r1_meet_receipts where id in ( select r.id from screening_v2.r1_meet_receipts r '
+      + "where r.received_at < p_older_than and r.outcome in ('recorded', 'processed', 'ignored', 'failed') "
+      + 'order by r.received_at limit p_limit for update skip locked);',
+    );
+    expect(body).toContain('get diagnostics v_deleted = row_count;');
+    expect(body.match(/\bdelete from\b/g)).toHaveLength(1);
+    // Every outcome but enqueued (work in flight) is prunable.
+    const outcomes = quoted(/check \( outcome in \(([^)]*)\) \)/.exec(receipts)![1]!);
+    const prunable = quoted(/r\.outcome in \(([^)]*)\)/.exec(body)![1]!);
+    expect([...prunable, 'enqueued'].sort()).toEqual([...outcomes].sort());
+  });
+
+  it('ends with exactly the ten RPCs and the two trigger functions, each RPC revoked and granted to service_role', () => {
+    // Lazy up to the first " ) returns": a parameter default such as now() cannot end the list early.
+    const created = [...code.matchAll(/create or replace function screening_v2\.([a-z0-9_]+)\(([\s\S]*?) ?\) returns /g)]
+      .map((m) => {
+        const params = m[2]!.trim();
+        const types = params === '' ? '' : params.split(', ').map((p) => p.split(' ')[1]).join(', ');
+        return `${m[1]}(${types})`;
+      });
+    const RPC_SIGS = [
+      'r1_meet_create_round_from_ashby(uuid, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, timestamptz, uuid, text, integer, timestamptz)',
+      'r1_meet_reschedule_booking(uuid, integer, timestamptz, timestamptz, text, timestamptz, integer, timestamptz)',
+      'r1_meet_cancel_booking(uuid, text, timestamptz)',
+      'r1_meet_set_bot(uuid, text, integer, integer, uuid, timestamptz)',
+      'r1_meet_transition_booking(uuid, text, text, text, timestamptz)',
+      'r1_meet_bind_session(uuid, uuid, timestamptz)',
+      'r1_meet_arm_ticket(uuid, text, timestamptz, timestamptz, timestamptz)',
+      'r1_meet_claim_ticket(text, timestamptz)',
+      'r1_meet_record_receipt(text, text, text, uuid, boolean, jsonb, timestamptz, timestamptz)',
+      'r1_meet_prune_receipts(timestamptz, integer, timestamptz)',
+    ];
+    expect(created).toEqual([
+      'reject_interview_round_channel_change()',
+      'enqueue_r1_meet_bot_release()',
+      ...RPC_SIGS,
+    ]);
+    for (const sig of RPC_SIGS) {
+      expect(code, sig).toContain(`revoke all on function screening_v2.${sig} from public, anon, authenticated;`);
+      expect(code, sig).toContain(`grant execute on function screening_v2.${sig} to service_role;`);
+      expect(code, sig).toContain(`comment on function screening_v2.${sig} is`);
+    }
+    expect(lc.match(/\bgrant execute on function\b/g)).toHaveLength(RPC_SIGS.length);
+    expect(lc.match(/\brevoke all on function\b/g)).toHaveLength(RPC_SIGS.length + 2);
+    // The SQL suite's privilege proof names exactly these ten.
+    const proof = suite.slice(suite.indexOf('-- T4-D. '));
+    const listed = quoted(/rpcs constant text\[\] := array\[([\s\S]*?)\];/.exec(proof)![1]!);
+    expect(listed).toEqual(RPC_SIGS.map((s) => `screening_v2.${s}`));
+    const denied = quoted(/denied_calls constant text\[\] := array\[([\s\S]*?)\];/.exec(proof)![1]!);
+    expect(denied.map((c) => /screening_v2\.([a-z0-9_]+)\(/.exec(c)![1])).toEqual(RPC_SIGS.map((s) => s.slice(0, s.indexOf('('))));
+    for (const sig of RPC_SIGS) {
+      const name = sig.slice(0, sig.indexOf('('));
+      expect(proof, name).toContain(`_r1_meet_tests.runs_as('service_role', 'T4-D ${name}'`);
+    }
+  });
+
+  it('is exercised by the SQL suite, with a labelled assertion for every case the brief lists', () => {
+    for (const rpc of RPCS) expect(suite, rpc.name).toContain(`screening_v2.${rpc.name}(`);
+    let last = suite.indexOf('-- T3-F. ');
+    expect(last).toBeGreaterThan(-1);
+    for (const section of ['-- T4-A. ', '-- T4-B. ', '-- T4-C. ', '-- T4-D. ']) {
+      expect(suite.split(section).length - 1, section).toBe(1);
+      expect(suite.indexOf(section), section).toBeGreaterThan(last);
+      last = suite.indexOf(section);
+    }
+    for (const label of [
+      // The ticket: armable states, the window, single use, replay, expiry, re-arm, the budget.
+      'T4-A arm on a pending booking: not_armable',
+      'T4-A arm on a bot_scheduled booking with the widest window',
+      'T4-A arm on a bot_joining booking: ok',
+      'T4-A arm on a human_present booking: ok',
+      'T4-A a window opening before start - 15 min: invalid_window',
+      'T4-A a window closing after end + 30 min: invalid_window',
+      'T4-A an empty window (not_before = expires_at): invalid_window',
+      'T4-A a window already closed (expires_at = p_now): invalid_window',
+      'T4-A a claim before not_before: ticket_not_yet_valid',
+      'T4-A a claim inside the window: ok with the booking, round, candidate, profile, event',
+      'T4-A the claim moved the booking to in_call and spent the ticket',
+      'T4-A a second claim of the same ticket: ticket_already_claimed with the booking id',
+      'T4-A a replay after the window closed: still ticket_already_claimed',
+      'T4-A a claim at expires_at: ticket_expired',
+      'T4-A a claim of a ticket never armed: ticket_unknown',
+      "T4-A a claim of ''xyz'': invalid_ticket",
+      'T4-A a claim on a cancelled booking that still holds an unclaimed ticket: booking_not_claimable',
+      'T4-A arming a digest another booking holds (unclaimed): digest_in_use',
+      'T4-A re-arming the spent (claimed) digest: digest_in_use',
+      'T4-A a re-arm in in_call: ok, a fresh unclaimed ticket',
+      'T4-A the same unclaimed ticket and window again: duplicate',
+      'T4-A a sixth arm in one bot generation: ticket_arms_exhausted',
+      'T4-A a claim whose round is not a Meet round (channel browser): round_not_live',
+      'T4-A a claim whose Meet round was cancelled: round_not_live',
+      'T4-A no call_sessions row was created by any arm or claim',
+      // Receipts: dedupe, the outbox, re-drive, settled work, the booking link, the S01 key.
+      'T4-B a first delivery without work: inserted, recorded, nothing queued',
+      'T4-B the same dedupe key again: duplicate with the same id',
+      'T4-B exactly one r1-meet job',
+      'T4-B a duplicate while the job is live: no second job',
+      'T4-B the job finished but the receipt is still enqueued: the duplicate re-drives exactly one job',
+      'T4-B a processed receipt: the duplicate queues nothing',
+      'T4-B a recorded-only receipt asked for work by a later delivery',
+      'T4-B an unknown booking id is stored as NULL',
+      'T4-B the 86-character S01 Ashby key is accepted by the RPC',
+      'T4-B the refused deliveries wrote no receipt and queued no job',
+      // The prune.
+      'T4-C six days of retention: retention_too_short',
+      'T4-C a limit of 0: invalid_request (limit)',
+      'T4-C a batch of 2: the two oldest settled receipts go; the older enqueued one stays',
+      'T4-C the rest: old ignored, failed and recorded receipts go; enqueued and recent ones stay',
+      // The privilege proof (anon / authenticated refused; service_role runs every RPC).
+      "'T4-D execute ' || split_part(fn, '(', 1)",
+      "'T4-D ' || fn || ' is executable by service_role only (catalog)'",
+      "'T4-D ' || fn || ' is security definer with search_path pg_catalog, screening_v2'",
+      "'T4-D select from ' || tbl", "'T4-D insert into ' || tbl", "'T4-D update ' || tbl", "'T4-D delete from ' || tbl",
+      "'T4-D service_role reads ' || tbl",
+      'T4-D the ten RPCs are the only screening_v2 functions named r1_meet_*, one overload each',
+      'T4-D the service_role calls left nothing behind (rolled back)',
+    ]) {
+      expect(suite, label).toContain(label);
+    }
+    // Every refusal code of the receipt RPC has a row in the refusal table.
+    const refusals = RPCS.find((r) => r.name === 'r1_meet_record_receipt')!.statuses.filter((s) => !['inserted', 'duplicate'].includes(s));
+    const t4b = suite.slice(suite.indexOf('-- T4-B. '), suite.indexOf('-- T4-C. '));
+    for (const code of refusals) expect(t4b, code).toContain(`('${code}', `);
+    // The anon / authenticated refusals and the service_role runs go through the role helpers.
+    const t4d = suite.slice(suite.indexOf('-- T4-D. '));
+    expect(t4d).toContain("foreach who in array array['anon', 'authenticated'] loop");
+    expect(t4d.match(/_r1_meet_tests\.raises_as\(who, /g)).toHaveLength(5);
+    expect(t4d.match(/'42501'\);/g)!.length).toBe(5);
+    expect(t4d.match(/_r1_meet_tests\.runs_as\('service_role', /g)).toHaveLength(11);
+    // Ticket digests are computed at run time, never written.
+    const t4 = suite.slice(suite.indexOf('-- T4-A. '));
+    expect(t4).not.toMatch(/'[a-f0-9]{16,}'/);
+  });
+});
+
 describe('migration 0142: SQL test wiring', () => {
   it('runs the assertions from supabase-test.sh and triggers supabase-ci on the helper', () => {
     const script = read('scripts/test-r1-meet.sh');

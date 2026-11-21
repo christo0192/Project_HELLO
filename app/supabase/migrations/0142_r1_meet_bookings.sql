@@ -34,6 +34,13 @@
 --      compare-and-set on the bot generation (version) and the Idempotency-Key attempt.
 --   §14 r1_meet_transition_booking: the runtime status moves of S06, compare-and-set on the status.
 --   §15 r1_meet_bind_session: binds the admitted call session of the round to an in-call booking.
+--   §16 r1_meet_arm_ticket: stores the digest and window of a single-use bridge ticket for a booking
+--      that holds a bot (at most 5 arms per bot generation); the status is unchanged.
+--   §17 r1_meet_claim_ticket: claims a ticket once, inside its window, under the booking row lock;
+--      the booking moves to in_call and the answer is the booking/round/candidate/profile binding.
+--   §18 r1_meet_record_receipt: insert-or-report-duplicate of a webhook receipt plus the 0030
+--      transactional outbox (one live `r1-meet` job per receipt while it is enqueued).
+--   §19 r1_meet_prune_receipts: the 30-day receipt retention (refuses less than 7 days).
 --   §90 RLS on (no policy) and service-role-only privileges.
 --
 -- PII-minimal: ids, times, statuses, the canonical Meet URL and the Ashby user id of the HR
@@ -1299,6 +1306,396 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------------------------
+-- §16. r1_meet_arm_ticket: a single-use bridge ticket for a booking that holds a bot.
+-- ---------------------------------------------------------------------------------------------
+-- S05/S06 mint the ticket (its plaintext and HMAC domain stay in the API, D-M034-7) and store only
+-- its SHA-256 hex digest here, with the window in which the bridge page may claim it. Arming does
+-- not depend on the bot's progress, so both modes work (armed when the bot is created, or when a
+-- human joins): bot_scheduled, bot_joining, human_present, and in_call (a re-arm after a claimed
+-- ticket recovers the page). Each arm replaces the previous ticket, claimed or not; a booking takes
+-- at most 5 arms per bot generation (r1_meet_set_bot('replace') resets the count). The window lies
+-- inside the slot: not_before >= start_at - 15 min, expires_at <= end_at + 30 min, not_before <
+-- expires_at, expires_at > p_now. A spent ticket is never armed again: S05 mints a fresh random
+-- ticket per arm, and the stored digest, once claimed, is refused. The status is unchanged. The
+-- first refusal wins:
+--   invalid_ticket (not a hex64 digest) | invalid_request (+field now) | invalid_window | not_found
+--   | invalid_window (outside the slot) | not_armable | digest_in_use (the stored ticket was
+--   claimed) | duplicate (the same unclaimed ticket and window again: nothing written) |
+--   ticket_arms_exhausted | digest_in_use (another booking holds it) | ok (+not_before,
+--   expires_at, ticket_arms).
+-- Locks the booking row only; never answers the digest.
+create or replace function screening_v2.r1_meet_arm_ticket(
+  p_booking_id uuid,
+  p_ticket_digest text,
+  p_not_before timestamptz,
+  p_expires_at timestamptz,
+  p_now timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_booking screening_v2.r1_meet_bookings%rowtype;
+begin
+  if p_ticket_digest is null or p_ticket_digest !~ '^[a-f0-9]{64}$' then
+    return jsonb_build_object('status', 'invalid_ticket');
+  end if;
+  if p_now is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'now');
+  end if;
+  if p_not_before is null or p_expires_at is null
+     or p_not_before >= p_expires_at or p_expires_at <= p_now then
+    return jsonb_build_object('status', 'invalid_window');
+  end if;
+
+  select * into v_booking
+    from screening_v2.r1_meet_bookings b
+   where b.id = p_booking_id
+   for update;
+  if not found then
+    return jsonb_build_object('status', 'not_found');
+  end if;
+  if p_not_before < v_booking.start_at - interval '15 minutes'
+     or p_expires_at > v_booking.end_at + interval '30 minutes' then
+    return jsonb_build_object('status', 'invalid_window', 'booking_id', v_booking.id);
+  end if;
+  if v_booking.status not in ('bot_scheduled', 'bot_joining', 'human_present', 'in_call') then
+    return jsonb_build_object('status', 'not_armable', 'booking_id', v_booking.id,
+                              'booking_status', v_booking.status);
+  end if;
+  if v_booking.ticket_digest = p_ticket_digest then
+    if v_booking.ticket_claimed_at is not null then
+      return jsonb_build_object('status', 'digest_in_use', 'booking_id', v_booking.id);
+    end if;
+    if v_booking.ticket_not_before = p_not_before and v_booking.ticket_expires_at = p_expires_at then
+      return jsonb_build_object('status', 'duplicate', 'booking_id', v_booking.id,
+                                'not_before', v_booking.ticket_not_before,
+                                'expires_at', v_booking.ticket_expires_at,
+                                'ticket_arms', v_booking.ticket_arms);
+    end if;
+  end if;
+  if v_booking.ticket_arms >= 5 then
+    return jsonb_build_object('status', 'ticket_arms_exhausted', 'booking_id', v_booking.id,
+                              'ticket_arms', v_booking.ticket_arms);
+  end if;
+  if exists (select 1 from screening_v2.r1_meet_bookings o
+              where o.ticket_digest = p_ticket_digest and o.id <> v_booking.id) then
+    return jsonb_build_object('status', 'digest_in_use', 'booking_id', v_booking.id);
+  end if;
+
+  update screening_v2.r1_meet_bookings
+     set ticket_digest = p_ticket_digest,
+         ticket_not_before = p_not_before,
+         ticket_expires_at = p_expires_at,
+         ticket_claimed_at = null,
+         ticket_arms = ticket_arms + 1,
+         updated_at = p_now
+   where id = v_booking.id
+  returning * into v_booking;
+  return jsonb_build_object('status', 'ok', 'booking_id', v_booking.id,
+                            'not_before', v_booking.ticket_not_before,
+                            'expires_at', v_booking.ticket_expires_at,
+                            'ticket_arms', v_booking.ticket_arms);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------------------------
+-- §17. r1_meet_claim_ticket: the bridge page exchanges its ticket, once.
+-- ---------------------------------------------------------------------------------------------
+-- S05 hashes the ticket the bridge page presents and claims it BEFORE admission. Single use: the
+-- booking row is found by the digest and locked, and ticket_claimed_at is set under that lock, so of
+-- two concurrent claims exactly one wins and the other answers ticket_already_claimed with the
+-- booking id (S05 answers 409 and alerts: a replayed or shared ticket). A re-arm changes the digest,
+-- so a claim racing it finds no row (ticket_unknown). The first refusal wins:
+--   invalid_ticket | invalid_request (+field now) | ticket_unknown | ticket_already_claimed
+--   (+booking_id) | booking_not_claimable (the booking is not in an armable state) |
+--   ticket_not_yet_valid | ticket_expired | round_not_live (not an invited or in-progress Meet
+--   round, or it has lapsed: the reschedule and attach definition) | ok.
+-- Writes ticket_claimed_at = p_now, status in_call (eligible) and updated_at. Answers the binding
+-- S05 admits with: booking, round, candidate, objective profile, Ashby event, the bound session (a
+-- re-arm after a restart), and the slot. Never a digest, a link or the attester. Locks the booking
+-- row only; reads the round.
+create or replace function screening_v2.r1_meet_claim_ticket(
+  p_ticket_digest text,
+  p_now timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_booking screening_v2.r1_meet_bookings%rowtype;
+  v_round screening_v2.interview_rounds%rowtype;
+begin
+  if p_ticket_digest is null or p_ticket_digest !~ '^[a-f0-9]{64}$' then
+    return jsonb_build_object('status', 'invalid_ticket');
+  end if;
+  if p_now is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'now');
+  end if;
+
+  select * into v_booking
+    from screening_v2.r1_meet_bookings b
+   where b.ticket_digest = p_ticket_digest
+   for update;
+  if not found then
+    return jsonb_build_object('status', 'ticket_unknown');
+  end if;
+  if v_booking.ticket_claimed_at is not null then
+    return jsonb_build_object('status', 'ticket_already_claimed', 'booking_id', v_booking.id);
+  end if;
+  if v_booking.status not in ('bot_scheduled', 'bot_joining', 'human_present', 'in_call') then
+    return jsonb_build_object('status', 'booking_not_claimable', 'booking_id', v_booking.id,
+                              'booking_status', v_booking.status);
+  end if;
+  if p_now < v_booking.ticket_not_before then
+    return jsonb_build_object('status', 'ticket_not_yet_valid', 'booking_id', v_booking.id);
+  end if;
+  if p_now >= v_booking.ticket_expires_at then
+    return jsonb_build_object('status', 'ticket_expired', 'booking_id', v_booking.id);
+  end if;
+  select * into v_round
+    from screening_v2.interview_rounds r
+   where r.id = v_booking.round_id;
+  if not found
+     or v_round.channel <> 'meet'
+     or v_round.status not in ('invited', 'in_progress')
+     or v_round.expires_at <= p_now then
+    return jsonb_build_object('status', 'round_not_live', 'booking_id', v_booking.id,
+                              'round_id', v_booking.round_id);
+  end if;
+
+  update screening_v2.r1_meet_bookings
+     set ticket_claimed_at = p_now,
+         status = 'in_call',
+         reason = 'eligible',
+         updated_at = p_now
+   where id = v_booking.id
+  returning * into v_booking;
+  return jsonb_build_object('status', 'ok', 'booking_id', v_booking.id,
+                            'round_id', v_booking.round_id,
+                            'candidate_id', v_booking.candidate_id,
+                            'objective_profile', v_booking.objective_profile,
+                            'ashby_interview_event_id', v_booking.ashby_interview_event_id,
+                            'session_id', v_booking.session_id,
+                            'start_at', v_booking.start_at,
+                            'end_at', v_booking.end_at);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------------------------
+-- §18. r1_meet_record_receipt: a durable, de-duplicated webhook receipt and its queued work.
+-- ---------------------------------------------------------------------------------------------
+-- S03 records every accepted Recall (Svix webhook-id) or Ashby schedule (S01 key) delivery here.
+-- Insert-or-report-duplicate on the dedupe key, with the inputs checked against the table CHECKs
+-- first. An unknown booking id is stored as NULL (booking_linked false), never an error: a webhook
+-- may outrun or outlive its booking. With p_enqueue the 0030 transactional outbox runs in the same
+-- transaction, so a receipt never exists without its work: one live job in the ONE Meet queue
+-- (`r1-meet`, hard-coded; the caller cannot name another queue), dedup key
+-- 'r1-meet:receipt:<receipt id>', payload = p_payload (`kind` plus ids, times and the canonical Meet
+-- URL only: never a body, a name or an email) || {receipt_id, source}, scheduled at p_scheduled_at
+-- (S06's delayed re-runs) or p_now. Re-drive (at least once, never doubled): a duplicate delivery
+-- inserts a missing job while the receipt is still `enqueued` and no live job (pending, active,
+-- delayed: the uq_job_queue_dedup_active set of 0009) carries the key; a terminal outcome
+-- (processed, ignored, failed) means the work is done. A recorded-only receipt that a later
+-- delivery asks work for becomes `enqueued` (the first delivery's source and event type stay). The
+-- first refusal wins:
+--   invalid_source | invalid_dedupe_key | invalid_event_type | invalid_request (+field now) |
+--   invalid_payload (p_enqueue needs an object whose `kind` matches ^[a-z][a-z0-9_]{0,39}$; a
+--   payload without p_enqueue is a caller bug) | payload_too_large (over 4096 bytes) |
+--   invalid_scheduled_at (outside p_now - 1 hour .. p_now + 30 days, or without p_enqueue).
+-- Answers {status: inserted | duplicate, id, outcome, enqueued, work_pending, booking_linked}; no
+-- dedupe key, no payload. Lock order: the booking (key share, so it outlives the insert), then the
+-- receipt row.
+create or replace function screening_v2.r1_meet_record_receipt(
+  p_source text,
+  p_dedupe_key text,
+  p_event_type text,
+  p_booking_id uuid default null,
+  p_enqueue boolean default false,
+  p_payload jsonb default null,
+  p_scheduled_at timestamptz default null,
+  p_now timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_enqueue constant boolean := coalesce(p_enqueue, false);
+  v_booking_id uuid;
+  v_id uuid;
+  v_outcome text;
+  v_linked uuid;
+  v_created boolean := false;
+  v_enqueued boolean := false;
+  v_work_pending boolean := false;
+begin
+  if p_source is null or p_source not in ('recall', 'ashby') then
+    return jsonb_build_object('status', 'invalid_source');
+  end if;
+  -- The table CHECKs, so a bad key is an answer, never a 23514.
+  if p_dedupe_key is null
+     or char_length(p_dedupe_key) not between 1 and 256
+     or p_dedupe_key !~ '^[A-Za-z0-9_.:-]+$'
+     or (p_source = 'ashby') <> (p_dedupe_key like 'ashby-schedule:%') then
+    return jsonb_build_object('status', 'invalid_dedupe_key');
+  end if;
+  if p_event_type is null or p_event_type !~ '^[A-Za-z0-9_.:-]{1,128}$' then
+    return jsonb_build_object('status', 'invalid_event_type');
+  end if;
+  if p_now is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'now');
+  end if;
+  if v_enqueue then
+    if p_payload is null
+       or jsonb_typeof(p_payload) <> 'object'
+       or jsonb_typeof(p_payload -> 'kind') is distinct from 'string'
+       or (p_payload ->> 'kind') !~ '^[a-z][a-z0-9_]{0,39}$' then
+      return jsonb_build_object('status', 'invalid_payload');
+    end if;
+    if octet_length(p_payload::text) > 4096 then
+      return jsonb_build_object('status', 'payload_too_large');
+    end if;
+  elsif p_payload is not null then
+    return jsonb_build_object('status', 'invalid_payload');
+  end if;
+  if p_scheduled_at is not null
+     and (not v_enqueue
+          or p_scheduled_at < p_now - interval '1 hour'
+          or p_scheduled_at > p_now + interval '30 days') then
+    return jsonb_build_object('status', 'invalid_scheduled_at');
+  end if;
+
+  if p_booking_id is not null then
+    select b.id into v_booking_id
+      from screening_v2.r1_meet_bookings b
+     where b.id = p_booking_id
+     for key share;
+  end if;
+
+  -- Race-safe insert-or-noop on the dedupe key: concurrent deliveries converge to one row. A prior
+  -- delivery's row is read back locked, so that a worker's outcome update and this re-drive see
+  -- each other; if a prune removed it between the two statements, this delivery is recorded afresh.
+  loop
+    insert into screening_v2.r1_meet_receipts
+      (source, dedupe_key, event_type, booking_id, outcome, received_at)
+    values
+      (p_source, p_dedupe_key, p_event_type, v_booking_id,
+       case when v_enqueue then 'enqueued' else 'recorded' end, p_now)
+    on conflict (dedupe_key) do nothing
+    returning id, outcome, booking_id into v_id, v_outcome, v_linked;
+    if v_id is not null then
+      v_created := true;
+      exit;
+    end if;
+    select r.id, r.outcome, r.booking_id into v_id, v_outcome, v_linked
+      from screening_v2.r1_meet_receipts r
+     where r.dedupe_key = p_dedupe_key
+     for update;
+    exit when found;
+  end loop;
+
+  if not v_created and v_enqueue and v_outcome = 'recorded' then
+    update screening_v2.r1_meet_receipts
+       set outcome = 'enqueued'
+     where id = v_id
+    returning outcome into v_outcome;
+  end if;
+
+  -- Atomic outbox / re-drive (0030): exactly one live r1-meet job while the receipt is enqueued.
+  if v_enqueue then
+    if v_outcome in ('processed', 'ignored', 'failed') then
+      -- The worker already reached a terminal decision: the durable work is done.
+      v_work_pending := true;
+    elsif exists (
+      select 1 from screening_v2.job_queue j
+       where j.dedup_key = 'r1-meet:receipt:' || v_id::text
+         and j.status in ('pending', 'active', 'delayed')
+    ) then
+      -- A live job already carries this receipt: no duplicate work.
+      v_work_pending := true;
+    else
+      begin
+        insert into screening_v2.job_queue
+          (name, payload, status, dedup_key, attempts, max_attempts, priority, scheduled_at, created_at)
+        values
+          ('r1-meet', p_payload || jsonb_build_object('receipt_id', v_id, 'source', p_source),
+           'pending', 'r1-meet:receipt:' || v_id::text, 0, 5, 0,
+           coalesce(p_scheduled_at, p_now), p_now);
+        v_enqueued := true;
+        v_work_pending := true;
+      exception when unique_violation then
+        -- A concurrent delivery won the enqueue race: a live job exists.
+        v_work_pending := true;
+      end;
+    end if;
+  end if;
+
+  return jsonb_build_object(
+    'status', case when v_created then 'inserted' else 'duplicate' end,
+    'id', v_id,
+    'outcome', v_outcome,
+    'enqueued', v_enqueued,
+    'work_pending', v_work_pending,
+    'booking_linked', v_linked is not null);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------------------------
+-- §19. r1_meet_prune_receipts: the 30-day receipt retention.
+-- ---------------------------------------------------------------------------------------------
+-- S06 calls this from an EXISTING tick with p_older_than = now - 30 days (no new loop). It refuses
+-- to keep less than 7 days (retention_too_short), deletes at most p_limit (1..5000) of the oldest
+-- receipts received before p_older_than, and only those whose work is settled or never existed
+-- (recorded, processed, ignored, failed): an `enqueued` receipt is kept while its job may still
+-- read it. Rows another prune holds are skipped. Answers invalid_request (+field now, older_than,
+-- limit) | retention_too_short | ok (+deleted).
+create or replace function screening_v2.r1_meet_prune_receipts(
+  p_older_than timestamptz,
+  p_limit integer default 500,
+  p_now timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_deleted integer;
+begin
+  if p_now is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'now');
+  end if;
+  if p_older_than is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'older_than');
+  end if;
+  if p_limit is null or p_limit not between 1 and 5000 then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'limit');
+  end if;
+  if p_older_than > p_now - interval '7 days' then
+    return jsonb_build_object('status', 'retention_too_short');
+  end if;
+
+  delete from screening_v2.r1_meet_receipts
+   where id in (
+     select r.id
+       from screening_v2.r1_meet_receipts r
+      where r.received_at < p_older_than
+        and r.outcome in ('recorded', 'processed', 'ignored', 'failed')
+      order by r.received_at
+      limit p_limit
+      for update skip locked);
+  get diagnostics v_deleted = row_count;
+  return jsonb_build_object('status', 'ok', 'deleted', v_deleted);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------------------------
 -- §90. Row level security and privileges.
 -- ---------------------------------------------------------------------------------------------
 -- RLS on, no policy: staff never read these tables directly; the API (service role) authorizes in
@@ -1385,6 +1782,51 @@ grant execute on function screening_v2.r1_meet_bind_session(uuid, uuid, timestam
 comment on function screening_v2.r1_meet_bind_session(uuid, uuid, timestamptz) is
   'M034: binds a call session of the booking''s round to an in-call booking (a restart re-binds). '
   'Answers ok (+previous_session_id) | duplicate | not_in_call | session_mismatch | not_found | '
+  'invalid_request. Service-role only.';
+
+revoke all on function screening_v2.r1_meet_arm_ticket(uuid, text, timestamptz, timestamptz, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.r1_meet_arm_ticket(uuid, text, timestamptz, timestamptz, timestamptz)
+  to service_role;
+comment on function screening_v2.r1_meet_arm_ticket(uuid, text, timestamptz, timestamptz, timestamptz) is
+  'M034: stores the SHA-256 hex digest and claim window of a single-use bridge ticket on a booking '
+  'that holds a bot (bot_scheduled, bot_joining, human_present, in_call); window inside start - 15 '
+  'min .. end + 30 min; at most 5 arms per bot generation; a claimed digest is never re-armed; the '
+  'status is unchanged. Answers ok | duplicate | invalid_ticket | invalid_window | not_found | '
+  'not_armable | digest_in_use | ticket_arms_exhausted | invalid_request. Service-role only.';
+
+revoke all on function screening_v2.r1_meet_claim_ticket(text, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.r1_meet_claim_ticket(text, timestamptz)
+  to service_role;
+comment on function screening_v2.r1_meet_claim_ticket(text, timestamptz) is
+  'M034: claims a bridge ticket by its digest exactly once, inside its window, under the booking row '
+  'lock: the booking moves to in_call and the answer is the booking, round, candidate, objective '
+  'profile, Ashby event, session and slot. Answers ok | ticket_already_claimed (+booking_id) | '
+  'ticket_unknown | booking_not_claimable | ticket_not_yet_valid | ticket_expired | round_not_live | '
+  'invalid_ticket | invalid_request. Service-role only.';
+
+revoke all on function screening_v2.r1_meet_record_receipt(text, text, text, uuid, boolean, jsonb, timestamptz, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.r1_meet_record_receipt(text, text, text, uuid, boolean, jsonb, timestamptz, timestamptz)
+  to service_role;
+comment on function screening_v2.r1_meet_record_receipt(text, text, text, uuid, boolean, jsonb, timestamptz, timestamptz) is
+  'M034: durable, de-duplicated webhook receipt (Recall Svix webhook-id or S01 Ashby schedule key; no '
+  'body) and, with p_enqueue, the transactional outbox: exactly one live r1-meet job per receipt '
+  'while it is enqueued (dedup r1-meet:receipt:<id>, payload p_payload || {receipt_id, source}); '
+  'duplicates re-drive a missing job, never double a live one or re-run settled work. An unknown '
+  'booking is stored as NULL. Answers inserted | duplicate (+id, outcome, enqueued, work_pending, '
+  'booking_linked) | invalid_source | invalid_dedupe_key | invalid_event_type | invalid_payload | '
+  'payload_too_large | invalid_scheduled_at | invalid_request. Service-role only.';
+
+revoke all on function screening_v2.r1_meet_prune_receipts(timestamptz, integer, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.r1_meet_prune_receipts(timestamptz, integer, timestamptz)
+  to service_role;
+comment on function screening_v2.r1_meet_prune_receipts(timestamptz, integer, timestamptz) is
+  'M034: the 30-day receipt retention, from an existing tick: deletes at most p_limit (1..5000) of '
+  'the oldest recorded, processed, ignored or failed receipts received before p_older_than (never an '
+  'enqueued one); refuses less than 7 days. Answers ok (+deleted) | retention_too_short | '
   'invalid_request. Service-role only.';
 
 notify pgrst, 'reload schema';

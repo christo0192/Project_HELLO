@@ -22,6 +22,11 @@
 --        (attach, rotate_key, replace, release; compare-and-set; the caps),
 --        r1_meet_reschedule_booking, r1_meet_transition_booking (the matrix) and
 --        r1_meet_bind_session.
+--   T4   the bridge ticket (r1_meet_arm_ticket, r1_meet_claim_ticket: armable states, the window,
+--        single use, replay, expiry, re-arm, the arm budget), durable receipts with the outbox
+--        (r1_meet_record_receipt: dedupe, one live r1-meet job, re-drive, settled work, refusals),
+--        the receipt prune (r1_meet_prune_receipts), and the behavioural privilege proof of both
+--        tables and all ten RPCs (anon / authenticated refused, service_role runs each).
 --
 -- The clock is pinned: every time is written explicitly (p_now = 2026-12-01 04:00 UTC); nothing
 -- asserts on now(). Fixture ids live in 7f000000-0000-4000-8000-<kind:4><n:8> (unused elsewhere);
@@ -2449,6 +2454,787 @@ begin
     perform _r1_meet_tests.raises_as(who, 'T3-F execute r1_meet_bind_session',
       'select screening_v2.r1_meet_bind_session(null, null)', '42501');
   end loop;
+end;
+$$;
+
+-- =============================================================================================
+-- T4. The bridge ticket, durable receipts with the outbox, the receipt prune, and the behavioural
+--     privilege proof of all ten RPCs.
+-- =============================================================================================
+-- Fixture numbers 300-399; Recall bots id(30, 3000 + n) on RPC attaches. Ticket digests are
+-- computed at run time (_r1_meet_tests.digest), never written. A booking from the RPCs has the
+-- default slot 2026-12-02 10:30-11:15 UTC, so a ticket window may run from 10:15 (start - 15 min)
+-- to 11:45 (end + 30 min); its Meet round lives until 13:15. Receipts recorded here are received on
+-- 2026-12-01, like every other receipt of the run, except the T4-C prune fixtures (received in
+-- 2026-08 to 2026-10), so the prune calls (p_now 2026-11-01) can only ever reach those.
+
+-- A bot_scheduled booking for event n through the RPCs: create, then attach bot id(30, 3000 + n).
+create function _r1_meet_tests.scheduled_booking(p_n integer) returns uuid
+language plpgsql as $$
+declare
+  v_booking uuid;
+  v_res jsonb;
+begin
+  v_booking := _r1_meet_tests.pending_booking(p_n);
+  v_res := _r1_meet_tests.set_bot(v_booking, 'attach', _r1_meet_tests.id(30, 3000 + p_n));
+  if v_res ->> 'status' is distinct from 'ok' then
+    raise exception 'R1 MEET FAIL: fixture booking % took no bot (%)', p_n, v_res::text;
+  end if;
+  return v_booking;
+end;
+$$;
+
+-- r1_meet_arm_ticket for the digest of p_tag: by default armed at 10:00 with the widest window the
+-- default slot allows (10:15-11:45).
+create function _r1_meet_tests.arm(p_booking uuid, p_tag text,
+                                   p_now timestamptz default '2026-12-02 10:00:00+00',
+                                   p_not_before timestamptz default '2026-12-02 10:15:00+00',
+                                   p_expires_at timestamptz default '2026-12-02 11:45:00+00')
+returns jsonb language sql as $$
+  select screening_v2.r1_meet_arm_ticket(p_booking, _r1_meet_tests.digest(p_tag), p_not_before,
+                                         p_expires_at, p_now)
+$$;
+
+-- r1_meet_claim_ticket for the digest of p_tag, by default at 10:31 (inside the default window).
+create function _r1_meet_tests.claim(p_tag text, p_now timestamptz default '2026-12-02 10:31:00+00')
+returns jsonb language sql as $$
+  select screening_v2.r1_meet_claim_ticket(_r1_meet_tests.digest(p_tag), p_now)
+$$;
+
+-- The r1-meet jobs of one receipt (all of them, or only the live ones: pending, active, delayed).
+create function _r1_meet_tests.receipt_jobs(p_receipt uuid, p_live boolean default false)
+returns integer language sql stable as $$
+  select count(*)::integer from screening_v2.job_queue j
+   where j.dedup_key = 'r1-meet:receipt:' || p_receipt::text
+     and (not p_live or j.status in ('pending', 'active', 'delayed'))
+$$;
+
+-- Runs a statement AS p_role that MUST complete, and returns its jsonb value. The role switch and
+-- every write of the statement are local to the inner block: an accepted statement raises a
+-- sentinel that rolls that subtransaction back (restoring the role) after its value is kept.
+create function _r1_meet_tests.runs_as(p_role text, p_label text, p_sql text)
+returns jsonb language plpgsql as $$
+declare
+  v_res jsonb;
+  v_before text := current_user;
+  v_switched boolean := false;
+  v_done boolean := false;
+  v_state text;
+  v_msg text;
+begin
+  begin
+    perform set_config('role', p_role, true);
+    v_switched := current_user = p_role;
+    execute p_sql into v_res;
+    v_done := true;
+    raise exception 'r1 meet runs_as sentinel' using errcode = 'P0001';
+  exception when others then
+    get stacked diagnostics v_state = returned_sqlstate, v_msg = message_text;
+  end;
+  if not v_switched then
+    raise exception 'R1 MEET FAIL: % (could not switch to role %: %)', p_label, p_role, v_msg;
+  end if;
+  perform _r1_meet_tests.assert(p_label || ' runs as ' || p_role,
+    v_done and v_res is not null and current_user = v_before,
+    coalesce(v_state, 'null') || ': ' || coalesce(v_msg, 'null'));
+  return v_res;
+end;
+$$;
+
+-- T4-A. The bridge ticket: armable states, the window inside the slot, single use under the row
+-- lock, replay, expiry, a re-arm for page recovery, the spent digest, the arm budget, and no call
+-- session from any arm or claim.
+do $$
+declare
+  t_arm constant timestamptz := '2026-12-02 10:00:00+00';
+  nb constant timestamptz := '2026-12-02 10:15:00+00';
+  ex constant timestamptz := '2026-12-02 11:45:00+00';
+  n_sessions bigint := (select count(*) from screening_v2.call_sessions);
+  b uuid;
+  b2 uuid;
+  b3 uuid;
+  r uuid;
+  c uuid;
+  rr screening_v2.interview_rounds%rowtype;
+  res jsonb;
+  bj jsonb;
+  bk screening_v2.r1_meet_bookings%rowtype;
+begin
+  -- A pending booking holds no bot yet, so no ticket.
+  b := _r1_meet_tests.pending_booking(300);
+  bj := _r1_meet_tests.booking_json(b);
+  res := _r1_meet_tests.arm(b, 'ticket-300');
+  perform _r1_meet_tests.assert('T4-A arm on a pending booking: not_armable, nothing written',
+    res = jsonb_build_object('status', 'not_armable', 'booking_id', b, 'booking_status', 'pending')
+    and _r1_meet_tests.booking_json(b) = bj, res::text);
+
+  -- Armed on a bot_scheduled booking, at both window bounds exactly: the status does not move.
+  b := _r1_meet_tests.scheduled_booking(301);
+  select x.round_id, x.candidate_id into r, c from screening_v2.r1_meet_bookings x where x.id = b;
+  res := _r1_meet_tests.arm(b, 'ticket-301');
+  select * into bk from screening_v2.r1_meet_bookings x where x.id = b;
+  perform _r1_meet_tests.assert(
+    'T4-A arm on a bot_scheduled booking with the widest window (start - 15 min .. end + 30 min): ok, status unchanged',
+    res ->> 'status' = 'ok' and res ->> 'booking_id' = b::text
+    and (res ->> 'not_before')::timestamptz = nb and (res ->> 'expires_at')::timestamptz = ex
+    and (res ->> 'ticket_arms')::integer = 1
+    and (select array_agg(k order by k) from jsonb_object_keys(res) k)
+        = array['booking_id', 'expires_at', 'not_before', 'status', 'ticket_arms']
+    and bk.status = 'bot_scheduled' and bk.reason = 'eligible'
+    and bk.ticket_digest = _r1_meet_tests.digest('ticket-301')
+    and bk.ticket_not_before = nb and bk.ticket_expires_at = ex and bk.ticket_claimed_at is null
+    and bk.ticket_arms = 1 and bk.updated_at = t_arm, res::text);
+
+  -- Every window bound is enforced; a refused window writes nothing.
+  bj := _r1_meet_tests.booking_json(b);
+  res := _r1_meet_tests.arm(b, 'ticket-301w', t_arm, nb - interval '1 second', ex);
+  perform _r1_meet_tests.assert('T4-A a window opening before start - 15 min: invalid_window',
+    res = jsonb_build_object('status', 'invalid_window', 'booking_id', b), res::text);
+  res := _r1_meet_tests.arm(b, 'ticket-301w', t_arm, nb, ex + interval '1 second');
+  perform _r1_meet_tests.assert('T4-A a window closing after end + 30 min: invalid_window',
+    res = jsonb_build_object('status', 'invalid_window', 'booking_id', b), res::text);
+  res := _r1_meet_tests.arm(b, 'ticket-301w', t_arm, '2026-12-02 11:00:00+00', '2026-12-02 11:00:00+00');
+  perform _r1_meet_tests.assert('T4-A an empty window (not_before = expires_at): invalid_window',
+    res = jsonb_build_object('status', 'invalid_window'), res::text);
+  res := _r1_meet_tests.arm(b, 'ticket-301w', '2026-12-02 11:00:00+00', nb, '2026-12-02 11:00:00+00');
+  perform _r1_meet_tests.assert('T4-A a window already closed (expires_at = p_now): invalid_window',
+    res = jsonb_build_object('status', 'invalid_window'), res::text);
+  res := _r1_meet_tests.arm(b, 'ticket-301w', t_arm, null, ex);
+  perform _r1_meet_tests.assert('T4-A no not_before: invalid_window',
+    res = jsonb_build_object('status', 'invalid_window'), res::text);
+  res := _r1_meet_tests.arm(b, 'ticket-301w', t_arm, nb, null);
+  perform _r1_meet_tests.assert('T4-A no expires_at: invalid_window',
+    res = jsonb_build_object('status', 'invalid_window'), res::text);
+  perform _r1_meet_tests.assert('T4-A the refused windows wrote nothing',
+    _r1_meet_tests.booking_json(b) = bj);
+
+  -- Single use: too early, then once inside the window, then never again.
+  res := _r1_meet_tests.claim('ticket-301', nb - interval '1 second');
+  perform _r1_meet_tests.assert('T4-A a claim before not_before: ticket_not_yet_valid, nothing written',
+    res = jsonb_build_object('status', 'ticket_not_yet_valid', 'booking_id', b)
+    and _r1_meet_tests.booking_json(b) = bj, res::text);
+  res := _r1_meet_tests.claim('ticket-301', '2026-12-02 10:31:00+00');
+  select * into bk from screening_v2.r1_meet_bookings x where x.id = b;
+  perform _r1_meet_tests.assert(
+    'T4-A a claim inside the window: ok with the booking, round, candidate, profile, event, session and slot binding',
+    res - 'start_at' - 'end_at' = jsonb_build_object(
+      'status', 'ok', 'booking_id', b, 'round_id', r, 'candidate_id', c,
+      'objective_profile', 'r1_dex_sales', 'ashby_interview_event_id', _r1_meet_tests.id(20, 301),
+      'session_id', null::uuid)
+    and (res ->> 'start_at')::timestamptz = '2026-12-02 10:30:00+00'
+    and (res ->> 'end_at')::timestamptz = '2026-12-02 11:15:00+00', res::text);
+  perform _r1_meet_tests.assert('T4-A the claim moved the booking to in_call and spent the ticket',
+    bk.status = 'in_call' and bk.reason = 'eligible'
+    and bk.ticket_claimed_at = '2026-12-02 10:31:00+00' and bk.updated_at = '2026-12-02 10:31:00+00'
+    and bk.ticket_digest = _r1_meet_tests.digest('ticket-301') and bk.ticket_arms = 1
+    and bk.recall_bot_id = _r1_meet_tests.id(30, 3301), to_jsonb(bk)::text);
+  bj := _r1_meet_tests.booking_json(b);
+  res := _r1_meet_tests.claim('ticket-301', '2026-12-02 10:32:00+00');
+  perform _r1_meet_tests.assert(
+    'T4-A a second claim of the same ticket: ticket_already_claimed with the booking id, nothing written',
+    res = jsonb_build_object('status', 'ticket_already_claimed', 'booking_id', b)
+    and _r1_meet_tests.booking_json(b) = bj, res::text);
+  res := _r1_meet_tests.claim('ticket-301', '2026-12-02 12:00:00+00');
+  perform _r1_meet_tests.assert('T4-A a replay after the window closed: still ticket_already_claimed',
+    res = jsonb_build_object('status', 'ticket_already_claimed', 'booking_id', b), res::text);
+
+  -- Page recovery: a re-arm in in_call is a new single-use ticket; the old digest is gone.
+  res := _r1_meet_tests.arm(b, 'ticket-301b', '2026-12-02 10:40:00+00');
+  select * into bk from screening_v2.r1_meet_bookings x where x.id = b;
+  perform _r1_meet_tests.assert('T4-A a re-arm in in_call: ok, a fresh unclaimed ticket, still in_call',
+    res ->> 'status' = 'ok' and (res ->> 'ticket_arms')::integer = 2
+    and bk.status = 'in_call' and bk.ticket_digest = _r1_meet_tests.digest('ticket-301b')
+    and bk.ticket_claimed_at is null and bk.ticket_arms = 2, res::text);
+  res := _r1_meet_tests.claim('ticket-301', '2026-12-02 10:41:00+00');
+  perform _r1_meet_tests.assert('T4-A the replaced ticket no longer exists: ticket_unknown',
+    res = jsonb_build_object('status', 'ticket_unknown'), res::text);
+  res := _r1_meet_tests.claim('ticket-301b', '2026-12-02 10:41:00+00');
+  perform _r1_meet_tests.assert('T4-A the re-armed ticket claims once: ok, in_call',
+    res ->> 'status' = 'ok' and res ->> 'booking_id' = b::text
+    and (select x.status = 'in_call' and x.ticket_claimed_at = '2026-12-02 10:41:00+00'
+           from screening_v2.r1_meet_bookings x where x.id = b), res::text);
+  res := _r1_meet_tests.claim('ticket-301b', '2026-12-02 10:42:00+00');
+  perform _r1_meet_tests.assert('T4-A the re-armed ticket a second time: ticket_already_claimed',
+    res = jsonb_build_object('status', 'ticket_already_claimed', 'booking_id', b), res::text);
+  bj := _r1_meet_tests.booking_json(b);
+  res := _r1_meet_tests.arm(b, 'ticket-301b', '2026-12-02 10:43:00+00');
+  perform _r1_meet_tests.assert('T4-A re-arming the spent (claimed) digest: digest_in_use, nothing written',
+    res = jsonb_build_object('status', 'digest_in_use', 'booking_id', b)
+    and _r1_meet_tests.booking_json(b) = bj, res::text);
+
+  -- An identical re-arm is idempotent; a new window for the same unclaimed ticket re-arms; the
+  -- sixth arm of one bot generation is refused.
+  res := _r1_meet_tests.arm(b, 'ticket-301c', '2026-12-02 10:44:00+00');
+  perform _r1_meet_tests.assert('T4-A the third arm: ok',
+    res ->> 'status' = 'ok' and (res ->> 'ticket_arms')::integer = 3, res::text);
+  bj := _r1_meet_tests.booking_json(b);
+  res := _r1_meet_tests.arm(b, 'ticket-301c', '2026-12-02 10:45:00+00');
+  perform _r1_meet_tests.assert(
+    'T4-A the same unclaimed ticket and window again: duplicate, no arm used, nothing written',
+    res ->> 'status' = 'duplicate' and res ->> 'booking_id' = b::text
+    and (res ->> 'ticket_arms')::integer = 3 and _r1_meet_tests.booking_json(b) = bj, res::text);
+  res := _r1_meet_tests.arm(b, 'ticket-301c', '2026-12-02 10:46:00+00', '2026-12-02 10:46:00+00', ex);
+  perform _r1_meet_tests.assert('T4-A the same unclaimed ticket with a new window re-arms: the fourth arm',
+    res ->> 'status' = 'ok' and (res ->> 'ticket_arms')::integer = 4
+    and (select x.ticket_not_before = '2026-12-02 10:46:00+00' and x.ticket_claimed_at is null
+           from screening_v2.r1_meet_bookings x where x.id = b), res::text);
+  res := _r1_meet_tests.arm(b, 'ticket-301d', '2026-12-02 10:47:00+00');
+  perform _r1_meet_tests.assert('T4-A the fifth arm: ok',
+    res ->> 'status' = 'ok' and (res ->> 'ticket_arms')::integer = 5, res::text);
+  bj := _r1_meet_tests.booking_json(b);
+  res := _r1_meet_tests.arm(b, 'ticket-301e', '2026-12-02 10:48:00+00');
+  perform _r1_meet_tests.assert('T4-A a sixth arm in one bot generation: ticket_arms_exhausted, nothing written',
+    res = jsonb_build_object('status', 'ticket_arms_exhausted', 'booking_id', b, 'ticket_arms', 5)
+    and _r1_meet_tests.booking_json(b) = bj, res::text);
+  res := _r1_meet_tests.claim('ticket-301d', '2026-12-02 10:49:00+00');
+  perform _r1_meet_tests.assert('T4-A the fifth ticket still claims once',
+    res ->> 'status' = 'ok' and res ->> 'booking_id' = b::text, res::text);
+  perform _r1_meet_tests.assert('T4-A arming and claiming created no call session for the round',
+    _r1_meet_tests.sessions_of(r) = 0);
+
+  -- Armable while the bot joins and once a human is present; a claim from human_present.
+  b2 := _r1_meet_tests.scheduled_booking(302);
+  res := screening_v2.r1_meet_transition_booking(b2, 'bot_scheduled', 'bot_joining', 'eligible',
+                                                 '2026-12-02 10:25:00+00');
+  perform _r1_meet_tests.assert('T4-A fixture: the bot is joining', res ->> 'status' = 'ok', res::text);
+  res := _r1_meet_tests.arm(b2, 'ticket-302', '2026-12-02 10:26:00+00');
+  perform _r1_meet_tests.assert('T4-A arm on a bot_joining booking: ok, still bot_joining',
+    res ->> 'status' = 'ok'
+    and (select x.status = 'bot_joining' from screening_v2.r1_meet_bookings x where x.id = b2), res::text);
+  res := screening_v2.r1_meet_transition_booking(b2, 'bot_joining', 'human_present', 'eligible',
+                                                 '2026-12-02 10:31:00+00');
+  res := _r1_meet_tests.arm(b2, 'ticket-302b', '2026-12-02 10:31:30+00');
+  perform _r1_meet_tests.assert('T4-A arm on a human_present booking: ok, still human_present',
+    res ->> 'status' = 'ok' and (res ->> 'ticket_arms')::integer = 2
+    and (select x.status = 'human_present' from screening_v2.r1_meet_bookings x where x.id = b2), res::text);
+  res := _r1_meet_tests.claim('ticket-302b', '2026-12-02 10:32:00+00');
+  perform _r1_meet_tests.assert('T4-A a claim from human_present: ok, in_call',
+    res ->> 'status' = 'ok'
+    and (select x.status = 'in_call' from screening_v2.r1_meet_bookings x where x.id = b2), res::text);
+
+  -- Expiry: a claim at expires_at is too late.
+  b3 := _r1_meet_tests.scheduled_booking(303);
+  res := _r1_meet_tests.arm(b3, 'ticket-303', t_arm, nb, '2026-12-02 10:45:00+00');
+  bj := _r1_meet_tests.booking_json(b3);
+  res := _r1_meet_tests.claim('ticket-303', '2026-12-02 10:45:00+00');
+  perform _r1_meet_tests.assert('T4-A a claim at expires_at: ticket_expired, nothing written',
+    res = jsonb_build_object('status', 'ticket_expired', 'booking_id', b3)
+    and _r1_meet_tests.booking_json(b3) = bj, res::text);
+
+  -- A digest another booking holds, claimed (301d) or not (303), is never armed twice.
+  res := _r1_meet_tests.arm(b3, 'ticket-301d', '2026-12-02 10:50:00+00');
+  perform _r1_meet_tests.assert('T4-A arming a digest another booking holds (claimed): digest_in_use',
+    res = jsonb_build_object('status', 'digest_in_use', 'booking_id', b3)
+    and _r1_meet_tests.booking_json(b3) = bj, res::text);
+  res := _r1_meet_tests.arm(b2, 'ticket-303', '2026-12-02 10:50:00+00');
+  perform _r1_meet_tests.assert('T4-A arming a digest another booking holds (unclaimed): digest_in_use',
+    res = jsonb_build_object('status', 'digest_in_use', 'booking_id', b2)
+    and (select x.ticket_digest = _r1_meet_tests.digest('ticket-302b')
+           from screening_v2.r1_meet_bookings x where x.id = b2), res::text);
+
+  -- Cancelled: the cancel clears the unclaimed ticket (its digest is then unknown) and a cancelled
+  -- booking is not armable. A terminal booking that still holds an unclaimed ticket is a state no
+  -- RPC writes; inserted directly, its ticket is still never claimable.
+  b3 := _r1_meet_tests.scheduled_booking(304);
+  res := _r1_meet_tests.arm(b3, 'ticket-304', '2026-12-01 05:00:00+00');
+  res := screening_v2.r1_meet_cancel_booking(b3, 'cancelled', '2026-12-01 06:00:00+00');
+  perform _r1_meet_tests.assert('T4-A fixture: the armed booking is cancelled', res ->> 'status' = 'ok', res::text);
+  res := _r1_meet_tests.claim('ticket-304');
+  perform _r1_meet_tests.assert('T4-A the ticket of a cancelled booking: ticket_unknown (the cancel cleared it)',
+    res = jsonb_build_object('status', 'ticket_unknown'), res::text);
+  res := _r1_meet_tests.arm(b3, 'ticket-304b', '2026-12-01 07:00:00+00');
+  perform _r1_meet_tests.assert('T4-A arm on a cancelled booking: not_armable',
+    res = jsonb_build_object('status', 'not_armable', 'booking_id', b3, 'booking_status', 'cancelled'),
+    res::text);
+  perform _r1_meet_tests.candidate(305, false);
+  perform _r1_meet_tests.round(305);
+  b3 := _r1_meet_tests.insert_booking(305, jsonb_build_object(
+    'status', 'cancelled', 'reason', 'cancelled',
+    'candidate_id', _r1_meet_tests.id(10, 305), 'round_id', _r1_meet_tests.id(11, 305),
+    'recall_bot_id', _r1_meet_tests.id(30, 3305),
+    'ticket_digest', _r1_meet_tests.digest('ticket-305'),
+    'ticket_not_before', nb, 'ticket_expires_at', ex, 'ticket_arms', 1));
+  res := _r1_meet_tests.claim('ticket-305');
+  perform _r1_meet_tests.assert(
+    'T4-A a claim on a cancelled booking that still holds an unclaimed ticket: booking_not_claimable',
+    res = jsonb_build_object('status', 'booking_not_claimable', 'booking_id', b3,
+                             'booking_status', 'cancelled')
+    and (select x.status = 'cancelled' and x.ticket_claimed_at is null
+           from screening_v2.r1_meet_bookings x where x.id = b3), res::text);
+
+  -- The round must be a live Meet round: a browser round, or one HR cancelled, is not claimable.
+  b3 := _r1_meet_tests.booking_in(306, 'bot_scheduled');
+  res := _r1_meet_tests.arm(b3, 'ticket-306');
+  perform _r1_meet_tests.assert('T4-A fixture: a booking on a browser round is armed', res ->> 'status' = 'ok', res::text);
+  res := _r1_meet_tests.claim('ticket-306');
+  perform _r1_meet_tests.assert('T4-A a claim whose round is not a Meet round (channel browser): round_not_live',
+    res = jsonb_build_object('status', 'round_not_live', 'booking_id', b3,
+                             'round_id', _r1_meet_tests.id(11, 306))
+    and (select x.status = 'bot_scheduled' and x.ticket_claimed_at is null
+           from screening_v2.r1_meet_bookings x where x.id = b3), res::text);
+  b3 := _r1_meet_tests.scheduled_booking(307);
+  select * into rr from screening_v2.interview_rounds x
+   where x.id = (select y.round_id from screening_v2.r1_meet_bookings y where y.id = b3);
+  res := _r1_meet_tests.arm(b3, 'ticket-307');
+  res := screening_v2.r1_transition_round(rr.id, 'cancel', rr.version, null, null, '2026-12-02 10:05:00+00');
+  perform _r1_meet_tests.assert('T4-A fixture: the Meet round is cancelled', res ->> 'status' = 'ok', res::text);
+  bj := _r1_meet_tests.booking_json(b3);
+  res := _r1_meet_tests.claim('ticket-307');
+  perform _r1_meet_tests.assert('T4-A a claim whose Meet round was cancelled: round_not_live, nothing written',
+    res = jsonb_build_object('status', 'round_not_live', 'booking_id', b3, 'round_id', rr.id)
+    and _r1_meet_tests.booking_json(b3) = bj, res::text);
+
+  -- Input checks.
+  res := screening_v2.r1_meet_claim_ticket('xyz', t_arm);
+  perform _r1_meet_tests.assert('T4-A a claim of ''xyz'': invalid_ticket',
+    res = jsonb_build_object('status', 'invalid_ticket'), res::text);
+  res := screening_v2.r1_meet_claim_ticket(upper(_r1_meet_tests.digest('ticket-303')), '2026-12-02 10:31:00+00');
+  perform _r1_meet_tests.assert('T4-A a claim of an upper-case digest: invalid_ticket',
+    res = jsonb_build_object('status', 'invalid_ticket'), res::text);
+  res := screening_v2.r1_meet_claim_ticket(null, t_arm);
+  perform _r1_meet_tests.assert('T4-A a claim of no ticket: invalid_ticket',
+    res = jsonb_build_object('status', 'invalid_ticket'), res::text);
+  res := screening_v2.r1_meet_claim_ticket(_r1_meet_tests.digest('ticket-303'), null);
+  perform _r1_meet_tests.assert('T4-A a claim without p_now: invalid_request (now)',
+    res = jsonb_build_object('status', 'invalid_request', 'field', 'now'), res::text);
+  res := _r1_meet_tests.claim('never-armed');
+  perform _r1_meet_tests.assert('T4-A a claim of a ticket never armed: ticket_unknown',
+    res = jsonb_build_object('status', 'ticket_unknown'), res::text);
+  res := screening_v2.r1_meet_arm_ticket(b2, 'xyz', nb, ex, t_arm);
+  perform _r1_meet_tests.assert('T4-A an arm of ''xyz'': invalid_ticket',
+    res = jsonb_build_object('status', 'invalid_ticket'), res::text);
+  res := screening_v2.r1_meet_arm_ticket(b2, null, nb, ex, t_arm);
+  perform _r1_meet_tests.assert('T4-A an arm of no digest: invalid_ticket',
+    res = jsonb_build_object('status', 'invalid_ticket'), res::text);
+  res := screening_v2.r1_meet_arm_ticket(b2, _r1_meet_tests.digest('ticket-x'), nb, ex, null);
+  perform _r1_meet_tests.assert('T4-A an arm without p_now: invalid_request (now)',
+    res = jsonb_build_object('status', 'invalid_request', 'field', 'now'), res::text);
+  res := screening_v2.r1_meet_arm_ticket(_r1_meet_tests.id(99, 1), _r1_meet_tests.digest('ticket-x'), nb, ex, t_arm);
+  perform _r1_meet_tests.assert('T4-A an arm on an unknown booking: not_found',
+    res = jsonb_build_object('status', 'not_found'), res::text);
+  perform _r1_meet_tests.assert('T4-A the unclaimed ticket 303 is still unclaimed after the refused claims',
+    (select x.ticket_claimed_at is null and x.status = 'bot_scheduled'
+       from screening_v2.r1_meet_bookings x where x.ticket_digest = _r1_meet_tests.digest('ticket-303')));
+
+  perform _r1_meet_tests.assert('T4-A no call_sessions row was created by any arm or claim',
+    (select count(*) from screening_v2.call_sessions) = n_sessions);
+end;
+$$;
+
+-- T4-B. r1_meet_record_receipt: insert-or-report-duplicate, the outbox (one live r1-meet job per
+-- receipt while it is enqueued), re-drive, settled work, the booking link, every refusal.
+do $$
+declare
+  p_now constant timestamptz := '2026-12-01 05:00:00+00';
+  k1 constant text := 'msg_t4' || left(_r1_meet_tests.digest('t4-svix-1'), 24);
+  k2 constant text := 'msg_t4' || left(_r1_meet_tests.digest('t4-svix-2'), 24);
+  k3 constant text := 'msg_t4' || left(_r1_meet_tests.digest('t4-svix-3'), 24);
+  k4 constant text := 'msg_t4' || left(_r1_meet_tests.digest('t4-svix-4'), 24);
+  fp constant text := left(_r1_meet_tests.digest('t4-fingerprint'), 16);
+  ka constant text := 'ashby-schedule:' || _r1_meet_tests.id(21, 311)::text || ':1764493205000:' || fp;
+  ka_longest constant text := 'ashby-schedule:' || _r1_meet_tests.id(21, 312)::text
+                              || ':r8640000000000000:' || fp;
+  w_payload constant jsonb := jsonb_build_object('kind', 'bot_status');
+  b uuid;
+  id1 uuid;
+  id2 uuid;
+  id3 uuid;
+  res jsonb;
+  rc jsonb;
+  jb screening_v2.job_queue%rowtype;
+  n_receipts bigint;
+  n_jobs bigint;
+  bad record;
+begin
+  -- A delivery without work: recorded, nothing queued; the same key again is a duplicate.
+  res := screening_v2.r1_meet_record_receipt('recall', k1, 'bot.status_change', null, false, null, null, p_now);
+  id1 := (res ->> 'id')::uuid;
+  perform _r1_meet_tests.assert('T4-B a first delivery without work: inserted, recorded, nothing queued',
+    res = jsonb_build_object('status', 'inserted', 'id', id1, 'outcome', 'recorded', 'enqueued', false,
+                             'work_pending', false, 'booking_linked', false)
+    and (select x.source = 'recall' and x.dedupe_key = k1 and x.event_type = 'bot.status_change'
+                and x.outcome = 'recorded' and x.received_at = p_now and x.processed_at is null
+                and x.booking_id is null
+           from screening_v2.r1_meet_receipts x where x.id = id1)
+    and _r1_meet_tests.receipt_jobs(id1) = 0, res::text);
+  rc := (select to_jsonb(x) from screening_v2.r1_meet_receipts x where x.id = id1);
+  res := screening_v2.r1_meet_record_receipt('recall', k1, 'bot.status_change', null, false, null, null,
+                                             p_now + interval '1 minute');
+  perform _r1_meet_tests.assert('T4-B the same dedupe key again: duplicate with the same id, nothing written',
+    res = jsonb_build_object('status', 'duplicate', 'id', id1, 'outcome', 'recorded', 'enqueued', false,
+                             'work_pending', false, 'booking_linked', false)
+    and (select to_jsonb(x) from screening_v2.r1_meet_receipts x where x.id = id1) = rc
+    and (select count(*) = 1 from screening_v2.r1_meet_receipts x where x.dedupe_key in (k1)), res::text);
+
+  -- A delivery with work: one job in the r1-meet queue, linked to its booking.
+  b := _r1_meet_tests.booking_in(310, 'bot_scheduled');
+  res := screening_v2.r1_meet_record_receipt('recall', k2, 'bot.in_call_recording', b, true,
+    jsonb_build_object('kind', 'bot_status', 'recall_bot_id', _r1_meet_tests.id(30, 310)), null, p_now);
+  id2 := (res ->> 'id')::uuid;
+  select * into jb from screening_v2.job_queue j where j.dedup_key = 'r1-meet:receipt:' || id2::text;
+  perform _r1_meet_tests.assert('T4-B a delivery with work: inserted, enqueued, work pending, linked to its booking',
+    res = jsonb_build_object('status', 'inserted', 'id', id2, 'outcome', 'enqueued', 'enqueued', true,
+                             'work_pending', true, 'booking_linked', true)
+    and (select x.outcome = 'enqueued' and x.booking_id = b and x.processed_at is null
+           from screening_v2.r1_meet_receipts x where x.id = id2), res::text);
+  perform _r1_meet_tests.assert(
+    'T4-B exactly one r1-meet job: the payload kind plus receipt_id and source, 5 attempts, due at p_now',
+    _r1_meet_tests.receipt_jobs(id2) = 1
+    and jb.name = 'r1-meet' and jb.status = 'pending'
+    and jb.payload = jsonb_build_object('kind', 'bot_status', 'recall_bot_id', _r1_meet_tests.id(30, 310),
+                                        'receipt_id', id2, 'source', 'recall')
+    and jb.attempts = 0 and jb.max_attempts = 5 and jb.priority = 0
+    and jb.scheduled_at = p_now and jb.created_at = p_now, to_jsonb(jb)::text);
+
+  -- Re-drive: never a second live job; a missing job comes back while the receipt is enqueued.
+  res := screening_v2.r1_meet_record_receipt('recall', k2, 'bot.in_call_recording', b, true, w_payload, null,
+                                             p_now + interval '1 minute');
+  perform _r1_meet_tests.assert('T4-B a duplicate while the job is live: no second job, work pending',
+    res = jsonb_build_object('status', 'duplicate', 'id', id2, 'outcome', 'enqueued', 'enqueued', false,
+                             'work_pending', true, 'booking_linked', true)
+    and _r1_meet_tests.receipt_jobs(id2) = 1, res::text);
+  update screening_v2.job_queue set status = 'completed', completed_at = p_now
+   where dedup_key = 'r1-meet:receipt:' || id2::text;
+  res := screening_v2.r1_meet_record_receipt('recall', k2, 'bot.in_call_recording', b, true, w_payload, null,
+                                             p_now + interval '2 minutes');
+  perform _r1_meet_tests.assert(
+    'T4-B the job finished but the receipt is still enqueued: the duplicate re-drives exactly one job',
+    res = jsonb_build_object('status', 'duplicate', 'id', id2, 'outcome', 'enqueued', 'enqueued', true,
+                             'work_pending', true, 'booking_linked', true)
+    and _r1_meet_tests.receipt_jobs(id2) = 2 and _r1_meet_tests.receipt_jobs(id2, true) = 1, res::text);
+
+  -- Settled work is never re-run: processed, and failed.
+  update screening_v2.job_queue set status = 'completed', completed_at = p_now
+   where dedup_key = 'r1-meet:receipt:' || id2::text and status = 'pending';
+  update screening_v2.r1_meet_receipts
+     set outcome = 'processed', processed_at = p_now + interval '3 minutes'
+   where id = id2;
+  res := screening_v2.r1_meet_record_receipt('recall', k2, 'bot.in_call_recording', b, true, w_payload, null,
+                                             p_now + interval '4 minutes');
+  perform _r1_meet_tests.assert('T4-B a processed receipt: the duplicate queues nothing, the work is settled',
+    res = jsonb_build_object('status', 'duplicate', 'id', id2, 'outcome', 'processed', 'enqueued', false,
+                             'work_pending', true, 'booking_linked', true)
+    and _r1_meet_tests.receipt_jobs(id2) = 2 and _r1_meet_tests.receipt_jobs(id2, true) = 0, res::text);
+  res := screening_v2.r1_meet_record_receipt('recall', k3, 'bot.fatal', null, true, w_payload, null, p_now);
+  id3 := (res ->> 'id')::uuid;
+  update screening_v2.job_queue set status = 'failed', failed_at = p_now
+   where dedup_key = 'r1-meet:receipt:' || id3::text;
+  update screening_v2.r1_meet_receipts set outcome = 'failed', processed_at = p_now where id = id3;
+  res := screening_v2.r1_meet_record_receipt('recall', k3, 'bot.fatal', null, true, w_payload, null,
+                                             p_now + interval '1 minute');
+  perform _r1_meet_tests.assert('T4-B a failed receipt: the duplicate queues nothing',
+    res = jsonb_build_object('status', 'duplicate', 'id', id3, 'outcome', 'failed', 'enqueued', false,
+                             'work_pending', true, 'booking_linked', false)
+    and _r1_meet_tests.receipt_jobs(id3) = 1 and _r1_meet_tests.receipt_jobs(id3, true) = 0, res::text);
+
+  -- A recorded-only receipt that a later delivery asks work for becomes enqueued, with one job.
+  res := screening_v2.r1_meet_record_receipt('recall', k1, 'bot.status_change', null, true, w_payload, null,
+                                             p_now + interval '5 minutes');
+  perform _r1_meet_tests.assert(
+    'T4-B a recorded-only receipt asked for work by a later delivery: enqueued, one live job',
+    res = jsonb_build_object('status', 'duplicate', 'id', id1, 'outcome', 'enqueued', 'enqueued', true,
+                             'work_pending', true, 'booking_linked', false)
+    and (select x.outcome = 'enqueued' and x.processed_at is null and x.received_at = p_now
+                and x.event_type = 'bot.status_change'
+           from screening_v2.r1_meet_receipts x where x.id = id1)
+    and _r1_meet_tests.receipt_jobs(id1, true) = 1, res::text);
+
+  -- An Ashby schedule receipt with a delayed job (S06 re-runs), and the longest S01 key.
+  res := screening_v2.r1_meet_record_receipt('ashby', ka, 'interviewScheduleUpdate', null, true,
+    jsonb_build_object('kind', 'ashby_schedule', 'schedule_id', _r1_meet_tests.id(21, 311)::text),
+    p_now + interval '2 hours', p_now);
+  select * into jb from screening_v2.job_queue j
+   where j.dedup_key = 'r1-meet:receipt:' || (res ->> 'id');
+  perform _r1_meet_tests.assert('T4-B an Ashby schedule receipt with p_scheduled_at: the job is due then',
+    res ->> 'status' = 'inserted' and (res ->> 'enqueued')::boolean
+    and jb.name = 'r1-meet' and jb.scheduled_at = p_now + interval '2 hours' and jb.created_at = p_now
+    and jb.payload ->> 'source' = 'ashby' and jb.payload ->> 'kind' = 'ashby_schedule'
+    and jb.payload ->> 'receipt_id' = res ->> 'id', res::text);
+  perform _r1_meet_tests.assert('T4-B fixture: the longest S01 Ashby key is 86 characters',
+    char_length(ka_longest) = 86, ka_longest);
+  res := screening_v2.r1_meet_record_receipt('ashby', ka_longest, 'interviewScheduleCreate', null, false,
+                                             null, null, p_now);
+  perform _r1_meet_tests.assert('T4-B the 86-character S01 Ashby key is accepted by the RPC',
+    res ->> 'status' = 'inserted'
+    and exists (select 1 from screening_v2.r1_meet_receipts x
+                 where x.id = (res ->> 'id')::uuid and x.dedupe_key in (ka_longest)
+                   and x.source = 'ashby'), res::text);
+
+  -- The booking link: an unknown booking id is stored as NULL, never an error.
+  res := screening_v2.r1_meet_record_receipt('recall', k4, 'bot.done', _r1_meet_tests.id(99, 2), false,
+                                             null, null, p_now);
+  perform _r1_meet_tests.assert('T4-B an unknown booking id is stored as NULL: inserted, booking_linked false',
+    res ->> 'status' = 'inserted' and (res ->> 'booking_linked')::boolean = false
+    and (select x.booking_id is null from screening_v2.r1_meet_receipts x where x.id = (res ->> 'id')::uuid),
+    res::text);
+  res := screening_v2.r1_meet_record_receipt('recall', 'msg_t4-nullenqueue', 'bot.done', null, null, null,
+                                             null, p_now);
+  perform _r1_meet_tests.assert('T4-B a NULL p_enqueue records without work',
+    res ->> 'status' = 'inserted' and res ->> 'outcome' = 'recorded'
+    and (res ->> 'enqueued')::boolean = false
+    and _r1_meet_tests.receipt_jobs((res ->> 'id')::uuid) = 0, res::text);
+  res := screening_v2.r1_meet_record_receipt('recall', 'msg_t4-sched-bounds', 'bot.done', null, true, w_payload,
+                                             p_now + interval '30 days', p_now);
+  perform _r1_meet_tests.assert('T4-B a job scheduled exactly 30 days ahead is accepted',
+    res ->> 'status' = 'inserted' and (res ->> 'enqueued')::boolean, res::text);
+  res := screening_v2.r1_meet_record_receipt('recall', 'msg_t4-sched-past', 'bot.done', null, true, w_payload,
+                                             p_now - interval '1 hour', p_now);
+  perform _r1_meet_tests.assert('T4-B a job scheduled exactly an hour back is accepted',
+    res ->> 'status' = 'inserted' and (res ->> 'enqueued')::boolean, res::text);
+
+  -- Every refusal, none of which writes a receipt or queues a job.
+  n_receipts := (select count(*) from screening_v2.r1_meet_receipts);
+  n_jobs := (select count(*) from screening_v2.job_queue j where j.name = 'r1-meet');
+  for bad in
+    select * from (values
+      ('invalid_source', 'no source', null::text, 'msg_t4-bad'::text, 'bot.done'::text, false, null::jsonb, null::timestamptz, p_now),
+      ('invalid_source', 'source calendly', 'calendly', 'msg_t4-bad', 'bot.done', false, null, null, p_now),
+      ('invalid_dedupe_key', 'no dedupe key', 'recall', null, 'bot.done', false, null, null, p_now),
+      ('invalid_dedupe_key', 'an empty dedupe key', 'recall', '', 'bot.done', false, null, null, p_now),
+      ('invalid_dedupe_key', 'a dedupe key with a space', 'recall', 'msg_t4 bad', 'bot.done', false, null, null, p_now),
+      ('invalid_dedupe_key', 'a 257-character dedupe key', 'recall', 'msg_' || repeat('a', 253), 'bot.done', false, null, null, p_now),
+      ('invalid_dedupe_key', 'an ashby receipt without the S01 prefix', 'ashby', 'msg_t4-bad', 'bot.done', false, null, null, p_now),
+      ('invalid_dedupe_key', 'a recall receipt with the S01 prefix', 'recall',
+        'ashby-schedule:' || _r1_meet_tests.id(21, 313)::text || ':1:' || fp, 'bot.done', false, null, null, p_now),
+      ('invalid_event_type', 'no event type', 'recall', 'msg_t4-bad', null, false, null, null, p_now),
+      ('invalid_event_type', 'an empty event type', 'recall', 'msg_t4-bad', '', false, null, null, p_now),
+      ('invalid_event_type', 'an event type with a space', 'recall', 'msg_t4-bad', 'bot done', false, null, null, p_now),
+      ('invalid_event_type', 'a 129-character event type', 'recall', 'msg_t4-bad', repeat('e', 129), false, null, null, p_now),
+      ('invalid_request', 'no p_now', 'recall', 'msg_t4-bad', 'bot.done', false, null, null, null),
+      ('invalid_payload', 'work without a payload', 'recall', 'msg_t4-bad', 'bot.done', true, null, null, p_now),
+      ('invalid_payload', 'work with an array payload', 'recall', 'msg_t4-bad', 'bot.done', true, '[]'::jsonb, null, p_now),
+      ('invalid_payload', 'work with a JSON null payload', 'recall', 'msg_t4-bad', 'bot.done', true, 'null'::jsonb, null, p_now),
+      ('invalid_payload', 'work without a kind', 'recall', 'msg_t4-bad', 'bot.done', true, '{}'::jsonb, null, p_now),
+      ('invalid_payload', 'a numeric kind', 'recall', 'msg_t4-bad', 'bot.done', true, '{"kind": 5}'::jsonb, null, p_now),
+      ('invalid_payload', 'a boolean kind', 'recall', 'msg_t4-bad', 'bot.done', true, '{"kind": true}'::jsonb, null, p_now),
+      ('invalid_payload', 'an upper-case kind', 'recall', 'msg_t4-bad', 'bot.done', true, '{"kind": "Bot"}'::jsonb, null, p_now),
+      ('invalid_payload', 'a kind that starts with a digit', 'recall', 'msg_t4-bad', 'bot.done', true, '{"kind": "1bot"}'::jsonb, null, p_now),
+      ('invalid_payload', 'a 41-character kind', 'recall', 'msg_t4-bad', 'bot.done', true, jsonb_build_object('kind', repeat('k', 41)), null, p_now),
+      ('invalid_payload', 'a payload without p_enqueue', 'recall', 'msg_t4-bad', 'bot.done', false, w_payload, null, p_now),
+      ('payload_too_large', 'a payload over 4096 bytes', 'recall', 'msg_t4-bad', 'bot.done', true,
+        jsonb_build_object('kind', 'bot_status', 'pad', repeat('p', 4100)), null, p_now),
+      ('invalid_scheduled_at', 'a job due more than an hour back', 'recall', 'msg_t4-bad', 'bot.done', true, w_payload,
+        p_now - interval '1 hour 1 second', p_now),
+      ('invalid_scheduled_at', 'a job due more than 30 days ahead', 'recall', 'msg_t4-bad', 'bot.done', true, w_payload,
+        p_now + interval '30 days 1 second', p_now),
+      ('invalid_scheduled_at', 'a due time without p_enqueue', 'recall', 'msg_t4-bad', 'bot.done', false, null,
+        p_now + interval '1 hour', p_now)
+    ) as v(code, label, src, dkey, evt, enq, payload, sched, at_now)
+  loop
+    res := screening_v2.r1_meet_record_receipt(bad.src, bad.dkey, bad.evt, null, bad.enq, bad.payload,
+                                               bad.sched, bad.at_now);
+    perform _r1_meet_tests.assert('T4-B ' || bad.label || ': ' || bad.code,
+      res = case when bad.code = 'invalid_request'
+                 then jsonb_build_object('status', bad.code, 'field', 'now')
+                 else jsonb_build_object('status', bad.code) end, res::text);
+  end loop;
+  perform _r1_meet_tests.assert('T4-B the refused deliveries wrote no receipt and queued no job',
+    (select count(*) from screening_v2.r1_meet_receipts) = n_receipts
+    and (select count(*) from screening_v2.job_queue j where j.name = 'r1-meet') = n_jobs);
+end;
+$$;
+
+-- T4-C. r1_meet_prune_receipts: the 7-day floor, the batch limit, settled receipts only. Its
+-- fixtures are the only receipts of the run received before 2026-11-01.
+do $$
+declare
+  p_now constant timestamptz := '2026-11-01 00:00:00+00';
+  cutoff constant timestamptz := '2026-10-01 00:00:00+00';
+  n_recent bigint := (select count(*) from screening_v2.r1_meet_receipts x
+                       where x.received_at >= '2026-11-01 00:00:00+00');
+  res jsonb;
+begin
+  insert into screening_v2.r1_meet_receipts
+    (source, dedupe_key, event_type, outcome, received_at, processed_at)
+  values
+    ('recall', 'msg_t4prune-p1', 'bot.done', 'processed', '2026-09-01 00:00:00+00', '2026-09-01 00:01:00+00'),
+    ('recall', 'msg_t4prune-p2', 'bot.done', 'processed', '2026-09-02 00:00:00+00', '2026-09-02 00:01:00+00'),
+    ('recall', 'msg_t4prune-i', 'bot.done', 'ignored', '2026-09-03 00:00:00+00', '2026-09-03 00:01:00+00'),
+    ('recall', 'msg_t4prune-f', 'bot.done', 'failed', '2026-09-04 00:00:00+00', '2026-09-04 00:01:00+00'),
+    ('recall', 'msg_t4prune-r', 'bot.done', 'recorded', '2026-09-05 00:00:00+00', null),
+    ('recall', 'msg_t4prune-e', 'bot.done', 'enqueued', '2026-08-01 00:00:00+00', null),
+    ('recall', 'msg_t4prune-new', 'bot.done', 'processed', '2026-10-30 00:00:00+00', '2026-10-30 00:01:00+00');
+
+  res := screening_v2.r1_meet_prune_receipts(p_now - interval '6 days', 500, p_now);
+  perform _r1_meet_tests.assert('T4-C six days of retention: retention_too_short',
+    res = jsonb_build_object('status', 'retention_too_short'), res::text);
+  res := screening_v2.r1_meet_prune_receipts(cutoff, 0, p_now);
+  perform _r1_meet_tests.assert('T4-C a limit of 0: invalid_request (limit)',
+    res = jsonb_build_object('status', 'invalid_request', 'field', 'limit'), res::text);
+  res := screening_v2.r1_meet_prune_receipts(cutoff, 5001, p_now);
+  perform _r1_meet_tests.assert('T4-C a limit of 5001: invalid_request (limit)',
+    res = jsonb_build_object('status', 'invalid_request', 'field', 'limit'), res::text);
+  res := screening_v2.r1_meet_prune_receipts(cutoff, null, p_now);
+  perform _r1_meet_tests.assert('T4-C no limit: invalid_request (limit)',
+    res = jsonb_build_object('status', 'invalid_request', 'field', 'limit'), res::text);
+  res := screening_v2.r1_meet_prune_receipts(null, 500, p_now);
+  perform _r1_meet_tests.assert('T4-C no cutoff: invalid_request (older_than)',
+    res = jsonb_build_object('status', 'invalid_request', 'field', 'older_than'), res::text);
+  res := screening_v2.r1_meet_prune_receipts(cutoff, 500, null);
+  perform _r1_meet_tests.assert('T4-C no p_now: invalid_request (now)',
+    res = jsonb_build_object('status', 'invalid_request', 'field', 'now'), res::text);
+  perform _r1_meet_tests.assert('T4-C the refused prunes deleted nothing',
+    (select count(*) = 7 from screening_v2.r1_meet_receipts x where x.dedupe_key like 'msg_t4prune-%'));
+
+  res := screening_v2.r1_meet_prune_receipts(cutoff, 2, p_now);
+  perform _r1_meet_tests.assert(
+    'T4-C a batch of 2: the two oldest settled receipts go; the older enqueued one stays',
+    res = jsonb_build_object('status', 'ok', 'deleted', 2)
+    and not exists (select 1 from screening_v2.r1_meet_receipts x
+                     where x.dedupe_key in ('msg_t4prune-p1', 'msg_t4prune-p2'))
+    and exists (select 1 from screening_v2.r1_meet_receipts x where x.dedupe_key in ('msg_t4prune-e')),
+    res::text);
+  res := screening_v2.r1_meet_prune_receipts(cutoff, 500, p_now);
+  perform _r1_meet_tests.assert(
+    'T4-C the rest: old ignored, failed and recorded receipts go; enqueued and recent ones stay',
+    res = jsonb_build_object('status', 'ok', 'deleted', 3)
+    and (select array_agg(x.dedupe_key order by x.dedupe_key) from screening_v2.r1_meet_receipts x
+          where x.dedupe_key like 'msg_t4prune-%') = array['msg_t4prune-e', 'msg_t4prune-new'],
+    res::text);
+  res := screening_v2.r1_meet_prune_receipts(p_now - interval '7 days', 500, p_now);
+  perform _r1_meet_tests.assert('T4-C exactly seven days of retention is allowed; nothing older is left',
+    res = jsonb_build_object('status', 'ok', 'deleted', 0)
+    and exists (select 1 from screening_v2.r1_meet_receipts x where x.dedupe_key in ('msg_t4prune-new')),
+    res::text);
+  perform _r1_meet_tests.assert('T4-C every receipt received on or after 2026-11-01 is untouched',
+    (select count(*) from screening_v2.r1_meet_receipts x
+      where x.received_at >= '2026-11-01 00:00:00+00') = n_recent);
+end;
+$$;
+
+-- T4-D. The privilege proof, by behaviour and by catalog: anon and authenticated can neither touch
+-- the two tables nor execute any of the ten RPCs (42501); service_role reads both tables and runs
+-- each RPC (its writes rolled back); every RPC is security definer with the pinned search_path and
+-- executable by service_role only; these ten are the only r1_meet_ functions.
+do $$
+declare
+  rpcs constant text[] := array[
+    'screening_v2.r1_meet_create_round_from_ashby(uuid, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, timestamptz, uuid, text, integer, timestamptz)',
+    'screening_v2.r1_meet_reschedule_booking(uuid, integer, timestamptz, timestamptz, text, timestamptz, integer, timestamptz)',
+    'screening_v2.r1_meet_cancel_booking(uuid, text, timestamptz)',
+    'screening_v2.r1_meet_set_bot(uuid, text, integer, integer, uuid, timestamptz)',
+    'screening_v2.r1_meet_transition_booking(uuid, text, text, text, timestamptz)',
+    'screening_v2.r1_meet_bind_session(uuid, uuid, timestamptz)',
+    'screening_v2.r1_meet_arm_ticket(uuid, text, timestamptz, timestamptz, timestamptz)',
+    'screening_v2.r1_meet_claim_ticket(text, timestamptz)',
+    'screening_v2.r1_meet_record_receipt(text, text, text, uuid, boolean, jsonb, timestamptz, timestamptz)',
+    'screening_v2.r1_meet_prune_receipts(timestamptz, integer, timestamptz)'];
+  -- The same order: one call each, with the fewest arguments the defaults allow.
+  denied_calls constant text[] := array[
+    'select screening_v2.r1_meet_create_round_from_ashby(null, null, null, null, null, null, null, null, null, null, null, null)',
+    'select screening_v2.r1_meet_reschedule_booking(null, null, null, null, null, null)',
+    'select screening_v2.r1_meet_cancel_booking(null, null)',
+    'select screening_v2.r1_meet_set_bot(null, null, null, null)',
+    'select screening_v2.r1_meet_transition_booking(null, null, null, null)',
+    'select screening_v2.r1_meet_bind_session(null, null)',
+    'select screening_v2.r1_meet_arm_ticket(null, null, null, null)',
+    'select screening_v2.r1_meet_claim_ticket(null)',
+    'select screening_v2.r1_meet_record_receipt(null, null, null)',
+    'select screening_v2.r1_meet_prune_receipts(null)'];
+  t_now constant text := '2026-12-01 04:00:00+00';
+  no_booking constant uuid := _r1_meet_tests.id(99, 3);
+  fn text;
+  tbl text;
+  who text;
+  i integer;
+  res jsonb;
+begin
+  for i in 1 .. array_length(rpcs, 1) loop
+    fn := rpcs[i];
+    perform _r1_meet_tests.assert(
+      'T4-D ' || fn || ' is security definer with search_path pg_catalog, screening_v2',
+      (select x.prosecdef and x.proconfig = array['search_path=pg_catalog, screening_v2']
+         from pg_proc x where x.oid = fn::regprocedure));
+    perform _r1_meet_tests.assert('T4-D ' || fn || ' is executable by service_role only (catalog)',
+      has_function_privilege('service_role', fn, 'execute')
+      and not has_function_privilege('anon', fn, 'execute')
+      and not has_function_privilege('authenticated', fn, 'execute')
+      and not has_function_privilege('public', fn, 'execute'));
+    foreach who in array array['anon', 'authenticated'] loop
+      perform _r1_meet_tests.raises_as(who, 'T4-D execute ' || split_part(fn, '(', 1),
+        denied_calls[i], '42501');
+    end loop;
+  end loop;
+  perform _r1_meet_tests.assert(
+    'T4-D the ten RPCs are the only screening_v2 functions named r1_meet_*, one overload each',
+    (select array_agg(x.oid order by x.oid) from pg_proc x
+      where x.pronamespace = 'screening_v2'::regnamespace and x.proname like 'r1\_meet\_%')
+    = (select array_agg(f::regprocedure::oid order by f::regprocedure::oid) from unnest(rpcs) f));
+
+  foreach tbl in array array['r1_meet_bookings', 'r1_meet_receipts'] loop
+    foreach who in array array['anon', 'authenticated'] loop
+      perform _r1_meet_tests.raises_as(who, 'T4-D select from ' || tbl,
+        format('select count(*) from screening_v2.%I', tbl), '42501');
+      perform _r1_meet_tests.raises_as(who, 'T4-D insert into ' || tbl,
+        format('insert into screening_v2.%I default values', tbl), '42501');
+      perform _r1_meet_tests.raises_as(who, 'T4-D update ' || tbl,
+        format('update screening_v2.%I set id = id', tbl), '42501');
+      perform _r1_meet_tests.raises_as(who, 'T4-D delete from ' || tbl,
+        format('delete from screening_v2.%I', tbl), '42501');
+    end loop;
+    res := _r1_meet_tests.runs_as('service_role', 'T4-D select from ' || tbl,
+      format('select jsonb_build_object(''n'', count(*)) from screening_v2.%I', tbl));
+    perform _r1_meet_tests.assert('T4-D service_role reads ' || tbl, (res ->> 'n')::bigint >= 0, res::text);
+  end loop;
+
+  -- service_role runs every RPC (each answer a closed status of its own).
+  res := _r1_meet_tests.runs_as('service_role', 'T4-D r1_meet_create_round_from_ashby', format(
+    'select screening_v2.r1_meet_create_round_from_ashby(%L::uuid, %L, %L, null, null, %L, %L::timestamptz, '
+    || '%L::timestamptz, %L, %L::timestamptz, %L::timestamptz, %L::uuid, %L, 7200, %L::timestamptz)',
+    _r1_meet_tests.id(20, 390), _r1_meet_tests.id(21, 390), _r1_meet_tests.id(22, 390),
+    _r1_meet_tests.id(25, 1), '2026-11-30 09:00:00+00', '2026-11-30 09:00:05+00',
+    'https://meet.google.com/abc-defg-hij', '2026-12-02 10:30:00+00', '2026-12-02 11:15:00+00',
+    _r1_meet_tests.id(1, 1), 'r1_dex_sales', t_now));
+  perform _r1_meet_tests.assert('T4-D service_role: create answers unmatched_application (event 390 has no link)',
+    res ->> 'status' = 'unmatched_application', res::text);
+  res := _r1_meet_tests.runs_as('service_role', 'T4-D r1_meet_reschedule_booking', format(
+    'select screening_v2.r1_meet_reschedule_booking(%L::uuid, 0, %L::timestamptz, %L::timestamptz, %L, '
+    || '%L::timestamptz, 7200, %L::timestamptz)',
+    no_booking, '2026-12-03 09:00:00+00', '2026-12-03 09:45:00+00', 'https://meet.google.com/xyz-abcd-efg',
+    '2026-11-30 12:00:00+00', t_now));
+  perform _r1_meet_tests.assert('T4-D service_role: reschedule answers not_found',
+    res = jsonb_build_object('status', 'not_found'), res::text);
+  res := _r1_meet_tests.runs_as('service_role', 'T4-D r1_meet_cancel_booking', format(
+    'select screening_v2.r1_meet_cancel_booking(%L::uuid, %L, %L::timestamptz)', no_booking, 'cancelled', t_now));
+  perform _r1_meet_tests.assert('T4-D service_role: cancel answers not_found',
+    res = jsonb_build_object('status', 'not_found'), res::text);
+  res := _r1_meet_tests.runs_as('service_role', 'T4-D r1_meet_set_bot', format(
+    'select screening_v2.r1_meet_set_bot(%L::uuid, %L, 0, 0, null, %L::timestamptz)', no_booking, 'rotate_key', t_now));
+  perform _r1_meet_tests.assert('T4-D service_role: set_bot answers not_found',
+    res = jsonb_build_object('status', 'not_found'), res::text);
+  res := _r1_meet_tests.runs_as('service_role', 'T4-D r1_meet_transition_booking', format(
+    'select screening_v2.r1_meet_transition_booking(%L::uuid, %L, %L, %L, %L::timestamptz)',
+    no_booking, 'pending', 'failed', 'in_past', t_now));
+  perform _r1_meet_tests.assert('T4-D service_role: transition answers not_found',
+    res = jsonb_build_object('status', 'not_found'), res::text);
+  res := _r1_meet_tests.runs_as('service_role', 'T4-D r1_meet_bind_session', format(
+    'select screening_v2.r1_meet_bind_session(%L::uuid, %L::uuid, %L::timestamptz)',
+    no_booking, _r1_meet_tests.id(12, 399), t_now));
+  perform _r1_meet_tests.assert('T4-D service_role: bind_session answers not_found',
+    res = jsonb_build_object('status', 'not_found'), res::text);
+  res := _r1_meet_tests.runs_as('service_role', 'T4-D r1_meet_arm_ticket', format(
+    'select screening_v2.r1_meet_arm_ticket(%L::uuid, %L, %L::timestamptz, %L::timestamptz, %L::timestamptz)',
+    no_booking, _r1_meet_tests.digest('t4d-ticket'), '2026-12-02 10:15:00+00', '2026-12-02 11:45:00+00', t_now));
+  perform _r1_meet_tests.assert('T4-D service_role: arm_ticket answers not_found',
+    res = jsonb_build_object('status', 'not_found'), res::text);
+  res := _r1_meet_tests.runs_as('service_role', 'T4-D r1_meet_claim_ticket', format(
+    'select screening_v2.r1_meet_claim_ticket(%L, %L::timestamptz)', _r1_meet_tests.digest('t4d-ticket'), t_now));
+  perform _r1_meet_tests.assert('T4-D service_role: claim_ticket answers ticket_unknown',
+    res = jsonb_build_object('status', 'ticket_unknown'), res::text);
+  res := _r1_meet_tests.runs_as('service_role', 'T4-D r1_meet_record_receipt', format(
+    'select screening_v2.r1_meet_record_receipt(%L, %L, %L, null, false, null, null, %L::timestamptz)',
+    'recall', 'msg_t4d-privilege', 'bot.done', t_now));
+  perform _r1_meet_tests.assert('T4-D service_role: record_receipt answers inserted',
+    res ->> 'status' = 'inserted', res::text);
+  res := _r1_meet_tests.runs_as('service_role', 'T4-D r1_meet_prune_receipts', format(
+    'select screening_v2.r1_meet_prune_receipts(%L::timestamptz, 10, %L::timestamptz)',
+    '2025-01-01 00:00:00+00', '2026-01-01 00:00:00+00'));
+  perform _r1_meet_tests.assert('T4-D service_role: prune_receipts answers ok',
+    res ->> 'status' = 'ok', res::text);
+  perform _r1_meet_tests.assert('T4-D the service_role calls left nothing behind (rolled back)',
+    not exists (select 1 from screening_v2.r1_meet_receipts x where x.dedupe_key in ('msg_t4d-privilege'))
+    and not exists (select 1 from screening_v2.r1_meet_bookings x
+                     where x.ashby_interview_event_id = _r1_meet_tests.id(20, 390)));
 end;
 $$;
 
