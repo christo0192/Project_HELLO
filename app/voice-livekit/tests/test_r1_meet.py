@@ -615,5 +615,424 @@ class TestMeetEnvContractAndFences(unittest.TestCase):
         )
 
 
+# --------------------------------------------------------------------------------------------
+# T3: the session plumbing (``r1_session.run_r1_session`` and ``R1Interview``).
+# --------------------------------------------------------------------------------------------
+
+import asyncio  # noqa: E402 - the session tests below need the event loop and the session fakes
+import contextlib  # noqa: E402
+import inspect  # noqa: E402
+
+import r1_session  # noqa: E402
+from r1_session import R1Interview, run_r1_session  # noqa: E402
+from tests.test_r1_core import (  # noqa: E402
+    FakeContext,
+    FakeParticipant,
+    FakeSession,
+    FakeWriter,
+    capture_r1_logs,
+    error_types,
+)
+
+MEET_CHANNEL = MeetChannel(MEET_IDENTITY, MEET_PROFILES["r1_dex_sales"])
+BROWSER_ROOM_OPTIONS = {"text_input": False, "close_on_disconnect": False}
+MEET_ROOM_OPTIONS = {**BROWSER_ROOM_OPTIONS, "participant_identity": MEET_IDENTITY}
+# Strings that must never reach a log line: the session id, the identity, metadata values.
+NEVER_LOGGED = (
+    MEET_SESSION_ID,
+    MEET_SESSION_ID[:8],
+    MEET_IDENTITY,
+    "deadbeef",
+    "corr-synthetic",
+    "r1_unknown_profile",
+    "Quokka-meta-4471",
+)
+
+
+def linked_identity(room_options: Any) -> str | None:
+    """The identity a started session's room options link (None: the SDK's first eligible one)."""
+    value = getattr(room_options, "participant_identity", None)
+    return value if isinstance(value, str) else None
+
+
+class RaisingMetadataRoom:
+    """Mixin: the room's metadata cannot be read (the failure comes after Meet is known)."""
+
+    @property
+    def metadata(self) -> Any:
+        raise RuntimeError("Quokka-meta-4471 room metadata unavailable")
+
+
+class TestMeetSessionPlumbing(unittest.IsolatedAsyncioTestCase):
+    """The runner resolves the channel once, fails closed, binds one identity, records audio only.
+
+    Every browser case (flag off, or any channel value but exactly "meet") is today's behaviour
+    exactly: no ``meet`` keyword, the first standard participant, the browser room options, the
+    original context to the recorder, and no ``r1_meet_*`` log line.
+    """
+
+    def rig(
+        self,
+        *,
+        dispatch_raw: Any = _UNSET,
+        room_raw: Any = _UNSET,
+        with_job: bool = True,
+        participants: tuple[str, ...] = (MEET_IDENTITY,),
+        activate_ok: bool = False,
+        context: dict[str, Any] | None = None,
+        raising_room_metadata: bool = False,
+    ) -> SimpleNamespace:
+        order: list = []
+        ctx = FakeContext(order)
+        if raising_room_metadata:
+            ctx.room.__class__ = type("RaisingRoom", (RaisingMetadataRoom, type(ctx.room)), {})
+        else:
+            ctx.room.metadata = json.dumps(mirror()) if room_raw is _UNSET else room_raw
+        ctx.room.name = MEET_ROOM
+        if with_job:
+            ctx.job = SimpleNamespace(
+                metadata=json.dumps(dispatch()) if dispatch_raw is _UNSET else dispatch_raw,
+                room=SimpleNamespace(metadata=None),
+            )
+        for identity in participants:
+            ctx.room.remote_participants[identity] = FakeParticipant(identity)
+        fetched = (
+            context
+            if context is not None
+            else {
+                "first_name": "Asha",
+                "round_id": "round",
+                "attempt_id": "attempt",
+                "attempt": {},
+                "settings": {},
+                "recording": {"mode": "av"},
+            }
+        )
+        rig = SimpleNamespace(
+            ctx=ctx,
+            order=order,
+            writer=FakeWriter(order, activate_ok=activate_ok),
+            session=FakeSession(log=order),
+            fetched=fetched,
+            fetches=[],
+            factories=[],
+            built=[],  # (instance, args, kwargs) of every R1Interview the runner constructs
+            recorder_contexts=[],
+        )
+
+        async def fetch(room):
+            rig.fetches.append(room)
+            return rig.fetched
+
+        async def factory(_ctx, _context):
+            rig.factories.append(_context)
+            return rig.session
+
+        original = R1Interview.__init__
+
+        def spy(self_, *args, **kwargs):
+            rig.built.append((self_, args, dict(kwargs)))
+            original(self_, *args, **kwargs)
+
+        def build_recorder(_ctx, recorder_context, *_args, **_kwargs):
+            rig.recorder_contexts.append(recorder_context)
+            return None
+
+        import r1_recorder as recorder_module
+
+        rig.fetch, rig.factory, rig.spy = fetch, factory, spy
+        rig.patches = (
+            mock.patch.object(r1_session, "fetch_context", fetch),
+            mock.patch.object(r1_session, "R1TurnWriter", lambda *_a, **_k: rig.writer),
+            mock.patch.object(R1Interview, "__init__", spy),
+            mock.patch.object(recorder_module, "build_r1_recorder", build_recorder),
+        )
+        return rig
+
+    @contextlib.contextmanager
+    def patched(self, rig: SimpleNamespace, *, flag: str | None):
+        env = env_without_flag()
+        if flag is not None:
+            env[FLAG] = flag
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
+            for patch in rig.patches:
+                stack.enter_context(patch)
+            yield
+
+    async def run_session(self, rig: SimpleNamespace, *, flag: str | None) -> tuple[str, list]:
+        with self.patched(rig, flag=flag), capture_r1_logs() as logs:
+            outcome = await asyncio.wait_for(
+                run_r1_session(rig.ctx, session_factory=rig.factory), 10.0
+            )
+        return outcome, logs
+
+    def main_interview(self, rig: SimpleNamespace) -> tuple[Any, tuple, dict]:
+        mains = [built for built in rig.built if built[1][2] is rig.session]
+        self.assertEqual(len(mains), 1)
+        return mains[0]
+
+    async def until(self, predicate, timeout: float = 5.0) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while not predicate():
+            if loop.time() > deadline:
+                self.fail("condition not reached in time")
+            await asyncio.sleep(0.01)
+
+    def assert_settled_before_connect(self, rig: SimpleNamespace, outcome: str) -> None:
+        """The shape of ``TestRunR1SessionFailurePaths.assert_settled``, with nothing started."""
+        self.assertEqual(outcome, "configuration_failed")
+        self.assertEqual(rig.ctx.connects, 0)
+        self.assertEqual(rig.fetches, [])
+        self.assertEqual(rig.factories, [])
+        self.assertEqual(rig.writer.activations, 0)
+        self.assertEqual(rig.writer.terminals, [("configuration_failed", {"activated": False})])
+        self.assertEqual(rig.writer.outcomes, ["configuration_failed"])
+        self.assertEqual(rig.ctx.deleted_rooms, [None])
+        self.assertEqual(rig.ctx.shutdowns, ["r1_exit"])
+        names = [item for item in rig.order if isinstance(item, str)]
+        self.assertEqual(names, ["ledger", "terminal", "outcome"])
+
+    def assert_no_meet_log(self, logs: list) -> None:
+        self.assertFalse([kind for kind in error_types(logs) if kind.startswith("r1_meet")])
+
+    def assert_nothing_identifying_logged(self, logs: list) -> None:
+        blob = json.dumps(logs)
+        for value in NEVER_LOGGED:
+            self.assertNotIn(value, blob)
+
+    # ------------------------------------------------------------ construction
+
+    def test_meet_is_a_keyword_only_seam_that_defaults_to_none(self) -> None:
+        parameter = inspect.signature(R1Interview.__init__).parameters["meet"]
+        self.assertIs(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIsNone(parameter.default)
+
+    def test_the_room_options_are_exact_for_each_channel(self) -> None:
+        ctx = FakeContext()
+        browser = R1Interview(ctx, {}, FakeSession(), FakeWriter([]))
+        self.assertIsNone(browser._meet)
+        self.assertIsNone(browser._candidate_identity)
+        self.assertEqual(browser._room_options_kwargs(), BROWSER_ROOM_OPTIONS)
+        meet = R1Interview(ctx, {}, FakeSession(), FakeWriter([]), meet=MEET_CHANNEL)
+        self.assertIs(meet._meet, MEET_CHANNEL)
+        self.assertEqual(meet._candidate_identity, MEET_IDENTITY)
+        self.assertEqual(meet._room_options_kwargs(), MEET_ROOM_OPTIONS)
+        # A context identity still binds a browser round exactly as before.
+        context_bound = R1Interview(ctx, {"candidate_identity": "candidate"}, FakeSession(), FakeWriter([]))
+        self.assertEqual(context_bound._candidate_identity, "candidate")
+        self.assertEqual(context_bound._room_options_kwargs(), BROWSER_ROOM_OPTIONS)
+
+    def test_a_meet_interview_ignores_every_other_standard_participant(self) -> None:
+        interview = R1Interview(FakeContext(), {}, FakeSession(), FakeWriter([]), meet=MEET_CHANNEL)
+        for identity in ("intruder", "meet-deadbeef", "MEET-3F2A9C1E", "meet-3f2a9c1e "):
+            interview._on_participant_connected(FakeParticipant(identity))
+            self.assertEqual(interview._candidate_identity, MEET_IDENTITY)
+            self.assertFalse(interview._candidate_present)
+        bridge = FakeParticipant(MEET_IDENTITY)
+        interview._on_participant_connected(bridge)
+        self.assertTrue(interview._candidate_present)
+        self.assertIs(interview._candidate_seen, bridge)
+        # An unrelated departure never looks like the bridge leaving.
+        interview._on_participant_disconnected(FakeParticipant("intruder"))
+        self.assertTrue(interview._candidate_present)
+
+    # ------------------------------------------------------------ identity binding
+
+    async def test_the_bridge_identity_is_bound_and_linked_never_an_earlier_intruder(self) -> None:
+        rig = self.rig(participants=("intruder",), activate_ok=True)
+        with self.patched(rig, flag="1"), capture_r1_logs() as logs:
+            task = asyncio.create_task(run_r1_session(rig.ctx, session_factory=rig.factory))
+            await self.until(
+                lambda: any(b[1][2] is rig.session for b in rig.built)
+                and "participant_connected" in rig.ctx.room.handlers
+            )
+            interview = self.main_interview(rig)[0]
+            await asyncio.sleep(0.05)
+            # The intruder was in the room first: it is never selected, and nothing is activated.
+            self.assertEqual(interview._candidate_identity, MEET_IDENTITY)
+            self.assertFalse(interview._candidate_present)
+            self.assertEqual(rig.writer.activations, 0)
+            bridge = FakeParticipant(MEET_IDENTITY)
+            rig.ctx.room.remote_participants[MEET_IDENTITY] = bridge
+            rig.ctx.room.emit("participant_connected", bridge)
+            await self.until(lambda: rig.session.started is not None)
+            # A later look-alike is never bound either.
+            other = FakeParticipant("meet-deadbeef")
+            rig.ctx.room.remote_participants["meet-deadbeef"] = other
+            rig.ctx.room.emit("participant_connected", other)
+            self.assertEqual(interview._candidate_identity, MEET_IDENTITY)
+            self.assertIs(interview._candidate_seen, bridge)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10.0)
+        self.assertEqual(rig.writer.activations, 1)
+        self.assertEqual(self.main_interview(rig)[2].get("meet"), MEET_CHANNEL)
+        options = rig.session.started["room_options"]
+        self.assertEqual(linked_identity(options), MEET_IDENTITY)
+        self.assertFalse(options.text_input)
+        self.assertFalse(options.close_on_disconnect)
+        self.assertEqual(interview._room_options_kwargs(), MEET_ROOM_OPTIONS)
+        meet_logs = [line for line in logs if line.get("error_type") == "r1_meet_channel"]
+        self.assertEqual(len(meet_logs), 1)
+        self.assertEqual(meet_logs[0]["error_category"], "meet")
+        self.assertEqual(meet_logs[0]["schema"], "r1_dex_sales")
+        self.assertNotIn("r1_meet_channel_invalid", error_types(logs))
+        self.assert_nothing_identifying_logged(logs)
+
+    async def test_only_an_intruder_present_is_a_no_show(self) -> None:
+        rig = self.rig(participants=("intruder",))
+        with mock.patch.object(r1_session, "NO_SHOW_SECONDS", 0.05):
+            outcome, logs = await self.run_session(rig, flag="1")
+        self.assertEqual(outcome, "no_show")
+        interview = self.main_interview(rig)[0]
+        self.assertEqual(interview._candidate_identity, MEET_IDENTITY)
+        self.assertFalse(interview._candidate_ever_present)
+        self.assertEqual(rig.writer.activations, 0)
+        self.assertIsNone(rig.session.started)
+        self.assertEqual([terminal[0] for terminal in rig.writer.terminals], ["no_show"])
+        self.assert_nothing_identifying_logged(logs)
+
+    # ------------------------------------------------------------ fail closed
+
+    async def test_every_invalid_meet_dispatch_settles_before_connecting(self) -> None:
+        other_session = "00000000-0000-4000-8000-000000000001"
+        cases = {
+            "session_mismatch": {"dispatch_raw": json.dumps(dispatch(session_id=other_session))},
+            "identity_invalid": {
+                "dispatch_raw": json.dumps(dispatch(candidate_identity="meet-deadbeef"))
+            },
+            "profile_unknown": {"dispatch_raw": json.dumps(dispatch(profile="r1_unknown_profile"))},
+            "room_mirror_mismatch": {
+                "room_raw": json.dumps(mirror(candidate_identity="meet-deadbeef"))
+            },
+            "unreadable": {"raising_room_metadata": True},
+        }
+        self.assertEqual(set(cases) | {"context_identity_mismatch"}, set(MEET_INVALID_REASONS))
+        for reason, overrides in cases.items():
+            with self.subTest(reason=reason):
+                rig = self.rig(activate_ok=True, **overrides)
+                outcome, logs = await self.run_session(rig, flag="1")
+                self.assert_settled_before_connect(rig, outcome)
+                invalid = [line for line in logs if line.get("error_type") == "r1_meet_channel_invalid"]
+                self.assertEqual(len(invalid), 1)
+                self.assertEqual(invalid[0]["error_category"], reason)
+                self.assertEqual(invalid[0]["level"], "error")
+                self.assertNotIn("r1_meet_channel", error_types(logs))
+                # Only the settle interview was built: no Meet seam, no session.
+                self.assertTrue(all("meet" not in built[2] for built in rig.built))
+                self.assertIsNone(rig.session.started)
+                self.assert_nothing_identifying_logged(logs)
+
+    async def test_a_context_naming_someone_else_is_refused_before_the_providers(self) -> None:
+        rig = self.rig(
+            activate_ok=True,
+            context={"first_name": "Asha", "candidate_identity": "candidate", "attempt": {}, "settings": {}},
+            participants=(MEET_IDENTITY, "candidate"),
+        )
+        outcome, logs = await self.run_session(rig, flag="1")
+        self.assertEqual(outcome, "configuration_failed")
+        self.assertEqual(rig.ctx.connects, 1)
+        self.assertEqual(len(rig.fetches), 1)
+        self.assertEqual(rig.factories, [])
+        self.assertEqual(rig.writer.activations, 0)
+        self.assertEqual(rig.writer.terminals, [("configuration_failed", {"activated": False})])
+        self.assertEqual(rig.writer.outcomes, ["configuration_failed"])
+        self.assertEqual(rig.ctx.shutdowns, ["r1_exit"])
+        invalid = [line for line in logs if line.get("error_type") == "r1_meet_channel_invalid"]
+        self.assertEqual([line["error_category"] for line in invalid], ["context_identity_mismatch"])
+        self.assertTrue(all("meet" not in built[2] for built in rig.built))
+        self.assert_nothing_identifying_logged(logs)
+
+    async def test_a_context_naming_the_bridge_or_nobody_proceeds(self) -> None:
+        for context_identity in (MEET_IDENTITY, None, ""):
+            with self.subTest(context_identity=context_identity):
+                context = {"first_name": "Asha", "attempt": {}, "settings": {}}
+                if context_identity is not None:
+                    context["candidate_identity"] = context_identity
+                rig = self.rig(context=context)
+                outcome, logs = await self.run_session(rig, flag="1")
+                # Activation is refused by the fake writer: the run got past every Meet check.
+                self.assertEqual(outcome, "configuration_failed")
+                self.assertEqual(len(rig.factories), 1)
+                self.assertEqual(rig.writer.activations, 1)
+                self.assertNotIn("r1_meet_channel_invalid", error_types(logs))
+                interview, _args, kwargs = self.main_interview(rig)
+                self.assertEqual(kwargs["meet"], MEET_CHANNEL)
+                self.assertEqual(interview._candidate_identity, MEET_IDENTITY)
+
+    # ------------------------------------------------------------ recording
+
+    async def test_a_meet_round_records_audio_only_without_touching_the_context(self) -> None:
+        rig = self.rig()
+        await self.run_session(rig, flag="1")
+        self.assertEqual(len(rig.recorder_contexts), 1)
+        given = rig.recorder_contexts[0]
+        self.assertIsNot(given, rig.fetched)
+        self.assertEqual(given["recording"], {"mode": "audio"})
+        self.assertEqual(rig.fetched["recording"], {"mode": "av"})  # not mutated
+        self.assertEqual({k: v for k, v in given.items() if k != "recording"},
+                         {k: v for k, v in rig.fetched.items() if k != "recording"})
+        # The interview itself still gets the context the API sent.
+        self.assertIs(self.main_interview(rig)[1][1], rig.fetched)
+
+    async def test_a_browser_round_hands_the_recorder_the_very_same_context(self) -> None:
+        rig = self.rig(dispatch_raw=json.dumps({"session_id": MEET_SESSION_ID, "channel": "browser"}),
+                       participants=("candidate",))
+        await self.run_session(rig, flag="1")
+        self.assertEqual(len(rig.recorder_contexts), 1)
+        self.assertIs(rig.recorder_contexts[0], rig.fetched)
+        self.assertEqual(rig.fetched["recording"], {"mode": "av"})
+
+    # ------------------------------------------------------------ browser equivalence
+
+    async def test_every_browser_case_is_todays_behaviour_exactly(self) -> None:
+        browser_dispatch = {"session_id": MEET_SESSION_ID, "channel": "browser"}
+        cases = {
+            "flag off, valid meet metadata": {"flag": None, "rig": {}},
+            "flag 0, valid meet metadata": {"flag": "0", "rig": {}},
+            "flag on, channel browser": {
+                "flag": "1",
+                "rig": {"dispatch_raw": json.dumps(browser_dispatch)},
+            },
+            "flag on, channel missing": {
+                "flag": "1",
+                "rig": {"dispatch_raw": json.dumps(dispatch(channel=_ABSENT))},
+            },
+            "flag on, channel MEET": {
+                "flag": "1",
+                "rig": {"dispatch_raw": json.dumps(dispatch(channel="MEET"))},
+            },
+            "flag on, empty dispatch metadata": {"flag": "1", "rig": {"dispatch_raw": ""}},
+            "flag on, no job": {"flag": "1", "rig": {"with_job": False}},
+        }
+        for name, case in cases.items():
+            with self.subTest(case=name):
+                rig = self.rig(participants=("candidate", MEET_IDENTITY), activate_ok=True, **case["rig"])
+                with self.patched(rig, flag=case["flag"]), capture_r1_logs() as logs:
+                    task = asyncio.create_task(run_r1_session(rig.ctx, session_factory=rig.factory))
+                    await self.until(lambda: rig.session.started is not None)
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await asyncio.wait_for(task, 10.0)
+                interview, args, kwargs = self.main_interview(rig)
+                self.assertNotIn("meet", kwargs)
+                self.assertEqual(set(kwargs), {"line_cache"})
+                self.assertIs(args[1], rig.fetched)
+                self.assertIsNone(interview._meet)
+                # The first standard participant is bound, exactly as before.
+                self.assertEqual(interview._candidate_identity, "candidate")
+                self.assertEqual(interview._room_options_kwargs(), BROWSER_ROOM_OPTIONS)
+                options = rig.session.started["room_options"]
+                self.assertIsNone(linked_identity(options))
+                self.assertFalse(options.text_input)
+                self.assertFalse(options.close_on_disconnect)
+                self.assertEqual(len(rig.recorder_contexts), 1)
+                self.assertIs(rig.recorder_contexts[0], rig.fetched)
+                self.assertEqual(rig.ctx.connects, 1)
+                self.assert_no_meet_log(logs)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -289,6 +289,7 @@ from r1_linecache import (
     RateLimitCounter,
     build_line_cache,
 )
+from r1_meet import MeetChannel, cap_recording_context, meet_voice_enabled, resolve_channel
 from r1_persistence import R1TurnWriter
 from r1_phases import ICEBREAKER_HARD_SEC, R1Phase, R1PhaseMachine
 from r1_replies import (
@@ -3671,9 +3672,10 @@ def _epoch_ms(seconds: Any) -> int | None:
 class R1Interview:
     """Drive one interview with prompt stop handling and one ordered exit invariant.
 
-    Candidate identity is context-provided or the first standard participant.
-    Once selected, unrelated people and tracks cannot advance phases, wake a
-    silence ladder, or trigger the microphone aside.
+    Candidate identity is the Meet bridge identity (a Google Meet round, ``meet``: the one
+    identity the dispatch names, bound at construction), else context-provided, else the
+    first standard participant.  Once selected, unrelated people and tracks cannot advance
+    phases, wake a silence ladder, or trigger the microphone aside.
     """
 
     def __init__(
@@ -3695,6 +3697,7 @@ class R1Interview:
         turn_reader_runner: Callable[[list[dict[str, str]]], Awaitable[Any]] | None = None,
         spec_reply_runner: Callable[[list[dict[str, str]]], Any] | None = None,
         bridge_runner: Callable[[list[dict[str, str]]], Awaitable[Any]] | None = None,
+        meet: MeetChannel | None = None,
     ) -> None:
         self.ctx = ctx
         self.context = context
@@ -3715,7 +3718,13 @@ class R1Interview:
         self._attention = asyncio.Event()
         self._reply_changed = asyncio.Event()
         self._candidate_departed = False
-        self._candidate_identity = self._context_candidate_identity()
+        # M034 S08 (R1_MEET_VOICE_ENABLED, default off): a Google Meet round (``r1_meet``) binds
+        # exactly the bridge identity the dispatch named, so "the first standard participant"
+        # never applies to it.  None (every browser round) keeps today's behaviour exactly.
+        self._meet = meet
+        self._candidate_identity = (
+            meet.candidate_identity if meet is not None else self._context_candidate_identity()
+        )
         self._candidate_present = False
         self._candidate_ever_present = False
         self._residency_expired = False
@@ -10630,6 +10639,19 @@ class R1Interview:
 
     # --------------------------------------------------------------- phases
 
+    def _room_options_kwargs(self) -> dict[str, Any]:
+        """The SDK ``RoomOptions`` for this round.
+
+        A browser round is exactly ``text_input=False, close_on_disconnect=False`` (RoomIO links
+        the first eligible participant; the worker's own candidate filter does the rest).  A
+        Google Meet round also names ``participant_identity``, so RoomIO links only the bridge
+        identity the dispatch named and never another participant's audio.
+        """
+        kwargs: dict[str, Any] = {"text_input": False, "close_on_disconnect": False}
+        if self._meet is not None:
+            kwargs["participant_identity"] = self._meet.candidate_identity
+        return kwargs
+
     async def _start(self) -> None:
         """Start the text-input-disabled R1 agent after candidate identity selection."""
         try:
@@ -10644,7 +10666,7 @@ class R1Interview:
                 R1Agent(self),
                 room=getattr(self.ctx, "room", None),
                 record=R1_RECORD,
-                room_options=RoomOptions(text_input=False, close_on_disconnect=False),
+                room_options=RoomOptions(**self._room_options_kwargs()),
             )
         )
 
@@ -11916,6 +11938,29 @@ async def run_r1_session(
         interview = R1Interview(ctx, {}, _NoopSession(), writer)
         await interview._exit(outcome)
 
+    # M034 S08 (R1_MEET_VOICE_ENABLED, default off; read once, so a flip never changes a live
+    # session).  Off, the job's dispatch is not read at all and this is a browser round exactly as
+    # before.  On, only a dispatch that says channel "meet" is a Google Meet round, and one whose
+    # binding facts disagree fails closed here, before connecting: it is never handed to the first
+    # standard participant.  Only closed labels are logged (never an identity or a metadata value).
+    decision = resolve_channel(ctx, session_id, enabled=meet_voice_enabled())
+    if decision.invalid_reason is not None:
+        _log.error(
+            "unknown_event",
+            error_type="r1_meet_channel_invalid",
+            error_category=decision.invalid_reason,
+        )
+        await settle_without_context("configuration_failed")
+        return "configuration_failed"
+    meet = decision.meet
+    if meet is not None:
+        _log.info(
+            "unknown_event",
+            error_type="r1_meet_channel",
+            error_category="meet",
+            schema=meet.profile.id,
+        )
+
     try:
         if callable(getattr(ctx, "connect", None)):
             # R1 reads only microphone publications.  The SDK's default (subscribe to everything)
@@ -11949,6 +11994,19 @@ async def run_r1_session(
     writer = R1TurnWriter(
         session_id, room, attempt_id=str(context.get("attempt_id") or session_id or "") or None
     )
+    if meet is not None:
+        # The worker context does not carry a candidate identity today; if it ever does and names
+        # someone else, a Meet round binds nobody rather than the wrong person.
+        context_identity = context.get("candidate_identity")
+        if context_identity and context_identity != meet.candidate_identity:
+            _log.error(
+                "unknown_event",
+                error_type="r1_meet_channel_invalid",
+                error_category="context_identity_mismatch",
+            )
+            interview = R1Interview(ctx, context, _NoopSession(), writer)
+            await interview._exit("configuration_failed")
+            return "configuration_failed"
     try:
         session = await _maybe_await(session_factory(ctx, context))
     except Exception as exc:  # noqa: BLE001
@@ -11978,7 +12036,10 @@ async def run_r1_session(
 
         recorder = build_r1_recorder(
             ctx,
-            context,
+            # A Meet round records audio only (its profile's cap: a copy, the context is untouched).
+            cap_recording_context(context, meet.profile.max_recording_mode)
+            if meet is not None
+            else context,
             session,
             room,
             session_id,
@@ -11996,6 +12057,8 @@ async def run_r1_session(
             error_type="r1_recorder_unavailable",
             error_category=_error_type_of(exc),
         )
+    # A browser round is constructed exactly as before (no ``meet`` keyword at all).
+    channel_seams: dict[str, Any] = {"meet": meet} if meet is not None else {}
     return await R1Interview(
-        ctx, context, session, writer, line_cache=line_cache, **recorder_seams
+        ctx, context, session, writer, line_cache=line_cache, **channel_seams, **recorder_seams
     ).run()

@@ -332,6 +332,34 @@ class TestR1SdkContract(unittest.TestCase):
         self.assertFalse(options.text_input)
         self.assertFalse(options.close_on_disconnect)
 
+    def test_room_options_can_link_exactly_one_participant_identity(self) -> None:
+        """M034 S08: a Google Meet round names the bridge identity; RoomIO then links only it."""
+        from livekit.agents.voice.room_io.room_io import RoomIO
+
+        options = RoomOptions(
+            text_input=False, close_on_disconnect=False, participant_identity="meet-3f2a9c1e"
+        )
+        self.assertEqual(options.participant_identity, "meet-3f2a9c1e")
+        self.assertFalse(options.text_input)
+        self.assertFalse(options.close_on_disconnect)
+        # RoomIO adopts the option as its linked identity, and refuses every other participant.
+        self.assertIn("self._options.participant_identity", inspect.getsource(RoomIO.__init__))
+        self.assertIn(
+            "participant.identity != self._participant_identity",
+            inspect.getsource(RoomIO._on_participant_connected),
+        )
+
+    def test_the_job_context_carries_the_dispatch_metadata(self) -> None:
+        """M034 S08 reads the agent dispatch's metadata as ``ctx.job.metadata`` (a string)."""
+        from livekit.protocol import agent as agent_protocol
+
+        self.assertIsInstance(inspect.getattr_static(JobContext, "job"), property)
+        self.assertIsInstance(inspect.getattr_static(JobContext, "room"), property)
+        job = agent_protocol.Job(metadata="{}")
+        self.assertEqual(job.metadata, "{}")
+        self.assertEqual(agent_protocol.Job().metadata, "")
+        self.assertEqual(job.room.metadata, "")
+
     def test_r1_connection_and_error_contracts_exist(self) -> None:
         """Pin retry construction and ErrorEvent's nested provider-error shape."""
         api_options = APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=10.0)
