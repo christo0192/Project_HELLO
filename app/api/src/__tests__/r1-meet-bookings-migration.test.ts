@@ -188,13 +188,16 @@ describe('migration 0142: additive', () => {
     expect(guard).toContain('add constraint chk_interview_round_consents_attestation check (');
   });
 
-  it('re-creates each of its two triggers after a guarded drop on the same table', () => {
-    const creates = [...lc.matchAll(/create trigger ([a-z0-9_]+) (?:before|after) [a-z ]+? on ([a-z0-9_.]+)/g)]
+  it('re-creates each of its four triggers after a guarded drop on the same table', () => {
+    const creates = [...lc.matchAll(/create trigger ([a-z0-9_]+) (?:before|after) [a-z_ ]+? on ([a-z0-9_.]+)/g)]
       .map((m) => `${m[1]} on ${m[2]}`);
     expect(creates).toEqual([
       'trg_interview_rounds_channel_locked on screening_v2.interview_rounds',
       'enqueue_r1_meet_bot_release on screening_v2.r1_meet_bookings',
+      'trg_interview_rounds_meet_link_locked on screening_v2.interview_rounds',
+      'enqueue_r1_meet_round_cancelled on screening_v2.interview_rounds',
     ]);
+    expect(lc.match(/\bcreate trigger\b/g)).toHaveLength(creates.length);
     for (const c of creates) expect(lc).toContain(`drop trigger if exists ${c};`);
   });
 
@@ -219,9 +222,13 @@ describe('migration 0142: additive', () => {
 
   it('writes no call_sessions row, never reissues through r1_transition_round, and queues only r1-meet', () => {
     expect(lc).not.toMatch(/insert into screening_v2\.call_sessions\b/);
-    expect(lc).not.toContain('r1_transition_round(');
+    // The one call of r1_transition_round is the sweep's expiry of a lapsed Meet round (create RPC
+    // step 8a); no reissue anywhere.
+    const transitions = [...lc.matchAll(/r1_transition_round\(([^;]*)\);/g)].map((m) => m[1]!);
+    expect(transitions).toEqual(["v_lapsed_id, 'expire', v_lapsed_version, null, null, p_now"]);
+    expect(lc).not.toMatch(/'reissue'/);
     const queueInserts = lc.match(/insert into screening_v2\.job_queue\b/g) ?? [];
-    const named = [...lc.matchAll(/insert into screening_v2\.job_queue \(name, [^)]*\) values \('([^']*)'/g)].map((m) => m[1]);
+    const named = [...lc.matchAll(/insert into screening_v2\.job_queue \(name, [^)]*\) (?:values \(|select )'([^']*)'/g)].map((m) => m[1]);
     expect(queueInserts.length).toBeGreaterThan(0);
     expect(named).toHaveLength(queueInserts.length);
     expect(new Set(named)).toEqual(new Set(['r1-meet']));
@@ -493,9 +500,48 @@ describe('migration 0142: the bot release trigger and privileges', () => {
     expect(code).toContain('revoke all on screening_v2.r1_meet_bookings, screening_v2.r1_meet_receipts from public, anon, authenticated;');
     expect(code).toContain('revoke all on screening_v2.r1_meet_bookings, screening_v2.r1_meet_receipts from service_role;');
     expect(code).toContain('grant select, insert, update, delete on screening_v2.r1_meet_bookings, screening_v2.r1_meet_receipts to service_role;');
-    for (const fn of ['reject_interview_round_channel_change', 'enqueue_r1_meet_bot_release']) {
+    for (const fn of [
+      'reject_interview_round_channel_change', 'enqueue_r1_meet_bot_release',
+      'reject_meet_round_link_reissue', 'enqueue_r1_meet_round_cancelled',
+    ]) {
       expect(code).toContain(`revoke all on function screening_v2.${fn}() from public, anon, authenticated;`);
     }
+  });
+
+  it('fences the app\'s round actions on a Meet round: no link reissue, and a cancel queues one round_cancelled job per live booking (review F3)', () => {
+    expect(sql.split('-- §6. ').length - 1).toBe(1);
+    expect(sql.indexOf('-- §6. ')).toBeGreaterThan(sql.indexOf('-- §5. '));
+    expect(sql.indexOf('-- §6. ')).toBeLessThan(sql.indexOf('-- §10. '));
+    // reissue is the only writer of link_token_digest after the Send (0128 r1_transition_round).
+    const reissue = functionBody('reject_meet_round_link_reissue');
+    expect(reissue).toContain('returns trigger language plpgsql security invoker set search_path = pg_catalog as $$');
+    expect(reissue).toContain(
+      "if old.channel = 'meet' and new.link_token_digest is distinct from old.link_token_digest then "
+      + "raise exception 'interview round % is a Meet round: its link is never reissued', old.id using errcode = 'P0001';",
+    );
+    expect(code).toContain(
+      'create trigger trg_interview_rounds_meet_link_locked before update of link_token_digest on screening_v2.interview_rounds '
+      + 'for each row execute function screening_v2.reject_meet_round_link_reissue();',
+    );
+    const transition = readFileSync(path.join(migrations, '0128_r1_twenty_minute_roleplay.sql'), 'utf8');
+    expect(transition).toContain('update screening_v2.interview_rounds set link_token_digest=p_link_token_digest,expires_at=p_expires_at');
+    // The cancel only queues ids (no booking lock, so no lock-order inversion with the Meet RPCs).
+    const cancelled = functionBody('enqueue_r1_meet_round_cancelled');
+    expect(cancelled).toContain('returns trigger language plpgsql security definer set search_path = pg_catalog, screening_v2 as $$');
+    expect(cancelled).toContain(
+      "insert into screening_v2.job_queue (name, payload, dedup_key, max_attempts) select 'r1-meet', "
+      + "jsonb_build_object('kind', 'round_cancelled', 'booking_id', b.id, 'round_id', new.id), "
+      + "'r1-meet:round-cancelled:' || b.id::text, 10 from screening_v2.r1_meet_bookings b where b.round_id = new.id "
+      + `and b.status not in (${TERMINAL.map((s) => `'${s}'`).join(', ')}) on conflict do nothing; return null;`,
+    );
+    expect(cancelled).not.toMatch(/\bfor update\b|\bupdate screening_v2\./);
+    expect(code).toContain(
+      'create trigger enqueue_r1_meet_round_cancelled after update of status on screening_v2.interview_rounds for each row '
+      + "when (new.channel = 'meet' and new.status = 'cancelled' and old.status is distinct from 'cancelled') "
+      + 'execute function screening_v2.enqueue_r1_meet_round_cancelled();',
+    );
+    // The reason S06 then writes is in the cancelled family.
+    expect(pairingFamilies().find((f) => f.statuses.includes('cancelled'))!.reasons).toContain('round_cancelled');
   });
 });
 
@@ -548,8 +594,10 @@ describe('migration 0142: r1_meet_create_round_from_ashby (T2)', () => {
       'meet_url', 'slot', 'attested_at', 'profile', 'grace', 'now',
     ]);
     const lastInvalid = body.lastIndexOf("'invalid_request'");
-    expect(lastInvalid).toBeLessThan(body.indexOf("'in_past'"));
-    expect(body.indexOf("'in_past'")).toBeLessThan(body.indexOf('pg_advisory_xact_lock('));
+    // Review F6: the event's booking is read BEFORE any in_past answer, so a replay for an event
+    // that has a booking always reads that booking, also after the slot started.
+    expect(lastInvalid).toBeLessThan(body.indexOf('pg_advisory_xact_lock('));
+    expect(body.indexOf('pg_advisory_xact_lock(')).toBeLessThan(body.indexOf("'in_past'"));
     // The same shapes as the table CHECKs and the S01 contracts.
     expect(body).toContain(`c_uuid constant text := '${UUID_RE}';`);
     const tableUrl = /constraint chk_r1_meet_bookings_meet_url check \( meet_url ~ '([^']+)' \)/.exec(bookings)![1]!;
@@ -558,13 +606,15 @@ describe('migration 0142: r1_meet_create_round_from_ashby (T2)', () => {
     expect(body).toContain("p_end_at <= p_start_at or p_end_at > p_start_at + interval '24 hours'");
     expect(body).toContain("p_attested_at is null or p_attested_at > p_now + interval '5 minutes'");
     expect(body).toContain('p_expiry_grace_sec not between 900 and 86400');
-    expect(body).toContain('if p_start_at <= p_now then return jsonb_build_object(\'status\', \'in_past\'); end if;');
+    expect(body).toContain("if p_start_at <= p_now then return jsonb_build_object('status', 'in_past', 'booking_id', v_booking.id); end if;");
+    expect(body).toContain("elsif p_start_at <= p_now then return jsonb_build_object('status', 'in_past'); end if;");
   });
 
   it('locks the event first, then (through r1_send_round) settings and month, then the hold month and the round', () => {
     const order = [
       "perform pg_advisory_xact_lock(hashtextextended('r1_meet_booking:' || p_ashby_interview_event_id::text, 0));",
       'from screening_v2.r1_meet_bookings b where b.ashby_interview_event_id = p_ashby_interview_event_id for update;',
+      "perform screening_v2.r1_transition_round(v_lapsed_id, 'expire', v_lapsed_version, null, null, p_now);",
       'v_send := screening_v2.r1_send_round(',
       'perform 1 from screening_v2.r1_budget_month where month_start = v_hold_month for update;',
       'select * into v_round from screening_v2.interview_rounds where id = v_live_id for update;',
@@ -581,14 +631,67 @@ describe('migration 0142: r1_meet_create_round_from_ashby (T2)', () => {
   });
 
   it('answers the replay rules of an existing booking before matching anything', () => {
-    const terminal = body.indexOf("v_booking.status in ('completed', 'cancelled', 'failed', 'drained')");
+    const terminal = body.indexOf("v_booking.status in ('completed', 'cancelled', 'drained')");
     const exists = body.indexOf("'status', 'exists'");
     const stale = body.indexOf('if p_ashby_updated_at < v_booking.ashby_updated_at then');
+    const bot = body.indexOf("'status', 'bot_attached'");
+    const exhausted = body.indexOf("'status', 'version_exhausted'");
+    const started = body.indexOf("'status', 'in_past', 'booking_id'");
     const match = body.indexOf('from screening_v2.ashby_application_links l');
     expect(terminal).toBeGreaterThan(-1);
     expect(exists).toBeGreaterThan(terminal);
     expect(stale).toBeGreaterThan(exists);
-    expect(match).toBeGreaterThan(stale);
+    expect(bot).toBeGreaterThan(stale);
+    expect(exhausted).toBeGreaterThan(bot);
+    expect(started).toBeGreaterThan(exhausted);
+    expect(match).toBeGreaterThan(started);
+  });
+
+  it('revives a failed booking moved to a new slot, and re-binds a lapsed round before dispatch, as a new bot generation (review F1)', () => {
+    // Only a failed booking whose slot or link moved, and has not started, is revived.
+    expect(body).toContain(
+      "or (v_booking.status = 'failed' and (p_start_at <= p_now or (p_start_at, p_end_at, p_meet_url) "
+      + 'is not distinct from (v_booking.start_at, v_booking.end_at, v_booking.meet_url))) then '
+      + "return jsonb_build_object('status', 'booking_terminal'",
+    );
+    // A booking with a round re-binds only when the round lapsed (expired, or live statuses past
+    // the expiry: never cancelled or completed), before dispatch, for a slot that has not started.
+    expect(body).toContain(
+      "v_round_lapsed := coalesce(v_old_status = 'expired' or (v_old_status in ('invited', 'in_progress') and v_old_expires <= p_now), false);",
+    );
+    expect(body).toContain(
+      "if not v_round_lapsed or v_booking.status in ('bot_joining', 'human_present', 'in_call') or p_start_at <= p_now then",
+    );
+    expect(body).toContain("'round_live', v_round_live");
+    expect(body).toContain("v_rebind := v_booking.round_id is not null or v_booking.status = 'failed';");
+    expect(body).toContain('if v_rebind and v_booking.version >= 50 then');
+    expect(body).toContain('if v_booking.recall_bot_id is not null then return jsonb_build_object(\'status\', \'bot_attached\'');
+    // The write: a new generation (the next Recall create uses a new Idempotency-Key), no old ticket or session.
+    const start = body.indexOf('update screening_v2.r1_meet_bookings set');
+    const update = body.slice(start, body.indexOf(';', start));
+    for (const set of [
+      'version = case when v_rebind then version + 1 else version end',
+      'key_attempt = case when v_rebind then 0 else key_attempt end',
+      'ticket_digest = case when v_rebind then null else ticket_digest end',
+      'ticket_claimed_at = case when v_rebind then null else ticket_claimed_at end',
+      'ticket_arms = case when v_rebind then 0 else ticket_arms end',
+      'session_id = case when v_rebind then null else session_id end',
+    ]) {
+      expect(update, set).toContain(set);
+    }
+    expect(body).toContain("if v_rebind then v_out := v_out || jsonb_build_object('rebound', true); end if;");
+    // Step 8a: only a lapsed, never-started Meet round with no live session and no live booking of
+    // another event is expired, through the sweep's own transition.
+    for (const condition of [
+      "r.candidate_id = v_candidate_id and r.kind = 'sales_r1' and r.channel = 'meet'",
+      "r.status = 'invited' and r.starts_used = 0 and r.expires_at <= p_now",
+      "s.interview_round_id = r.id and s.status in ('created', 'waiting', 'in_progress')",
+      "o.round_id = r.id and o.status not in ('completed', 'cancelled', 'failed', 'drained') and o.ashby_interview_event_id <> p_ashby_interview_event_id",
+    ]) {
+      expect(body, condition).toContain(condition);
+    }
+    const sweep = readFileSync(path.join(migrations, '0119_r1_capacity_model.sql'), 'utf8').replace(/\s+/g, ' ');
+    expect(sweep).toContain("if r.status='invited' then v_result := screening_v2.r1_transition_round(r.id,'expire',r.version,null,null,p_now);");
   });
 
   it('matches the candidate by the Ashby application link only, and requires created_by in auth.users', () => {
@@ -604,7 +707,10 @@ describe('migration 0142: r1_meet_create_round_from_ashby (T2)', () => {
   it('bounds the expiry at 14 days and never reissues the round link', () => {
     expect(body).toContain('v_expires := p_end_at + make_interval(secs => p_expiry_grace_sec);');
     expect(body).toContain("if v_expires > p_now + interval '14 days' then v_retry_after := v_expires - interval '14 days';");
-    expect(bodyLc).not.toContain('r1_transition_round');
+    // r1_transition_round only expires a lapsed round (step 8a), never reissues.
+    expect(bodyLc.match(/r1_transition_round\(/g)).toHaveLength(1);
+    expect(bodyLc).toContain("r1_transition_round(v_lapsed_id, 'expire',");
+    expect(bodyLc).not.toContain('reissue');
     expect(bodyLc).not.toContain('link_token_digest');
   });
 
@@ -733,7 +839,7 @@ describe('migration 0142: the booking lifecycle RPCs (T3)', () => {
       statuses: [
         'ok', 'invalid_request', 'not_found', 'booking_terminal', 'version_conflict', 'stale_update',
         'booking_dispatched', 'bot_attached', 'no_round', 'not_allowed', 'in_past', 'slot_too_far',
-        'round_not_live',
+        'version_exhausted', 'round_not_live',
       ],
     },
     {
@@ -915,8 +1021,8 @@ describe('migration 0142: the booking lifecycle RPCs (T3)', () => {
       "'invalid_request', 'field', 'now'", BOOKING_LOCK, "'status', 'not_found'", "'status', 'booking_terminal'",
       "'status', 'version_conflict'", "'status', 'stale_update'", "'status', 'booking_dispatched'",
       "'status', 'bot_attached'", "'status', 'no_round'", "'status', 'not_allowed'", "'status', 'in_past'",
-      "'status', 'slot_too_far'", 'r1_settings where singleton for update', "'status', 'round_not_live'",
-      "'status', 'ok'",
+      "'status', 'slot_too_far'", "'status', 'version_exhausted'", 'r1_settings where singleton for update',
+      "'status', 'round_not_live'", "'status', 'ok'",
     ];
     let last = -1;
     for (const step of refusals) {
@@ -933,12 +1039,21 @@ describe('migration 0142: the booking lifecycle RPCs (T3)', () => {
       "if not found or v_round.channel <> 'meet' or v_round.status not in ('invited', 'in_progress') or v_round.expires_at <= p_now then",
     );
     expect(body).toContain('update screening_v2.interview_rounds set expires_at = v_expires, version = version + 1, updated_at = p_now where id = v_round.id;');
-    // The booking keeps its bot generation; it goes back to pending/eligible with the new slot.
+    // Review F2: a new slot or Meet link is a new bot generation (the Idempotency-Key follows the
+    // body); a reschedule that moves neither keeps both counters. Back to pending/eligible.
+    expect(body).toContain(
+      'v_moved := (p_start_at, p_end_at, p_meet_url) is distinct from (v_booking.start_at, v_booking.end_at, v_booking.meet_url);',
+    );
+    expect(body).toContain("if v_moved and v_booking.version >= 50 then return jsonb_build_object('status', 'version_exhausted'");
     const start = body.indexOf('update screening_v2.r1_meet_bookings set');
     const update = body.slice(start, body.indexOf(';', start));
-    expect(update).not.toMatch(/\bversion\b|\bkey_attempt\b|\bround_id\b|\bcandidate_id\b|\brecall_bot_id\b/);
+    expect(update).not.toMatch(/\bround_id\b|\bcandidate_id\b|\brecall_bot_id\b/);
+    expect(update.match(/\bversion\b/g)).toHaveLength(3);
+    expect(update.match(/\bkey_attempt\b/g)).toHaveLength(2);
     for (const set of [
       'start_at = p_start_at', 'end_at = p_end_at', 'meet_url = p_meet_url',
+      'version = case when v_moved then version + 1 else version end',
+      'key_attempt = case when v_moved then 0 else key_attempt end',
       'ashby_updated_at = greatest(ashby_updated_at, p_ashby_updated_at)', "status = 'pending'", "reason = 'eligible'",
       'updated_at = p_now',
     ]) {
@@ -1032,10 +1147,37 @@ describe('migration 0142: the booking lifecycle RPCs (T3)', () => {
   it('is exercised by the SQL suite, and the T2 re-link cancels through r1_meet_cancel_booking', () => {
     const suite = read('app/supabase/tests/r1_meet_bookings_assert.sql');
     for (const rpc of RPCS) expect(suite, rpc.name).toContain(`screening_v2.${rpc.name}(`);
-    for (const section of ['-- T3-A. ', '-- T3-B. ', '-- T3-C. ', '-- T3-D. ', '-- T3-E. ', '-- T3-F. ']) {
+    let last = suite.indexOf('-- T2-H. ');
+    for (const section of ['-- T3-A. ', '-- T3-B. ', '-- T3-C. ', '-- T3-D. ', '-- T3-E. ', '-- T3-F. ', '-- T3-G. ', '-- T3-H. ']) {
       expect(suite.split(section).length - 1, section).toBe(1);
+      expect(suite.indexOf(section), section).toBeGreaterThan(last);
+      last = suite.indexOf(section);
     }
-    expect(suite.indexOf('-- T3-A. ')).toBeGreaterThan(suite.indexOf('-- T2-H. '));
+    expect(suite.indexOf('-- T4-A. ')).toBeGreaterThan(last);
+    // The review fixes (F1, F2, F3, F6) each have labelled assertions.
+    for (const label of [
+      'T3-C a new slot alone is a new generation: version 1, key attempt 0',
+      'T3-C the bot that the lost slot-A create made cannot attach: version_conflict, no bot',
+      'T3-C a reschedule that moves neither the slot nor the link keeps the generation and the key attempt',
+      'T3-C a move at generation 50: version_exhausted, nothing written',
+      'T3-G the create replay re-binds a blocked booking whose round lapsed: a fresh round, generation 1',
+      'T3-G a lapsed round under a scheduled bot: bot_attached, nothing written',
+      'T3-G a dispatched booking with a lapsed round: exists, round_live false',
+      'T3-G a replay during the slot answers exists, not in_past',
+      'T3-G a failed booking that Ashby moved to a future slot is revived on a fresh round, generation 1',
+      'T3-G a failed booking whose round is live is revived by re-linking that round',
+      'T3-G a moved failed booking that still holds a bot: bot_attached',
+      'T3-G a cancelled booking on a moved slot: booking_terminal, nothing written',
+      'T3-G a booking on a round HR cancelled: exists, round_live false, nothing written',
+      'T3-G a lapsed browser round is left alone: blocked/round_active',
+      'T3-H reissuing the link of a Meet round raises P0001',
+      'T3-H a browser round is reissued unchanged',
+      'T3-H exactly one r1-meet round_cancelled job, ids only',
+      'T3-H no job for a round with no live booking, a browser round, or an expiry',
+      'T2-G a lapsed Meet round is not re-linked: it is expired (hold released) and a fresh round is created',
+    ]) {
+      expect(suite, label).toContain(label);
+    }
     // No fixture shortcut for a cancel is left anywhere.
     expect(suite).not.toMatch(/set status = 'cancelled'/);
     expect(suite).not.toMatch(/T3 replaces/);
@@ -1087,6 +1229,13 @@ describe('migration 0142: the bridge ticket, receipts and prune RPCs (T4)', () =
       sig: 'timestamptz, integer, timestamptz',
       statuses: ['ok', 'invalid_request', 'retention_too_short'],
     },
+    {
+      name: 'r1_meet_prune_bookings',
+      section: '-- §20. ',
+      args: 'p_older_than timestamptz, p_limit integer default 500, p_now timestamptz default now()',
+      sig: 'timestamptz, integer, timestamptz',
+      statuses: ['ok', 'invalid_request', 'retention_too_short'],
+    },
   ] as const;
 
   /** The plpgsql body of an RPC (after `as $$`), comments stripped, whitespace collapsed. */
@@ -1102,7 +1251,7 @@ describe('migration 0142: the bridge ticket, receipts and prune RPCs (T4)', () =
   const familyOf = (status: string) => families.find((f) => f.statuses.includes(status))!.reasons;
   const suite = read('app/supabase/tests/r1_meet_bookings_assert.sql');
 
-  it('sits in sections §16 to §19, in order, between §15 and §90', () => {
+  it('sits in sections §16 to §20, in order, between §15 and §90', () => {
     let last = sql.indexOf('-- §15. ');
     expect(last).toBeGreaterThan(-1);
     for (const rpc of RPCS) {
@@ -1328,20 +1477,45 @@ describe('migration 0142: the bridge ticket, receipts and prune RPCs (T4)', () =
     expect(fields).toEqual(['now', 'older_than', 'limit']);
     expect(body).toContain('if p_limit is null or p_limit not between 1 and 5000 then');
     expect(body).toContain("if p_older_than > p_now - interval '7 days' then return jsonb_build_object('status', 'retention_too_short');");
+    // Review F5: an enqueued receipt goes once no live job (the 0009 live set) can settle it.
+    const live = /where dedup_key is not null and status in \(([^)]*)\)/.exec(
+      readFileSync(path.join(migrations, '0009_queue.sql'), 'utf8').replace(/\s+/g, ' '),
+    )![1]!;
     expect(body).toContain(
       'delete from screening_v2.r1_meet_receipts where id in ( select r.id from screening_v2.r1_meet_receipts r '
-      + "where r.received_at < p_older_than and r.outcome in ('recorded', 'processed', 'ignored', 'failed') "
+      + "where r.received_at < p_older_than and (r.outcome in ('recorded', 'processed', 'ignored', 'failed') "
+      + "or (r.outcome = 'enqueued' and not exists (select 1 from screening_v2.job_queue j "
+      + `where j.dedup_key = 'r1-meet:receipt:' || r.id::text and j.status in (${live})))) `
       + 'order by r.received_at limit p_limit for update skip locked);',
     );
     expect(body).toContain('get diagnostics v_deleted = row_count;');
     expect(body.match(/\bdelete from\b/g)).toHaveLength(1);
-    // Every outcome but enqueued (work in flight) is prunable.
+    // Every outcome but enqueued (work in flight) is prunable outright.
     const outcomes = quoted(/check \( outcome in \(([^)]*)\) \)/.exec(receipts)![1]!);
     const prunable = quoted(/r\.outcome in \(([^)]*)\)/.exec(body)![1]!);
     expect([...prunable, 'enqueued'].sort()).toEqual([...outcomes].sort());
+    // The job key is the outbox's own.
+    expect(bodyOf('r1_meet_record_receipt')).toContain("'r1-meet:receipt:' || v_id::text");
   });
 
-  it('ends with exactly the ten RPCs and the two trigger functions, each RPC revoked and granted to service_role', () => {
+  it('prunes only round-less bookings that hold no bot, whose slot ended before the cutoff, never under 7 days (review F5)', () => {
+    const body = bodyOf('r1_meet_prune_bookings');
+    const fields = [...body.matchAll(/'status', 'invalid_request', 'field', '([a-z_]+)'/g)].map((m) => m[1]);
+    expect(fields).toEqual(['now', 'older_than', 'limit']);
+    expect(body).toContain('if p_limit is null or p_limit not between 1 and 5000 then');
+    expect(body).toContain("if p_older_than > p_now - interval '7 days' then return jsonb_build_object('status', 'retention_too_short');");
+    expect(body).toContain(
+      'delete from screening_v2.r1_meet_bookings where id in ( select b.id from screening_v2.r1_meet_bookings b '
+      + 'where b.round_id is null and b.recall_bot_id is null and b.end_at < p_older_than '
+      + 'order by b.end_at limit p_limit for update skip locked);',
+    );
+    expect(body.match(/\bdelete from\b/g)).toHaveLength(1);
+    expect(body).not.toMatch(/\bupdate screening_v2\.|\binsert into\b/);
+    // A booking with a round goes only with its round (the cascade): the predicate never reaches it.
+    expect(bookings).toContain('round_id uuid references screening_v2.interview_rounds(id) on delete cascade');
+  });
+
+  it('ends with exactly the eleven RPCs and the four trigger functions, each RPC revoked and granted to service_role', () => {
     // Lazy up to the first " ) returns": a parameter default such as now() cannot end the list early.
     const created = [...code.matchAll(/create or replace function screening_v2\.([a-z0-9_]+)\(([\s\S]*?) ?\) returns /g)]
       .map((m) => {
@@ -1360,20 +1534,23 @@ describe('migration 0142: the bridge ticket, receipts and prune RPCs (T4)', () =
       'r1_meet_claim_ticket(text, timestamptz)',
       'r1_meet_record_receipt(text, text, text, uuid, boolean, jsonb, timestamptz, timestamptz)',
       'r1_meet_prune_receipts(timestamptz, integer, timestamptz)',
+      'r1_meet_prune_bookings(timestamptz, integer, timestamptz)',
     ];
-    expect(created).toEqual([
+    const TRIGGER_FNS = [
       'reject_interview_round_channel_change()',
       'enqueue_r1_meet_bot_release()',
-      ...RPC_SIGS,
-    ]);
+      'reject_meet_round_link_reissue()',
+      'enqueue_r1_meet_round_cancelled()',
+    ];
+    expect(created).toEqual([...TRIGGER_FNS, ...RPC_SIGS]);
     for (const sig of RPC_SIGS) {
       expect(code, sig).toContain(`revoke all on function screening_v2.${sig} from public, anon, authenticated;`);
       expect(code, sig).toContain(`grant execute on function screening_v2.${sig} to service_role;`);
       expect(code, sig).toContain(`comment on function screening_v2.${sig} is`);
     }
     expect(lc.match(/\bgrant execute on function\b/g)).toHaveLength(RPC_SIGS.length);
-    expect(lc.match(/\brevoke all on function\b/g)).toHaveLength(RPC_SIGS.length + 2);
-    // The SQL suite's privilege proof names exactly these ten.
+    expect(lc.match(/\brevoke all on function\b/g)).toHaveLength(RPC_SIGS.length + TRIGGER_FNS.length);
+    // The SQL suite's privilege proof names exactly these eleven.
     const proof = suite.slice(suite.indexOf('-- T4-D. '));
     const listed = quoted(/rpcs constant text\[\] := array\[([\s\S]*?)\];/.exec(proof)![1]!);
     expect(listed).toEqual(RPC_SIGS.map((s) => `screening_v2.${s}`));
@@ -1443,7 +1620,12 @@ describe('migration 0142: the bridge ticket, receipts and prune RPCs (T4)', () =
       "'T4-D ' || fn || ' is security definer with search_path pg_catalog, screening_v2'",
       "'T4-D select from ' || tbl", "'T4-D insert into ' || tbl", "'T4-D update ' || tbl", "'T4-D delete from ' || tbl",
       "'T4-D service_role reads ' || tbl",
-      'T4-D the ten RPCs are the only screening_v2 functions named r1_meet_*, one overload each',
+      'T4-D the eleven RPCs are the only screening_v2 functions named r1_meet_*, one overload each',
+      // The retention fixes (review F5).
+      'T4-C an old enqueued receipt whose job dead-lettered goes; one whose job is still live stays',
+      'T4-C (bookings) a batch of 2: the two oldest round-less bookings go',
+      'T4-C (bookings) the rest: a terminal round-less booking goes; a booking with a round and a recent one stay',
+      'T4-C (bookings) six days after the slot: retention_too_short',
       'T4-D the service_role calls left nothing behind (rolled back)',
     ]) {
       expect(suite, label).toContain(label);
@@ -1457,7 +1639,7 @@ describe('migration 0142: the bridge ticket, receipts and prune RPCs (T4)', () =
     expect(t4d).toContain("foreach who in array array['anon', 'authenticated'] loop");
     expect(t4d.match(/_r1_meet_tests\.raises_as\(who, /g)).toHaveLength(5);
     expect(t4d.match(/'42501'\);/g)!.length).toBe(5);
-    expect(t4d.match(/_r1_meet_tests\.runs_as\('service_role', /g)).toHaveLength(11);
+    expect(t4d.match(/_r1_meet_tests\.runs_as\('service_role', /g)).toHaveLength(12);
     // Ticket digests are computed at run time, never written.
     const t4 = suite.slice(suite.indexOf('-- T4-A. '));
     expect(t4).not.toMatch(/'[a-f0-9]{16,}'/);
@@ -1559,6 +1741,15 @@ describe('migration 0142: docs (T5)', () => {
     expect(text).toMatch(/30 days/);
     expect(text).toMatch(/less than 7 days/);
     expect(text).toContain('scheduledByEmail');
+    // Review F5: round-less bookings, dead-lettered receipts, job rows and the round-cancel job.
+    expect(text).toContain('r1_meet_prune_bookings');
+    expect(text).toContain('whose job is no longer live');
+    expect(text).toContain('enqueue_r1_meet_round_cancelled');
+    expect(text).toContain("kind: 'round_cancelled'");
+    expect(text).toContain('reap_completed_jobs');
+    expect(text).toContain('job_dlq');
+    expect(text).toContain('Only\nan Ashby interview-schedule job may also carry the canonical Meet URL');
+    expect(text).not.toContain('Clearing stale unmatched bookings is left to the runtime slices');
   });
 
   it('docs/runbooks/r1-operations.md has the 0142 deploy note between the 0119 note and Scoring', () => {
@@ -1575,6 +1766,16 @@ describe('migration 0142: docs (T5)', () => {
     expect(text).toContain('bot_release');
     expect(text).toContain('r1-meet:bot-release:');
     expect(text).toMatch(/forward-only/);
+    // Review F4: the template-release recovery is a new HR act after the old booking is cancelled
+    // (a new event while it is live is refused), never an automatic re-attestation.
+    expect(text).toContain('Nothing re-attests automatically');
+    expect(text).toContain('HR cancels the Dex interview');
+    expect(text).toContain('`blocked/round_active`, so the cancel comes first');
+    expect(text).not.toContain('Recovery: HR schedules a new Dex event in Ashby. The Meet round RPC then');
+    // Review F1 and F3: per-event recovery and the fenced round actions.
+    expect(text).toContain('`rebound: true`');
+    expect(text).toContain('r1-meet:round-cancelled:');
+    expect(text).toContain('503 `service_unavailable`');
     // Its SQL is read-only.
     const sqlBlocks = [...text.matchAll(/```sql\n([\s\S]*?)```/g)].map((m) => m[1]!.replace(/--.*$/gm, ''));
     expect(sqlBlocks.length).toBeGreaterThan(0);

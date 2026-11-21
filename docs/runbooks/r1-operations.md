@@ -508,8 +508,8 @@ the dashboard figure to re-stamp its baseline.
 
 0142 is the database half of R1 over Google Meet (HR schedules the interview in Ashby with Dex
 as an interviewer; Dex joins that Meet). It adds `r1_meet_bookings`, `r1_meet_receipts`,
-`interview_rounds.channel`, four HR-attestation columns on `interview_round_consents`, ten
-service-role RPCs and two trigger functions. Data classification:
+`interview_rounds.channel`, four HR-attestation columns on `interview_round_consents`, eleven
+service-role RPCs and four trigger functions. Data classification:
 `docs/data-classification.md`, "R1 Meet bookings (0142, M034)".
 
 - **Additive and dark.** It changes no existing row: every new column has a constant default or
@@ -538,9 +538,39 @@ service-role RPCs and two trigger functions. Data classification:
 - **Template release (D31).** An HR-attested consent row names the newest active `en-IN`
   template at booking time. Releasing a new consent template version makes every outstanding
   Meet round fail admission with `consent_missing`, exactly like browser rounds that consented to
-  the older notice. Recovery: HR schedules a new Dex event in Ashby. The Meet round RPC then
-  re-links the candidate's reusable Meet round and re-attests under the new template. Prefer to
-  release a template when no Meet round is outstanding.
+  the older notice. Nothing re-attests automatically: the stored attester attested the OLD
+  notice, and writing the new version under their name would record an attestation that never
+  happened. Recovery, per booking, is a new HR act in Ashby: HR cancels the Dex interview (or
+  removes Dex from it), so the runtime cancels the booking and removes its bot, and then
+  schedules a new Dex interview. The new event re-links the candidate's reusable Meet round and
+  attests under the new template, naming the HR user who scheduled it. A new event while the old
+  booking is still live is refused as `blocked/round_active`, so the cancel comes first. Release a
+  template only when no Meet booking is live (the consent release is the last M034 PR, at
+  go-live). Before a release, list the live bookings:
+
+  ```sql
+  select status, count(*) from screening_v2.r1_meet_bookings
+   where status not in ('completed', 'cancelled', 'failed', 'drained') group by 1;
+  ```
+
+- **One Ashby event, recovered on its own (review F1).** HR often moves the same interview in
+  Ashby. When the booking's round lapsed before its bot was dispatched (for example a move more
+  than 14 days out answered `slot_too_far`), the reschedule RPC answers `round_not_live` and the
+  runtime replays the create RPC, which re-binds the booking to a fresh round. When a `failed`
+  booking (a no-show, a bot failure) is moved to a new slot or Meet link that has not started,
+  the create RPC revives it the same way, or re-links its round while that round is still live.
+  Both answer `rebound: true` and start a new bot generation (`version` + 1, `key_attempt` 0),
+  so the next Recall create uses a new Idempotency-Key. So does every reschedule that moves the
+  slot or the link. A lapsed Meet round that nothing can use is expired, as
+  `r1_sweep_expired_rounds` would expire it, so it never blocks the candidate's next booking.
+  `completed`, `cancelled` and `drained` bookings are never revived.
+- **Round actions on a Meet round.** `r1_transition_round` is unchanged, but 0142 fences it on
+  Meet rounds. A reissue of a Meet round's link is refused (P0001, so HR's Reissue button answers
+  503 `service_unavailable` until S10 hides it for Meet rounds): the candidate joins through the
+  Meet, never a link. HR's cancel of a Meet round queues one `r1-meet` job per live booking on it
+  (payload kind `round_cancelled`, dedup key `r1-meet:round-cancelled:<booking id>`), so the
+  runtime cancels the booking and removes its bot. While dark there are no Meet rounds, so
+  nothing is queued.
 - **Owed bot releases and `bot_release` jobs (D18).** A terminal booking (`completed`,
   `cancelled`, `failed`, `drained`) keeps its `recall_bot_id` until S06 confirms the Recall
   DELETE or `leave_call` and calls `r1_meet_set_bot(..., 'release', ...)`. Deleting a booking

@@ -550,7 +550,7 @@ never nudged. No audit row: a webhook is not a person's action, and the nudge de
 `0142_r1_meet_bookings.sql` adds two tables, one column on `interview_rounds` and four columns on
 `interview_round_consents` for R1 over Google Meet: HR schedules the interview in Ashby with Dex
 as an interviewer, and Dex joins that Meet (D-M034-11). Both tables are service-role only (RLS
-on, no policy, no browser grant, no anon or authenticated EXECUTE on any of the ten RPCs). The
+on, no policy, no browser grant, no anon or authenticated EXECUTE on any of the eleven RPCs). The
 migration is dark: nothing writes these tables until S03, S05 and S06 ship behind
 `R1_MEET_ENABLED` (default off).
 
@@ -611,24 +611,41 @@ transaction, so the bot is still released at Recall after an erasure. The job pa
 `{kind: 'bot_release', recall_bot_id, booking_id}`, with dedup key
 `r1-meet:bot-release:<bot id>` and 10 attempts. Receipts follow a deleted booking with
 `booking_id` set NULL; they carry nothing personal. HR-attested consent rows follow the same
-withdrawal and erasure as browser rows: they cascade with the round. A booking that never
-matched a candidate (`unmatched_application`) has no candidate id, so no cascade reaches it. It
-holds only opaque Ashby ids, the slot, the Meet URL and the attester id, and nothing that names
-the candidate. Clearing stale unmatched bookings is left to the runtime slices (S06/S10).
+withdrawal and erasure as browser rows: they cascade with the round. A booking that never got a
+round (`unmatched_application`, `unmapped_scheduler`, a round-less `blocked`, or a terminal
+booking that never had a round) is reached by no round cascade, and an unmatched one has no
+candidate id either. It holds only opaque Ashby ids, the slot, the Meet URL and the attester id,
+and nothing that names the candidate. `r1_meet_prune_bookings` deletes it 30 days after its slot
+(see Retention). When HR cancels a Meet round in the app, the trigger
+`enqueue_r1_meet_round_cancelled` queues one `r1-meet` job per live booking on it, payload
+`{kind: 'round_cancelled', booking_id, round_id}` (ids only), so the runtime cancels the booking
+and removes its bot.
 
 **Retention.** Receipts are kept for 30 days. `r1_meet_prune_receipts(p_older_than, p_limit,
 p_now)` deletes them in batches of at most 5000, and S06 calls it from an existing tick with
 `p_older_than = now - 30 days`. The function refuses a cutoff that would keep less than 7 days.
-It deletes only `recorded`, `processed`, `ignored` and `failed` receipts: an `enqueued` receipt
-stays until its work settles. Bookings live as long as their round: they cascade with it, and a
-terminal booking stays as the round's history. Consent rows follow the existing R1 consent
-retention (PENDING Legal, above).
+It deletes `recorded`, `processed`, `ignored` and `failed` receipts, and an `enqueued` receipt
+whose job is no longer live (it dead-lettered, so nothing will ever settle it). An `enqueued`
+receipt stays while a live job (pending, active, delayed) may still read it. A booking with a
+round lives as long as its round: it cascades with it, and a terminal booking stays as the
+round's history. A booking that never got a round is deleted by
+`r1_meet_prune_bookings(p_older_than, p_limit, p_now)`, which S06 calls from an existing tick
+with `p_older_than = now - 30 days`: it deletes, in batches of at most 5000, the round-less
+bookings that hold no Recall bot and whose slot ended before the cutoff, and it refuses a cutoff
+that would keep less than 7 days after the slot. Their receipts keep `booking_id` NULL. Consent
+rows follow the existing R1 consent retention (PENDING Legal, above).
 
-**Job payloads.** Every `r1-meet` job payload (the receipt outbox of `r1_meet_record_receipt`,
-the bot-release trigger, and the S03/S06 jobs) carries only ids, times and the canonical Meet
-URL. It never carries the Ashby `scheduledByEmail`, a name, an email, a raw webhook body or a
-signature. The receipt RPC caps a payload at 4096 bytes and requires a `kind`. S03 and S06 own
-the rest of this rule.
+**Job payloads.** An `r1-meet` job payload (the receipt outbox of `r1_meet_record_receipt`, the
+bot-release and round-cancel triggers, and the S03/S06 jobs) carries ids, kinds and times. Only
+an Ashby interview-schedule job may also carry the canonical Meet URL, because it runs before any
+booking exists. Every other `r1-meet` job (a Recall receipt, a bot release, a round cancel, a
+delayed re-run) carries no Meet URL, and its worker reads the URL from the booking. No payload
+ever carries the Ashby `scheduledByEmail`, a name, an email, a raw webhook body or a signature.
+The receipt RPC caps a payload at 4096 bytes and requires a `kind`. S03 and S06 own the rest of
+this rule. Job rows are not reached by the DSAR cascade: a completed job is deleted 7 days after
+it completes (`reap_completed_jobs`), and a dead-lettered one stays in `job_dlq` until an operator
+deletes it after triage. A DSAR erasure therefore also deletes the candidate's pending and
+dead-lettered `r1-meet` rows, found by their booking id or Ashby application id.
 
 ## Classification summary
 

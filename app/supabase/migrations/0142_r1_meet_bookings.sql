@@ -4,7 +4,8 @@
 -- DARK. Nothing calls any object below until S03 (webhook receipts), S05 (bridge ticket) and S06
 -- (booking runtime) ship behind R1_MEET_ENABLED (default OFF). No queue is registered here. Every
 -- job row an object below can write is named `r1-meet`, and none is written while the flag is off:
--- the §5 bot release fires only when a booking is deleted, and only S06 creates bookings.
+-- the §5 bot release fires only when a booking is deleted, the §6 round cancel only for a Meet
+-- round with a live booking, and only S06 creates bookings and Meet rounds.
 --
 --   §1 interview_rounds.channel ('browser' default | 'meet') and trg_interview_rounds_channel_locked:
 --      the only allowed change is browser -> meet, and only while the round is `invited`, unstarted
@@ -23,11 +24,17 @@
 --   §5 enqueue_r1_meet_bot_release: deleting a booking that still holds a Recall bot (including the
 --      DSAR cascade from candidates and rounds) queues one `r1-meet` bot_release job, so a cascade
 --      never orphans a billing bot.
+--   §6 trg_interview_rounds_meet_link_locked refuses a reissue of a Meet round's link, and
+--      enqueue_r1_meet_round_cancelled queues one `r1-meet` round_cancelled job per live booking
+--      when HR cancels a Meet round in the app (r1_transition_round itself is unchanged).
 --   §10 r1_meet_create_round_from_ashby: the R1 round (through r1_send_round, channel meet), the
 --      HR-attested consent and the booking for one Ashby event, in one transaction; re-links a
---      reusable Meet round after HR re-books. Never creates a call_sessions row.
+--      reusable Meet round after HR re-books; re-binds a booking whose round lapsed before its bot
+--      was dispatched, and revives a failed booking that Ashby moved to a new slot, each as a new
+--      bot generation. Never creates a call_sessions row.
 --   §11 r1_meet_reschedule_booking: a new slot or Meet link for a booking that holds no bot; moves
---      the round's bounded expiry with it.
+--      the round's bounded expiry with it, and starts a new bot generation when the slot or link
+--      moved.
 --   §12 r1_meet_cancel_booking: cancels the booking ONLY; the round, its consent and the candidate
 --      are never touched.
 --   §13 r1_meet_set_bot: the Recall bot of a booking (attach, rotate_key, replace, release),
@@ -41,6 +48,8 @@
 --   §18 r1_meet_record_receipt: insert-or-report-duplicate of a webhook receipt plus the 0030
 --      transactional outbox (one live `r1-meet` job per receipt while it is enqueued).
 --   §19 r1_meet_prune_receipts: the 30-day receipt retention (refuses less than 7 days).
+--   §20 r1_meet_prune_bookings: the retention of bookings that never got a round (no cascade
+--      reaches them): deleted 30 days after their slot (refuses less than 7 days).
 --   §90 RLS on (no policy) and service-role-only privileges.
 --
 -- PII-minimal: ids, times, statuses, the canonical Meet URL and the Ashby user id of the HR
@@ -417,16 +426,95 @@ create trigger enqueue_r1_meet_bot_release
   execute function screening_v2.enqueue_r1_meet_bot_release();
 
 -- ---------------------------------------------------------------------------------------------
+-- §6. The round actions of the app on a Meet round.
+-- ---------------------------------------------------------------------------------------------
+-- r1_transition_round is unchanged (no existing function is redeclared), so its actions are fenced
+-- here, on the round row itself.
+--   a. reissue: the only writer of link_token_digest after the Send. A Meet round's candidate
+--      never gets a link (the digest's preimage is unknown), so a reissue would hand out a browser
+--      link with a fresh 72-hour expiry that admission accepts on the HR-attested consent, without
+--      the consent page (critic A1, C2). Any change of a Meet round's link digest is refused.
+--      grant-retake (status and expiry only) and cancel/expire stay as they are.
+--   b. cancel: HR's cancel of a Meet round in the app queues one `r1-meet` job per live booking
+--      on it ({kind: 'round_cancelled', booking_id, round_id}, ids only), so S06 cancels the
+--      booking (r1_meet_cancel_booking, round_cancelled) and removes its Recall bot instead of
+--      letting it join the Meet and bill. The trigger only inserts a job: it locks no booking,
+--      so it never inverts the booking-then-settings lock order of the Meet RPCs. Dedup key per
+--      booking; uq_job_queue_dedup_active (0009) is partial over live jobs. An expiry (the sweep,
+--      or step 8a of the create RPC) queues nothing: a lapsed round is re-bound, not cancelled.
+create or replace function screening_v2.reject_meet_round_link_reissue()
+returns trigger
+language plpgsql
+security invoker
+set search_path = pg_catalog
+as $$
+begin
+  if old.channel = 'meet' and new.link_token_digest is distinct from old.link_token_digest then
+    raise exception 'interview round % is a Meet round: its link is never reissued', old.id
+      using errcode = 'P0001';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_interview_rounds_meet_link_locked on screening_v2.interview_rounds;
+create trigger trg_interview_rounds_meet_link_locked
+  before update of link_token_digest on screening_v2.interview_rounds
+  for each row execute function screening_v2.reject_meet_round_link_reissue();
+
+-- SECURITY DEFINER so that row level security on r1_meet_bookings (no policy) never hides a live
+-- booking from the round's writer (the channel lock's reason, §1).
+create or replace function screening_v2.enqueue_r1_meet_round_cancelled()
+returns trigger
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+begin
+  insert into screening_v2.job_queue (name, payload, dedup_key, max_attempts)
+  select 'r1-meet',
+         jsonb_build_object('kind', 'round_cancelled', 'booking_id', b.id, 'round_id', new.id),
+         'r1-meet:round-cancelled:' || b.id::text, 10
+    from screening_v2.r1_meet_bookings b
+   where b.round_id = new.id
+     and b.status not in ('completed', 'cancelled', 'failed', 'drained')
+  on conflict do nothing;
+  return null;
+end;
+$$;
+
+drop trigger if exists enqueue_r1_meet_round_cancelled on screening_v2.interview_rounds;
+create trigger enqueue_r1_meet_round_cancelled
+  after update of status on screening_v2.interview_rounds
+  for each row
+  when (new.channel = 'meet' and new.status = 'cancelled' and old.status is distinct from 'cancelled')
+  execute function screening_v2.enqueue_r1_meet_round_cancelled();
+
+-- ---------------------------------------------------------------------------------------------
 -- §10. r1_meet_create_round_from_ashby: the round, the HR-attested consent and the booking.
 -- ---------------------------------------------------------------------------------------------
 -- S06 calls this for every Ashby interview event that has Dex as an interviewer (S01 decision
 -- `eligible`). One transaction, idempotent per Ashby event id; the first refusal wins:
 --   1. validation, no write: invalid_request with a closed `field` code;
---   2. a slot that has already started, no write: in_past;
---   3. the event lock (advisory lock, then the booking row): a terminal booking answers
---      booking_terminal; a booking that has a round answers exists (changes go through the
---      reschedule RPC); an older Ashby updatedAt answers stale_update; a round-less booking
---      (unmatched, unmapped, blocked) is retried in place;
+--   2. the event lock (advisory lock, then the booking row), BEFORE any other answer, so that a
+--      replay for an event that has a booking always reads that booking, also after the slot
+--      started:
+--      - completed, cancelled and drained bookings answer booking_terminal (history; HR books a
+--        new event, which re-links per step 10);
+--      - a failed booking answers booking_terminal too, unless Ashby moved it to a new slot or
+--        Meet link that has not started (a reschedule of the same event after a no-show or a bot
+--        failure): that one is REVIVED below;
+--      - a booking with a round answers exists (+round_live; changes go through the reschedule
+--        RPC), unless its round LAPSED (expired, or invited/in progress past its expiry) before a
+--        bot was dispatched and the slot has not started: that one is RE-BOUND below (the
+--        reschedule RPC answers round_not_live for it and S06 replays this RPC);
+--      - an older Ashby updatedAt answers stale_update;
+--      - a booking that is revived or re-bound while it still holds a Recall bot answers
+--        bot_attached (S06 deletes the bot at Recall, then replace or release, then replays);
+--        at generation 50 it answers version_exhausted;
+--      - a round-less booking (unmatched, unmapped, blocked) whose slot started answers in_past
+--        (+booking_id); otherwise it is retried in place;
+--   3. no booking and a slot that has started: in_past, no write;
 --   4. the candidate, through ashby_application_links only (never by email):
 --      unmatched_application / application_unknown | application_terminal;
 --   5. created_by (the staff user S06 mapped from the Ashby scheduler, or the
@@ -438,19 +526,30 @@ create trigger enqueue_r1_meet_bot_release
 --   7. the newest active consent template for en-IN, requiring something, else
 --      blocked/consent_template_unavailable;
 --   8. exactly one sales_r1 role (the browser route's rule), else blocked/role_not_configured;
+--  8a. a lapsed Meet round of the candidate that nothing can use any more (invited, never started,
+--      past its expiry, no live session, no live booking of another event) is expired through
+--      r1_transition_round('expire'), exactly as r1_sweep_expired_rounds does (its hold is
+--      released). A lapsed round is never revived, and without this r1_send_round would answer
+--      round_active for it until a sweep or HR's cancel. A browser round is never touched;
 --   9. the round is created BY r1_send_round itself, so every check, the 65-minute hold, the
 --      hold month and the month counter are the browser path's, with a link digest whose
 --      preimage nobody has (the candidate gets no link); then channel = meet. Its refusals become
 --      blocked/<code>;
 --  10. round_active: the candidate's live round is re-linked when it is a reusable Meet round (HR
---      cancelled and re-booked), else blocked/round_active (or the phone code).
+--      cancelled and re-booked, or a revived booking whose round is still live), else
+--      blocked/round_active (or the phone code).
 -- created and relinked insert the HR-attested consent: the attester is ALWAYS the Ashby
--- scheduledBy user id, never created_by. Every outcome after step 3 upserts the booking. No
--- call_sessions row, no audit row, no clock read (p_now only), no digest in any answer.
+-- scheduledBy user id, never created_by. Every outcome after step 3 upserts the booking. A revival
+-- or a re-bind (`rebound` in the answer) detaches the old round, starts a new bot generation
+-- (version + 1, key_attempt 0, so the next Recall create uses a new Idempotency-Key) and clears
+-- the old ticket and session; the old round, its consent and its sessions are never touched
+-- beyond the step-8a expiry. No call_sessions row, no audit row, no clock read (p_now only), no
+-- digest in any answer.
 --
--- Lock order: the event's advisory lock and booking row first, then (inside r1_send_round)
--- settings and the current month, then for a re-link the round's hold month and the round: the
--- admission order (settings, month, round), and no other booking is ever locked.
+-- Lock order: the event's advisory lock and booking row first, then (inside r1_transition_round
+-- and r1_send_round) settings, the lapsed round's hold month, the lapsed round and the current
+-- month, then for a re-link the round's hold month and the round: every capacity writer takes
+-- settings first, and no other booking is ever locked.
 create or replace function screening_v2.r1_meet_create_round_from_ashby(
   p_ashby_interview_event_id uuid,
   p_ashby_schedule_id text,
@@ -498,6 +597,13 @@ declare
   v_reason text;
   v_result text;
   v_out jsonb;
+  v_rebind boolean := false;
+  v_old_status text;
+  v_old_expires timestamptz;
+  v_round_live boolean;
+  v_round_lapsed boolean;
+  v_lapsed_id uuid;
+  v_lapsed_version integer;
 begin
   -- 1. Validation. Nothing is written.
   if p_ashby_interview_event_id is null then
@@ -538,12 +644,7 @@ begin
     return jsonb_build_object('status', 'invalid_request', 'field', 'now');
   end if;
 
-  -- 2. A slot that has started is never booked. Nothing is written.
-  if p_start_at <= p_now then
-    return jsonb_build_object('status', 'in_past');
-  end if;
-
-  -- 3. The event lock, then the booking row.
+  -- 2. The event lock, then the booking row: a replay always reads the event's booking first.
   perform pg_advisory_xact_lock(hashtextextended('r1_meet_booking:' || p_ashby_interview_event_id::text, 0));
   select * into v_booking
     from screening_v2.r1_meet_bookings b
@@ -551,23 +652,59 @@ begin
    for update;
   v_has_booking := found;
   if v_has_booking then
-    if v_booking.status in ('completed', 'cancelled', 'failed', 'drained') then
+    -- Terminal = history; only a failed booking that Ashby moved to a new, unstarted slot or Meet
+    -- link is revived.
+    if v_booking.status in ('completed', 'cancelled', 'drained')
+       or (v_booking.status = 'failed'
+           and (p_start_at <= p_now
+                or (p_start_at, p_end_at, p_meet_url)
+                   is not distinct from (v_booking.start_at, v_booking.end_at, v_booking.meet_url))) then
       return jsonb_build_object('status', 'booking_terminal', 'booking_id', v_booking.id,
                                 'booking_status', v_booking.status, 'reason', v_booking.reason);
     end if;
-    if v_booking.round_id is not null then
-      return jsonb_build_object(
-        'status', 'exists', 'booking_id', v_booking.id, 'round_id', v_booking.round_id,
-        'candidate_id', v_booking.candidate_id, 'booking_status', v_booking.status,
-        'reason', v_booking.reason, 'version', v_booking.version,
-        'key_attempt', v_booking.key_attempt,
-        'round_expires_at', (select r.expires_at from screening_v2.interview_rounds r
-                              where r.id = v_booking.round_id),
-        'objective_profile', v_booking.objective_profile);
+    -- A booking with a round: exists, unless the round lapsed under a booking whose bot was never
+    -- dispatched, for a slot that has not started (re-bound). A round HR cancelled or that
+    -- completed is never re-bound.
+    if v_booking.round_id is not null and v_booking.status <> 'failed' then
+      select r.status, r.expires_at into v_old_status, v_old_expires
+        from screening_v2.interview_rounds r
+       where r.id = v_booking.round_id;
+      v_round_live := coalesce(v_old_status in ('invited', 'in_progress') and v_old_expires > p_now, false);
+      v_round_lapsed := coalesce(v_old_status = 'expired'
+                                 or (v_old_status in ('invited', 'in_progress') and v_old_expires <= p_now),
+                                 false);
+      if not v_round_lapsed
+         or v_booking.status in ('bot_joining', 'human_present', 'in_call')
+         or p_start_at <= p_now then
+        return jsonb_build_object(
+          'status', 'exists', 'booking_id', v_booking.id, 'round_id', v_booking.round_id,
+          'candidate_id', v_booking.candidate_id, 'booking_status', v_booking.status,
+          'reason', v_booking.reason, 'version', v_booking.version,
+          'key_attempt', v_booking.key_attempt, 'round_expires_at', v_old_expires,
+          'round_live', v_round_live, 'objective_profile', v_booking.objective_profile);
+      end if;
     end if;
     if p_ashby_updated_at < v_booking.ashby_updated_at then
       return jsonb_build_object('status', 'stale_update', 'booking_id', v_booking.id);
     end if;
+    -- A revival or a re-bind needs the bot gone first (a re-bound bot_scheduled booking is
+    -- replaced, a failed one released).
+    if v_booking.recall_bot_id is not null then
+      return jsonb_build_object('status', 'bot_attached', 'booking_id', v_booking.id,
+                                'booking_status', v_booking.status, 'version', v_booking.version,
+                                'key_attempt', v_booking.key_attempt);
+    end if;
+    v_rebind := v_booking.round_id is not null or v_booking.status = 'failed';
+    if v_rebind and v_booking.version >= 50 then
+      return jsonb_build_object('status', 'version_exhausted', 'booking_id', v_booking.id,
+                                'version', v_booking.version);
+    end if;
+    if p_start_at <= p_now then
+      return jsonb_build_object('status', 'in_past', 'booking_id', v_booking.id);
+    end if;
+  -- 3. No booking and a slot that has started: never booked. Nothing is written.
+  elsif p_start_at <= p_now then
+    return jsonb_build_object('status', 'in_past');
   end if;
 
   <<decide>>
@@ -630,6 +767,25 @@ begin
       v_status := 'blocked';
       v_reason := 'role_not_configured';
       exit decide;
+    end if;
+
+    -- 8a. A lapsed Meet round that nothing can use any more is expired, as the sweep would do
+    -- (r1_sweep_expired_rounds: invited and past its expiry). r1_transition_round takes settings,
+    -- the hold month and the round, and compares the version read here.
+    select r.id, r.version into v_lapsed_id, v_lapsed_version
+      from screening_v2.interview_rounds r
+     where r.candidate_id = v_candidate_id and r.kind = 'sales_r1' and r.channel = 'meet'
+       and r.status = 'invited' and r.starts_used = 0 and r.expires_at <= p_now
+       and not exists (select 1 from screening_v2.call_sessions s
+                        where s.interview_round_id = r.id
+                          and s.status in ('created', 'waiting', 'in_progress'))
+       and not exists (select 1 from screening_v2.r1_meet_bookings o
+                        where o.round_id = r.id
+                          and o.status not in ('completed', 'cancelled', 'failed', 'drained')
+                          and o.ashby_interview_event_id <> p_ashby_interview_event_id)
+     limit 1;
+    if v_lapsed_id is not null then
+      perform screening_v2.r1_transition_round(v_lapsed_id, 'expire', v_lapsed_version, null, null, p_now);
     end if;
 
     -- 9. The round, through r1_send_round. The digest's preimage is never stored or returned.
@@ -760,7 +916,8 @@ begin
             p_now, 'hr_attested_ashby', p_ashby_scheduled_by_user_id, p_attested_at, true);
   end if;
 
-  -- The booking: every outcome from here on is recorded on the event's one row.
+  -- The booking: every outcome from here on is recorded on the event's one row. A revival or a
+  -- re-bind is a new bot generation with no ticket and no session of the old attempt.
   if v_has_booking then
     update screening_v2.r1_meet_bookings
        set ashby_schedule_id = p_ashby_schedule_id,
@@ -777,6 +934,14 @@ begin
            meet_url = p_meet_url,
            start_at = p_start_at,
            end_at = p_end_at,
+           version = case when v_rebind then version + 1 else version end,
+           key_attempt = case when v_rebind then 0 else key_attempt end,
+           ticket_digest = case when v_rebind then null else ticket_digest end,
+           ticket_not_before = case when v_rebind then null else ticket_not_before end,
+           ticket_expires_at = case when v_rebind then null else ticket_expires_at end,
+           ticket_claimed_at = case when v_rebind then null else ticket_claimed_at end,
+           ticket_arms = case when v_rebind then 0 else ticket_arms end,
+           session_id = case when v_rebind then null else session_id end,
            updated_at = p_now
      where id = v_booking.id
     returning * into v_booking;
@@ -794,16 +959,20 @@ begin
   end if;
 
   if v_result is not null then
-    return jsonb_build_object(
+    v_out := jsonb_build_object(
       'status', v_result, 'booking_id', v_booking.id, 'round_id', v_booking.round_id,
       'candidate_id', v_booking.candidate_id, 'booking_status', v_booking.status,
       'reason', v_booking.reason, 'version', v_booking.version,
       'key_attempt', v_booking.key_attempt, 'round_expires_at', v_expires,
       'objective_profile', v_booking.objective_profile);
+  else
+    v_out := jsonb_build_object('status', v_status, 'reason', v_reason, 'booking_id', v_booking.id);
+    if v_retry_after is not null then
+      v_out := v_out || jsonb_build_object('retry_after', v_retry_after);
+    end if;
   end if;
-  v_out := jsonb_build_object('status', v_status, 'reason', v_reason, 'booking_id', v_booking.id);
-  if v_retry_after is not null then
-    v_out := v_out || jsonb_build_object('retry_after', v_retry_after);
+  if v_rebind then
+    v_out := v_out || jsonb_build_object('rebound', true);
   end if;
   return v_out;
 end;
@@ -821,11 +990,16 @@ $$;
 --   version_conflict (the bot generation moved) | stale_update (an older Ashby updatedAt) |
 --   booking_dispatched | bot_attached | no_round (a round-less booking retries through the create
 --   RPC) | not_allowed | in_past | slot_too_far (+retry_after; nothing changes, S06 marks the
---   booking blocked/slot_too_far) | round_not_live (the round is not an invited or in-progress
---   Meet round, or it has lapsed).
+--   booking blocked/slot_too_far) | version_exhausted (a new slot or link at generation 50) |
+--   round_not_live (the round is not an invited or in-progress Meet round, or it has lapsed; for a
+--   lapsed round S06 replays the create RPC, which re-binds the booking to a fresh round).
 -- Writes: the round's expiry (slot end + grace, at most 14 days ahead, and it may also shorten), its
 -- version and updated_at; the booking's slot, Meet link and Ashby updatedAt, back to
--- pending/eligible. The booking version (the bot generation) is NOT bumped here. The round has not
+-- pending/eligible. A new slot or Meet link is a new bot generation (version + 1, key_attempt 0):
+-- Recall ignores the body of a request whose Idempotency-Key it has seen, so a create for the new
+-- slot must never reuse the key of a create for the old one (an answer lost in flight would
+-- otherwise replay the old bot), and a bot made by that lost create can no longer attach
+-- (version_conflict). A reschedule that moves neither keeps both counters. The round has not
 -- lapsed, so its hold still counts and stays in its month: no capacity re-check, as for a re-link.
 -- Never reissues the round link; no call_sessions row; time only from p_now.
 --
@@ -853,6 +1027,7 @@ declare
   v_hold_month date;
   v_uncounted boolean;
   v_round screening_v2.interview_rounds%rowtype;
+  v_moved boolean;
 begin
   -- Validation (the create RPC's rules). Nothing is locked or written.
   if p_meet_url is null or p_meet_url !~ '^https://meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}$' then
@@ -911,6 +1086,12 @@ begin
     return jsonb_build_object('status', 'slot_too_far', 'booking_id', v_booking.id,
                               'retry_after', v_expires - interval '14 days');
   end if;
+  v_moved := (p_start_at, p_end_at, p_meet_url)
+             is distinct from (v_booking.start_at, v_booking.end_at, v_booking.meet_url);
+  if v_moved and v_booking.version >= 50 then
+    return jsonb_build_object('status', 'version_exhausted', 'booking_id', v_booking.id,
+                              'version', v_booking.version);
+  end if;
 
   -- The round, in the admission order: settings, the round's hold month, the round.
   perform 1 from screening_v2.r1_settings where singleton for update;
@@ -942,6 +1123,8 @@ begin
      set start_at = p_start_at,
          end_at = p_end_at,
          meet_url = p_meet_url,
+         version = case when v_moved then version + 1 else version end,
+         key_attempt = case when v_moved then 0 else key_attempt end,
          ashby_updated_at = greatest(ashby_updated_at, p_ashby_updated_at),
          ticket_digest = null,
          ticket_not_before = null,
@@ -1652,9 +1835,10 @@ $$;
 -- S06 calls this from an EXISTING tick with p_older_than = now - 30 days (no new loop). It refuses
 -- to keep less than 7 days (retention_too_short), deletes at most p_limit (1..5000) of the oldest
 -- receipts received before p_older_than, and only those whose work is settled or never existed
--- (recorded, processed, ignored, failed): an `enqueued` receipt is kept while its job may still
--- read it. Rows another prune holds are skipped. Answers invalid_request (+field now, older_than,
--- limit) | retention_too_short | ok (+deleted).
+-- (recorded, processed, ignored, failed), or an `enqueued` one whose job is no longer live
+-- (dead-lettered: nothing will ever settle it). An `enqueued` receipt is kept while a live job
+-- (pending, active, delayed) may still read it. Rows another prune holds are skipped. Answers
+-- invalid_request (+field now, older_than, limit) | retention_too_short | ok (+deleted).
 create or replace function screening_v2.r1_meet_prune_receipts(
   p_older_than timestamptz,
   p_limit integer default 500,
@@ -1686,8 +1870,66 @@ begin
      select r.id
        from screening_v2.r1_meet_receipts r
       where r.received_at < p_older_than
-        and r.outcome in ('recorded', 'processed', 'ignored', 'failed')
+        and (r.outcome in ('recorded', 'processed', 'ignored', 'failed')
+             or (r.outcome = 'enqueued'
+                 and not exists (select 1 from screening_v2.job_queue j
+                                  where j.dedup_key = 'r1-meet:receipt:' || r.id::text
+                                    and j.status in ('pending', 'active', 'delayed'))))
       order by r.received_at
+      limit p_limit
+      for update skip locked);
+  get diagnostics v_deleted = row_count;
+  return jsonb_build_object('status', 'ok', 'deleted', v_deleted);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------------------------
+-- §20. r1_meet_prune_bookings: the retention of bookings that never got a round.
+-- ---------------------------------------------------------------------------------------------
+-- A booking with a round lives as long as its round and goes with it (the DSAR cascade). One
+-- that never got a round (unmatched_application, unmapped_scheduler, a round-less blocked, or a
+-- terminal booking that never had a round) is reached by no round cascade, and an unmatched one
+-- by no candidate cascade either, yet it holds the Meet URL and the attester id. S06 calls this
+-- from an EXISTING tick with p_older_than = now - 30 days (no new loop): it deletes at most
+-- p_limit (1..5000) of the round-less bookings whose slot ENDED before p_older_than and that hold
+-- no Recall bot, oldest slot first. It refuses a cutoff that would keep less than 7 days after the
+-- slot (retention_too_short). Their receipts keep booking_id NULL (the FK). Rows another call
+-- holds (a create on the same event) are skipped. Answers invalid_request (+field now, older_than,
+-- limit) | retention_too_short | ok (+deleted).
+create or replace function screening_v2.r1_meet_prune_bookings(
+  p_older_than timestamptz,
+  p_limit integer default 500,
+  p_now timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_deleted integer;
+begin
+  if p_now is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'now');
+  end if;
+  if p_older_than is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'older_than');
+  end if;
+  if p_limit is null or p_limit not between 1 and 5000 then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'limit');
+  end if;
+  if p_older_than > p_now - interval '7 days' then
+    return jsonb_build_object('status', 'retention_too_short');
+  end if;
+
+  delete from screening_v2.r1_meet_bookings
+   where id in (
+     select b.id
+       from screening_v2.r1_meet_bookings b
+      where b.round_id is null
+        and b.recall_bot_id is null
+        and b.end_at < p_older_than
+      order by b.end_at
       limit p_limit
       for update skip locked);
   get diagnostics v_deleted = row_count;
@@ -1716,6 +1958,10 @@ revoke all on function screening_v2.reject_interview_round_channel_change()
   from public, anon, authenticated;
 revoke all on function screening_v2.enqueue_r1_meet_bot_release()
   from public, anon, authenticated;
+revoke all on function screening_v2.reject_meet_round_link_reissue()
+  from public, anon, authenticated;
+revoke all on function screening_v2.enqueue_r1_meet_round_cancelled()
+  from public, anon, authenticated;
 
 -- The RPCs: service_role only (S03/S05/S06 call them through the API's service client).
 revoke all on function screening_v2.r1_meet_create_round_from_ashby(uuid, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, timestamptz, uuid, text, integer, timestamptz)
@@ -1726,10 +1972,12 @@ comment on function screening_v2.r1_meet_create_round_from_ashby(uuid, text, tex
   'M034: for one Ashby interview event with Dex, in one transaction and idempotent per event id: '
   'creates the R1 round through r1_send_round (channel meet, bounded expiry, no usable link), the '
   'HR-attested consent (attester = the Ashby scheduledBy user id, never created_by) and the booking; '
-  're-links a reusable Meet round after a re-booking. Answers created | relinked | exists | '
-  'booking_terminal | stale_update | unmatched_application | unmapped_scheduler | blocked (+reason, '
-  'retry_after for slot_too_far) | in_past | invalid_request (+field). Writes no call_sessions. '
-  'Service-role only.';
+  're-links a reusable Meet round after a re-booking; re-binds a booking whose round lapsed before '
+  'its bot was dispatched, and revives a failed booking that Ashby moved to a new slot (a new bot '
+  'generation, rebound true); expires a lapsed Meet round nothing can use. Answers created | '
+  'relinked | exists (+round_live) | booking_terminal | stale_update | bot_attached | '
+  'version_exhausted | unmatched_application | unmapped_scheduler | blocked (+reason, retry_after '
+  'for slot_too_far) | in_past | invalid_request (+field). Writes no call_sessions. Service-role only.';
 
 revoke all on function screening_v2.r1_meet_reschedule_booking(uuid, integer, timestamptz, timestamptz, text, timestamptz, integer, timestamptz)
   from public, anon, authenticated;
@@ -1738,10 +1986,10 @@ grant execute on function screening_v2.r1_meet_reschedule_booking(uuid, integer,
 comment on function screening_v2.r1_meet_reschedule_booking(uuid, integer, timestamptz, timestamptz, text, timestamptz, integer, timestamptz) is
   'M034: a new slot or Meet link for a booking with a round and no bot (S06 deletes and replaces a '
   'bot first): moves the round expiry to slot end + grace (at most 14 days ahead), back to '
-  'pending/eligible; the bot generation is not bumped. Answers ok | invalid_request (+field) | '
-  'not_found | booking_terminal | version_conflict | stale_update | booking_dispatched | '
-  'bot_attached | no_round | not_allowed | in_past | slot_too_far (+retry_after) | round_not_live. '
-  'Service-role only.';
+  'pending/eligible; a new slot or link is a new bot generation (version + 1, key_attempt 0). '
+  'Answers ok | invalid_request (+field) | not_found | booking_terminal | version_conflict | '
+  'stale_update | booking_dispatched | bot_attached | no_round | not_allowed | in_past | '
+  'slot_too_far (+retry_after) | version_exhausted | round_not_live. Service-role only.';
 
 revoke all on function screening_v2.r1_meet_cancel_booking(uuid, text, timestamptz)
   from public, anon, authenticated;
@@ -1825,8 +2073,18 @@ grant execute on function screening_v2.r1_meet_prune_receipts(timestamptz, integ
   to service_role;
 comment on function screening_v2.r1_meet_prune_receipts(timestamptz, integer, timestamptz) is
   'M034: the 30-day receipt retention, from an existing tick: deletes at most p_limit (1..5000) of '
-  'the oldest recorded, processed, ignored or failed receipts received before p_older_than (never an '
-  'enqueued one); refuses less than 7 days. Answers ok (+deleted) | retention_too_short | '
-  'invalid_request. Service-role only.';
+  'the oldest recorded, processed, ignored or failed receipts received before p_older_than, and '
+  'enqueued ones whose job is no longer live (never one a live job may read); refuses less than 7 '
+  'days. Answers ok (+deleted) | retention_too_short | invalid_request. Service-role only.';
+
+revoke all on function screening_v2.r1_meet_prune_bookings(timestamptz, integer, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.r1_meet_prune_bookings(timestamptz, integer, timestamptz)
+  to service_role;
+comment on function screening_v2.r1_meet_prune_bookings(timestamptz, integer, timestamptz) is
+  'M034: the retention of bookings that never got a round (no round or candidate cascade reaches '
+  'them), from an existing tick: deletes at most p_limit (1..5000) of the round-less bookings that '
+  'hold no Recall bot and whose slot ended before p_older_than; refuses less than 7 days after the '
+  'slot. Answers ok (+deleted) | retention_too_short | invalid_request. Service-role only.';
 
 notify pgrst, 'reload schema';
