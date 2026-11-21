@@ -94,6 +94,9 @@ export const R1_CONTRACT: Readonly<Record<R1RouteName, R1RouteContract>> = Objec
       'starts_remaining',
       'live_attempt',
       'can_start',
+      // Pending on the server until M034 S05 (Meet rounds): absent reads `browser`. The contract
+      // test allows it to be undocumented until the spec documents it, then checks it like any field.
+      'channel',
     ],
   }),
   consentTemplate: route('consentTemplate', {
@@ -189,6 +192,14 @@ const CONSENT_STATES: readonly string[] = ['granted', 'required', 'declined', 'w
 export type R1Audience = 'candidate' | 'staff';
 
 /**
+ * Where the interview takes place: this page (`browser`), or a Google Meet call the hiring team
+ * scheduled (`meet`, M034), which this page never starts.
+ */
+export type R1Channel = 'browser' | 'meet';
+
+const CHANNELS: readonly string[] = ['browser', 'meet'];
+
+/**
  * The closed vocabularies `parseStatus` accepts. A value outside them fails closed, so a
  * server that grows a new one would show every candidate the "unavailable" screen;
  * `r1-contract.test.ts` pins these to the enums `openapi.yaml` documents.
@@ -197,6 +208,7 @@ export const R1_STATUS_VOCABULARY = Object.freeze({
   round_status: ROUND_STATES,
   availability: AVAILABILITIES,
   consent_state: CONSENT_STATES,
+  channel: CHANNELS,
 });
 
 /**
@@ -223,6 +235,11 @@ export interface R1Status {
   availability: R1Availability;
   /** `staff` for an internal dry run (its closing screens speak for the project team). */
   audience: R1Audience;
+  /**
+   * `meet` when the interview takes place in Google Meet (the page then starts nothing); absent
+   * from an older API reads `browser`.
+   */
+  channel: R1Channel;
 }
 
 export interface R1ConsentItem {
@@ -306,6 +323,8 @@ export type R1ErrorKind =
   | 'rate_limited'
   | 'unavailable'
   | 'network'
+  // The round takes place in Google Meet: this page starts nothing for it (M034).
+  | 'meet_round'
   | 'unknown';
 
 type Json = Record<string, unknown>;
@@ -456,6 +475,10 @@ export function parseStatus(data: unknown): R1Status {
   if (!CONSENT_STATES.includes(consentState)) malformed();
   const format = record(body.format);
   const minutes = format ? optionalCount(format.duration_minutes) : null;
+  // Absent (a server that predates Meet rounds) reads `browser`; an unknown value fails closed
+  // like every other enum, never as a browser round the page would then try to start.
+  const rawChannel = body.channel ?? 'browser';
+  if (typeof rawChannel !== 'string' || !CHANNELS.includes(rawChannel)) malformed();
   return {
     state: state as R1RoundState,
     attempts_left: attemptsLeft as number,
@@ -469,6 +492,7 @@ export function parseStatus(data: unknown): R1Status {
     availability: availability as R1Availability,
     // Anything but the staff notice reads as a candidate: the stricter wording.
     audience: body.audience === 'staff' ? 'staff' : 'candidate',
+    channel: rawChannel as R1Channel,
   };
 }
 
@@ -613,11 +637,31 @@ const ERROR_KINDS: Readonly<Record<string, R1ErrorKind>> = Object.freeze({
 /** The server error codes `classifyR1Error` recognises by name. */
 export const R1_SERVER_ERROR_CODES: readonly string[] = Object.freeze(Object.keys(ERROR_KINDS));
 
+/**
+ * Codes the server will answer once M034 S05 ships, and what each means to the page. They are
+ * kept apart from `ERROR_KINDS` because `r1-candidate.ts` does not answer them yet;
+ * `r1-contract.test.ts` checks each against the candidate spec the moment `r1-candidate.ts`
+ * answers it.
+ *
+ *   round_channel_meet: the round takes place in Google Meet (409 from status and attempts).
+ */
+const PENDING_ERROR_KINDS: Readonly<Record<string, R1ErrorKind>> = Object.freeze({
+  round_channel_meet: 'meet_round',
+});
+
+/** The pending server error codes `classifyR1Error` already recognises by name. */
+export const R1_PENDING_SERVER_ERROR_CODES: readonly string[] = Object.freeze(
+  Object.keys(PENDING_ERROR_KINDS),
+);
+
 /** Map any thrown value to the small closed set the pages know how to explain. */
 export function classifyR1Error(error: unknown): R1ErrorKind {
   if (!(error instanceof ApiError)) return 'unknown';
   if (Object.prototype.hasOwnProperty.call(ERROR_KINDS, error.message)) {
     return ERROR_KINDS[error.message] as R1ErrorKind;
+  }
+  if (Object.prototype.hasOwnProperty.call(PENDING_ERROR_KINDS, error.message)) {
+    return PENDING_ERROR_KINDS[error.message] as R1ErrorKind;
   }
   if (error.status === 0) return 'network';
   if (error.status === 410) return 'link_expired';
@@ -636,9 +680,10 @@ export const R1_FINAL_REFUSAL_CODES: readonly string[] = Object.freeze(['round_n
 
 /**
  * The server refused this request for a reason that will not go away (the round has lapsed or
- * closed, the attempt is no longer live, the consent is withdrawn, or it does not know the
- * link or nonce), so repeating it only spends the link's rate limit. False for a rate limit, an
- * outage and a dropped network: those clear, and a retry is the right answer to them.
+ * closed, the attempt is no longer live, the consent is withdrawn, the round takes place in
+ * Google Meet, or it does not know the link or nonce), so repeating it only spends the link's
+ * rate limit. False for a rate limit, an outage and a dropped network: those clear, and a retry
+ * is the right answer to them.
  */
 export function isFinalRefusal(error: unknown): boolean {
   switch (classifyR1Error(error)) {
@@ -646,6 +691,7 @@ export function isFinalRefusal(error: unknown): boolean {
     case 'link_invalid':
     case 'attempt_not_live':
     case 'consent_required':
+    case 'meet_round':
       return true;
     default:
       return error instanceof ApiError && R1_FINAL_REFUSAL_CODES.includes(error.message);

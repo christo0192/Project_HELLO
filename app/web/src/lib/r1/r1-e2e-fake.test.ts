@@ -96,6 +96,39 @@ describe('the fake R1 candidate API', () => {
     expect(parseStatus(status(state).json).audience).toBe('staff');
   });
 
+  it('sends no channel for a browser round, as today\'s server does', () => {
+    const state = createR1State();
+    expect(state.meetRound).toBeNull();
+    expect(Object.keys(status(state).json as object)).not.toContain('channel');
+    expect(parseStatus(status(state).json).channel).toBe('browser');
+  });
+
+  it('answers a Google Meet round either way the contract allows, and the page reads both', () => {
+    const attempt = (state: R1MockState) => call(state, 'attempts', { token: R1_LINK_TOKEN });
+    const refusalKind = (response: { status: number; json?: unknown }) =>
+      classifyR1Error(
+        new ApiError((response.json as { error: string }).error, response.status),
+      );
+
+    const context = createR1State();
+    context.meetRound = 'context';
+    expect(status(context).status).toBe(200);
+    expect(parseStatus(status(context).json).channel).toBe('meet');
+    expect(attempt(context).status).toBe(409);
+    expect(refusalKind(attempt(context))).toBe('meet_round');
+
+    const refuse = createR1State();
+    refuse.meetRound = 'refuse';
+    for (const response of [status(refuse), attempt(refuse)]) {
+      expect(response.status).toBe(409);
+      expect(response.json).toEqual({ error: 'round_channel_meet' });
+      expect(refusalKind(response)).toBe('meet_round');
+    }
+    // Nothing was admitted: a Meet round never holds a browser session.
+    expect(refuse.liveSession).toBe(false);
+    expect(context.liveSession).toBe(false);
+  });
+
   it('refuses a body the real routes refuse with the real validator envelope', () => {
     const bodies: Array<[string, Record<string, unknown>]> = [
       ['status', { token: R1_LINK_TOKEN, extra: 1 }],

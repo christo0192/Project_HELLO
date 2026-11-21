@@ -1857,3 +1857,92 @@ describe('a staff dry run is spoken to as staff', () => {
     expect(screen.getByText(/The hiring team will review it and get back to you/)).toBeVisible();
   });
 });
+
+describe('a Google Meet round shows the Meet card and starts nothing', () => {
+  const MEET_TITLE = 'This interview takes place in Google Meet at the scheduled time';
+
+  async function expectMeetCard(): Promise<void> {
+    expect(await findH1(MEET_TITLE)).toBeVisible();
+    expect(screen.getByText(/Join from your Google Meet invitation/)).toBeVisible();
+    // No start, retry, withdraw or decline: questions go to HR, who attested the consent.
+    expect(screen.queryByRole('button')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+  }
+
+  it('closes on a status that says the round takes place in Google Meet', async () => {
+    h.status.mockResolvedValue({ ...STATUS, channel: 'meet' });
+    openPage();
+    await expectMeetCard();
+    expect(screen.queryByRole('button', { name: 'Check my camera and microphone' })).toBeNull();
+    expect(h.consentTemplate).not.toHaveBeenCalled();
+    expect(h.createAttempt).not.toHaveBeenCalled();
+    expect(h.withdrawConsent).not.toHaveBeenCalled();
+  });
+
+  it('closes the same way when the status read is refused with round_channel_meet', async () => {
+    h.status.mockRejectedValue(new R1ApiError('round_channel_meet', 409));
+    openPage();
+    await expectMeetCard();
+    expect(h.consentTemplate).not.toHaveBeenCalled();
+    expect(h.createAttempt).not.toHaveBeenCalled();
+  });
+
+  it('never shows the notice for a Meet round with no consent on file (HR attested it)', async () => {
+    h.status.mockResolvedValue({ ...NEEDS_CONSENT, channel: 'meet' });
+    openPage();
+    await expectMeetCard();
+    expect(screen.queryByRole('heading', { name: 'Notice and consent' })).toBeNull();
+    expect(screen.queryByRole('checkbox')).toBeNull();
+    expect(h.consentTemplate).not.toHaveBeenCalled();
+    expect(h.submitConsent).not.toHaveBeenCalled();
+  });
+
+  it('shows the Meet card, not the paused one, while R1 is paused, and fetches no notice', async () => {
+    h.status.mockResolvedValue({ ...NEEDS_CONSENT, channel: 'meet', availability: 'paused' });
+    openPage();
+    await expectMeetCard();
+    expect(screen.queryByRole('button', { name: 'Check again' })).toBeNull();
+    expect(h.consentTemplate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['completed', { state: 'completed' }, 'Your interview is already complete'],
+    ['expired', { state: 'expired' }, 'This interview link has expired'],
+    ['cancelled', { state: 'cancelled' }, 'This interview link was cancelled'],
+    ['withdrawn', { consent_state: 'withdrawn' }, 'We have recorded your withdrawal'],
+    ['declined', { consent_state: 'declined' }, 'This interview cannot start without your consent'],
+    [
+      'out of starts',
+      { can_start: false, starts_left: 0, live_attempt: false },
+      'This link cannot start another interview',
+    ],
+  ])('still says a Meet round is %s (the terminal cards come first)', async (_name, over, title) => {
+    h.status.mockResolvedValue({ ...STATUS, channel: 'meet', ...over });
+    openPage();
+    expect(await findH1(title)).toBeVisible();
+    expect(screen.queryByRole('heading', { name: MEET_TITLE })).toBeNull();
+    expect(h.createAttempt).not.toHaveBeenCalled();
+  });
+
+  it('closes on a round_channel_meet refusal of the attempt, with the devices off and the nonce gone', async () => {
+    saveNonce(LINK, NONCE);
+    h.createAttempt.mockRejectedValue(new R1ApiError('round_channel_meet', 409));
+    await toLanding();
+    fireEvent.click(screen.getByRole('button', { name: 'Check my camera and microphone' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Pass device check' }));
+    await expectMeetCard();
+    expect(h.media?.audio.stop).toHaveBeenCalled();
+    expect(h.media?.video.stop).toHaveBeenCalled();
+    expect(h.createAttempt).toHaveBeenCalledTimes(1);
+    expect(h.exchange).not.toHaveBeenCalled();
+    expect(h.created).toHaveLength(0);
+    expect(readNonce(LINK)).toBeNull();
+  });
+
+  it('treats an explicit browser channel exactly like a status without one', async () => {
+    h.status.mockResolvedValue({ ...STATUS, channel: 'browser' });
+    openPage();
+    expect(await findH1('Video interview')).toBeVisible();
+    expect(screen.queryByRole('heading', { name: MEET_TITLE })).toBeNull();
+  });
+});

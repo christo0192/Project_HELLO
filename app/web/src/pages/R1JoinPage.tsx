@@ -66,6 +66,10 @@ import { createR1Room, type R1RoomController, type R1RoomHandlers } from '../lib
  *     button, which re-runs the status and device checks and then sends the
  *     stored nonce. The fragment was stripped from the address bar, so reloading
  *     or reopening the email link cannot do it.
+ *   - A Google Meet round (status `channel: 'meet'`, or a `round_channel_meet` refusal
+ *     from status or attempts) shows the Meet card, never the notice or a start button;
+ *     on a status read the terminal cards (withdrawn, declined, expired, cancelled,
+ *     completed, no starts left) still come first.
  */
 
 type Stage =
@@ -145,6 +149,7 @@ function restartNote(status: R1Status): string {
 function closedKindFor(kind: R1ErrorKind): R1ClosedKind {
   if (kind === 'link_invalid') return 'invalid';
   if (kind === 'link_expired') return 'expired';
+  if (kind === 'meet_round') return 'meet';
   return 'unavailable';
 }
 
@@ -259,6 +264,8 @@ export function R1JoinPage() {
       else if (next.state === 'cancelled') show({ name: 'closed', kind: 'cancelled' });
       else if (next.state === 'completed' || spent) show({ name: 'closed', kind: 'completed' });
       else if (noStarts) show({ name: 'closed', kind: 'starts_exhausted' });
+      // A Google Meet round: nothing to start here, and no notice (HR attested the consent).
+      else if (next.channel === 'meet') show({ name: 'closed', kind: 'meet' });
       else if (next.availability !== 'open') {
         // R1 is off for now. Someone who has not agreed can still say no: the notice is not
         // gated by availability, and the decline needs its version. Without a notice, no decline.
@@ -525,6 +532,12 @@ export function R1JoinPage() {
       }
       if (kind === 'attempts_exhausted') {
         setStage({ name: 'closed', kind: 'completed' });
+        return;
+      }
+      // The round takes place in Google Meet: no attempt of this link can ever be held here.
+      if (kind === 'meet_round') {
+        clearNonce();
+        setStage({ name: 'closed', kind: 'meet' });
         return;
       }
       // Forget the nonce only when the server refused the link or the nonce itself. A

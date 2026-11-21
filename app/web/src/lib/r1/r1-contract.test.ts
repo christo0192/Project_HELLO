@@ -12,6 +12,7 @@ import {
   parseStatus,
   R1_CONTRACT,
   R1_FINAL_REFUSAL_CODES,
+  R1_PENDING_SERVER_ERROR_CODES,
   R1_ROUTES,
   R1_SERVER_ERROR_CODES,
   R1_STATUS_VOCABULARY,
@@ -70,6 +71,7 @@ const FULL_RESPONSES: Record<R1RouteName, unknown> = {
     role_title: 'Sales Program Advisor',
     format: { duration_minutes: 20, camera_required: true, includes_role_play: true },
     audience: 'candidate',
+    channel: 'browser',
   },
   consentTemplate: {
     version: 'v1',
@@ -324,13 +326,30 @@ function successResponses(operation: string[]): string[] {
  */
 const PENDING_ON_SERVER: ReadonlySet<R1RouteName> = new Set<R1RouteName>(['ready']);
 
+type PendingFields = Readonly<Partial<Record<R1RouteName, readonly string[]>>>;
+
+/**
+ * Optional response fields the web reads on a route the server HAS shipped, but that the server
+ * does not send yet. Same rule as `PENDING_ON_SERVER`, one level down: while the spec does not
+ * document the field it is not a problem (the parser reads it as absent), and the moment the spec
+ * documents it the field is checked like any other. It never excuses a required field.
+ *
+ *   status.channel: `browser` | `meet` (M034 S05 emits it for Google Meet rounds).
+ */
+const PENDING_FIELDS_ON_SERVER: PendingFields = Object.freeze({
+  status: Object.freeze(['channel']),
+});
+
 /**
  * Everything wrong between `specText` and R1_CONTRACT, as readable lines. A route in `pending`
- * that the spec does not document yet is not a problem; one it does document is checked.
+ * that the spec does not document yet is not a problem; one it does document is checked. An
+ * optional response field in `pendingFields` that the spec does not document yet is not a
+ * problem either; one it does document is checked.
  */
 function contractProblems(
   specText: string,
   pending: ReadonlySet<R1RouteName> = new Set(),
+  pendingFields: PendingFields = {},
 ): string[] {
   const spec = splitLines(specText);
   const paths = nested(spec, 'paths', 0) ?? [];
@@ -371,7 +390,7 @@ function contractProblems(
     // An optional field the page reads must still be one the server can send: a field the
     // spec's closed (additionalProperties: false) schema does not list is a dead contract.
     for (const field of contract.responseOptional) {
-      if (!hasProperty(responseText, field)) {
+      if (!hasProperty(responseText, field) && !(pendingFields[name] ?? []).includes(field)) {
         problems.push(`${where}: response lacks optional ${field}`);
       }
     }
@@ -384,33 +403,53 @@ const REAL_SPEC = readFileSync(SPEC_PATH, 'utf8');
 /** True once PR-3 (or anything) documents a candidate route under /api/r1/. */
 const SPEC_DOCUMENTS_R1_CANDIDATE_ROUTES = /^ {2}\/api\/r1\//m.test(REAL_SPEC);
 
+/** The text of the `/api/r1/status` path block of a spec, or '' when it has none. */
+function statusOperation(specText: string): string {
+  const spec = splitLines(specText);
+  return (nested(nested(spec, 'paths', 0) ?? [], '/api/r1/status', 2) ?? []).join('\n');
+}
+
+/** The sorted `enum` of a string property declared as `name:` / `type: string` / `enum: [...]`. */
+function documentedEnum(operation: string, property: string): string[] | null {
+  const match = new RegExp(
+    `\\b${property}:\\s*\\n\\s*type: string\\s*\\n\\s*enum: \\[([^\\]]*)\\]`,
+  ).exec(operation);
+  return match ? match[1].split(',').map((item) => item.trim()).sort() : null;
+}
+
+/** True when a block declares `property:` as a key of its own line (not inside prose). */
+function documentsProperty(operation: string, property: string): boolean {
+  return new RegExp(`^\\s+${property}:`, 'm').test(operation);
+}
+
 describe('openapi.yaml documents the R1 candidate contract', () => {
   it.skipIf(!SPEC_DOCUMENTS_R1_CANDIDATE_ROUTES)(
     'documents every route, request field and required response field the web relies on ' +
       '(SKIPPED while PR-3 has not documented /api/r1/*: the contract is UNVERIFIED)',
     () => {
-      expect(contractProblems(REAL_SPEC, PENDING_ON_SERVER)).toEqual([]);
+      expect(contractProblems(REAL_SPEC, PENDING_ON_SERVER, PENDING_FIELDS_ON_SERVER)).toEqual([]);
     },
   );
 
   it.skipIf(!SPEC_DOCUMENTS_R1_CANDIDATE_ROUTES)(
     'accepts exactly the status vocabularies the spec documents (an unknown one fails closed)',
     () => {
-      const spec = splitLines(REAL_SPEC);
-      const operation = (nested(nested(spec, 'paths', 0) ?? [], '/api/r1/status', 2) ?? []).join(
-        '\n',
-      );
-      const documented = (property: string): string[] | null => {
-        const match = new RegExp(
-          `\\b${property}:\\s*\\n\\s*type: string\\s*\\n\\s*enum: \\[([^\\]]*)\\]`,
-        ).exec(operation);
-        return match ? match[1].split(',').map((item) => item.trim()).sort() : null;
-      };
+      const operation = statusOperation(REAL_SPEC);
+      const documented = (property: string) => documentedEnum(operation, property);
       expect(documented('round_status')).toEqual([...R1_STATUS_VOCABULARY.round_status].sort());
       expect(documented('availability')).toEqual([...R1_STATUS_VOCABULARY.availability].sort());
       expect(documented('state')).toEqual([...R1_STATUS_VOCABULARY.consent_state].sort());
     },
   );
+
+  it('accepts exactly the channel vocabulary the spec documents, the moment it documents one', () => {
+    // Pending on the server (M034 S05): until the status response documents `channel`, the page
+    // reads an absent one as `browser` and this pins what it will accept.
+    expect([...R1_STATUS_VOCABULARY.channel]).toEqual(['browser', 'meet']);
+    const operation = statusOperation(REAL_SPEC);
+    if (!documentsProperty(operation, 'channel')) return;
+    expect(documentedEnum(operation, 'channel')).toEqual(['browser', 'meet']);
+  });
 
   it('finds the real spec, and tells candidate routes from the admin and worker ones', () => {
     expect(REAL_SPEC).toContain('openapi: 3.0.3');
@@ -437,6 +476,13 @@ const CANDIDATE_SPEC = (() => {
   const to = REAL_SPEC.indexOf('\n  /api/health:');
   return from > -1 && to > from ? REAL_SPEC.slice(from, to) : '';
 })();
+
+/** The pending codes `source` answers (quotes) that `spec` does not name. */
+function pendingCodesUndocumented(source: string, spec: string): string[] {
+  return R1_PENDING_SERVER_ERROR_CODES.filter(
+    (code) => source.includes(`'${code}'`) && !new RegExp(`\\b${code}\\b`).test(spec),
+  );
+}
 
 describe('the error codes the web acts on are the ones the server answers', () => {
   it('pins the three codes the page relies on most, by name', () => {
@@ -470,6 +516,29 @@ describe('the error codes the web acts on are the ones the server answers', () =
       expect({ unanswered, undocumented }).toEqual({ unanswered: [], undocumented: [] });
     },
   );
+
+  it('keeps the codes awaiting the server to the one named, apart from those it answers', () => {
+    expect([...R1_PENDING_SERVER_ERROR_CODES]).toEqual(['round_channel_meet']);
+    expect(R1_PENDING_SERVER_ERROR_CODES.filter((code) => R1_SERVER_ERROR_CODES.includes(code)))
+      .toEqual([]);
+  });
+
+  it('checks a code awaiting the server against the candidate spec the moment r1-candidate.ts answers it', () => {
+    // While the server does not answer a pending code there is nothing to check; once it does,
+    // the candidate spec must name it, exactly as for every code the page already acts on.
+    expect(pendingCodesUndocumented(SERVER_SOURCE, CANDIDATE_SPEC)).toEqual([]);
+  });
+
+  it('would notice a pending code the server answers but the spec does not name', () => {
+    const answering = "refuse(res, 409, 'round_channel_meet');";
+    const naming = '409: round_channel_meet (the round takes place in Google Meet)';
+    expect(pendingCodesUndocumented("refuse(res, 409, 'r1_busy');", '')).toEqual([]);
+    expect(pendingCodesUndocumented(answering, '409: r1_busy')).toEqual(['round_channel_meet']);
+    expect(pendingCodesUndocumented(answering, naming)).toEqual([]);
+    expect(pendingCodesUndocumented(answering, '409: round_channel_meet_v2')).toEqual([
+      'round_channel_meet',
+    ]);
+  });
 
   it('would notice a code that is no longer there', () => {
     const answered = (code: string, source: string) => source.includes(`'${code}'`);
@@ -684,5 +753,57 @@ describe('the contract checker', () => {
 
   it('keeps the pending allowance to the one route that is awaiting the server', () => {
     expect([...PENDING_ON_SERVER]).toEqual(['ready']);
+  });
+
+  it('lets an optional field the server has not shipped yet be undocumented, and nothing else', () => {
+    const spec = syntheticSpec((name, parts) => {
+      if (name === 'status') parts.response = without(parts.response, 'channel');
+    });
+    expect(contractProblems(spec)).toEqual(['POST /api/r1/status: response lacks optional channel']);
+    expect(contractProblems(spec, new Set(), PENDING_FIELDS_ON_SERVER)).toEqual([]);
+    // Pending covers only the field named, on the route named.
+    const other = syntheticSpec((name, parts) => {
+      if (name === 'status') parts.response = without(without(parts.response, 'channel'), 'audience');
+    });
+    expect(contractProblems(other, new Set(), PENDING_FIELDS_ON_SERVER)).toEqual([
+      'POST /api/r1/status: response lacks optional audience',
+    ]);
+    expect(contractProblems(spec, new Set(), { attempts: ['channel'] })).toEqual([
+      'POST /api/r1/status: response lacks optional channel',
+    ]);
+  });
+
+  it('never lets a pending field excuse a required one', () => {
+    const spec = syntheticSpec((name, parts) => {
+      if (name !== 'status') return;
+      parts.response = without(parts.response, 'round_status');
+      parts.required = without(parts.required, 'round_status');
+    });
+    expect(contractProblems(spec, new Set(), { status: ['round_status'] })).toEqual([
+      'POST /api/r1/status: response lacks round_status',
+    ]);
+  });
+
+  it('checks a pending field like any other the moment the spec documents it', () => {
+    // The synthetic spec documents every declared field, `status.channel` included: no problem,
+    // with or without the allowance, so the allowance is simply no longer used.
+    expect(contractProblems(syntheticSpec(), new Set(), PENDING_FIELDS_ON_SERVER)).toEqual([]);
+    // Once documented, its enum must be exactly what the parser accepts (the vocabulary test).
+    const documented = [
+      '        channel:',
+      '          type: string',
+      '          enum: [meet, browser]',
+    ].join('\n');
+    expect(documentsProperty(documented, 'channel')).toBe(true);
+    expect(documentedEnum(documented, 'channel')).toEqual(['browser', 'meet']);
+    expect(documentedEnum(documented.replace('meet, browser', 'browser, meet, phone'), 'channel'))
+      .not.toEqual(['browser', 'meet']);
+    // Prose that mentions the word is not a declaration.
+    expect(documentsProperty("        description: 'the channel: browser or meet'", 'channel'))
+      .toBe(false);
+  });
+
+  it('keeps the field-level pending allowance to the one field awaiting the server', () => {
+    expect(PENDING_FIELDS_ON_SERVER).toEqual({ status: ['channel'] });
   });
 });

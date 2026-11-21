@@ -14,6 +14,7 @@ import {
   parsePreflight,
   parseStatus,
   R1_FINAL_REFUSAL_CODES,
+  R1_PENDING_SERVER_ERROR_CODES,
   R1_ROUTES,
   R1_SERVER_ERROR_CODES,
   R1ApiError,
@@ -317,7 +318,23 @@ describe('response validation (fail closed)', () => {
       format: { duration_minutes: 20 },
       availability: 'open',
       audience: 'candidate',
+      channel: 'browser',
     });
+  });
+
+  it('reads the channel: absent or null is a browser round, and anything unknown fails closed', () => {
+    const channelOf = (channel: unknown) => parseStatus({ ...STATUS, channel }).channel;
+    // Today's server sends no channel at all.
+    expect(parseStatus(STATUS).channel).toBe('browser');
+    expect(channelOf(undefined)).toBe('browser');
+    expect(channelOf(null)).toBe('browser');
+    expect(channelOf('browser')).toBe('browser');
+    expect(channelOf('meet')).toBe('meet');
+    for (const bad of ['phone', 'Meet', 'meet ', '', 1, true, {}, ['meet']]) {
+      expect(() => channelOf(bad), String(bad)).toThrow(
+        expect.objectContaining({ message: 'r1_malformed_response' }),
+      );
+    }
   });
 
   it('keeps the four consent states apart: declined and withdrawn are not "required"', () => {
@@ -375,6 +392,7 @@ describe('response validation (fail closed)', () => {
       can_start: null,
       live_attempt: null,
       audience: 'candidate',
+      channel: 'browser',
     });
   });
 
@@ -529,6 +547,17 @@ describe('classifyR1Error', () => {
     }
   });
 
+  it('recognises a Google Meet round (a code awaiting the server), whatever status carries it', () => {
+    expect([...R1_PENDING_SERVER_ERROR_CODES]).toEqual(['round_channel_meet']);
+    for (const status of [409, 503, 500, 404]) {
+      expect(kind('round_channel_meet', status), String(status)).toBe('meet_round');
+    }
+    expect(classifyR1Error(new R1ApiError('round_channel_meet', 409))).toBe('meet_round');
+    // It is not one of the codes the server answers today.
+    expect(R1_SERVER_ERROR_CODES).not.toContain('round_channel_meet');
+    expect(kind('round_channel_meet_v2', 409)).toBe('unknown');
+  });
+
   it('treats a malformed response as unknown, not as the link being bad', () => {
     expect(kind('r1_malformed_response', 500)).toBe('unknown');
   });
@@ -552,6 +581,7 @@ describe('isFinalRefusal', () => {
     expect(final('r1_link_invalid_or_expired', 404)).toBe(true);
     expect(final('http_410', 410)).toBe(true);
     expect(final('http_400', 400)).toBe(true);
+    expect(final('round_channel_meet', 409)).toBe(true);
   });
 
   it('is false for what clears: a rate limit, an outage, a dropped network, a disabled lane', () => {

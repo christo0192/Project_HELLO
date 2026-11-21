@@ -1487,3 +1487,40 @@ test.describe('scenario card, role-play clock and "I\'m ready"', () => {
     r1.expectHealthy();
   });
 });
+
+/**
+ * A round that takes place in Google Meet (M034; contract section 3, refined in section 9). The
+ * server may say so either way: a 200 status with `channel: 'meet'`, or a 409
+ * `round_channel_meet`. Both show the same neutral card: no notice, no device check, no start.
+ */
+test.describe('a Google Meet round', () => {
+  const MEET_TITLE = 'This interview takes place in Google Meet at the scheduled time';
+
+  for (const meetRound of ['context', 'refuse'] as const) {
+    test(`says the interview takes place in Google Meet and starts nothing (${meetRound})`, async ({ r1 }, testInfo) => {
+      r1.state.meetRound = meetRound;
+      await openLink(r1);
+      const { page } = r1;
+      await expect(heading(page, MEET_TITLE)).toBeVisible();
+      await expect(page.getByText(/Join from your Google Meet invitation/)).toBeVisible();
+      await expect(page.getByRole('button', { name: /start|continue|check my camera/i })).toHaveCount(0);
+      await expect(page.getByRole('checkbox')).toHaveCount(0);
+      expect(
+        r1.state.requests.filter((request) =>
+          /^\/api\/r1\/(consent-template|preflight|attempts)$/.test(request.path)),
+      ).toEqual([]);
+      expect(bodiesOf(r1, '/api/r1/status')).toEqual([{ token: R1_LINK_TOKEN }]);
+      expect(r1.page.url()).not.toContain(R1_LINK_TOKEN);
+      expect(new URL(r1.page.url()).pathname).toBe('/candidate/r1');
+      expect((await r1.mock.snapshot()).mediaRequests).toEqual([]);
+      expectCandidateHygiene(r1);
+      await expectMobileFits(page, testInfo);
+      const audit = meetRound === 'context' ? 'r1-meet-round' : 'r1-meet-round-refused';
+      await auditA11y(page, testInfo, audit, { strict: true });
+      // The 409 of the refusing server is logged by the browser's network layer.
+      const others = r1.consoleErrors.filter((message) => !/status of 409/.test(message));
+      r1.consoleErrors.splice(0, r1.consoleErrors.length, ...others);
+      r1.expectHealthy();
+    });
+  }
+});

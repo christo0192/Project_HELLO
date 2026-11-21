@@ -26,7 +26,9 @@ export type R1ClosedKind =
   | 'withdrawn'
   | 'declined'
   | 'starts_exhausted'
-  | 'unsupported';
+  | 'unsupported'
+  // The interview takes place in Google Meet (M034): this page has nothing to start.
+  | 'meet';
 
 export interface ClosedCopy {
   eyebrow: string;
@@ -92,6 +94,14 @@ export const R1_CLOSED_COPY: Readonly<Record<R1ClosedKind, ClosedCopy>> = Object
     body:
       'The interview needs camera, microphone and WebRTC support. Please open your link in '
       + 'a current version of Chrome, Edge or Safari over HTTPS.',
+  },
+  // Names no team, so the staff wording is the same (no override below).
+  meet: {
+    eyebrow: 'Google Meet interview',
+    title: 'This interview takes place in Google Meet at the scheduled time',
+    body:
+      'Join from your Google Meet invitation at the scheduled time. There is nothing to do on '
+      + 'this page.',
   },
 });
 

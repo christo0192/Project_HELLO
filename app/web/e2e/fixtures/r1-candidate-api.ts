@@ -89,6 +89,13 @@ export interface R1MockState {
   attemptTokenTtlSec: number;
   /** When each token this fake minted stops being accepted by `/api/r1/ready`, in epoch ms. */
   tokenExpiresAt: Record<string, number>;
+  /**
+   * A Google Meet round (M034; contract section 3, refined in section 9). `null` is today's
+   * server: the status body has no `channel` key at all. `'context'`: the status answers 200
+   * with `channel: 'meet'` and `/attempts` refuses 409 `round_channel_meet`. `'refuse'`: both
+   * `/status` and `/attempts` refuse 409 `round_channel_meet`. The real server may give either.
+   */
+  meetRound: null | 'context' | 'refuse';
   /** Install an error to make one route fail (consumed on use unless `sticky`). */
   failures: Partial<
     Record<'status' | 'preflight' | 'attempts' | 'exchange' | 'consent' | 'ready', R1ForcedError>
@@ -109,6 +116,7 @@ export function createR1State(): R1MockState {
     exchangePreparing: 0,
     attemptTokenTtlSec: 300,
     tokenExpiresAt: {},
+    meetRound: null,
     failures: {},
   };
 }
@@ -179,6 +187,8 @@ function consentState(state: R1MockState): 'granted' | 'required' | 'declined' |
 }
 /** One stable answer for an unknown, expired or cancelled link, as the real routes give. */
 const LINK_INVALID = 'r1_link_invalid_or_expired';
+/** The refusal for a round that takes place in Google Meet (contract section 3; the string is fixed). */
+const ROUND_CHANNEL_MEET = 'round_channel_meet';
 const fail = (error: R1ForcedError): MockResponse => json(error.status, { error: error.error });
 
 function tokenOk(body: Record<string, unknown> | null): boolean {
@@ -207,6 +217,7 @@ export function r1Router(state: R1MockState): ApiRouter {
       case 'POST /api/r1/status': {
         if (!onlyKeys(body, ['token'])) return validationError();
         if (!tokenOk(body)) return json(404, { error: LINK_INVALID });
+        if (state.meetRound === 'refuse') return json(409, { error: ROUND_CHANNEL_MEET });
         return (
           forced('status') ??
           json(200, {
@@ -228,6 +239,8 @@ export function r1Router(state: R1MockState): ApiRouter {
               includes_role_play: true,
             },
             audience: state.audience,
+            // Today's server sends no channel: the key appears only for a Meet round.
+            ...(state.meetRound === 'context' ? { channel: 'meet' } : {}),
           })
         );
       }
@@ -300,6 +313,7 @@ export function r1Router(state: R1MockState): ApiRouter {
       case 'POST /api/r1/attempts': {
         if (!onlyKeys(body, ['token', 'nonce'])) return validationError();
         if (!tokenOk(body)) return json(404, { error: LINK_INVALID });
+        if (state.meetRound !== null) return json(409, { error: ROUND_CHANNEL_MEET });
         const failure = forced('attempts');
         if (failure) return failure;
         // Every token is minted with a lifetime, like the real route's (`attempt_token_expires_at`).
