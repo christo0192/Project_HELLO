@@ -218,7 +218,7 @@
 .r1-meet-tile__stage { display: flex; flex-direction: column; align-items: center; gap: 12px; margin: 0 auto; padding: 28px 20px; text-align: center; }
 .r1-meet-tile__stage .candidate-eyebrow { margin: 0; }
 .r1-meet-tile__title { margin: 0; font-size: 24px; font-weight: 600; letter-spacing: -.01em; line-height: 32px; overflow-wrap: anywhere; }
-.r1-meet-tile__body { max-width: 520px; margin: 0; font-size: 15px; }
+.r1-meet-tile__body { max-width: 520px; margin: 0; font-size: 16px; }
 .r1-meet-tile .r1-scenario { margin: 0 auto; }
 @media (min-width: 860px) and (min-height: 480px) {
   .r1-meet-tile { grid-template-columns: minmax(0, 1fr) minmax(300px, 400px); align-items: center; margin-top: 20px; }
@@ -226,6 +226,6 @@
   /* Outside the role-play the stage is alone: it takes the whole row rather than half of it. */
   .r1-meet-tile__stage:only-child { grid-column: 1 / -1; }
   .r1-meet-tile__title { font-size: 30px; line-height: 38px; }
-  .r1-meet-tile .r1-phase__label { font-size: 18px; }
+  .r1-meet-tile .r1-phase__label { font-size: 20px; }
   .r1-meet-tile .r1-scenario { width: 100%; }
 }
