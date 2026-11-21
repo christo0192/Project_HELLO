@@ -108,6 +108,8 @@ export interface R1MockControls {
   publishes: PublishRecord[];
   connects: ConnectRecord[];
   disconnects: DisconnectRecord[];
+  /** How many times the page called `room.startAudio()` (the Meet bridge does, once per room). */
+  audioStarts: number;
   /** The level `createAudioAnalyser` reports, 0..1. Set 0 to simulate a silent microphone. */
   micVolume: number;
   /** When set, the next `room.connect` rejects with this message. */
@@ -277,6 +279,11 @@ export class MockRoom extends Emitter {
     this.state = 'connected';
   }
 
+  /** Counted only: the harness's Chromium needs no gesture to play, so there is nothing to unlock. */
+  async startAudio(): Promise<void> {
+    ensureControls().audioStarts += 1;
+  }
+
   async disconnect(stopTracks = true): Promise<void> {
     ensureControls().disconnects.push({ roomIndex: this.index, stopTracks });
     if (this.state === 'disconnected') return;
@@ -296,6 +303,7 @@ function ensureControls(): R1MockControls {
     publishes: [],
     connects: [],
     disconnects: [],
+    audioStarts: 0,
     micVolume: 0.25,
     failNextConnect: null,
     current: () => controls.rooms[controls.rooms.length - 1] ?? null,
