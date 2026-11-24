@@ -2428,3 +2428,70 @@ describe('between attempts', () => {
     await waitFor(() => expect(mockApi.getR1Recording).toHaveBeenLastCalledWith(ROUND, 's2'));
   });
 });
+
+describe('a round held over Google Meet', () => {
+  const chips = () => screen.getByRole('list', { name: 'About this interview' });
+  const meetRound = (over: Partial<R1ReviewResponse['round']> = {}) => ({ ...review().round, channel: 'meet' as const, ...over });
+
+  it('is marked Via Meet in the header, as its own item, in words a screen reader hears on their own', async () => {
+    await opened(review({ round: meetRound() }));
+    const marker = within(chips()).getByText('Via Meet');
+    expect(marker).toHaveTextContent('Interview: Via Meet');
+    expect(within(marker).getByText('Interview:')).toHaveClass('sr-only');
+    expect(marker.closest('li')?.parentElement).toBe(chips());
+    expect(marker.className).toContain('--c-border-light');
+  });
+
+  it.each<[string, Partial<R1ReviewResponse['round']>]>([
+    ['a browser round', { channel: 'browser' }],
+    ['a null channel', { channel: null }],
+    ['no channel at all (every API today)', {}],
+    ['a channel this page does not know', { channel: 'zoom' as unknown as R1ReviewResponse['round']['channel'] }],
+  ])('is not marked for %s, and adds no empty item', async (_name, over) => {
+    await opened(review({ round: { ...review().round, ...over } }));
+    expect(chips()).not.toHaveTextContent('Via Meet');
+    for (const item of within(chips()).getAllByRole('listitem')) expect(item.textContent).not.toBe('');
+  });
+
+  it('invited: says nobody has started and when it closes, with no link', async () => {
+    await opened(review({ assessment: null, attempts: [], round: meetRound({ status: 'invited', recommendation: null, overall: null }) }));
+    expect(within(chips()).getByText('Not started')).toHaveClass('bg-moving-soft');
+    expect(panel('Overview')).toHaveTextContent(/Open until .*\./);
+    expect(panel('Overview')).not.toHaveTextContent(/link/i);
+    expect(chips()).not.toHaveTextContent('Link sent');
+  });
+
+  it('in progress: says so, and when it closes, with no link', async () => {
+    await opened(review({
+      assessment: null,
+      attempts: [attempt({ session_status: 'in_progress', ended_at: null, in_progress: true, turns: [], recording: recording({ state: 'recording', started_at_ms: null, duration_ms: null }) })],
+      round: meetRound({ status: 'in_progress', recommendation: null, overall: null }),
+    }));
+    expect(panel('Overview')).toHaveTextContent('The interview is in progress. The review opens here once it ends. Open until');
+    expect(panel('Overview')).not.toHaveTextContent(/Link valid until/);
+    expect(within(chips()).getByText('In progress')).toHaveClass('bg-moving-soft');
+  });
+
+  it('an attempt that ended uncounted: nobody is in it, and the round is still open, with no link', async () => {
+    await opened(review({
+      assessment: null,
+      attempts: [attempt({ counted: false, outcome: 'provider_error', session_status: 'failed', ended_at: new Date(Date.now() - 60_000).toISOString() })],
+      round: meetRound({ status: 'in_progress', attempts_counted: 0, recommendation: null, overall: null }),
+    }));
+    expect(panel('Overview')).toHaveTextContent('No interview is running. Open until');
+    expect(panel('Overview')).not.toHaveTextContent(/Link valid until/);
+    expect(within(chips()).getByText('Open')).toHaveClass('bg-moving-soft');
+    expect(chips()).not.toHaveTextContent('Link open');
+  });
+
+  it('a scored Meet round reads as any other, with its marker', async () => {
+    await opened(review({ round: meetRound() }));
+    expect(screen.getByRole('region', { name: 'AI recommendation' })).toBeInTheDocument();
+    expect(chips()).toHaveTextContent('Via Meet');
+  });
+
+  it('has no axe violations in the header with the marker', async () => {
+    const { container } = await opened(review({ assessment: null, attempts: [], round: meetRound({ status: 'invited', recommendation: null, overall: null }) }));
+    await expect(container.querySelector('header') as HTMLElement).toHaveNoViolations();
+  });
+});

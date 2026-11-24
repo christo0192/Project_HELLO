@@ -96,6 +96,8 @@ const CANDIDATE_SCOPE_SOURCES = [
   'src/components/r1/IssuedLink.tsx',
   // R1-REC: the recording player keeps to the same tokens, with no motion import.
   'src/components/r1/R1RecordingPlayer.tsx',
+  // M034 S10: the "Via Meet" chip on a Meet round, in the rounds panel above.
+  'src/components/r1/ViaMeetTag.tsx',
   // M013 S02: each call leg of a phone session on the Review tab.
   'src/components/talent/SessionLegRow.tsx',
   // M026: the Logsheet Review workspace.

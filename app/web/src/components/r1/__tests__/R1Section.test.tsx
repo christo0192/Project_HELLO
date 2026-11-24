@@ -1241,3 +1241,120 @@ describe('accessibility', () => {
     await expect(container).toHaveNoViolations();
   });
 });
+
+describe('a round held over Google Meet', () => {
+  const rowOf = async (over: Partial<R1Round>, role: 'admin' | 'interviewer' | 'viewer' = 'interviewer') => {
+    api.listR1Rounds.mockResolvedValue({ rounds: [round(over)] });
+    renderSection(role);
+    const list = await screen.findByRole('list', { name: 'R1 rounds' });
+    return within(list).getAllByRole('listitem')[0];
+  };
+
+  it('is marked Via Meet on the R1 tab, in words a screen reader hears on their own', async () => {
+    const row = await rowOf({ channel: 'meet' });
+    const marker = within(row).getByText('Via Meet');
+    expect(marker).toHaveTextContent('Interview: Via Meet');
+    expect(within(marker).getByText('Interview:')).toHaveClass('sr-only');
+    expect(marker.className).toContain('--c-border-light');
+  });
+
+  it.each<[string, Partial<R1Round>]>([
+    ['a browser round', { channel: 'browser' }],
+    ['a null channel', { channel: null }],
+    ['no channel at all (every API today)', {}],
+    ['a channel this page does not know', { channel: 'zoom' as unknown as R1Round['channel'] }],
+  ])('is not marked for %s, which keeps its link words and its Reissue', async (_name, over) => {
+    const row = await rowOf(over);
+    expect(row).not.toHaveTextContent('Via Meet');
+    expect(row).toHaveTextContent('Status: Link sent');
+    expect(row).toHaveTextContent(/Link valid until .*2099/);
+    expect(within(row).getByRole('button', { name: 'Reissue link' })).toBeInTheDocument();
+  });
+
+  it('says nobody has started and when it closes, with no link, and offers no Reissue', async () => {
+    const row = await rowOf({ channel: 'meet' }, 'admin');
+    expect(row).toHaveTextContent('Status: Not started');
+    expect(row).toHaveTextContent(/Open until .*2099/);
+    expect(row).not.toHaveTextContent(/link/i);
+    expect(within(row).queryByRole('button', { name: 'Reissue link' })).not.toBeInTheDocument();
+    expect(within(row).getByRole('button', { name: 'Cancel round' })).toBeInTheDocument();
+  });
+
+  it('says it is open when nobody is in it, on the same wash as a link nobody is on', async () => {
+    const row = await rowOf({ channel: 'meet', status: 'in_progress', attempts: [listed({ counted: false })] });
+    expect(within(row).getByText('Open')).toHaveClass('bg-moving-soft');
+    expect(row).not.toHaveTextContent('Link open');
+  });
+
+  it('cancels with words about Ashby, not a link', async () => {
+    const user = userEvent.setup();
+    await rowOf({ channel: 'meet' });
+    await user.click(await screen.findByRole('button', { name: 'Cancel round' }));
+    const well = await screen.findByRole('group', { name: 'Cancel this R1 round?' });
+    expect(well).toHaveTextContent(
+      'Its reserved minutes are released. The interview stays in Ashby until it is cancelled there.',
+    );
+    expect(well).not.toHaveTextContent(/link/i);
+    expect(well).not.toHaveTextContent(/does not end a call/);
+  });
+
+  it('warns that cancelling does not end a call that is already running', async () => {
+    const user = userEvent.setup();
+    await rowOf({ channel: 'meet', status: 'in_progress' });
+    await user.click(await screen.findByRole('button', { name: 'Cancel round' }));
+    expect(await screen.findByRole('group', { name: 'Cancel this R1 round?' })).toHaveTextContent(
+      'Its reserved minutes are released. This does not end a call that is already running. ' +
+        'The interview stays in Ashby until it is cancelled there.',
+    );
+  });
+
+  it('grants the retake with words about scheduling it in Ashby, not a link', async () => {
+    const user = userEvent.setup();
+    await rowOf({ channel: 'meet', status: 'completed', attempts_counted: 1 });
+    await user.click(await screen.findByRole('button', { name: 'Grant retake' }));
+    const well = await screen.findByRole('group', { name: 'Grant the one retake?' });
+    expect(well).toHaveTextContent(
+      'The round opens again for 72 hours. Schedule the retake in Ashby with Dex before then; there is no link.',
+    );
+    expect(well).not.toHaveTextContent(/original link/);
+    api.listR1Rounds.mockResolvedValue({ rounds: [round({ channel: 'meet', status: 'invited', attempts_counted: 1 })] });
+    await user.click(within(well).getByRole('button', { name: 'Grant retake' }));
+    expect(api.grantR1Retake).toHaveBeenCalledWith('round-1');
+    expect(
+      await screen.findByText('Retake granted. Schedule it in Ashby with Dex within 72 hours.'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/original link works again/)).not.toBeInTheDocument();
+  });
+
+  it('keeps a browser round beside it in the link words, with its Reissue', async () => {
+    api.listR1Rounds.mockResolvedValue({
+      rounds: [
+        round({ id: 'meet-1', channel: 'meet', status: 'cancelled' }),
+        round({ id: 'browser-1', created_at: '2026-10-07T10:00:00.000Z' }),
+      ],
+    });
+    renderSection('admin');
+    const list = await screen.findByRole('list', { name: 'R1 rounds' });
+    const [meet, browser] = within(list).getAllByRole('listitem');
+    expect(meet).toHaveTextContent('Via Meet');
+    expect(browser).not.toHaveTextContent('Via Meet');
+    expect(browser).toHaveTextContent('Status: Link sent');
+    expect(within(browser).getByRole('button', { name: 'Reissue link' })).toBeInTheDocument();
+  });
+
+  it('has no axe violations for the R1 tab list with a Meet round, and with its confirmation open', async () => {
+    api.listR1Rounds.mockResolvedValue({
+      rounds: [
+        round({ id: 'a', channel: 'meet' }),
+        round({ id: 'b', status: 'expired', channel: 'meet', created_at: '2026-09-01T10:00:00.000Z' }),
+      ],
+    });
+    const user = userEvent.setup();
+    const { container } = renderSection('admin');
+    await screen.findByRole('list', { name: 'R1 rounds' });
+    await expect(container).toHaveNoViolations();
+    await user.click(await screen.findByRole('button', { name: 'Cancel round' }));
+    await screen.findByRole('group', { name: 'Cancel this R1 round?' });
+    await expect(container).toHaveNoViolations();
+  });
+});

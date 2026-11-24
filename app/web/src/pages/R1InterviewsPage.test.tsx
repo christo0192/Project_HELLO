@@ -463,3 +463,78 @@ describe('accessibility', () => {
     await expect(empty.container).toHaveNoViolations();
   });
 });
+
+describe('a round held over Google Meet', () => {
+  const rowOf = async (over: Partial<R1QueueRound>, search = '?view=all') => {
+    mockApi.listR1Queue.mockResolvedValue(answer({ view: 'all', sort: 'newest', rounds: [round(over)] }));
+    open(search);
+    return (await screen.findByRole('link', { name: 'Ava Example' })).closest('tr')!;
+  };
+
+  it('is marked Via Meet, in words a screen reader hears on their own, as a neutral chip', async () => {
+    const row = await rowOf({ channel: 'meet' });
+    const marker = within(row).getByText('Via Meet');
+    expect(marker).toHaveTextContent('Interview: Via Meet');
+    expect(within(marker).getByText('Interview:')).toHaveClass('sr-only');
+    expect(marker.className).toContain('--c-border-light');
+    expect(marker.className).not.toMatch(/\bbg-(?:moving|ready|unresolved|closed)-soft\b/);
+  });
+
+  it.each<[string, Partial<R1QueueRound>]>([
+    ['a browser round', { channel: 'browser' }],
+    ['a null channel', { channel: null }],
+    ['no channel at all (every API today)', {}],
+    ['a channel this page does not know', { channel: 'zoom' as unknown as R1QueueRound['channel'] }],
+  ])('is not marked for %s', async (_name, over) => {
+    const row = await rowOf(over);
+    expect(row).not.toHaveTextContent('Via Meet');
+    expect(within(row).queryByText('Interview:')).toBeNull();
+  });
+
+  it('says nobody has started, in both layouts, and never that a link was sent', async () => {
+    const row = await rowOf({ channel: 'meet', status: 'invited', recommendation: null, overall: null, status_write: null, attempts: [] });
+    const printed = within(row).getAllByText('Not started');
+    expect(printed).toHaveLength(2);
+    for (const span of printed) expect(span).toHaveClass('text-moving-text');
+    expect(row).not.toHaveTextContent(/Link/);
+  });
+
+  it('says it is open when nobody is in it, in both layouts, and never that a link is', async () => {
+    const row = await rowOf({ channel: 'meet', status: 'in_progress', recommendation: null, overall: null, status_write: null, attempts: [attempt({ counted: false })] });
+    const printed = within(row).getAllByText('Open');
+    expect(printed).toHaveLength(2);
+    for (const span of printed) expect(span).toHaveClass('text-moving-text');
+    expect(row).not.toHaveTextContent(/Link/);
+  });
+
+  it('reads a running interview as In progress, as a browser round does', async () => {
+    const running = await rowOf({ channel: 'meet', status: 'in_progress', attempts: [attempt({ in_progress: true, ended_at: null })] });
+    expect(within(running).getAllByText('In progress')).toHaveLength(2);
+  });
+
+  it('reads a lapsed round as Expired, as a browser round does', async () => {
+    const lapsed = await rowOf({ channel: 'meet', status: 'invited', expires_at: '2026-11-04T10:00:00.000Z', attempts: [] });
+    for (const span of within(lapsed).getAllByText('Expired')) expect(span).toHaveClass('text-closed-text');
+    expect(lapsed).not.toHaveTextContent('Not started');
+  });
+
+  it('keeps a browser round beside it in the link words', async () => {
+    const meet = round({ id: 'round-m', candidate_name: 'Meera Meet', channel: 'meet', status: 'invited', attempts: [] });
+    const browser = round({ id: 'round-b', status: 'invited', attempts: [] });
+    mockApi.listR1Queue.mockResolvedValue(answer({ view: 'all', total: 2, rounds: [meet, browser] }));
+    open('?view=all');
+    const meetRow = (await screen.findByRole('link', { name: 'Meera Meet' })).closest('tr')!;
+    const browserRow = screen.getByRole('link', { name: 'Ava Example' }).closest('tr')!;
+    expect(meetRow).toHaveTextContent('Via Meet');
+    expect(meetRow).toHaveTextContent('Not started');
+    expect(browserRow).not.toHaveTextContent('Via Meet');
+    expect(within(browserRow).getAllByText('Link sent')).toHaveLength(2);
+  });
+
+  it('has no axe violations with a marked row', async () => {
+    mockApi.listR1Queue.mockResolvedValue(answer({ rounds: [round({ channel: 'meet' }), round({ id: 'round-2', candidate_name: 'Bo Browser' })], total: 2 }));
+    const { container } = open();
+    await screen.findByRole('link', { name: 'Ava Example' });
+    await expect(container).toHaveNoViolations();
+  });
+});

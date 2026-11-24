@@ -705,3 +705,40 @@ describe('replacedAssessmentOf', () => {
     expect(replacedAssessmentOf({ assessment: null, replaced_assessments: [scorecard('s1')] }, null)).toBeNull();
   });
 });
+
+describe('roundStatusWord on a round held over Google Meet', () => {
+  const alive = '2026-11-06T00:00:00Z';
+  const lapsed = '2026-11-02T11:59:59Z';
+  const nobody = [{ in_progress: false }];
+  const someone = [{ in_progress: true }];
+  const meet = { channel: 'meet' as const };
+
+  it('says nobody has started, not that a link was sent', () => {
+    expect(roundStatusWord({ status: 'invited', expires_at: alive, ...meet }, [], NOW)).toBe('Not started');
+  });
+
+  it('says it is open when nobody is in it, not that a link is', () => {
+    expect(roundStatusWord({ status: 'in_progress', expires_at: alive, ...meet }, nobody, NOW)).toBe('Open');
+    expect(roundStatusWord({ status: 'in_progress', expires_at: alive, ...meet }, [], NOW)).toBe('Open');
+  });
+
+  it('says every other state in the same word as a browser round', () => {
+    expect(roundStatusWord({ status: 'in_progress', expires_at: alive, ...meet }, someone, NOW)).toBe('In progress');
+    expect(roundStatusWord({ status: 'invited', expires_at: lapsed, ...meet }, [], NOW)).toBe('Expired');
+    expect(roundStatusWord({ status: 'in_progress', expires_at: lapsed, ...meet }, nobody, NOW)).toBe('Expired');
+    expect(roundStatusWord({ status: 'in_progress', expires_at: lapsed, ...meet }, someone, NOW)).toBe('In progress');
+    expect(roundStatusWord({ status: 'completed', expires_at: lapsed, ...meet }, nobody, NOW)).toBe('Completed');
+    expect(roundStatusWord({ status: 'expired', expires_at: alive, ...meet }, nobody, NOW)).toBe('Expired');
+    expect(roundStatusWord({ status: 'cancelled', expires_at: lapsed, ...meet }, someone, NOW)).toBe('Cancelled');
+  });
+
+  it.each([
+    ['browser', 'browser'],
+    ['null', null],
+    ['unknown', 'zoom'],
+  ] as const)('keeps the link words for a %s channel', (_name, channel) => {
+    const asSent = { channel: channel as 'browser' | null };
+    expect(roundStatusWord({ status: 'invited', expires_at: alive, ...asSent }, [], NOW)).toBe('Link sent');
+    expect(roundStatusWord({ status: 'in_progress', expires_at: alive, ...asSent }, nobody, NOW)).toBe('Link open');
+  });
+});

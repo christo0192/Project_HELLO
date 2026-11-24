@@ -23,6 +23,11 @@
  * at a time; focus moves to it, Escape closes it and returns focus to the
  * button that opened it, and a finished action hands focus to the card.
  *
+ * A round held over Google Meet (`channel: 'meet'`) carries a "Via Meet" chip
+ * and has no candidate link: no Reissue, "Open until" for its expiry, and its
+ * cancel and retake words point to Ashby, where the interview is scheduled.
+ * A round without `channel: 'meet'` reads exactly as before.
+ *
  * Recordings: one chip per attempt that has anything to say (a recording in any
  * state, or, once the round has completed, the fact that none was made), for
  * EVERY role. Nothing plays here: "Open R1 review" is where the recording is, so
@@ -37,6 +42,7 @@ import { api, ApiError } from '../../api';
 import { CandidateButton, Tag } from '../design/candidate';
 import { FAMILY_CLASSES, verdictFamily } from '../design/tones';
 import type { IssuedLinkValue } from './SendR1Controls';
+import { ViaMeetTag } from './ViaMeetTag';
 import { formatDateTime } from '../../lib/datetime';
 import {
   R1_LINK_VALID_HOURS,
@@ -47,6 +53,8 @@ import {
   canCancel,
   canGrantRetake,
   canReissue,
+  isMeetRound,
+  openUntilLead,
   r1ErrorMessage,
   r1StatusTone,
 } from '../../lib/r1';
@@ -77,23 +85,31 @@ const CONFIRM_COPY: Record<
   cancel: {
     title: 'Cancel this R1 round?',
     body: (round) =>
-      `The link stops working and its reserved minutes are released. ${
-        round.status === 'in_progress'
-          ? 'This does not end a call that is already running. '
-          : ''
-      }A new round can be sent afterwards.`,
+      isMeetRound(round)
+        ? `Its reserved minutes are released. ${runningCallNote(round)}The interview stays in Ashby ` +
+          'until it is cancelled there.'
+        : `The link stops working and its reserved minutes are released. ${runningCallNote(round)}` +
+          'A new round can be sent afterwards.',
     confirm: 'Cancel round',
     keep: 'Keep round',
   },
   'grant-retake': {
     title: 'Grant the one retake?',
-    body: () =>
-      'The candidate can use their original link again for ' +
-      `${R1_LINK_VALID_HOURS} hours. A retake can be granted once.`,
+    body: (round) =>
+      isMeetRound(round)
+        ? `The round opens again for ${R1_LINK_VALID_HOURS} hours. Schedule the retake in Ashby with Dex ` +
+          'before then; there is no link.'
+        : 'The candidate can use their original link again for ' +
+          `${R1_LINK_VALID_HOURS} hours. A retake can be granted once.`,
     confirm: 'Grant retake',
     keep: 'Not now',
   },
 };
+
+/** Cancelling a round does not hang up an interview that is running: said only while one may be. */
+function runningCallNote(round: R1Round): string {
+  return round.status === 'in_progress' ? 'This does not end a call that is already running. ' : '';
+}
 
 export interface R1RoundsPanelProps {
   rounds: readonly R1Round[];
@@ -190,8 +206,10 @@ export function R1RoundsPanel({
       } else {
         await api.grantR1Retake(round.id);
         onMessage(
-          'Retake granted. The candidate’s original link works again for ' +
-            `${R1_LINK_VALID_HOURS} hours; reissue a link if you no longer have it.`,
+          isMeetRound(round)
+            ? `Retake granted. Schedule it in Ashby with Dex within ${R1_LINK_VALID_HOURS} hours.`
+            : 'Retake granted. The candidate’s original link works again for ' +
+                `${R1_LINK_VALID_HOURS} hours; reissue a link if you no longer have it.`,
         );
       }
       setPending(null);
@@ -251,6 +269,7 @@ export function R1RoundsPanel({
                 {roundStatusWord(round, attempts, nowMs)}
               </Tag>
               {round.is_staff_dry_run === true && <Tag>Staff dry run</Tag>}
+              <ViaMeetTag channel={round.channel} />
               <span className="text-label text-ink-secondary">{attemptsLabel(round)}</span>
               <Link
                 to={`/interviews/${round.id}`}
@@ -262,7 +281,7 @@ export function R1RoundsPanel({
 
             {status === 'invited' && (
               <p className="mt-1 text-label text-ink-secondary">
-                Link valid until {formatDateTime(round.expires_at)}
+                {openUntilLead(round)} {formatDateTime(round.expires_at)}
               </p>
             )}
 

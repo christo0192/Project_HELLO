@@ -14,7 +14,7 @@ import { FAMILY_CLASSES, ratingFamily, verdictFamily } from '../design/tones';
 import { ScorePips } from '../session/ScoreVerdict';
 import { formatDateTime } from '../../lib/datetime';
 import { isEvidenceInsufficient } from '../../lib/evidence-hold';
-import { R1_RESULT_WITHHELD } from '../../lib/r1';
+import { R1_RESULT_WITHHELD, openUntilLead } from '../../lib/r1';
 import { attemptLabels, clockText } from '../../lib/r1-recording';
 import {
   evidenceMarks,
@@ -247,17 +247,17 @@ function AttemptResult({ review, attempt, candidateName, onOpenTurn, onCheckAgai
   const stage = reviewStage(review, Date.now());
 
   if (stage === 'withheld') return <StateLine>{R1_RESULT_WITHHELD}</StateLine>;
-  if (stage === 'invited') return <StateLine>Link valid until {formatDateTime(round.expires_at)}.</StateLine>;
+  if (stage === 'invited') return <StateLine>{openUntilLead(round)} {formatDateTime(round.expires_at)}.</StateLine>;
   if (stage === 'in_progress') {
     return (
       <StateLine onCheckAgain={onCheckAgain}>
-        The interview is in progress. The review opens here once it ends. Link valid until {formatDateTime(round.expires_at)}.
+        The interview is in progress. The review opens here once it ends. {openUntilLead(round)} {formatDateTime(round.expires_at)}.
       </StateLine>
     );
   }
   // An attempt ended without counting, so the round waits on its link with nobody in it.
   if (stage === 'link_open') {
-    return <StateLine onCheckAgain={onCheckAgain}>No interview is running. Link valid until {formatDateTime(round.expires_at)}.</StateLine>;
+    return <StateLine onCheckAgain={onCheckAgain}>No interview is running. {openUntilLead(round)} {formatDateTime(round.expires_at)}.</StateLine>;
   }
   if (stage === 'scoring') {
     return <StateLine onCheckAgain={onCheckAgain}>Scoring in progress. The result appears here once it is ready.</StateLine>;
