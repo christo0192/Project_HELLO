@@ -222,3 +222,26 @@ export async function readRoundConsent(
   }
   return { ok: true, value: { state: 'required', templateVersion: newestVersion } };
 }
+
+/**
+ * The admission-time consent re-check: the round's live consent names the newest active
+ * template, of the round's audience, and covers what it requires (`readRoundConsent`).
+ * Preflight, attempts (fresh and rejoin), the exchange (before and after the worker gate)
+ * and the ready relay all ask it; the caller maps `unreadable` to a retryable 503 and
+ * `not_granted` to "consent required". Meet rounds' HR-attested rows are ordinary consent
+ * rows for the newest template, so this answers for them unchanged.
+ */
+export type R1ConsentRecheck =
+  | { ok: true }
+  | { ok: false; reason: 'unreadable' }
+  | { ok: false; reason: 'not_granted'; state: 'required' | 'declined' | 'withdrawn' };
+
+export async function recheckRoundConsent(
+  db: Db,
+  round: { id: string; consent_locale: string },
+): Promise<R1ConsentRecheck> {
+  const consent = await readRoundConsent(db, round.id, round.consent_locale);
+  if (!consent.ok) return { ok: false, reason: 'unreadable' };
+  if (consent.value.state !== 'granted') return { ok: false, reason: 'not_granted', state: consent.value.state };
+  return { ok: true };
+}

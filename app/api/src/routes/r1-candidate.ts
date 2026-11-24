@@ -27,7 +27,9 @@
  *  4. The candidate token grants camera and microphone publishing ONLY, no
  *     data channel, no metadata updates, 10 minute TTL, and is signed with the
  *     secret of the endpoint `browserLiveKitEndpoint()` selected: the R1
- *     secret when `BROWSER_LIVEKIT_TARGET=r1`, otherwise the Cloud secret.
+ *     secret when `BROWSER_LIVEKIT_TARGET=r1`, otherwise the Cloud secret. It is
+ *     minted by `mintCandidateJoin` (lib/r1/candidate-join.ts) with its default
+ *     `browser` grant.
  *  5. Withdrawal is never gated by a kill switch, maintenance mode or the
  *     round's state: a candidate can always withdraw. A decline (the
  *     human-interview alternative, D14) is not gated by the kill switch either.
@@ -104,6 +106,7 @@ import {
   loadLiveConsent,
   loadNewestTemplate,
   readRoundConsent,
+  recheckRoundConsent,
   type ConsentTemplate,
   type Read,
 } from '../lib/r1/consent.js';
@@ -126,7 +129,10 @@ import {
 } from '../lib/r1/consent-items.js';
 import { r1DeepSeekHealth } from '../lib/r1/deepseek-health.js';
 import { createReadyLimiter, type ReadyLimiter } from '../lib/r1/ready-limiter.js';
-import { runR1WorkerGate, type DispatchListerLike } from '../lib/r1/worker-gate.js';
+import type { DispatchListerLike } from '../lib/r1/worker-gate.js';
+import { mintCandidateJoin } from '../lib/r1/candidate-join.js';
+import { provisionMarkedRoom } from '../lib/r1/marked-room.js';
+import { r1WorkerGateMissing, runR1JoinGate, type R1JoinGateDeps } from '../lib/r1/join-gate.js';
 
 const log = createLogger('r1-candidate');
 
@@ -135,8 +141,7 @@ const log = createLogger('r1-candidate');
 /** Unknown, expired and cancelled links are indistinguishable (invariant 1). */
 export const STABLE_LINK_ERROR = 'r1_link_invalid_or_expired';
 export const STABLE_ATTEMPT_ERROR = 'r1_attempt_invalid';
-/** Plan 7.10: LiveKit token expiry only bounds the initial connection. */
-export const CANDIDATE_TOKEN_TTL_SEC = 10 * 60;
+export { CANDIDATE_TOKEN_TTL_SEC } from '../lib/r1/candidate-join.js';
 /** The preflight token only has to survive one connection attempt. */
 export const PREFLIGHT_TOKEN_TTL_SEC = 30;
 /** Plan 4 step 5 / 3.3: the A/V check lasts at most 10 s; the room is cut at 12 s. */
@@ -353,6 +358,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
   const schedule = deps.schedule ?? defaultSchedule;
   const readyLimiter = deps.readyLimiter ?? createReadyLimiter();
   const readyTimeoutMs = deps.readyRelayTimeoutMs ?? READY_RELAY_TIMEOUT_MS;
+  const joinGateDeps: R1JoinGateDeps = { db, now, resolveGate, dispatches: dispatchesFor, requireMachineAgentName, log };
 
   // Tokens, nonces and consent state must never be cached by a proxy or browser.
   router.use((_req, res, next) => {
@@ -434,6 +440,15 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
     return CONSENT_AUDIENCES.has(round.consent_locale) ? round.consent_locale : null;
   }
 
+  /** The consent re-check (lib/r1/consent.ts `recheckRoundConsent`); true when granted, else the refusal is written. */
+  async function consentStillGranted(res: Response, round: RoundRow): Promise<boolean> {
+    const standing = await recheckRoundConsent(db, round);
+    if (standing.ok) return true;
+    if (standing.reason === 'unreadable') refuse(res, 503, 'service_unavailable');
+    else refuse(res, 409, 'consent_required');
+    return false;
+  }
+
   /**
    * Does admission run more than one live R1 session at once? 0131's limit, read only to word a
    * busy answer: on the self-hosted target it is least(max_concurrent_sessions, browser worker
@@ -461,37 +476,6 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
     } catch {
       return false;
     }
-  }
-
-  /**
-   * M019 interlock at dispatch time, not only when the limit is saved. With
-   * BROWSER_REQUIRE_MACHINE_AGENT_NAME off, an R1 dispatch may go to the SHARED agent name, which
-   * is safe only while this is the one live R1 session: with another live, LiveKit could hand
-   * this session's job to a machine leased to the other interview, whose release would then stop
-   * it mid-call. So, flag off on the self-hosted target, dispatch only when no OTHER R1 session
-   * is live (0131's live predicate). At limit 1 admission already guarantees that, so today's
-   * behaviour is unchanged; after a misordered rollback (flag off while several were admitted,
-   * or the limit still above 1) every join but one defers instead. An unreadable answer defers
-   * too. Cloud, and the flag on (per-machine names enforced by the gate), skip the read.
-   */
-  async function sharedNameDispatchSafe(endpoint: LiveKitEndpoint, sessionId: string): Promise<boolean> {
-    if (endpoint.target !== 'r1' || requireMachineAgentName()) return true;
-    try {
-      const others = await db
-        .from('call_sessions')
-        .select('id')
-        .not('interview_round_id', 'is', null)
-        .in('status', ['created', 'waiting', 'in_progress'])
-        .neq('id', sessionId)
-        .limit(1);
-      if (!others.error && Array.isArray(others.data) && others.data.length === 0) return true;
-      log.error('unknown_event', {
-        error_category: others.error ? 'r1_live_count_unreadable' : 'r1_concurrency_needs_machine_names',
-      });
-    } catch {
-      log.error('unknown_event', { error_category: 'r1_live_count_unreadable' });
-    }
-    return false;
   }
 
   /** New-work gate: maintenance blocks new joins (503); a read failure fails closed. */
@@ -544,30 +528,11 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       refuse(res, 503, 'r1_unavailable');
       return null;
     }
-    if (r1GateMissing(endpoint)) {
+    if (r1WorkerGateMissing(endpoint, joinGateDeps)) {
       refuse(res, 503, 'r1_unavailable');
       return null;
     }
     return endpoint;
-  }
-
-  /**
-   * Fence 7 on the R1 SFU. Nothing auto-dispatches there, so with no worker gate
-   * (orchestration off, `BROWSER_AGENT_NAME` empty or malformed) a candidate token
-   * would be minted for a room no interviewer will ever join. True means "refuse
-   * with 503 r1_unavailable", and it must be asked BEFORE anything is provisioned.
-   * Cloud is never affected: its unnamed worker auto-dispatches (legacy behaviour).
-   * A gate that cannot even be built counts as missing.
-   */
-  function r1GateMissing(endpoint: LiveKitEndpoint): boolean {
-    if (endpoint.target !== 'r1') return false;
-    try {
-      if (resolveGate() !== null) return false;
-    } catch {
-      /* unbuildable gate: fail closed below */
-    }
-    log.error('unknown_event', { error_category: 'r1_worker_gate_missing' });
-    return true;
   }
 
   // ── POST /api/r1/status ────────────────────────────────────────────
@@ -971,15 +936,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       refuse(res, 409, 'round_not_admissible');
       return;
     }
-    const consent = await readRoundConsent(db, round.id, round.consent_locale);
-    if (!consent.ok) {
-      refuse(res, 503, 'service_unavailable');
-      return;
-    }
-    if (consent.value.state !== 'granted') {
-      refuse(res, 409, 'consent_required');
-      return;
-    }
+    if (!(await consentStillGranted(res, round))) return;
     if (!(await maintenanceClear(res))) return;
     const endpoint = await laneForNewWork(res);
     if (!endpoint) return;
@@ -1119,15 +1076,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
         refuse(res, 404, STABLE_ATTEMPT_ERROR);
         return;
       }
-      const consent = await readRoundConsent(db, round.id, round.consent_locale);
-      if (!consent.ok) {
-        refuse(res, 503, 'service_unavailable');
-        return;
-      }
-      if (consent.value.state !== 'granted') {
-        refuse(res, 409, 'consent_required');
-        return;
-      }
+      if (!(await consentStillGranted(res, round))) return;
       const reissued = attemptResponse(
         live.value.id,
         attempt.value.attempt_number,
@@ -1157,15 +1106,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
     // the candidate notice from the staff dry-run notice (both ship at one version),
     // so the audience the consent was given under is checked here, before a start
     // is spent. The rejoin branch and the exchange re-check it the same way.
-    const standing = await readRoundConsent(db, round.id, round.consent_locale);
-    if (!standing.ok) {
-      refuse(res, 503, 'service_unavailable');
-      return;
-    }
-    if (standing.value.state !== 'granted') {
-      refuse(res, 409, 'consent_required');
-      return;
-    }
+    if (!(await consentStillGranted(res, round))) return;
 
     const nonce = generateNonce();
     const nonceDigest = hashNonce(nonce);
@@ -1216,52 +1157,15 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
 
   // ── POST /api/r1/exchange ──────────────────────────────────────────
 
-  async function mintCandidateJoin(
-    endpoint: LiveKitEndpoint,
-    session: { id: string; candidate_id: string },
-    roomName: string,
-  ): Promise<{ jwt: string; expiresAt: string }> {
-    const token = accessTokenFor(endpoint, {
-      identity: `candidate-${session.candidate_id.slice(0, 8)}-${session.id.slice(0, 8)}`,
-      ttl: CANDIDATE_TOKEN_TTL_SEC,
-    });
-    // Camera and microphone only. SCREEN_SHARE is reserved for future rounds.
-    token.addGrant({
-      room: roomName,
-      roomJoin: true,
-      canPublish: true,
-      canPublishSources: [TrackSource.MICROPHONE, TrackSource.CAMERA],
-      canSubscribe: true,
-      canPublishData: false,
-      canUpdateOwnMetadata: false,
-    });
-    return {
-      jwt: await token.toJwt(),
-      expiresAt: new Date(now() + CANDIDATE_TOKEN_TTL_SEC * 1000).toISOString(),
-    };
-  }
-
-  /**
-   * Provision (or re-assert) the egress-free, `lane: r1`-marked room for an R1
-   * round session. True means the room is there; otherwise the refusal has been
-   * written: a provider failure is 503 `r1_room_unavailable` (the attempt stays
-   * retryable), anything else means the attempt is no longer joinable. An
-   * `adopted: true` answer (a concurrent exchange won the `created` -> `waiting`
-   * CAS, or the session was already `waiting`) is success.
-   */
-  async function provisionMarkedRoom(
+  /** Provision (or re-assert) the attempt's marked room (lib/r1/marked-room.ts); true when it is there, else the refusal is written. */
+  async function markedRoomReady(
     res: Response,
     session: { id: string; interview_round_id: string | null },
     endpoint: LiveKitEndpoint,
   ): Promise<boolean> {
-    const provisioned = await provisionRoom(session.id, 'existing_session', {
-      endpoint,
-      lane: 'r1',
-      interviewRoundId: session.interview_round_id,
-      ...(deps.rooms ? { rooms: roomsFor(endpoint) } : {}),
-    });
-    if (provisioned.ok) return true;
-    if (provisioned.code === 'provider_failed') {
+    const room = await provisionMarkedRoom(session, endpoint, { provisionRoom, ...(deps.rooms ? { rooms: roomsFor } : {}) });
+    if (room.ok) return true;
+    if (room.reason === 'provider_failed') {
       refuse(res, 503, 'r1_room_unavailable');
       return false;
     }
@@ -1348,15 +1252,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
     }
     // Consent is re-checked on EVERY exchange: a withdrawal or a newer
     // template stops a join that admission already allowed (plan 7.8).
-    const consent = await readRoundConsent(db, round.id, round.consent_locale);
-    if (!consent.ok) {
-      refuse(res, 503, 'service_unavailable');
-      return;
-    }
-    if (consent.value.state !== 'granted') {
-      refuse(res, 409, 'consent_required');
-      return;
-    }
+    if (!(await consentStillGranted(res, round))) return;
     const roomName = roomNameForSession(session.id);
     if (session.external_call_id !== null && session.external_call_id !== roomName) {
       refuse(res, 404, STABLE_ATTEMPT_ERROR);
@@ -1378,7 +1274,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       }
       // The attempt stays `created` on a provider failure: nothing was consumed and
       // a retry converges.
-      if (!(await provisionMarkedRoom(res, session, endpoint))) return;
+      if (!(await markedRoomReady(res, session, endpoint))) return;
     } else {
       // Rejoin or retry of an attempt that already has a room.
       try {
@@ -1389,7 +1285,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       }
       if (session.status === 'waiting') {
         // Fence 7, BEFORE anything is provisioned: no gate on the R1 SFU, no token.
-        if (r1GateMissing(endpoint)) {
+        if (r1WorkerGateMissing(endpoint, joinGateDeps)) {
           refuse(res, 503, 'r1_unavailable');
           return;
         }
@@ -1404,22 +1300,13 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
         // converges the marker and limits on an existing room; a lost
         // `created` -> `waiting` CAS is `adopted: true`, which is success).
         if (session.external_call_id === roomName) {
-          if (!(await provisionMarkedRoom(res, session, endpoint))) return;
+          if (!(await markedRoomReady(res, session, endpoint))) return;
         }
       }
     }
 
     if (session.status !== 'in_progress') {
-      const gate = !(await sharedNameDispatchSafe(endpoint, session.id)) ? 'preparing' : await runR1WorkerGate({
-        gate: resolveGate(),
-        sessionId: session.id,
-        roomName,
-        dispatches: () => dispatchesFor(endpoint),
-        now,
-        // The R1 SFU has no unnamed worker to auto-dispatch: a null gate or a
-        // `disabled` verdict defers instead of minting a token (fence 7).
-        failClosed: endpoint.target === 'r1',
-      });
+      const gate = await runR1JoinGate({ endpoint, sessionId: session.id, roomName }, joinGateDeps);
       if (gate === 'preparing') {
         res.setHeader('Retry-After', String(PREPARING_RETRY_AFTER_SEC));
         res.status(202).json({ status: 'preparing', retry_after_sec: PREPARING_RETRY_AFTER_SEC });
@@ -1427,18 +1314,10 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       }
       // Booting a worker can take tens of seconds. A withdrawal that landed in
       // that window must still stop the join: re-check before the token exists.
-      const settled = await readRoundConsent(db, round.id, round.consent_locale);
-      if (!settled.ok) {
-        refuse(res, 503, 'service_unavailable');
-        return;
-      }
-      if (settled.value.state !== 'granted') {
-        refuse(res, 409, 'consent_required');
-        return;
-      }
+      if (!(await consentStillGranted(res, round))) return;
     }
 
-    const join = await mintCandidateJoin(endpoint, session, roomName);
+    const join = await mintCandidateJoin(endpoint, session, roomName, { now });
     res.status(200).json({
       url: endpoint.url,
       livekit_token: join.jwt,
@@ -1557,15 +1436,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       return;
     }
     // A withdrawal stops the relay as it stops the join.
-    const consent = await readRoundConsent(db, round.id, round.consent_locale);
-    if (!consent.ok) {
-      refuse(res, 503, 'service_unavailable');
-      return;
-    }
-    if (consent.value.state !== 'granted') {
-      refuse(res, 409, 'consent_required');
-      return;
-    }
+    if (!(await consentStillGranted(res, round))) return;
     let endpoint: LiveKitEndpoint;
     try {
       endpoint = requireBrowserLiveKitConfigured();
