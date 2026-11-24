@@ -136,6 +136,8 @@ import type {
   AshbyStageMilestone,
   AshbyStageMilestoneUpdateResponse,
 } from './lib/ashby-stages';
+import { r1MeetBookingsPath, readR1MeetBookings } from './lib/r1-meet-bookings';
+import type { R1MeetBookingsQuery } from './lib/r1-meet-bookings';
 
 export { ApiError };
 
@@ -324,6 +326,10 @@ export const api = {
   // One round as a reviewer sees it. Carries no link: a recording is minted by `getR1Recording`.
   getR1Review: (roundId: string) =>
     request<R1ReviewResponse>(`/api/interview-rounds/${encodeURIComponent(roundId)}/review`),
+  // The R1 bookings over Google Meet a person may see. Read through the strict reader: an answer that
+  // is not in the contract shape is refused, and `meet_enabled: false` (Meet is off) is an empty page.
+  listR1MeetBookings: (query: R1MeetBookingsQuery = {}) =>
+    request<unknown>(r1MeetBookingsPath(query)).then(readR1MeetBookings),
   cancelR1PendingReject: (roundId: string) =>
     request<R1CancelPendingRejectResponse>(
       `/api/interview-rounds/${encodeURIComponent(roundId)}/cancel-pending-reject`,

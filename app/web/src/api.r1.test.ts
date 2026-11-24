@@ -140,4 +140,34 @@ describe('R1 api client', () => {
     const [, init] = request.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({ candidate_id: 'c-1', note: 'Follow up.' });
   });
+
+  it('reads the Meet bookings with nothing it was not asked for', async () => {
+    request.mockResolvedValue({ meet_enabled: false, bookings: [], next_cursor: null });
+    await expect(api.listR1MeetBookings()).resolves.toEqual({ meet_enabled: false, bookings: [], next_cursor: null });
+    // A GET: one argument, no init (no method, no body).
+    expect(request.mock.calls).toEqual([['/api/interview-rounds/meet-bookings']]);
+  });
+
+  it('asks for the Meet bookings it was asked for, with the cursor encoded', async () => {
+    request.mockResolvedValue({ meet_enabled: true, bookings: [], next_cursor: 'x' });
+    await expect(
+      api.listR1MeetBookings({
+        status: 'unmatched_application',
+        from: '2026-11-23T18:30:00.000Z',
+        to: '2026-11-30T18:30:00.000Z',
+        cursor: 'a+b/c=&x',
+      }),
+    ).resolves.toEqual({ meet_enabled: true, bookings: [], next_cursor: 'x' });
+    expect(request.mock.calls).toEqual([
+      [
+        '/api/interview-rounds/meet-bookings?status=unmatched_application' +
+          '&from=2026-11-23T18%3A30%3A00.000Z&to=2026-11-30T18%3A30%3A00.000Z&cursor=a%2Bb%2Fc%3D%26x',
+      ],
+    ]);
+  });
+
+  it('refuses a Meet bookings answer that is not in the contract shape', async () => {
+    request.mockResolvedValue({ bookings: [] });
+    await expect(api.listR1MeetBookings()).rejects.toThrow('r1_meet_bookings_malformed');
+  });
 });
