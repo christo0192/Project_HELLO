@@ -48,6 +48,12 @@
  * Meet is active only when `getR1Config().enabled` AND this module says `enabled`: see
  * `r1MeetActive`.
  *
+ * `R1_MEET_ASHBY_FEEDBACK_FORM_ID` (M034 S09) is the UUID of the Ashby feedback form assigned to the
+ * Dex interview: Dex's scorecard is posted there as that interview's feedback. It has its own silent
+ * reader, `getR1MeetFeedbackConfig` (blank = `off`, a UUID = `on`, anything else = `invalid`), and
+ * `getR1MeetConfig` IGNORES it: a missing or malformed form id never turns Meet off, so bots keep
+ * joining while the feedback form is fixed.
+ *
  * This is the ONLY module that reads the Meet variables. The vendor modules (integrations/recall,
  * integrations/google-meet) read no environment at all and take the values below as explicit
  * arguments; `r1-room-isolation.test.ts` pins both rules. The credentials are Fly secrets on the
@@ -90,7 +96,7 @@ const R1_MEET_DEX_USER_VARIABLE = 'R1_MEET_ASHBY_DEX_USER_ID';
 
 /**
  * Every variable this module owns (WEB_ORIGIN is shared and declared elsewhere): the flag, the
- * knobs and the Dex user id first, then the two credentials.
+ * knobs, the Dex user id and the feedback form id first, then the two credentials.
  */
 export const R1_MEET_ENV_VARIABLES = [
   'R1_MEET_ENABLED',
@@ -102,6 +108,7 @@ export const R1_MEET_ENV_VARIABLES = [
   'R1_MEET_ARM_AT_CREATE',
   'R1_MEET_MULTI_HUMAN_POLICY',
   R1_MEET_DEX_USER_VARIABLE,
+  'R1_MEET_ASHBY_FEEDBACK_FORM_ID',
   'RECALL_API_KEY',
   'RECALL_WEBHOOK_SECRET',
 ] as const;
@@ -182,6 +189,16 @@ export interface R1MeetDrainRecallSettings {
 export type R1MeetDrainConfig =
   | { readonly available: false }
   | { readonly available: true; readonly recall: R1MeetDrainRecallSettings };
+
+/**
+ * Where Dex's scorecard is posted in Ashby (M034 S09). `off` = not posted (inert); `on` = the form id,
+ * verbatim (Ashby ids are matched exactly); `invalid` = not posted, with a fixed reason that names
+ * the variable but never its value. Independent of `R1MeetConfig`: it never turns Meet off.
+ */
+export type R1MeetFeedbackConfig =
+  | { readonly status: 'off' }
+  | { readonly status: 'on'; readonly formDefinitionId: string }
+  | { readonly status: 'invalid'; readonly reason: string };
 
 // Every reason is one of a small set of fixed strings, so remembering them all is bounded and means
 // each problem is logged once per process however often the config is re-read.
@@ -328,6 +345,7 @@ function readProcessEnv(): R1MeetEnvSource {
     R1_MEET_ARM_AT_CREATE: process.env.R1_MEET_ARM_AT_CREATE,
     R1_MEET_MULTI_HUMAN_POLICY: process.env.R1_MEET_MULTI_HUMAN_POLICY,
     R1_MEET_ASHBY_DEX_USER_ID: process.env.R1_MEET_ASHBY_DEX_USER_ID,
+    R1_MEET_ASHBY_FEEDBACK_FORM_ID: process.env.R1_MEET_ASHBY_FEEDBACK_FORM_ID,
     RECALL_API_KEY: process.env.RECALL_API_KEY,
     RECALL_WEBHOOK_SECRET: process.env.RECALL_WEBHOOK_SECRET,
     WEB_ORIGIN: process.env.WEB_ORIGIN,
@@ -416,6 +434,38 @@ export function getR1MeetConfig(source?: R1MeetEnvSource): R1MeetConfig {
 /** Meet work may run only when R1 itself is on AND the Meet configuration is enabled. */
 export function r1MeetActive(r1: { readonly enabled: boolean }, meet: R1MeetConfig): boolean {
   return r1.enabled === true && meet.enabled === true;
+}
+
+const FEEDBACK_OFF: R1MeetFeedbackConfig = Object.freeze({ status: 'off' as const });
+const FEEDBACK_FORM_REASON =
+  'R1_MEET_ASHBY_FEEDBACK_FORM_ID must be a UUID (the feedback form of the Dex interview in Ashby)';
+/** The nil UUID names no Ashby form: refused, like `R1_MEET_REFUSED_SERVICE_USER_IDS`. */
+const NIL_UUID = '00000000-0000-0000-0000-000000000000';
+
+/**
+ * The Ashby feedback form Dex's scorecard is posted to (M034 S09). Reads R1_MEET_ASHBY_FEEDBACK_FORM_ID
+ * and nothing else. Silent (no log line: the S09 handler alerts per affected interview) and NEVER
+ * throws. Unset or blank = `off`; a UUID other than the nil one = `on`, verbatim; anything else,
+ * including surrounding spaces, = `invalid`. `source` is a test seam, as for `getR1MeetConfig`.
+ */
+export function getR1MeetFeedbackConfig(
+  source?: Pick<R1MeetEnvSource, 'R1_MEET_ASHBY_FEEDBACK_FORM_ID'>,
+): R1MeetFeedbackConfig {
+  try {
+    const env = source ?? readProcessEnv();
+    const formDefinitionId: unknown = env.R1_MEET_ASHBY_FEEDBACK_FORM_ID;
+    if (!present(formDefinitionId)) return FEEDBACK_OFF;
+    if (typeof formDefinitionId !== 'string' || !UUID.test(formDefinitionId) || formDefinitionId === NIL_UUID) {
+      return Object.freeze({ status: 'invalid' as const, reason: FEEDBACK_FORM_REASON });
+    }
+    return Object.freeze({ status: 'on' as const, formDefinitionId });
+  } catch {
+    // Defensive (e.g. a throwing getter on the source): this reader never throws either.
+    return Object.freeze({
+      status: 'invalid' as const,
+      reason: 'unexpected error while reading the Meet feedback configuration',
+    });
+  }
 }
 
 const DRAIN_UNAVAILABLE: R1MeetDrainConfig = Object.freeze({ available: false as const });

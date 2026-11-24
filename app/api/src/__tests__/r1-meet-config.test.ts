@@ -28,11 +28,13 @@ import {
   describeR1MeetConfig,
   getR1MeetConfig,
   getR1MeetDrainConfig,
+  getR1MeetFeedbackConfig,
   r1MeetActive,
   r1MeetDrainAllowed,
   resetR1MeetConfigReport,
   type R1MeetConfig,
   type R1MeetEnvSource,
+  type R1MeetFeedbackConfig,
 } from '../lib/r1/meet/config.js';
 import { RECALL_DEFAULT_BASE_URL } from '../integrations/recall/settings.js';
 
@@ -52,6 +54,8 @@ const DEX_ID = '5e1d0c9b-8a7f-4e6d-9c5b-4a3f2e1d0c9b';
 /** Synthetic staff (auth) user id for the optional fallback owner. */
 const SERVICE_ID = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d';
 const NIL_UUID = '00000000-0000-0000-0000-000000000000';
+/** Synthetic Ashby feedback form id (M034 S09), in the harness id namespace. */
+const FORM_ID = '7f000000-0000-4000-8000-0000000000fb';
 /** The Ashby integration's system actor (integrations/ashby/workflow-stores.ts): no auth.users row. */
 const ASHBY_SYSTEM_ACTOR = '00000000-0000-4000-8000-000000000001';
 /** The removed booking vendor's name, built so this file never spells it (the slice greps it out). */
@@ -658,6 +662,8 @@ describe('R1 Meet configuration: process.env (the production path)', () => {
     ['R1_MEET_ASHBY_DEX_USER_ID', 'nope', MALFORMED_REASON.R1_MEET_ASHBY_DEX_USER_ID],
     ['RECALL_API_KEY', 'short', MALFORMED_REASON.RECALL_API_KEY],
     ['RECALL_WEBHOOK_SECRET', 'nope', MALFORMED_REASON.RECALL_WEBHOOK_SECRET],
+    // Deliberately absent: R1_MEET_ASHBY_FEEDBACK_FORM_ID (M034 S09). It can never make Meet invalid:
+    // getR1MeetConfig ignores it and getR1MeetFeedbackConfig validates it (its own describe below).
   ])('reads %s from process.env', (name, bad, reason) => {
     stubAll({ [name]: bad });
     expectInvalid(getR1MeetConfig(), reason);
@@ -800,13 +806,174 @@ describe('R1 Meet configuration: the drain', () => {
   });
 });
 
+describe('R1 Meet configuration: the Ashby feedback form (M034 S09)', () => {
+  const FEEDBACK_REASON = 'R1_MEET_ASHBY_FEEDBACK_FORM_ID must be a UUID (the feedback form of the Dex interview in Ashby)';
+  const FEEDBACK_UNEXPECTED_REASON = 'unexpected error while reading the Meet feedback configuration';
+  const feedback = (value: unknown): R1MeetFeedbackConfig =>
+    getR1MeetFeedbackConfig({ R1_MEET_ASHBY_FEEDBACK_FORM_ID: value as string });
+
+  it('is off (inert) when unset or blank', () => {
+    for (const config of [getR1MeetFeedbackConfig({}), feedback(undefined), feedback('')]) {
+      expect(config).toStrictEqual({ status: 'off' });
+      expect(Object.isFrozen(config)).toBe(true);
+    }
+    expect(logged).toEqual([]);
+  });
+
+  it('is on for a UUID, kept verbatim in either case', () => {
+    for (const formId of [FORM_ID, FORM_ID.toUpperCase(), GROUP_ID, GROUP_ID.toUpperCase()]) {
+      const config = feedback(formId);
+      expect(config, formId).toStrictEqual({ status: 'on', formDefinitionId: formId });
+      expect(Object.isFrozen(config), formId).toBe(true);
+    }
+    expect(logged).toEqual([]);
+  });
+
+  it('is invalid for anything else, the nil UUID included, with a reason that never carries the value', () => {
+    const bad: unknown[] = [
+      'not-a-uuid',
+      ` ${FORM_ID}`,
+      `${FORM_ID} `,
+      `${FORM_ID}\n`,
+      ' ',
+      FORM_ID.replace(/-/g, ''),
+      `{${FORM_ID}}`,
+      FORM_ID.slice(0, -1),
+      `${FORM_ID}0`,
+      NIL_UUID,
+      'replace_me',
+      42,
+      null,
+      {},
+      [FORM_ID],
+      true,
+    ];
+    for (const value of bad) {
+      const config = feedback(value);
+      expect(config, JSON.stringify(value)).toStrictEqual({ status: 'invalid', reason: FEEDBACK_REASON });
+      expect(Object.isFrozen(config)).toBe(true);
+    }
+    expect(FEEDBACK_REASON).not.toContain(FORM_ID);
+    // Silent: the S09 handler alerts per affected interview; this reader never logs.
+    expect(logged).toEqual([]);
+  });
+
+  it('never throws, even when the source itself throws, and stays silent', () => {
+    const throwingGetter = {} as R1MeetEnvSource;
+    Object.defineProperty(throwingGetter, 'R1_MEET_ASHBY_FEEDBACK_FORM_ID', {
+      enumerable: true,
+      get() {
+        throw new Error('boom');
+      },
+    });
+    const throwingEverywhere = new Proxy({} as R1MeetEnvSource, {
+      get() {
+        throw new Error('boom');
+      },
+    });
+    for (const source of [throwingGetter, throwingEverywhere]) {
+      let result: R1MeetFeedbackConfig | undefined;
+      expect(() => {
+        result = getR1MeetFeedbackConfig(source);
+      }).not.toThrow();
+      expect(result).toStrictEqual({ status: 'invalid', reason: FEEDBACK_UNEXPECTED_REASON });
+    }
+    expect(logged).toEqual([]);
+  });
+
+  it('reads only R1_MEET_ASHBY_FEEDBACK_FORM_ID', () => {
+    const reads: string[] = [];
+    const source = new Proxy(valid({ R1_MEET_ASHBY_FEEDBACK_FORM_ID: FORM_ID }), {
+      get(target, name) {
+        reads.push(String(name));
+        return target[name as keyof R1MeetEnvSource];
+      },
+    });
+    expect(getR1MeetFeedbackConfig(source)).toStrictEqual({ status: 'on', formDefinitionId: FORM_ID });
+    expect([...new Set(reads)]).toEqual(['R1_MEET_ASHBY_FEEDBACK_FORM_ID']);
+  });
+
+  it('reads process.env when no source is passed', () => {
+    vi.stubEnv('R1_MEET_ASHBY_FEEDBACK_FORM_ID', FORM_ID);
+    expect(getR1MeetFeedbackConfig()).toStrictEqual({ status: 'on', formDefinitionId: FORM_ID });
+    vi.stubEnv('R1_MEET_ASHBY_FEEDBACK_FORM_ID', 'nope');
+    expect(getR1MeetFeedbackConfig()).toStrictEqual({ status: 'invalid', reason: FEEDBACK_REASON });
+    vi.stubEnv('R1_MEET_ASHBY_FEEDBACK_FORM_ID', '');
+    expect(getR1MeetFeedbackConfig()).toStrictEqual({ status: 'off' });
+    expect(logged).toEqual([]);
+  });
+
+  it('is independent of the Meet flag: the form id is read whatever R1_MEET_ENABLED says', () => {
+    for (const flag of [undefined, '', 'false', 'true', 'nope']) {
+      expect(
+        getR1MeetFeedbackConfig(valid({ R1_MEET_ENABLED: flag, R1_MEET_ASHBY_FEEDBACK_FORM_ID: FORM_ID })),
+        String(flag),
+      ).toStrictEqual({ status: 'on', formDefinitionId: FORM_ID });
+    }
+  });
+
+  it('getR1MeetConfig ignores it: the same answer with it unset, valid or malformed, and it is never read', () => {
+    const bases: R1MeetEnvSource[] = [
+      valid(),
+      valid({ R1_MEET_SERVICE_USER_ID: SERVICE_ID, R1_MEET_GOOGLE_LOGIN_GROUP_ID: GROUP_ID }),
+      {},
+      valid({ R1_MEET_ENABLED: 'false' }),
+      valid({ R1_MEET_ENABLED: 'yes' }),
+      valid({ R1_MEET_DAILY_BOT_CAP: '0' }),
+      valid({ RECALL_API_KEY: undefined }),
+    ];
+    for (const [index, base] of bases.entries()) {
+      const without = getR1MeetConfig(base);
+      for (const formId of [FORM_ID, 'not-a-uuid', NIL_UUID, '']) {
+        const withIt = getR1MeetConfig({ ...base, R1_MEET_ASHBY_FEEDBACK_FORM_ID: formId });
+        expect(withIt, `${index}: ${formId}`).toStrictEqual(without);
+        if (without.enabled && withIt.enabled) {
+          // The hidden credentials are non-enumerable, so toStrictEqual skips them: compare by name.
+          expect([withIt.recall.apiKey, withIt.recall.webhookSecret]).toEqual([
+            without.recall.apiKey,
+            without.recall.webhookSecret,
+          ]);
+        }
+      }
+    }
+    expect(getR1MeetConfig(valid({ R1_MEET_ASHBY_FEEDBACK_FORM_ID: 'not-a-uuid' })).status).toBe('enabled');
+
+    const reads: string[] = [];
+    const source = new Proxy(valid({ R1_MEET_ASHBY_FEEDBACK_FORM_ID: 'not-a-uuid' }), {
+      get(target, name) {
+        reads.push(String(name));
+        return target[name as keyof R1MeetEnvSource];
+      },
+    });
+    expect(getR1MeetConfig(source).status).toBe('enabled');
+    expect(reads).not.toContain('R1_MEET_ASHBY_FEEDBACK_FORM_ID');
+    // The invalid Meet bases above logged their own reasons; the form id never added a line.
+    for (const line of logged) expect(line).not.toContain('FEEDBACK');
+  });
+
+  it('getR1MeetConfig from process.env is unchanged by a malformed form id', () => {
+    for (const name of R1_MEET_ENV_VARIABLES) vi.stubEnv(name, '');
+    vi.stubEnv('R1_MEET_ENABLED', 'true');
+    vi.stubEnv('R1_MEET_ASHBY_DEX_USER_ID', DEX_ID);
+    vi.stubEnv('RECALL_API_KEY', RECALL_KEY_VALUE);
+    vi.stubEnv('RECALL_WEBHOOK_SECRET', RECALL_WEBHOOK_VALUE);
+    vi.stubEnv('WEB_ORIGIN', WEB);
+    const without = getR1MeetConfig();
+    expect(without.status).toBe('enabled');
+    vi.stubEnv('R1_MEET_ASHBY_FEEDBACK_FORM_ID', 'not-a-uuid');
+    expect(getR1MeetConfig()).toStrictEqual(without);
+    expect(getR1MeetFeedbackConfig().status).toBe('invalid');
+    expect(logged).toEqual([]);
+  });
+});
+
 describe('R1 Meet configuration: env contract', () => {
   const schema = JSON.parse(
     readFileSync(fileURLToPath(new URL('../../../../config/environment.schema.json', import.meta.url)), 'utf8'),
   ) as { components: { api: { variables: Record<string, { requiredInProduction: boolean; secret: boolean; external?: boolean }> } } };
   const example = readFileSync(fileURLToPath(new URL('../../.env.example', import.meta.url)), 'utf8');
 
-  it('lists exactly the eleven Meet variables: non-secrets first, then the two credentials', () => {
+  it('lists exactly the twelve Meet variables: non-secrets first, then the two credentials', () => {
     expect([...R1_MEET_ENV_VARIABLES]).toEqual([
       'R1_MEET_ENABLED',
       'R1_MEET_BOT_NAME',
@@ -817,6 +984,7 @@ describe('R1 Meet configuration: env contract', () => {
       'R1_MEET_ARM_AT_CREATE',
       'R1_MEET_MULTI_HUMAN_POLICY',
       'R1_MEET_ASHBY_DEX_USER_ID',
+      'R1_MEET_ASHBY_FEEDBACK_FORM_ID',
       'RECALL_API_KEY',
       'RECALL_WEBHOOK_SECRET',
     ]);
@@ -855,6 +1023,7 @@ describe('R1 Meet configuration: env contract', () => {
     expect(example).not.toMatch(/whsec_[A-Za-z0-9+/]{8,}/);
     // A copied example file is "disabled", not "half configured".
     expect(getR1MeetConfig(parsed as R1MeetEnvSource)).toEqual({ enabled: false, status: 'disabled' });
+    expect(getR1MeetFeedbackConfig(parsed as R1MeetEnvSource)).toStrictEqual({ status: 'off' });
     expect(logged).toEqual([]);
   });
 });

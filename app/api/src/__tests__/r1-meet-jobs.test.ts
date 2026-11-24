@@ -1,8 +1,9 @@
 /**
- * M034 S06 T1: the `r1-meet` job contract (lib/r1/meet/jobs.ts).
+ * M034 S06 T1: the `r1-meet` job contract (lib/r1/meet/jobs.ts). M034 S09 T1 adds the twelfth kind,
+ * `scorecard_feedback`.
  *
  * Pinned here:
- *  - the queue name, the eleven kinds, the attempts and the dedup keys, with the ones migration 0142
+ *  - the queue name, the twelve kinds, the attempts and the dedup keys, with the ones migration 0142
  *    hard-codes read from the SQL;
  *  - the payloads the S03 receivers write, spelled out literally in S03's key order (S03 is not in this
  *    branch, so nothing of it is imported), plus `receipt_id` and `source` as `r1_meet_record_receipt`
@@ -43,6 +44,7 @@ import {
   parseAshbyScheduleJob,
   parseDrainJob,
   parseRecallEventJob,
+  parseScorecardFeedbackJob,
   r1MeetDedupKeys,
   r1MeetDefer,
   r1MeetIgnored,
@@ -71,6 +73,7 @@ const BOT = id('d1');
 const BOOKING = id('d2');
 const ROUND = id('d3');
 const SESSION = id('d4');
+const ASSESSMENT = id('d5');
 const MEET_URL = 'https://meet.google.com/abc-defg-hij';
 
 /** S03 `R1_MEET_ASHBY_SCHEDULE_PAYLOAD_KEYS`, written out. */
@@ -208,7 +211,7 @@ const sql = readFileSync(path.resolve(here, '../../../supabase/migrations/0142_r
   .replace(/\s+/g, ' ');
 
 describe('the r1-meet queue contract', () => {
-  it('has one queue, eleven kinds and one parser per kind', () => {
+  it('has one queue, twelve kinds and one parser per kind', () => {
     expect(R1_MEET_QUEUE).toBe('r1-meet');
     expect([...R1_MEET_JOB_KINDS]).toEqual([
       'ashby_schedule',
@@ -222,6 +225,7 @@ describe('the r1-meet queue contract', () => {
       'multi_human_check',
       'maintenance',
       'drain',
+      'scorecard_feedback',
     ]);
     expect(Object.keys(R1_MEET_JOB_PARSERS)).toEqual([...R1_MEET_JOB_KINDS]);
     expect(Object.keys(R1_MEET_JOB_MAX_ATTEMPTS)).toEqual([...R1_MEET_JOB_KINDS]);
@@ -245,6 +249,7 @@ describe('the r1-meet queue contract', () => {
       multi_human_check: 10,
       maintenance: 3,
       drain: 10,
+      scorecard_feedback: 5,
     });
     expect(sql).toContain(
       "values ('r1-meet', jsonb_build_object('kind', 'bot_release', 'recall_bot_id', old.recall_bot_id, 'booking_id', old.id), "
@@ -254,7 +259,8 @@ describe('the r1-meet queue contract', () => {
       "select 'r1-meet', jsonb_build_object('kind', 'round_cancelled', 'booking_id', b.id, 'round_id', new.id), "
       + "'r1-meet:round-cancelled:' || b.id::text, 10",
     );
-    // r1_meet_record_receipt: five attempts, and the two keys it adds to every S03 payload.
+    // r1_meet_record_receipt: five attempts, and the two keys it adds to every S03 payload (and to the
+    // S09 scorecard_feedback payload, which it also writes: hence its five attempts).
     expect(sql).toContain(
       "('r1-meet', p_payload || jsonb_build_object('receipt_id', v_id, 'source', p_source), "
       + "'pending', 'r1-meet:receipt:' || v_id::text, 0, 5, 0,",
@@ -641,6 +647,12 @@ const SIMPLE: Array<{ kind: R1MeetJobKind; payload: Payload; parsed: Payload; ba
     parsed: { kind: 'drain', force: false },
     bad: { force: [null, 'true', 1, {}] },
   },
+  {
+    kind: 'scorecard_feedback',
+    payload: { kind: 'scorecard_feedback', booking_id: BOOKING, assessment_id: ASSESSMENT },
+    parsed: { kind: 'scorecard_feedback', bookingId: BOOKING, assessmentId: ASSESSMENT },
+    bad: { booking_id: NOT_UUIDS, assessment_id: NOT_UUIDS },
+  },
 ];
 
 describe('the kinds of the triggers, S06 and the operator', () => {
@@ -746,6 +758,9 @@ describe('dedup keys and the jobs S06 writes', () => {
     expect(r1MeetDedupKeys.multiHuman(BOOKING.toUpperCase(), 3)).toBe(`r1-meet:multi-human:${BOOKING}:v3`);
     expect(r1MeetDedupKeys.maintenance(2103840)).toBe('r1-meet:maintenance:2103840');
     expect(r1MeetDedupKeys.drain()).toBe('r1-meet:drain');
+    expect(r1MeetDedupKeys.scorecardFeedback(BOOKING.toUpperCase(), ASSESSMENT.toUpperCase())).toBe(
+      `r1-meet:scorecard-feedback:${BOOKING}:${ASSESSMENT}`,
+    );
   });
 
   it('builds payloads that parse back, with the key and the attempts of their kind', () => {
@@ -758,6 +773,11 @@ describe('dedup keys and the jobs S06 writes', () => {
       [r1MeetJobs.bridgeCheck(BOOKING, 4, 1), { bookingId: BOOKING, version: 4, arm: 1 }, `r1-meet:bridge-check:${BOOKING}:v4:a1`],
       [r1MeetJobs.multiHumanCheck(BOOKING, 4), { bookingId: BOOKING, version: 4 }, `r1-meet:multi-human:${BOOKING}:v4`],
       [r1MeetJobs.maintenance(12), { bucket: 12 }, 'r1-meet:maintenance:12'],
+      [
+        r1MeetJobs.scorecardFeedback(BOOKING, ASSESSMENT),
+        { bookingId: BOOKING, assessmentId: ASSESSMENT },
+        `r1-meet:scorecard-feedback:${BOOKING}:${ASSESSMENT}`,
+      ],
     ] as const;
     for (const [spec, parsed, key] of specs) {
       const kind = spec.payload.kind;
@@ -768,6 +788,80 @@ describe('dedup keys and the jobs S06 writes', () => {
       // Ids, counters and closed words only: no URL, no address, no free text.
       for (const value of Object.values(spec.payload)) expect(String(value), kind).toMatch(/^[a-z0-9_-]+$/);
     }
+  });
+});
+
+describe('scorecard_feedback (M034 S09)', () => {
+  /** What `r1_meet_record_receipt` enqueues for the S09 trigger: the payload plus receipt_id and source. */
+  const receiptJob = (over: Payload = {}): Payload => ({
+    kind: 'scorecard_feedback',
+    booking_id: BOOKING,
+    assessment_id: ASSESSMENT,
+    receipt_id: RECEIPT,
+    source: 'ashby',
+    ...over,
+  });
+
+  it('parses the receipt job: ids lower-cased, receipt_id and source ignored, frozen', () => {
+    const job = parseScorecardFeedbackJob(receiptJob({ booking_id: BOOKING.toUpperCase(), assessment_id: ASSESSMENT.toUpperCase() }));
+    expect(job).toStrictEqual({ kind: 'scorecard_feedback', bookingId: BOOKING, assessmentId: ASSESSMENT });
+    expect(Object.isFrozen(job)).toBe(true);
+    expect(Object.keys(job!)).toEqual(['kind', 'bookingId', 'assessmentId']);
+    // The receipt keys are never read: any value (or none) parses to the same job.
+    expect(parseScorecardFeedbackJob(receiptJob({ receipt_id: 'not-a-uuid', source: 7 }))).toEqual(job);
+    expect(parseScorecardFeedbackJob(without(without(receiptJob(), 'receipt_id'), 'source'))).toEqual(job);
+    expect(R1_MEET_JOB_PARSERS.scorecard_feedback).toBe(parseScorecardFeedbackJob);
+  });
+
+  it('round-trips r1MeetJobs.scorecardFeedback, through JSON as the queue stores it', () => {
+    const spec = r1MeetJobs.scorecardFeedback(BOOKING.toUpperCase(), ASSESSMENT.toUpperCase());
+    expect(Object.keys(spec.payload)).toEqual(['kind', 'booking_id', 'assessment_id']);
+    expect(parseScorecardFeedbackJob(JSON.parse(JSON.stringify(spec.payload)))).toStrictEqual({
+      kind: 'scorecard_feedback',
+      bookingId: BOOKING,
+      assessmentId: ASSESSMENT,
+    });
+    expect(spec.dedupKey).toBe(`r1-meet:scorecard-feedback:${BOOKING}:${ASSESSMENT}`);
+    expect(spec.maxAttempts).toBe(5);
+    expect(R1_MEET_JOB_MAX_ATTEMPTS.scorecard_feedback).toBe(5);
+    expect(Object.isFrozen(spec) && Object.isFrozen(spec.payload)).toBe(true);
+  });
+
+  it('refuses a missing, non-UUID or numeric id, and every other kind', () => {
+    for (const key of ['booking_id', 'assessment_id']) {
+      expect(parseScorecardFeedbackJob(without(receiptJob(), key)), `${key} absent`).toBeNull();
+      for (const value of [null, '', 'not-a-uuid', 7, 7.5, BOOKING.replace(/-/g, ''), ` ${BOOKING}`, [BOOKING], {}]) {
+        expect(parseScorecardFeedbackJob(receiptJob({ [key]: value })), `${key} = ${JSON.stringify(value)}`).toBeNull();
+      }
+    }
+    for (const other of R1_MEET_JOB_KINDS) {
+      if (other !== 'scorecard_feedback') expect(parseScorecardFeedbackJob(receiptJob({ kind: other })), other).toBeNull();
+    }
+    for (const kind of ['scorecard-feedback', 'Scorecard_feedback', 'scorecard_feedback ', null]) {
+      expect(parseScorecardFeedbackJob(receiptJob({ kind })), String(kind)).toBeNull();
+    }
+    // A scorecard_feedback payload is not a job of any other kind either.
+    for (const other of R1_MEET_JOB_KINDS) {
+      if (other === 'scorecard_feedback') continue;
+      expect((R1_MEET_JOB_PARSERS[other] as (payload: unknown) => unknown)(receiptJob()), other).toBeNull();
+    }
+  });
+
+  it('keeps its dedup key apart from every other key family', () => {
+    const key = r1MeetDedupKeys.scorecardFeedback(BOOKING, ASSESSMENT);
+    expect(key).toMatch(/^r1-meet:scorecard-feedback:[0-9a-f-]{36}:[0-9a-f-]{36}$/);
+    expect(key).toHaveLength('r1-meet:scorecard-feedback:'.length + 36 + 1 + 36);
+    for (const other of [
+      r1MeetDedupKeys.ensureBot(BOOKING),
+      r1MeetDedupKeys.attemptEnded(BOOKING),
+      r1MeetDedupKeys.roundCancelled(BOOKING),
+      `r1-meet:receipt:${RECEIPT}`,
+    ]) {
+      expect(key.startsWith(other.slice(0, other.lastIndexOf(':') + 1))).toBe(false);
+    }
+    // One key per (booking, assessment): a new assessment of the same booking is a new job.
+    expect(r1MeetDedupKeys.scorecardFeedback(BOOKING, SESSION)).not.toBe(key);
+    expect(r1MeetDedupKeys.scorecardFeedback(ROUND, ASSESSMENT)).not.toBe(key);
   });
 });
 

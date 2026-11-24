@@ -61,7 +61,7 @@ const MEET_SUPPORT_FILES = ['recall-fake.ts', 'meet-webhook-signing.ts', 'ashby-
   (name) => path.join(TESTS_DIR, 'support', name),
 );
 
-/** The eleven Meet variables (config/environment.schema.json, api), in `R1_MEET_ENV_VARIABLES` order. */
+/** The twelve Meet variables (config/environment.schema.json, api), in `R1_MEET_ENV_VARIABLES` order. */
 const MEET_ENV_NAMES = [
   'R1_MEET_ENABLED',
   'R1_MEET_BOT_NAME',
@@ -72,6 +72,7 @@ const MEET_ENV_NAMES = [
   'R1_MEET_ARM_AT_CREATE',
   'R1_MEET_MULTI_HUMAN_POLICY',
   'R1_MEET_ASHBY_DEX_USER_ID',
+  'R1_MEET_ASHBY_FEEDBACK_FORM_ID',
   'RECALL_API_KEY',
   'RECALL_WEBHOOK_SECRET',
 ] as const;

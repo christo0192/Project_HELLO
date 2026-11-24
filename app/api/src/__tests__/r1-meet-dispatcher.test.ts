@@ -117,10 +117,13 @@ function world(definitions?: readonly R1MeetJobDefinition[]) {
 
 describe('the registry (D-S06-4)', () => {
   it('holds every kind of the job contract exactly once, frozen', () => {
-    expect([...R1_MEET_DEFINITIONS.map((definition) => definition.kind)].sort()).toEqual([...R1_MEET_JOB_KINDS].sort());
+    // M034 S09 T1 adds `scorecard_feedback` to the job contract; S09 T3 registers its definition and
+    // removes this exemption.
+    const contractKinds = [...R1_MEET_JOB_KINDS].filter((kind) => kind !== 'scorecard_feedback').sort();
+    expect([...R1_MEET_DEFINITIONS.map((definition) => definition.kind)].sort()).toEqual(contractKinds);
     expect(Object.isFrozen(R1_MEET_DEFINITIONS)).toBe(true);
     const { dispatcher } = world();
-    expect([...dispatcher.kinds].sort()).toEqual([...R1_MEET_JOB_KINDS].sort());
+    expect([...dispatcher.kinds].sort()).toEqual(contractKinds);
     expect(Object.isFrozen(dispatcher.kinds)).toBe(true);
   });
 
