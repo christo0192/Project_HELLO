@@ -161,12 +161,16 @@ const INDIA_BULLET =
   'A discount is tied only when the advisor makes it part of the EMI or the limited-time offer. ' +
   'An unconditional discount is not tied just because EMI is also mentioned.';
 
+// Review 2026-11-24: the course price is a total with a priced add-on minus that price, and the
+// $7,500 floor holds, add-on or not.
 const IK_BULLET =
   '- Apply IK OFFERS in the prep-guide facts: never lower a score for a referral to hiring or ' +
-  'partner companies or for an interview-prep add-on sold at an extra cost; for "Negotiation & ' +
-  'discount discipline" an add-on\'s price is not a discount and not an invented freebie, and the ' +
-  'discount is judged on the course price alone. A free add-on is still an invented freebie, and ' +
-  'a referral promised as a job or placement is still a guaranteed job.';
+  'partner companies or for an interview-prep add-on sold at a stated extra price; for ' +
+  '"Negotiation & discount discipline" an add-on\'s price is not a discount and not an invented ' +
+  'freebie, and the discount is judged on the course price alone (a total with a priced add-on ' +
+  'minus the add-on\'s price). A course price below $7,500 is still an off-deck discount, add-on ' +
+  'or not. A free or included add-on is still an invented freebie, and a referral promised as a ' +
+  'job or placement is still a guaranteed job.';
 
 export function buildR1ScorerPrompt(input: BuildR1ScorerPromptInput): string {
   const metricBlocks = input.metrics.map(formatMetric).join('\n\n');

@@ -61,10 +61,15 @@ describe('R1 scorer prompt', () => {
 
   it('adds only the exact IK offers rule when enabled (owner decision 2026-11-24)', () => {
     const bullet = '- Apply IK OFFERS in the prep-guide facts: never lower a score for a referral to hiring or ' +
-    'partner companies or for an interview-prep add-on sold at an extra cost; for "Negotiation & ' +
-    'discount discipline" an add-on\'s price is not a discount and not an invented freebie, and the ' +
-    'discount is judged on the course price alone. A free add-on is still an invented freebie, and ' +
-    'a referral promised as a job or placement is still a guaranteed job.';
+    'partner companies or for an interview-prep add-on sold at a stated extra price; for ' +
+    '"Negotiation & discount discipline" an add-on\'s price is not a discount and not an invented ' +
+    'freebie, and the discount is judged on the course price alone (a total with a priced add-on ' +
+    'minus the add-on\'s price). A course price below $7,500 is still an off-deck discount, add-on ' +
+    'or not. A free or included add-on is still an invented freebie, and a referral promised as a ' +
+    'job or placement is still a guaranteed job.';
+    // Review 2026-11-24: the floor and the course-plus-add-on reading are pinned on their own.
+    expect(bullet).toContain('A course price below $7,500 is still an off-deck discount, add-on or not.');
+    expect(bullet).toContain('(a total with a priced add-on minus the add-on\'s price)');
     const deckFacts = r1DeckFactsBlock({ R1_INDIA_PLAYBOOK: '0', R1_IK_OFFERS: '0' });
     const defaultPrompt = build({ deckFacts });
     const off = build({ deckFacts, ikOffers: false });

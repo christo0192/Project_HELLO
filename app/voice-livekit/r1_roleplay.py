@@ -1856,6 +1856,9 @@ class RolePlayEngine:
         self._callback_after_pressure = flag_on(FLAG_CALLBACK_AFTER_PRESSURE)
         self._callback_turn: int | None = None
         self._callback_slot: str | None = None
+        # The role-play turns whose line the open callback capped at MEDIUM (review 2026-11-24:
+        # the rehearsal leak metric mirrors ``_commitment_cap`` from these, not from the booking).
+        self._callback_open_turns: list[int] = []
         self._ik_offers = flag_on(FLAG_IK_OFFERS)
         self._turn_time_offer = False
         self._time_offer_notes = 0
@@ -2394,14 +2397,17 @@ class RolePlayEngine:
 
         She then agrees to a reasonable callback time (the level on record stays WEAK and she never
         enrols).  Pressure is ``CommitmentEvidence.pressured``'s own reading; her own explicit
-        decline of a call (``call_declined``) still holds.  A WEAK that is only unearned (a terse
+        decline of a call (``call_declined``) before the booking still holds.  Once her agreement
+        was heard (``_callback_turn``) it stays open (review 2026-11-24): "please don't call
+        before seven" while she moves the call reads as a decline, and closing the callback then
+        would turn her confirmation into a guard hit.  A WEAK that is only unearned (a terse
         advisor, too little evidence) keeps the previous behaviour.
         """
         return (
             self._callback_after_pressure
             and self._commitment_level is Level.WEAK
             and (self.tracker.invented_offer or self.tracker.coercive_urgency)
-            and not self.negotiation.call_declined()
+            and (self._callback_turn is not None or not self.negotiation.call_declined())
         )
 
     def _callback_next_step_note(self) -> str:
@@ -6345,7 +6351,11 @@ class RolePlayEngine:
         # names her own below.
         choice = negotiation.slot_choice(self.turn, picks_own=False)
         negotiation.chosen_slot = logged
-        if choice.deferred:
+        # Review 2026-11-24: ``slot_choice`` checks only the advisor's slot, so the 7 PM it moves a
+        # daytime proposal to may be an evening she called difficult; she names her own instead.
+        moved_refused = choice.moved and negotiation.slot_refused(parse_slot(choice.phrase))
+        moved = choice.moved and not moved_refused
+        if choice.deferred or moved_refused:
             slot = next(
                 (own for own in CALLBACK_OWN_SLOTS
                  if not negotiation.slot_refused(parse_slot(own))),
@@ -6354,13 +6364,13 @@ class RolePlayEngine:
             source = "own"
         else:
             slot = choice.phrase
-            source = "moved" if choice.moved else "advisor"
+            source = "moved" if moved else "advisor"
         self._callback_slot = slot
         negotiation.note_response(self.turn, "callback:agreed")
         return self._plan(
             TurnMode.SAY_ONLY,
             [*reasons, "callback_after_pressure", f"callback_slot:{source}"],
-            scripted=callback_line(dm, slot, moved=choice.moved),
+            scripted=callback_line(dm, slot, moved=moved),
         )
 
     def _commit_stall_plan(
@@ -7647,6 +7657,8 @@ class RolePlayEngine:
             return
         when = self.last_r if r_sec is None else r_sec
         cap = self._commitment_cap()  # the level on record BEFORE this turn's line
+        if self._callback_open() and plan.turn not in self._callback_open_turns:
+            self._callback_open_turns.append(plan.turn)  # the callback raised this line's cap
         # SWEEP-1: the primaries already delivered before this line, to tell which one it delivered.
         primaries_before = {
             primary for primary in _REACT_PUSHES.values() if self.scheduler.is_delivered(primary)
@@ -8221,6 +8233,9 @@ class RolePlayEngine:
                 # agreement was heard (logged, never posted; the level above stays WEAK).
                 **({"callback_turn": self._callback_turn}
                    if self._callback_after_pressure and self._callback_turn is not None else {}),
+                # The turns the open callback capped her line at MEDIUM (review 2026-11-24).
+                **({"callback_open_turns": list(self._callback_open_turns)}
+                   if self._callback_open_turns else {}),
             },
             "guard": self.ledger.summary(),
             # Which layer of each need was handed to the model on which role-play turn

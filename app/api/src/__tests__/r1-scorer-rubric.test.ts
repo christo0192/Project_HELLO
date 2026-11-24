@@ -200,6 +200,18 @@ describe('R1 deck facts (owner decision: the deck is the only product source)', 
       'guaranteed job, role or placement']) {
       expect(R1_IK_OFFERS_TEXT).toContain(text);
     }
+    // Review 2026-11-24: a total with a priced add-on implies a larger course discount, never none,
+    // and the $7,500 floor holds, add-on or not.
+    for (const text of [
+      'A stated total that includes a priced add-on is the course price plus the add-on\'s price',
+      'read the course price as that total minus the add-on\'s price',
+      'the course price must be $9,000, $8,500, $8,000 or $7,500',
+      'A course price below $7,500 is still an off-deck discount and a violation, add-on or not.',
+      'is a free perk plus whatever discount that total itself shows',
+    ]) {
+      expect(R1_IK_OFFERS_TEXT).toContain(text);
+    }
+    expect(R1_IK_OFFERS_TEXT).not.toContain('never read a discount from a stated total');
     expect(r1DeckFactsBlock({ R1_INDIA_PLAYBOOK: '0' }).endsWith(R1_IK_OFFERS_TEXT)).toBe(true);
     for (const value of ['0', 'off', 'false', 'no', ' OFF ', 'No']) {
       expect(r1DeckFactsBlock({ R1_IK_OFFERS: value })).not.toContain('IK OFFERS');
@@ -270,10 +282,10 @@ describe('R1 provenance and pins', () => {
     );
     // These pins cover the IK offers text (owner decision 2026-11-24), with and without India.
     expect(r1DeckFactsSha({})).toBe(
-      '438b362c42635d2a49832806af61184927b8815af13da630e56282254e4d58ee',
+      '07b83bd5fd37ff5caf5bf5f6b3a247a89a4b5ad43f8f6bd10671433e2888c9cc',
     );
     expect(r1DeckFactsSha({ R1_INDIA_PLAYBOOK: '0' })).toBe(
-      '26bca1b03edac9d0dfa23b459767262c18d8320ddee14d85f7f02da507a363de',
+      '23fcdd0d69d48110c5e5c0f212df9c22ac1b30be5bae648a68a6dbfebd4ba44a',
     );
   });
 });

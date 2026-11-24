@@ -252,6 +252,60 @@ class CallbackAfterPressureTests(unittest.TestCase):
         self.assertIn(P.CALLBACK_NEXT_STEP_NOTE.format(decision_maker=dm), plan.reminder)
         self.assertNotIn(P.NEXT_STEP_NOTE, plan.reminder)
 
+    def test_a_reschedule_after_the_booking_keeps_the_callback_open(self):
+        # Review 2026-11-24: "please don't call before ..." after the booking reads as a call
+        # decline, which must not close the callback she already agreed to.
+        session, r = pressured(seed="cb-14")
+        dm = session.eng.persona.decision_maker
+        _, r = to_weak(session, r)
+        booked = session.say("Can I call you tomorrow evening?", r + 40)
+        self.assertIn("callback_after_pressure", booked.reasons)
+        session.reply = (f"Please don't call before I've talked to my {dm}, but tomorrow evening "
+                         "should be fine.")
+        session.say("Great, does that work for you?", r + 70)
+        self.assertTrue(session.eng.negotiation.call_declined())
+        self.assertIs(session.eng._commitment_cap(), Level.MEDIUM)
+        session.reply = "Yes, tomorrow evening works for the call."
+        plan = session.say("So I'll call you tomorrow evening, okay?", r + 100)
+        self.assertIn("callback_on_record", plan.reasons)
+        self.assertNotIn("commitment_on_record", plan.reasons)
+        self.assertEqual(session.spoken[-1], "Yes, tomorrow evening works for the call.")
+        self.assertEqual(commitment_hits(session), 0)
+        self.assertTrue(session.eng.fidelity()["checks"]["no_commitment_violation"])
+        self.assertEqual(session.eng.admin_log()["commitment"]["level"], "WEAK")
+
+    def test_a_moved_evening_she_called_difficult_is_never_booked(self):
+        # Review 2026-11-24: a daytime proposal moves to 7 PM, which she may have ruled out.
+        for seed, refusal in (("cb-15", "Evenings are tricky for me."),
+                              ("cb-16", "I can't do evenings, honestly.")):
+            with self.subTest(refusal=refusal):
+                session, r = pressured(seed=seed)
+                dm = session.eng.persona.decision_maker
+                _, r = to_weak(session, r)
+                session.reply = refusal
+                session.say(CHAT, r + 30)
+                self.assertTrue(session.eng.negotiation.refused_slots)
+                plan = session.say(DAYTIME_ASK, r + 60)
+                self.assertEqual(plan.scripted_text, callback_line(dm, "this weekend"))
+                self.assertIn("callback_slot:own", plan.reasons)
+                self.assertNotIn("Evenings are easier", plan.scripted_text)
+
+    def test_the_turns_the_callback_raised_the_cap_are_logged(self):
+        # Review 2026-11-24: the cap is MEDIUM from the first turn after the WEAK line to a
+        # pressured advisor, before any callback is booked; the rehearsal metric reads these turns.
+        session, r = pressured(seed="cb-17")
+        weak, r = to_weak(session, r)
+        session.reply = "Okay, I'll pay today. Sure, tomorrow evening works for a call."
+        free = session.say("Just tell me a time that suits you.", r + 40)
+        self.assertEqual(session.spoken[-1], "Sure, tomorrow evening works for a call.")
+        commitment = session.eng.admin_log()["commitment"]
+        self.assertNotIn("callback_turn", commitment)
+        self.assertEqual(commitment["callback_open_turns"], [free.turn])
+        self.assertNotIn(weak.turn, commitment["callback_open_turns"])
+        unpressured, r2 = run_cooperative(72.5, eng=engine(seed="cb-18"))
+        to_weak(unpressured, r2)
+        self.assertNotIn("callback_open_turns", unpressured.eng.admin_log()["commitment"])
+
     def test_owner_shaped_paraphrase(self):
         persona = resolve_persona("p2_recent_grad", variant="v2")
         session = Session(engine(persona, name="Advisor", seed="cb-13"))
@@ -326,6 +380,17 @@ class CallbackHarnessTests(unittest.TestCase):
         self.assertEqual(
             len(self.leaks(medium, {"level": "WEAK", "turn": 18, "callback_turn": 22})), 1)
 
+    def test_the_cap_is_medium_on_the_turns_the_callback_was_open(self):
+        # Review 2026-11-24: the engine's cap is MEDIUM while the callback is open, before any
+        # booking.
+        medium = "Sure, tomorrow evening works for a call."
+        self.assertEqual(
+            self.leaks(medium, {"level": "WEAK", "turn": 18, "callback_open_turns": [20, 22]}), [])
+        self.assertEqual(len(self.leaks(
+            STRONG_REPLY, {"level": "WEAK", "turn": 18, "callback_open_turns": [22]})), 1)
+        self.assertEqual(len(self.leaks(
+            medium, {"level": "WEAK", "turn": 18, "callback_open_turns": [20, 21]})), 1)
+
 
 class CallbackLineShapeTests(unittest.TestCase):
     def lines(self):
@@ -369,6 +434,20 @@ class JudgeIkOffersTests(unittest.TestCase):
         self.assertIn("partner companies", JUDGE_IK_OFFERS_RULE)
         self.assertIn("still invented", JUDGE_IK_OFFERS_RULE)
 
+    def test_rule_keeps_the_floor_and_reads_a_bundle_total_as_course_plus_addon(self):
+        # Review 2026-11-24: a total with a priced add-on implies a LARGER course discount, never
+        # none.
+        rule = JUDGE_IK_OFFERS_RULE
+        self.assertIn("the course price is that total minus the add-on's price", rule)
+        self.assertIn("the discount is $9000 minus that course price", rule)
+        self.assertIn("A course price below $7500 is still", rule)
+        self.assertIn("add-on or not", rule)
+        self.assertIn("included with no price of its own is still a free extra", rule)
+        self.assertIn("a course price of $7000, a $2000 discount, which is invented", rule)
+        self.assertIn("a course price of $7500, a $1500 discount, which is not", rule)
+        self.assertNotIn("never read it, or a total that includes it, as a discount", rule)
+        self.assertNotIn("does not apply to such a total", rule)
+
     def test_engine_follows_the_flag(self):
         for value, expected in (("1", True), ("0", False)):
             with self.subTest(value=value), flags(R1_IK_OFFERS=value):
@@ -389,6 +468,22 @@ ADDON_TOTAL = (
     "Interview prep is a separate program; we can add it on top of the course for an extra "
     "$1,000, so your total comes to $10,000."
 )
+BUNDLE_7000 = (
+    "Interview prep is a separate program for an extra $1,000. I can do the whole thing for $8,000."
+)
+BUNDLE_7500 = "With interview prep at $1,000 more, I can do both for $8,500 in total."
+# The course's own price said next to the words "interview prep" (review 2026-11-24), and the
+# discount the deck reader logs for it with the flag on or off.
+COURSE_PRICES = (
+    ("I can do our interview prep program for $7,800.", 1200),
+    ("I can give you the interview prep program for $7,800.", 1200),
+    ("I can offer you the course at $7,600, and it covers interview prep too.", 1400),
+    ("Interview prep is our core, and I can offer it to you at $7,900.", 1100),
+    ("Forget the add-on, I can do the course for $8,200 today.", 800),
+    ("Without the interview prep add-on, I can do the course for $7,800.", 1200),
+    ("I can do it for $7,800 including the interview prep add-on.", 1200),
+    ("I can bring it down to $7,700 and you get the whole interview prep curriculum.", 1300),
+)
 
 
 def mentions(text, ik):
@@ -404,12 +499,73 @@ class AddonReaderTests(unittest.TestCase):
         self.assertFalse(invented_offer_in(ADDON_WHITENED, v2=True, reconcile=True,
                                            ik_offers=False))
 
-    def test_a_total_with_the_addon_is_no_course_net_price(self):
-        self.assertEqual(mentions(ADDON_INCLUDED_8000, True), [])
-        self.assertEqual(mentions(ADDON_INCLUDED_8000, False), [(1000, None)])
-        # Below $7,500 is more than the deck allows, add-on or not.
-        self.assertEqual(mentions(ADDON_INCLUDED_7000, True), [(2000, None)])
-        self.assertTrue(invented_offer_in(ADDON_INCLUDED_7000, v2=True, ik_offers=True))
+    def test_an_included_addon_is_a_free_perk_and_the_net_price_is_read(self):
+        # Review 2026-11-24: an add-on "included" has no price of its own, so it is no paid add-on
+        # and the figure is the course's net price, as with the flag off.
+        for ik in (True, False):
+            with self.subTest(ik=ik):
+                self.assertEqual(mentions(ADDON_INCLUDED_8000, ik), [(1000, None)])
+                self.assertEqual(mentions(ADDON_INCLUDED_7000, ik), [(2000, None)])
+                self.assertTrue(invented_offer_in(ADDON_INCLUDED_7000, v2=True, ik_offers=ik))
+        self.assertFalse(sells_paid_addon(ADDON_INCLUDED_8000))
+
+    def test_a_total_with_a_priced_addon_is_read_as_course_plus_addon(self):
+        # Review 2026-11-24: total minus the add-on's price is the course; the discount is read
+        # on it.
+        self.assertEqual(mentions(BUNDLE_7000, True), [(2000, None)])  # the course at $7,000
+        self.assertTrue(invented_offer_in(BUNDLE_7000, v2=True, reconcile=True, ik_offers=True))
+        self.assertEqual(mentions(BUNDLE_7000, False), [(1000, None)])
+        self.assertEqual(mentions(BUNDLE_7500, True), [(1500, None)])
+        self.assertFalse(invented_offer_in(BUNDLE_7500, v2=True, reconcile=True, ik_offers=True))
+        self.assertEqual(mentions(BUNDLE_7500, False), [(500, None)])
+
+    def test_only_the_figures_own_clause_makes_it_a_total_with_the_addon(self):
+        # A total word elsewhere ("when it comes to", "together", "so your total comes to $8,500")
+        # belongs to another figure; reading the course price as a bundle would invent $1,000 off.
+        for text, logged in (
+            ("Interview prep is $1,000 more. When it comes to the course, I can do it for $7,500.",
+             1500),
+            ("Let's work together: the add-on is $1,000 more, and I can do it for $7,500 today.",
+             1500),
+            ("With interview prep at $1,000 more, I can do the course for $7,500.", 1500),
+            ("Interview prep is $1,000 extra. I can do the course for $7,500, so your total "
+             "comes to $8,500.", 1500),
+            ("Interview prep is $1,000 extra, so I can do both for $8,000.", 2000),
+            ("We can add interview prep for an extra $1,000, and I can do the course plus the "
+             "add-on for $8,500.", 1500),
+            ("The add-on is $1,000 more, so in total I can do it for $8,500.", 1500),
+            ("The add-on is $1,000 more, so I can do it for $8,000 for both.", 2000),
+            ("The add-on is $1,000 extra. I can give both of you the course for $7,500.", 1500),
+            ("The add-on is $1,000 extra. If you're all in I can do it for $7,500.", 1500),
+            ("The add-on is $1,000 extra. I can give you everything you need for $7,500.", 1500),
+            ("The add-on is $1,000 extra, so I can do it all for $8,000.", 2000),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(mentions(text, True), [(logged, None)])
+                self.assertIs(invented_offer_in(text, v2=True, reconcile=True, ik_offers=True),
+                              logged > 1500)
+
+    def test_a_course_price_beside_a_paid_addon_is_the_course_price(self):
+        text = "I can do it for $7,500 today, and interview prep for $1,000 more."
+        self.assertTrue(sells_paid_addon(text))
+        for ik in (True, False):
+            with self.subTest(ik=ik):
+                self.assertEqual(mentions(text, ik), [(1500, None)])
+                self.assertFalse(invented_offer_in(text, v2=True, reconcile=True, ik_offers=ik))
+        before = "The add-on is $1,000 more. I can do the course for $7,800."
+        self.assertEqual(mentions(before, True), [(1200, None)])
+        self.assertTrue(invented_offer_in(before, v2=True, reconcile=True, ik_offers=True))
+
+    def test_course_prices_next_to_interview_prep_are_still_read(self):
+        # Review 2026-11-24: "interview prep" names IK's course; a left-out or included add-on, or
+        # the course's own price, is no paid add-on, so the off-deck price stays invented.
+        for text, usd in COURSE_PRICES:
+            for ik in (True, False):
+                with self.subTest(text=text, ik=ik):
+                    self.assertEqual(mentions(text, ik), [(usd, None)])
+                    self.assertTrue(invented_offer_in(text, v2=True, reconcile=True,
+                                                      ik_offers=ik))
+                    self.assertFalse(sells_paid_addon(text))
 
     def test_explicit_discounts_are_unchanged(self):
         stacked = "With the $1,500 discount and the interview prep add-on at $1,000 more, you pay $8,500."
@@ -436,6 +592,9 @@ class AddonReaderTests(unittest.TestCase):
             "I can take another $1,000 off if you add interview prep.",
             "We don't sell interview prep for $1,000.",
             "The course is $9,000 with mentorship.",
+            "The course costs $9,000, and we also have an interview prep add-on.",
+            "On top of that I can give you the interview prep course for $7,500.",
+            "I can give you the interview prep program for $9,500.",
         )
         for text in positives:
             with self.subTest(text=text):
@@ -472,6 +631,9 @@ class AddonReaderTests(unittest.TestCase):
             self.assertEqual(stated_totals(ADDON_TOTAL), [])
             self.assertEqual(stated_totals(split), [])
             self.assertEqual(stated_totals("The total comes to $9,500 for this cohort."), [9500])
+            # Review 2026-11-24: the course's own price next to "interview prep" is still a total.
+            self.assertEqual(
+                stated_totals("I can give you the interview prep program for $9,500."), [9500])
         with flags(R1_IK_OFFERS="0"):
             self.assertEqual(stated_totals(ADDON_TOTAL), [10000])
             self.assertEqual(stated_totals(split), [10000])
@@ -494,6 +656,44 @@ class AddonTrackerTests(unittest.TestCase):
         off = self.judge_on(False)
         self.assertIn(2, off._reconciled_turns)
         self.assertFalse(off.invented_offer)
+
+    def test_course_prices_next_to_interview_prep_stay_in_the_discount_log(self):
+        # Review 2026-11-24: the posted discount_detected rows come from this log.
+        for line, logged, invented in (
+            ("I can give you the interview prep program for $7,800.", [1200], True),
+            ("I can do it for $7,500 today, and interview prep for $1,000 more.", [1500], False),
+            (BUNDLE_7000, [2000], True),
+        ):
+            for ik in (True, False):
+                if line is BUNDLE_7000 and not ik:
+                    continue
+                with self.subTest(line=line, ik=ik):
+                    tracker = CoverageTracker(
+                        P1, seed="ik-c", invented_v2=True, discipline_v2=True,
+                        total_reconcile=True, india_playbook=True, ik_offers=ik,
+                    )
+                    tracker.observe_candidate_turn("The course costs $9000.", 1)
+                    tracker.observe_candidate_turn(line, 2)
+                    self.assertEqual([item["usd"] for item in tracker.discount_log], logged)
+                    self.assertIs(tracker.invented_offer, invented)
+                    if invented:
+                        self.assertFalse(tracker.discount_ok)
+
+
+class AddonEngineTests(unittest.TestCase):
+    def test_an_off_deck_price_next_to_interview_prep_keeps_the_advisor_pressured(self):
+        # Review 2026-11-24: with the flag on this advisor was no longer pressured, so the callback
+        # path never opened and the learner's grade was no longer capped at WEAK.
+        for value in ("1", "0"):
+            with self.subTest(flag=value), flags(R1_IK_OFFERS=value):
+                session, r = run_cooperative(72.5, eng=engine(seed="ik-press"))
+                session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+                session.say("I can offer you the course at $7,600, and it covers interview prep "
+                            "too.", r + 30)
+                self.assertTrue(session.eng.tracker.invented_offer)
+                evidence = session.eng.tracker.commitment_evidence(AskKind.CALL)
+                self.assertTrue(evidence.pressured)
+                self.assertFalse(evidence.discount_ok)
 
 
 class AddonConflictTests(unittest.TestCase):

@@ -285,8 +285,10 @@ import r1_world
 # 51: M034 S08 Meet line variants (r1_script.MEET_LINES), with the hello-again disclosure.
 # 52: the owner's W4 agenda (R1_AGENDA_W4, AGENDA_W4_LINES), picked by ear 2026-11-24.
 # 53: owner 2026-11-24: the callback after pressure (R1_CALLBACK_AFTER_PRESSURE) and IK offers
-#     (R1_IK_OFFERS: the judge sentence, the paid add-on readers, world revision 5).
-PINNED_CONTENT_SHA256 = "5bf005500cef1e2f0b5ed7b79346236e77a960961afc4e006a010c3217f23f81"
+#     (R1_IK_OFFERS: the judge sentence, the paid add-on readers, world revision 5).  Review
+#     2026-11-24, same revision: the judge sentence reads a total with a priced add-on as course
+#     plus add-on and keeps the $7,500 floor; only a stated extra price makes a figure the add-on's.
+PINNED_CONTENT_SHA256 = "f0c37bec3273623e4e794dfda7534602424c782f087bec0add9a3c94e8497c92"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -1128,6 +1130,9 @@ class FinalReviewRoundOnePinTests(unittest.TestCase):
                 "paid_addon_pattern": r1_tracker._PAID_ADDON.pattern,
                 "addon_free_pattern": r1_tracker._ADDON_FREE.pattern,
                 "addon_past_pattern": r1_tracker._ADDON_PAST.pattern,
+                "addon_bundle_before_pattern": r1_tracker._ADDON_BUNDLE_BEFORE.pattern,
+                "addon_bundle_after_pattern": r1_tracker._ADDON_BUNDLE_AFTER.pattern,
+                "addon_left_out_pattern": r1_tracker._ADDON_LEFT_OUT.pattern,
                 "addon_total_cue_pattern": r1_negotiation._ADDON_TOTAL_CUE.pattern,
                 "max_deep_offers": r1_tracker.MAX_DEEP_OFFERS,
                 "max_deep_misses": r1_tracker.MAX_DEEP_MISSES,

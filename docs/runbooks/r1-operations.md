@@ -2963,7 +2963,7 @@ times. What changed (all learner-side, `CONTENT_REVISION` 20):
 No environment variable, migration, API or transcript-masking change: no new line id, row kind or
 admin-log event type (`app/api/src/lib/r1` is untouched).
 
-### The learner after the owner mock test of 2026-11-24 (content revision 52)
+### The learner after the owner mock test of 2026-11-24 (content revision 53)
 
 In the owner's mock test (recent-graduate persona, deep-evaluator temperament) the learner ended
 WEAK because the shadow judge marked several advisor turns as invented offers, which makes the
@@ -2971,7 +2971,7 @@ advisor "pressured" and caps the grade at WEAK. Two of those turns were real IK 
 through partner companies, and interview prep sold as an add-on at extra cost). After the WEAK line
 she then refused every callback time three times, although the advisor only asked when to call
 back after she talked to her father, and one refusal was a commitment guard hit. The owner chose
-two changes (both default on, both pinned in content revision 52):
+two changes (both default on, both pinned in content revision 53):
 
 * **`R1_CALLBACK_AFTER_PRESSURE`** (worker only). After the WEAK line to a pressured advisor (an
   invented offer or a coercive deadline: the same reading as `CommitmentEvidence.pressured`) she
@@ -2987,10 +2987,13 @@ two changes (both default on, both pinned in content revision 52):
   While this is open the guard cap is MEDIUM (never STRONG), so the agreement and its
   confirmations are no `guard_hit` row of kind commitment (no `out_of_level_commitment` gate
   failure); an enrolment or payment sentence is still blocked. Her own explicit decline of a call
-  (`call_declined`) still wins, and a WEAK that is only unearned (a terse advisor, little evidence)
+  (`call_declined`) before the booking still wins; after the booking a reschedule ("please don't
+  call before seven") keeps the callback open. A moved 7 PM she called difficult is never booked:
+  she names her own slot instead. A WEAK that is only unearned (a terse advisor, little evidence)
   keeps the previous refusal path. The admin log's `commitment.callback_turn` (logged, never posted)
-  is the role-play turn the agreement was heard, and the Fly log has `r1_fidelity_callback
-  after_pressure` with its transcript turn. The API masks the line already
+  is the role-play turn the agreement was heard, `commitment.callback_open_turns` the turns whose
+  line the open callback capped at MEDIUM (the rehearsal leak metric reads both), and the Fly log
+  has `r1_fidelity_callback after_pressure` with its transcript turn. The API masks the line already
   (`let's book a call`, `transcript.ts`). Plan reasons: `callback_after_pressure`,
   `callback_slot:advisor|moved|own`, `callback_on_record`.
   Rollback: `fly secrets set R1_CALLBACK_AFTER_PRESSURE=0 -a project-hello-voice`.
@@ -2999,13 +3002,21 @@ two changes (both default on, both pinned in content revision 52):
   separate program at an extra cost are real IK offers. The shadow judge gets
   `JUDGE_IK_OFFERS_RULE` after the playbook sentence (validated by an offline replay of the owner's
   session: the referral and paid add-on turns are no longer invented; the off-deck $7,000, the
-  promised role, the promised placement and the outcome statistic still are). The add-on's cost
-  raises the total and is never a discount: a turn that sells the add-on is not reconciled with a
-  stated total, so "$2,000 off and interview prep for $1,000, so $8,000" stays an off-deck $2,000
-  (with the flag off the reconcile read it as a deck $1,000 and voided the judge's flag); a net
-  price of $7,500 or more that includes the add-on is no course discount, while one below $7,500
-  is still read as more than the deck allows. A total that includes the paid add-on raises no
-  website or rise price check for the learner. Still violations: off-deck discounts and prices
+  promised role, the promised placement and the outcome statistic still are). The add-on's price
+  is never a discount: a turn that sells the add-on is not reconciled with a stated total, so
+  "$2,000 off and interview prep for $1,000, so $8,000" stays an off-deck $2,000 (with the flag off
+  the reconcile read it as a deck $1,000 and voided the judge's flag). A figure is the add-on's
+  only with a stated extra price ("an extra $1,000", "$1,000 more", "the add-on costs $1,000",
+  "add interview prep for $1,000"): IK's course itself is interview prep, so "our interview prep
+  program for $7,800" is still $1,200 off and invented. A total stated in its own clause as
+  including the priced add-on ("interview prep for an extra $1,000 ... the whole thing for $8,000")
+  is read as the course plus the add-on: the course at $7,000, still $2,000 off and invented, while
+  "$8,500 in total" with a $1,000 add-on is the deck's $1,500. A free, included or left-out add-on
+  never changes the reading. A total that includes the paid add-on raises no website or rise
+  price check for the learner. Review 2026-11-24: the first version dropped every net price from
+  $7,500 up in a sentence that named "interview prep"; the judge sentence and the scorer text now
+  read a total with a priced add-on as course plus add-on and keep the $7,500 floor (replayed on
+  the owner's session: every turn kept its verdict). Still violations: off-deck discounts and prices
   below $7,500, guarantees, promised jobs, roles or placements, refunds and free perks (a free
   add-on included). The API scorer gets `R1_IK_OFFERS_TEXT` in the prep-guide facts and the IK
   bullet in its rules; the deck-facts version is `r1-deck-facts-2026-11.2` (India playbook and IK

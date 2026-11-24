@@ -874,21 +874,68 @@ def _ik_offers_on() -> bool:
 
 
 # Owner decision 2026-11-24 (R1_IK_OFFERS): IK's interview-preparation program sold as an add-on
-# (or a separate program) at an extra cost is a real IK offer.  Its cost raises the total and is
-# never a discount: ``parse_discounts`` reads no course discount from a total that includes it, and
-# ``r1_negotiation.stated_totals`` reads no website price conflict from such a total.
+# (or a separate program) at an extra cost is a real IK offer.  Its price is never a discount:
+# ``parse_discounts`` reads a stated total that includes it as the course price plus the add-on's
+# price (so the course discount is read on total minus that price), and
+# ``r1_negotiation.stated_totals`` reads no website price conflict from such a total.  IK's course
+# itself is interview prep (``r1_world``), so the words alone never make a figure the add-on's:
+# only a stated extra price does (``_PAID_ADDON``, review 2026-11-24).
 _ADDON_NAMED = re.compile(
     r"\b(?:interview[- ]prep(?:aration)?|add-?ons?|mock[- ]interview (?:program(?:me)?s?|"
     r"packages?|courses?)|separate (?:program(?:me)?|course|package))\b",
     re.IGNORECASE,
 )
 _ADDON_AMOUNT = r"\$\s?\d[\d,]*(?:\.\d+)?\s*k?"
-# The add-on's price: "$1000 more", "an extra $1000", "on top ... $1000", "costs $1000" or
-# "for $1000".
+# An explicit add-on noun, and the interview-prep program added on ("add interview prep").
+_ADDON_NOUN = r"(?:add-?ons?|separate (?:program(?:me)?|course|package))"
+_ADDON_ADDED = (
+    r"\badd(?:s|ed|ing)?\s+(?:it\s+)?(?:on\s+)?(?:our |the |an? |this |that )?"
+    r"(?:interview[- ]prep(?:aration)?|mock[- ]interviews?)"
+    r"(?:\s+(?:program(?:me)?|package|course|sessions?|add-?on))?"
+)
+_ADDON_PRICE_TAIL = r"(?:just |only )?(?:an? )?(?:extra |additional )?" + _ADDON_AMOUNT
+# The add-on noun as the object of a bundle ("the course plus the add-on for $8,500"): that figure
+# is the bundle's total, not the add-on's price.
+_ADDON_BUNDLED_NOUN = "".join(
+    rf"(?<!\b{word} )(?<!\b{word} the )" for word in ("plus", "with", "and", "including")
+)
+# The add-on's price, always an extra cost: "$1000 more", "an extra $1000", "on top of the course
+# for $1000", "the add-on costs $1000", "a separate program for $800" or "add interview prep for
+# $1000".  A bare "for $X" or "at $X" counts only right after the add-on noun or "add interview
+# prep": "our interview prep program for $7,800" is the course's own price.
 _PAID_ADDON = re.compile(
     _ADDON_AMOUNT + r"\s*(?:more|extra|additional|on top)\b"
-    r"|\b(?:extra|additional|more|on top)\b[^.?!$]{0,30}" + _ADDON_AMOUNT
-    + r"|\b(?:costs?|priced at|for|at)\s+(?:an?\s+)?(?:extra\s+|additional\s+)?" + _ADDON_AMOUNT,
+    r"|\b(?:extra|additional|on top(?! of (?:that|this|it all|everything|all that)))\b"
+    r"[^.?!$,;]{0,30}" + _ADDON_AMOUNT
+    + r"|" + _ADDON_BUNDLED_NOUN + r"\b" + _ADDON_NOUN
+    + r"(?:\s+(?:itself|alone|only|program(?:me)?|package|course))?\s+"
+    r"(?:costs?|is|are|priced at|comes? (?:to|at)|would be|will be|for|at)\s+" + _ADDON_PRICE_TAIL
+    + r"|" + _ADDON_ADDED + r"\s+(?:for|at)\s+" + _ADDON_PRICE_TAIL,
+    re.IGNORECASE,
+)
+# A figure stated as a total that includes the add-on, read in the figure's own clause: before it
+# ("so in total I can do it for", "I can do both for", "the whole thing for", "the course plus
+# the add-on for") or right after it ("for $8,500 in total", "for $8,500 for both").  A total
+# word elsewhere in the sentence belongs to another figure ("the course for $7,500, so your total
+# comes to $8,500").  The objects ("both", "everything", "the whole thing") count only right before
+# the figure ("both for $"), so "both of you" or "everything you need" elsewhere is none.
+_ADDON_BUNDLE_BEFORE = re.compile(
+    r"\b(?:total|altogether|all together|combined|bundle|"
+    r"(?:plus|with|and) (?:the |that |this |our )?(?:interview[- ]prep(?:aration)?|add-?ons?|"
+    r"separate program))\b"
+    r"|\b(?:both|everything|it all|all of it|the two|(?:the )?whole (?:thing|package|bundle|lot))"
+    r"(?: together)?\s+(?:for|at)\s+(?:just |only )?\$\s?$",
+    re.IGNORECASE,
+)
+_ADDON_BUNDLE_AFTER = re.compile(
+    r"^\s*(?:dollars?\s+)?(?:in total|total|altogether|all in|in all|all together|combined|"
+    r"for (?:both|everything|the two|the whole thing|it all|all of it))\b",
+    re.IGNORECASE,
+)
+# The add-on left out of the figure: "without the add-on", "forget the add-on", "just the course".
+_ADDON_LEFT_OUT = re.compile(
+    r"\b(?:without|forget|excluding|except|minus|not including|leav(?:e|ing) out|skip(?:ping)?|"
+    r"(?:just|only) the course|the course (?:alone|only|by itself))\b",
     re.IGNORECASE,
 )
 # A free, included or bonus add-on is a free perk, never a paid one.
@@ -909,27 +956,64 @@ _ADDON_DISCOUNT_AFTER = re.compile(
 )
 
 
+def _addon_prices(sentence: str) -> list[tuple[int, int]]:
+    """The add-on prices ``sentence`` sells, as (position of the amount, usd) (R1_IK_OFFERS).
+
+    ``sentence`` is one sentence, already ``canonical_amounts``-ed, that names the add-on
+    ("interview prep", "add-on", "a separate program") and puts an extra price on it
+    (``_PAID_ADDON``).  Not a question, not an add-on that is free, included or a bonus, not an old
+    or someone else's price, not a negated price, and not a discount ("another $1,000 off if you add
+    interview prep").
+    """
+    if (is_question_like(sentence) or _ADDON_NAMED.search(sentence) is None
+            or _ADDON_FREE.search(sentence) or _ADDON_PAST.search(sentence)):
+        return []
+    prices: list[tuple[int, int]] = []
+    for match in _PAID_ADDON.finditer(sentence):
+        if _ADDON_DISCOUNT_AFTER.match(sentence[match.end():]):
+            continue
+        if negated_before(sentence, match.start()):
+            continue
+        amounts = dollar_amounts(match.group(0))
+        if amounts:
+            prices.append((match.start() + match.group(0).index("$"), amounts[0]))
+    return prices
+
+
 def sells_paid_addon(text: object) -> bool:
     """A statement that sells the interview-prep add-on at an extra cost (R1_IK_OFFERS).
 
-    A sentence that names the add-on ("interview prep", "add-on", "a separate program") and puts a
-    price on it ("for an extra $1,000", "$1,000 more", "the add-on costs $1,000").  Not a question,
-    not an add-on that is free, included or a bonus, not an old or someone else's price, not a
-    negated price, and not a discount ("another $1,000 off if you add interview prep").
+    Some sentence of ``text`` has an add-on price (``_addon_prices``): "for an extra $1,000",
+    "$1,000 more", "the add-on costs $1,000", "add interview prep for $1,000".  The course's own
+    price said next to "interview prep" is none (review 2026-11-24).
     """
-    for sentence in split_sentences(text):
-        if is_question_like(sentence):
-            continue
-        folded = canonical_amounts(fold(sentence))
-        if (_ADDON_NAMED.search(folded) is None or _ADDON_FREE.search(folded)
-                or _ADDON_PAST.search(folded)):
-            continue
-        for match in _PAID_ADDON.finditer(folded):
-            if _ADDON_DISCOUNT_AFTER.match(folded[match.end():]):
-                continue
-            if not negated_before(folded, match.start()):
-                return True
-    return False
+    return any(_addon_prices(canonical_amounts(sentence)) for sentence in split_sentences(text))
+
+
+def _bundled_addon_usd(
+    prices: list[tuple[int, int, int]], index: int, sentence: str, match: re.Match[str],
+    total: int,
+) -> int | None:
+    """The add-on's price when the net figure ``total`` (``_NET_OFFER`` ``match``) includes it.
+
+    ``prices`` are the turn's add-on prices as (sentence index, position, usd).  The figure is a
+    total with the add-on only when the add-on's price was said before the offer (earlier in the
+    turn, or earlier in its sentence) and the figure's own clause says it is a total
+    (``_ADDON_BUNDLE_BEFORE`` / ``_ADDON_BUNDLE_AFTER``); a free, included or left-out add-on
+    (``_ADDON_FREE``, ``_ADDON_LEFT_OUT``) is never part of it.  "I can do it for $7,500 today, and
+    interview prep for $1,000 more" names the course price first, and "The add-on is $1,000 more.
+    I can do the course for $7,500" is the course price too.
+    """
+    if _ADDON_FREE.search(sentence) or _ADDON_LEFT_OUT.search(sentence):
+        return None
+    if (_ADDON_BUNDLE_BEFORE.search(clause_before(sentence, match.start(1))) is None
+            and _ADDON_BUNDLE_AFTER.match(clause_after(sentence, match.end())) is None):
+        return None
+    earlier = [usd for at, pos, usd in prices
+               if at < index or (at == index and pos < match.start())]
+    if not earlier or not 0 < earlier[-1] < total:
+        return None
+    return earlier[-1]
 
 
 def parse_discounts(
@@ -952,10 +1036,14 @@ def parse_discounts(
     stated deck total resolves one adjacent misheard discount.
 
     R1_IK_OFFERS (owner 2026-11-24, ``ik_offers``): a paid interview-prep add-on raises the total.
-    In a sentence that names the add-on, a net price of $7,500 or more is no course discount (the
-    total includes the add-on), and a turn that sells the add-on is not reconciled ("$2,000 off and
-    interview prep for $1,000, so $8,000" stays $2,000 off).  A net price below $7,500 is still
-    read: an add-on cannot make more than the deck's $1,500 off any cleaner.
+    A net figure that is a stated total including the add-on sold at a price earlier in the turn
+    (``_bundled_addon_usd``) is read as the course price plus that price, so the course discount is
+    $9,000 minus (total minus the add-on's price): "interview prep for an extra $1,000 ... the whole
+    thing for $8,000" is the course at $7,000, still $2,000 off.  Every other figure is read as it
+    is, whatever names "interview prep" (IK's course is interview prep), and a turn that sells the
+    add-on is not reconciled ("$2,000 off and interview prep for $1,000, so $8,000" stays $2,000
+    off).  Review 2026-11-24: the earlier reading dropped every net price from $7,500 up in a
+    sentence that named "interview prep" or an add-on.
     """
     if ik_offers is None:
         ik_offers = _ik_offers_on()
@@ -970,12 +1058,16 @@ def parse_discounts(
     sentences = split_sentences(text)
     mentions: list[DiscountMention] = []
     origins: dict[int, tuple[set[int], set[int]]] = {}
+    addon_prices = [
+        (index, position, usd)
+        for index, sentence in enumerate(sentences)
+        for position, usd in _addon_prices(canonical_amounts(sentence))
+    ] if ik_offers else []
     for index, sentence in enumerate(sentences):
         folded = canonical_amounts(sentence)
         amounts: list[int] = []
         explicit: set[int] = set()
         derived: set[int] = set()
-        addon = ik_offers and _ADDON_NAMED.search(folded) is not None
         for pattern in (_DISC_BEFORE, _DISC_VERB, _NET_OFFER):
             for match in pattern.finditer(folded):
                 value = _amount_usd(match.group(1), match.group(2))
@@ -984,9 +1076,11 @@ def parse_discounts(
                 if pattern is _NET_OFFER:
                     if not 4500 <= value < PRICE_USD:
                         continue
-                    if addon and value >= PRICE_USD - DISCOUNT_CAP_USD:
-                        continue  # R1_IK_OFFERS: a total with the add-on is no course net price
-                    value = PRICE_USD - value
+                    addon_usd = _bundled_addon_usd(
+                        addon_prices, index, folded, match, value
+                    ) if addon_prices else None
+                    # R1_IK_OFFERS: a total with the priced add-on is the course plus the add-on.
+                    value = PRICE_USD - (value - (addon_usd or 0))
                 if _declined(folded, match, verb_in_match=pattern is not _DISC_BEFORE):
                     continue
                 amounts.append(value)
@@ -2307,15 +2401,26 @@ def neutralise_candidate_text(text: object, sentinel: str) -> str:
 # add-on are real IK offers.  Validated by an offline judge replay of the owner's session (the
 # referral and paid add-on turns no longer invented; the off-deck price, the promised role and
 # placement, the outcome statistic, a free add-on and a guarantee still are).  Re-run the replay
-# when this wording changes.
+# when this wording changes.  Review 2026-11-24: a total that includes a priced add-on implies a
+# LARGER course discount (total minus the add-on's price is the course), and a course price below
+# $7,500 stays invented, add-on or not.  Replayed with this wording: every owner turn kept its
+# verdict, and a free or included add-on and "$7,800 including the add-on" are invented while a
+# deck bundle ($7,500 course plus $1,000, "$8,500 in total") is not.  The judge still reads "an
+# extra $1,000 ... you pay $8,000" as not invented (so did the earlier wording); the worker's
+# reader logs such a total as $2,000 off when an offer verb carries it (``parse_discounts``).
 JUDGE_IK_OFFERS_RULE = (
     " Under IK's own offers these are also NOT invented offers: a referral to hiring or partner "
     "companies, IK's partner companies or hiring network, and IK's interview preparation "
-    "program sold as an add-on or a separate program at an extra cost. That extra cost raises "
-    "the total and is not a discount: never read it, or a total that includes it, as a "
-    "discount, and the total rule above does not apply to such a total. An add-on offered for "
-    "free is still a free extra, and a referral is no promise of a job: a promised job, role or "
-    "placement is still invented."
+    "program sold as an add-on or a separate program at a stated extra price. The add-on's price "
+    "is never a discount. A total that includes such a priced add-on is the course price plus "
+    "the add-on's price: the course price is that total minus the add-on's price, the discount "
+    "is $9000 minus that course price, and any total rule above applies only to that course "
+    "price, never to the total. For example, an add-on for an extra $1000 and a total of $8000 "
+    "is a course price of $7000, a $2000 discount, which is invented; with a total of $8500 it "
+    "is a course price of $7500, a $1500 discount, which is not. A course price below $7500 is "
+    "still a discount above $1500 and still invented, add-on or not. An add-on offered for free "
+    "or included with no price of its own is still a free extra, and a referral is no promise of "
+    "a job: a promised job, role or placement is still invented."
 )
 
 
