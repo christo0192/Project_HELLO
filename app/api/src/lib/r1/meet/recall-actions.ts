@@ -42,6 +42,7 @@ import { isRecallError, type RecallErrorCategory } from '../../../integrations/r
 import type { RecallBot } from '../../../integrations/recall/types.js';
 import { createLogger } from '../../logger.js';
 import type { R1MeetMultiHumanPolicy } from './config.js';
+import type { R1MeetFeedbackDeps } from './feedback.js';
 import {
   R1MeetJobError,
   canDeferR1MeetJob,
@@ -114,6 +115,12 @@ export interface R1MeetFlowDeps {
    * for an idle backoff. Only the later of two hints counts. Optional: no lane, no hint.
    */
   readonly hotUntil?: (untilMs: number) => void;
+  /**
+   * The ports of Dex's scorecard feedback to Ashby (M034 S09, `feedback.ts`): the form setting, the
+   * feedback store, the Ashby port, the Dex user and the bridge page. Optional so the S06 flows and
+   * harnesses compile unchanged; absent, a `scorecard_feedback` job throws `r1_meet_feedback_unwired`.
+   */
+  readonly feedback?: R1MeetFeedbackDeps;
 }
 
 /**
