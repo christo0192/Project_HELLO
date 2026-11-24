@@ -417,8 +417,9 @@ import r1_world
 #    closing move; the time-limit, demand and guilt readers and the two time-offer notes.
 # 50: IND-REV review fixes: narrow the demand and India money-path readers.
 # 51: M034 S08 (R1_MEET_VOICE_ENABLED, default off): the Google Meet line variants
-#    (r1_script.MEET_LINES): the recording disclosure in the three openings, and no button, link
-#    or window wording. No browser text changed.
+#    (r1_script.MEET_LINES): the recording disclosure in the three openings and the sound check's
+#    hello-again (with the AI disclosure), and no button, link or window wording. No browser text
+#    changed.
 CONTENT_REVISION = 51
 
 

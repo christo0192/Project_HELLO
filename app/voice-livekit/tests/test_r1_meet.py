@@ -90,6 +90,11 @@ def mirror(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
+def browser_room() -> str:
+    """The room metadata the API writes for a browser R1 round: no ``channel``, no identity."""
+    return json.dumps(mirror(channel=_ABSENT, candidate_identity=_ABSENT))
+
+
 _ABSENT = object()
 _UNSET = object()
 
@@ -214,10 +219,12 @@ class TestResolveChannel(unittest.TestCase):
         ctx = make_ctx(json.dumps(dispatch(session_id=MEET_SESSION_ID.upper())))
         self.assertMeet(resolve_channel(ctx, MEET_SESSION_ID, enabled=True))
 
-    def test_everything_that_is_not_exactly_channel_meet_is_the_browser_channel(self) -> None:
+    @staticmethod
+    def not_meet_dispatches() -> dict[str, Any]:
+        """Every dispatch metadata that is not exactly a ``channel`` ``"meet"`` object."""
         oversize = json.dumps({**dispatch(), "pad": "x" * METADATA_MAX_CHARS})
-        self.assertGreater(len(oversize), METADATA_MAX_CHARS)
-        rows = {
+        assert len(oversize) > METADATA_MAX_CHARS
+        return {
             "metadata None": None,
             "metadata empty": "",
             "not utf-8 bytes": b"\xff\xfe{\"channel\": \"meet\"}",
@@ -240,12 +247,59 @@ class TestResolveChannel(unittest.TestCase):
             "channel object": json.dumps(dispatch(channel={"name": "meet"})),
             "not a string or bytes": 12345,
         }
-        for label, raw in rows.items():
-            with self.subTest(label):
-                self.assertBrowser(resolve_channel(make_ctx(raw), MEET_SESSION_ID, enabled=True))
+
+    def test_everything_that_is_not_exactly_channel_meet_is_the_browser_channel(self) -> None:
+        # In a room that is not a Meet mirror: today's browser room, one naming another channel,
+        # or one with no metadata at all.
+        rooms = {
+            "browser room": (browser_room(), None),
+            "room channel browser": (json.dumps(mirror(channel="browser")), None),
+            "room channel phone": (json.dumps({"channel": "phone"}), None),
+            "room channel MEET": (json.dumps(mirror(channel="MEET")), None),
+            "no room metadata": (None, None),
+            "room metadata not json": ("lane=r1", None),
+        }
+        for room_label, (room_raw, job_room_raw) in rooms.items():
+            for label, raw in self.not_meet_dispatches().items():
+                with self.subTest(room=room_label, dispatch=label):
+                    ctx = make_ctx(raw, room_raw, job_room_raw)
+                    self.assertBrowser(resolve_channel(ctx, MEET_SESSION_ID, enabled=True))
+
+    def test_a_meet_room_mirror_without_a_meet_dispatch_fails_closed(self) -> None:
+        # Review S08-3: the room says Meet and the dispatch does not (none at all, an unnamed
+        # worker's empty job metadata, a stale or reused "browser" dispatch).  The binding facts
+        # disagree, so the round is refused, never run as a browser round on the first standard
+        # participant with the browser lines.
+        rooms = {
+            "room metadata says meet": (json.dumps(mirror()), None),
+            "only the job's room copy says meet": (None, json.dumps(mirror())),
+            "a meet mirror naming another identity": (
+                json.dumps(mirror(candidate_identity="meet-deadbeef")), None
+            ),
+            "a meet mirror with no identity": (json.dumps(mirror(candidate_identity=_ABSENT)), None),
+        }
+        for room_label, (room_raw, job_room_raw) in rooms.items():
+            for label, raw in self.not_meet_dispatches().items():
+                with self.subTest(room=room_label, dispatch=label):
+                    ctx = make_ctx(raw, room_raw, job_room_raw)
+                    decision = resolve_channel(ctx, MEET_SESSION_ID, enabled=True)
+                    self.assertReason(decision, "room_mirror_mismatch")
+            with self.subTest(room=room_label, dispatch="no job at all"):
+                ctx = make_ctx(room_raw=room_raw or json.dumps(mirror()), with_job=False)
+                self.assertReason(
+                    resolve_channel(ctx, MEET_SESSION_ID, enabled=True), "room_mirror_mismatch"
+                )
+        # The flag off still reads nothing and is today's browser round.
+        self.assertBrowser(
+            resolve_channel(make_ctx(json.dumps({"channel": "browser"})), MEET_SESSION_ID,
+                            enabled=False)
+        )
 
     def test_a_context_without_a_job_or_dispatch_metadata_is_the_browser_channel(self) -> None:
-        self.assertBrowser(resolve_channel(make_ctx(with_job=False), MEET_SESSION_ID, enabled=True))
+        self.assertBrowser(
+            resolve_channel(make_ctx(room_raw=browser_room(), with_job=False), MEET_SESSION_ID,
+                            enabled=True)
+        )
         no_metadata = SimpleNamespace(room=SimpleNamespace(name=MEET_ROOM), job=SimpleNamespace())
         self.assertBrowser(resolve_channel(no_metadata, MEET_SESSION_ID, enabled=True))
         for ctx in (None, 5, "ctx", object()):
@@ -580,6 +634,28 @@ class TestMeetEnvContractAndFences(unittest.TestCase):
         self.assertIn(f"{FLAG}=0", lines)
         self.assertEqual(sum(1 for line in lines if line.startswith(f"{FLAG}=")), 1)
 
+    def test_the_env_example_and_the_reader_state_the_rollback_order(self) -> None:
+        # Review S08-1: off, the worker runs a Meet dispatch as a browser round (no recording
+        # disclosure, the button and window lines), so the API's R1_MEET_ENABLED goes off FIRST.
+        lines = (HERE / ".env.example").read_text(encoding="utf-8").splitlines()
+        index = lines.index(f"{FLAG}=0")
+        block: list[str] = []
+        for line in reversed(lines[:index]):
+            if not line.startswith("#"):
+                break
+            block.insert(0, line.lstrip("# "))
+        comment = " ".join(block)
+        self.assertIn("Set it before the API's R1_MEET_ENABLED", comment)
+        self.assertIn(
+            "Rollback order: turn the API's R1_MEET_ENABLED off FIRST, and only then unset this.",
+            comment,
+        )
+        self.assertIn("no recording disclosure", comment)
+        doc = " ".join((meet_voice_enabled.__doc__ or "").split())
+        self.assertIn(
+            "Roll back in the reverse order: the API's ``R1_MEET_ENABLED`` off FIRST", doc
+        )
+
     def test_no_fly_config_sets_it(self) -> None:
         for name in ("fly.toml", "fly.phone.toml"):
             path = HERE / name
@@ -788,9 +864,10 @@ class MeetRunnerRig:
 class TestMeetSessionPlumbing(MeetRunnerRig, unittest.IsolatedAsyncioTestCase):
     """The runner resolves the channel once, fails closed, binds one identity, records audio only.
 
-    Every browser case (flag off, or any channel value but exactly "meet") is today's behaviour
-    exactly: no ``meet`` keyword, the first standard participant, the browser room options, the
-    original context to the recorder, and no ``r1_meet_*`` log line.
+    Every browser case (flag off, or any channel value but exactly "meet" in a room that is not a
+    Meet mirror) is today's behaviour exactly: no ``meet`` keyword, the first standard participant,
+    the browser room options, the original context to the recorder, and no ``r1_meet_*`` log line.
+    A Meet room mirror without a Meet dispatch fails closed (``room_mirror_mismatch``).
     """
 
     def assert_settled_before_connect(self, rig: SimpleNamespace, outcome: str) -> None:
@@ -938,6 +1015,31 @@ class TestMeetSessionPlumbing(MeetRunnerRig, unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(rig.session.started)
                 self.assert_nothing_identifying_logged(logs)
 
+    async def test_a_meet_room_without_a_meet_dispatch_settles_before_connecting(self) -> None:
+        # Review S08-3: the room's mirror says Meet, the dispatch does not.  Never a browser round
+        # on the first standard participant (the intruder below is in the room first).
+        cases = {
+            "channel browser": {
+                "dispatch_raw": json.dumps({"session_id": MEET_SESSION_ID, "channel": "browser"})
+            },
+            "channel missing": {"dispatch_raw": json.dumps(dispatch(channel=_ABSENT))},
+            "empty dispatch metadata (an unnamed worker)": {"dispatch_raw": ""},
+            "no job": {"with_job": False},
+        }
+        for label, overrides in cases.items():
+            with self.subTest(case=label):
+                rig = self.rig(
+                    activate_ok=True, participants=("intruder", MEET_IDENTITY), **overrides
+                )
+                outcome, logs = await self.run_session(rig, flag="1")
+                self.assert_settled_before_connect(rig, outcome)
+                invalid = [line for line in logs if line.get("error_type") == "r1_meet_channel_invalid"]
+                self.assertEqual([line["error_category"] for line in invalid], ["room_mirror_mismatch"])
+                self.assertEqual(invalid[0]["level"], "error")
+                self.assertIsNone(rig.session.started)
+                self.assertTrue(all("meet" not in built[2] for built in rig.built))
+                self.assert_nothing_identifying_logged(logs)
+
     async def test_a_context_naming_someone_else_is_refused_before_the_providers(self) -> None:
         rig = self.rig(
             activate_ok=True,
@@ -992,7 +1094,7 @@ class TestMeetSessionPlumbing(MeetRunnerRig, unittest.IsolatedAsyncioTestCase):
 
     async def test_a_browser_round_hands_the_recorder_the_very_same_context(self) -> None:
         rig = self.rig(dispatch_raw=json.dumps({"session_id": MEET_SESSION_ID, "channel": "browser"}),
-                       participants=("candidate",))
+                       room_raw=browser_room(), participants=("candidate",))
         await self.run_session(rig, flag="1")
         self.assertEqual(len(rig.recorder_contexts), 1)
         self.assertIs(rig.recorder_contexts[0], rig.fetched)
@@ -1002,23 +1104,31 @@ class TestMeetSessionPlumbing(MeetRunnerRig, unittest.IsolatedAsyncioTestCase):
 
     async def test_every_browser_case_is_todays_behaviour_exactly(self) -> None:
         browser_dispatch = {"session_id": MEET_SESSION_ID, "channel": "browser"}
+        room = browser_room()  # today's browser room metadata: no channel, no identity
         cases = {
             "flag off, valid meet metadata": {"flag": None, "rig": {}},
             "flag 0, valid meet metadata": {"flag": "0", "rig": {}},
+            "flag off, meet room, browser dispatch": {
+                "flag": None,
+                "rig": {"dispatch_raw": json.dumps(browser_dispatch)},
+            },
             "flag on, channel browser": {
                 "flag": "1",
-                "rig": {"dispatch_raw": json.dumps(browser_dispatch)},
+                "rig": {"dispatch_raw": json.dumps(browser_dispatch), "room_raw": room},
             },
             "flag on, channel missing": {
                 "flag": "1",
-                "rig": {"dispatch_raw": json.dumps(dispatch(channel=_ABSENT))},
+                "rig": {"dispatch_raw": json.dumps(dispatch(channel=_ABSENT)), "room_raw": room},
             },
             "flag on, channel MEET": {
                 "flag": "1",
-                "rig": {"dispatch_raw": json.dumps(dispatch(channel="MEET"))},
+                "rig": {"dispatch_raw": json.dumps(dispatch(channel="MEET")), "room_raw": room},
             },
-            "flag on, empty dispatch metadata": {"flag": "1", "rig": {"dispatch_raw": ""}},
-            "flag on, no job": {"flag": "1", "rig": {"with_job": False}},
+            "flag on, empty dispatch metadata": {
+                "flag": "1",
+                "rig": {"dispatch_raw": "", "room_raw": room},
+            },
+            "flag on, no job": {"flag": "1", "rig": {"with_job": False, "room_raw": room}},
         }
         for name, case in cases.items():
             with self.subTest(case=name):
@@ -1060,6 +1170,7 @@ from tests.test_r1_core import (  # noqa: E402
     FakePublication,
     R1TestCase,
     append,
+    final_event,
     ready_packet,
 )
 
@@ -1073,9 +1184,9 @@ OPENING_IDS = ("L-OPEN", "L-OPEN-HELLO", "L-OPEN-HI")
 NOT_OPENING_IDS = (
     "L-TRANSITION-REASK-2", "L-SYSTEM-STOP", "L-CLOSE", "L-CLOSE-SHORT", "L-SIL-NOAUDIO",
 )
-# Every id a Meet round speaks at its edges: the openings, the closes, the system stop, the
-# no-audio ladder and the transition's last reask.
-EDGE_IDS = (*OPENING_IDS, *NOT_OPENING_IDS, "L-SIL-END-NOAUDIO")
+# Every id a Meet round speaks at its edges: the openings and the sound check's hello-again, the
+# closes, the system stop, the no-audio ladder and the transition's last reask.
+EDGE_IDS = (*OPENING_IDS, "L-OPEN-HELLO-AGAIN", *NOT_OPENING_IDS, "L-SIL-END-NOAUDIO")
 MUTE_IDS = ("L-MUTE", "L-MUTE-RP", "L-MUTE-IV")
 INTERVIEWERS = {"1": "Dex", "0": "Christy"}  # R1_INTERVIEWER_DEX -> who introduces themself
 
@@ -1166,7 +1277,7 @@ class MeetCase(R1TestCase):
 
 
 class TestMeetRendering(MeetCase):
-    """``render_line``: a Meet round speaks the Meet text of the eight ``MEET_LINES`` ids and
+    """``render_line``: a Meet round speaks the Meet text of the nine ``MEET_LINES`` ids and
     the browser text of every other id; a browser round renders exactly as it did."""
 
     FLAG_STATES = tuple(
@@ -1312,7 +1423,11 @@ class TestMeetDisclosure(MeetRunnerRig, unittest.IsolatedAsyncioTestCase):
         browser_dispatch = json.dumps({"session_id": MEET_SESSION_ID, "channel": "browser"})
         cases = (
             ("flag off, valid meet metadata", None, {}),
-            ("flag on, channel browser", "1", {"dispatch_raw": browser_dispatch}),
+            (
+                "flag on, channel browser",
+                "1",
+                {"dispatch_raw": browser_dispatch, "room_raw": browser_room()},
+            ),
         )
         for env, base in self.OPENINGS:
             for dex, name in INTERVIEWERS.items():
@@ -1327,6 +1442,108 @@ class TestMeetDisclosure(MeetRunnerRig, unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(first, expected.browser)
                         self.assertNotIn("recorded", first)
                         self.assertTrue(first.startswith(f"Hi Asha, I'm {name}, "), first)
+
+
+class TestMeetSoundCheckRepeat(R1TestCase):
+    """Review S08-2: in Meet the spoken disclosure is the candidate's only recording notice (no
+    consent page), so when the candidate says they could not hear the hello that carried it, the
+    hello-again repeats the AI and recording disclosure.  The sound check runs with
+    ``R1_OPENING_NO_HEARING_CHECK=0`` (a documented rollback).  Timings as
+    ``TestTheOpeningSoundCheck``; a browser round's hello-again is today's text."""
+
+    DISCLOSURE = "Just so you know, I'm an AI interviewer and this call is recorded."
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        patcher = mock.patch.dict(
+            os.environ, {"R1_OPENING_SOUND_CHECK": "1", "R1_OPENING_NO_HEARING_CHECK": "0"}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name, value in (
+            ("OPEN_CHECK_SILENCE_SECONDS", 0.2),
+            ("OPEN_HELLO_FOLLOW_SECONDS", 0.6),
+            ("NO_AUDIO_END_SECONDS", 0.2),
+            ("ICEBREAKER_PROMPT_SECONDS", 30.0),
+            ("MUTE_ASIDE_DEBOUNCE_SECONDS", 0.0),
+        ):
+            patcher = mock.patch.object(r1_session, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    async def opening(self, *, meet: MeetChannel | None) -> SimpleNamespace:
+        ctx = FakeContext(self.order)
+        identity = MEET_IDENTITY if meet is not None else "candidate"
+        ctx.room.remote_participants[identity] = FakeParticipant(identity)
+        context: dict[str, Any] = {"first_name": "Asha"}
+        if meet is None:
+            context["candidate_identity"] = "candidate"
+        session = FakeSession(log=self.order)
+        interview = R1Interview(ctx, context, session, self.writer, clock=Clock(), meet=meet)
+        task = asyncio.create_task(interview.run())
+        run = SimpleNamespace(interview=interview, session=session, task=task)
+        self.addCleanup(self.stop, run)
+        await self.until(lambda: session.agent is not None)
+        return run
+
+    async def stop(self, run: SimpleNamespace) -> None:
+        if not run.task.done():
+            run.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await run.task
+
+    def played(self, run: SimpleNamespace, line_id: str) -> bool:
+        return ("play_end", run.interview.render_line(line_id)) in self.order
+
+    async def reply(self, run: SimpleNamespace, text: str) -> None:
+        """A reply the way the SDK delivers it: the final, then the committed turn (no reply)."""
+        run.session.emit("user_input_transcribed", final_event(text))
+        await self.settle()
+        with self.assertRaises(r1_session.StopResponse):
+            await run.session.agent.on_user_turn_completed(
+                None, SimpleNamespace(text_content=text, id=f"msg_meet_{len(self.order)}")
+            )
+        await self.settle()
+
+    async def cant_hear_then_yes(self, run: SimpleNamespace) -> list[str]:
+        await self.until(lambda: self.played(run, "L-OPEN-HELLO"))
+        await self.settle()
+        await self.reply(run, "Sorry, I can't hear you.")
+        await self.until(lambda: self.played(run, "L-OPEN-HELLO-AGAIN"))
+        await self.settle()
+        await self.reply(run, "Yes, now I can.")
+        await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+        return list(run.session.spoken)
+
+    async def test_the_meet_hello_again_repeats_the_ai_and_recording_disclosure(self) -> None:
+        run = await self.opening(meet=MEET_CHANNEL)
+        spoken = await self.cant_hear_then_yes(run)
+        values = {"first_name": run.interview._first_name(), **run.interview.persona.line_values}
+        self.assertEqual(
+            spoken,
+            [
+                line("L-OPEN-HELLO-MEET", **values),
+                line("L-OPEN-HELLO-AGAIN-MEET", **values),
+                line(active_line_id("L-OPEN-AGENDA"), **values),
+            ],
+        )
+        again = spoken[1]
+        self.assertIn(self.DISCLOSURE, again)
+        self.assertIn("this call is recorded", again)
+        self.assertIn("AI interviewer", again)
+        self.assertTrue(again.endswith("Can you hear me now?"), again)
+        self.assertIsNone(BANNED.search(again), again)
+
+    async def test_a_browser_hello_again_is_todays_text(self) -> None:
+        run = await self.opening(meet=None)
+        spoken = await self.cant_hear_then_yes(run)
+        values = {"first_name": run.interview._first_name(), **run.interview.persona.line_values}
+        self.assertEqual(spoken[1], line("L-OPEN-HELLO-AGAIN", **values))
+        self.assertEqual(
+            spoken[1],
+            "Sorry about that. Please check your speaker or headphone volume. Can you hear me now?",
+        )
+        self.assertNotIn("recorded", spoken[1])
 
 
 class TestMeetNoButtonOrLinkWording(MeetCase):

@@ -540,9 +540,11 @@ LINES: dict[str, str] = {
         "link. Goodbye."
     ),
     # M034 S08 (R1_MEET_VOICE_ENABLED, default off): the lines a Google Meet session speaks in
-    # place of eight browser lines (``MEET_LINES``, ``meet_line_id``).  The three openings add the
-    # recording disclosure; the other five drop the button, link and window wording, because a Meet
-    # candidate never sees our page.  The browser texts above are unchanged.
+    # place of nine browser lines (``MEET_LINES``, ``meet_line_id``).  The three openings add the
+    # recording disclosure, and the sound check's hello-again repeats it with the AI disclosure
+    # (the candidate said they could not hear the hello that carried them); the other five drop
+    # the button, link and window wording, because a Meet candidate never sees our page.  The
+    # browser texts above are unchanged.
     # M034 S08 (R1_MEET_VOICE_ENABLED): L-OPEN with the recording disclosure.
     "L-OPEN-MEET": (
         "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart, and "
@@ -564,6 +566,12 @@ LINES: dict[str, str] = {
     "L-OPEN-HI-MEET": (
         "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart. Just so you "
         "know, this call is recorded."
+    ),
+    # M034 S08 (R1_MEET_VOICE_ENABLED): L-OPEN-HELLO-AGAIN repeating the AI and recording
+    # disclosure, persona-neutral and name-free like the browser line.
+    "L-OPEN-HELLO-AGAIN-MEET": (
+        "Sorry about that. Please check your speaker or headphone volume. Just so you know, I'm "
+        "an AI interviewer and this call is recorded. Can you hear me now?"
     ),
     # M034 S08 (R1_MEET_VOICE_ENABLED): L-TRANSITION-REASK-2 without the I'm ready button.
     "L-TRANSITION-REASK-2-MEET": (
@@ -686,6 +694,7 @@ MEET_LINES: dict[str, str] = {
     "L-OPEN": "L-OPEN-MEET",
     "L-OPEN-HELLO": "L-OPEN-HELLO-MEET",
     "L-OPEN-HI": "L-OPEN-HI-MEET",
+    "L-OPEN-HELLO-AGAIN": "L-OPEN-HELLO-AGAIN-MEET",
     "L-TRANSITION-REASK-2": "L-TRANSITION-REASK-2-MEET",
     "L-SYSTEM-STOP": "L-SYSTEM-STOP-MEET",
     "L-CLOSE": "L-CLOSE-MEET",

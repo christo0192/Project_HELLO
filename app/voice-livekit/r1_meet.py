@@ -14,7 +14,10 @@ behaves exactly as it does today.  With the flag on, only a dispatch whose metad
 ``channel`` ``"meet"`` selects Meet, and then every binding fact must agree (the session id of
 the room, the exact bridge identity, a known profile, the room-metadata mirror) or the decision
 names one closed reason and the session fails closed before it connects: a Meet round that
-cannot be bound exactly is never handed to "the first standard participant".
+cannot be bound exactly is never handed to "the first standard participant".  The agreement is
+checked both ways: a room whose metadata mirror says ``channel`` ``"meet"`` without such a
+dispatch (none at all, or one naming another channel) is refused as ``room_mirror_mismatch``,
+never run as a browser round.  A browser room's metadata carries no ``channel``.
 
 This module is pure: standard library only, no ``r1_*`` import, no logging (the session logs
 the closed labels this module returns), and no function here raises.
@@ -58,6 +61,11 @@ def meet_voice_enabled() -> bool:
     Turn it on only as a Fly secret at go-live (``fly secrets set R1_MEET_VOICE_ENABLED=1
     -a project-hello-voice``), before the API's ``R1_MEET_ENABLED``.  Unset, blank, ``0`` or
     anything but ``1``/``true``/``on``/``yes`` is today's browser behaviour exactly.
+
+    Roll back in the reverse order: the API's ``R1_MEET_ENABLED`` off FIRST (no new Meet
+    dispatch), and only then this flag.  Off while the API still dispatches Meet rounds, the
+    worker runs them as browser rounds: no recording disclosure, the button and window lines,
+    the browser mute aside and the uncapped recording.
     """
     return (os.getenv("R1_MEET_VOICE_ENABLED") or "").strip().lower() in _ON_VALUES
 
@@ -188,17 +196,26 @@ def resolve_channel(ctx: Any, session_id: str | None, *, enabled: bool) -> Chann
 
     ``enabled`` False returns the browser decision without touching ``ctx``.  Otherwise Meet is
     selected only when the dispatch metadata is a JSON object whose ``channel`` is exactly
-    ``"meet"``; anything else is browser, silently.  Once Meet is selected every check must hold
-    (``session_mismatch``, ``identity_invalid``, ``profile_unknown``, ``room_mirror_mismatch``, in
-    that order), and an unexpected failure after that point is ``unreadable``.
+    ``"meet"``.  Without such a dispatch the round is browser, unless the room's metadata mirror
+    says ``channel`` ``"meet"``: the two binding facts then disagree and the decision is
+    ``room_mirror_mismatch`` (fail closed, never the first standard participant).  Once Meet is
+    selected every check must hold (``session_mismatch``, ``identity_invalid``,
+    ``profile_unknown``, ``room_mirror_mismatch``, in that order), and an unexpected failure after
+    that point is ``unreadable``.  A read that fails before Meet is known is the browser channel.
     """
     if not enabled:
         return ChannelDecision()
     try:
         dispatch = parse_metadata_object(dispatch_metadata_of(ctx))
-        if not _is_meet(dispatch):
-            return ChannelDecision()
-    except Exception:  # noqa: BLE001 - before Meet is known, a failure is the browser channel
+    except Exception:  # noqa: BLE001 - an unreadable dispatch is no Meet dispatch
+        dispatch = {}
+    if not _is_meet(dispatch):
+        try:
+            room_says_meet = _is_meet(parse_metadata_object(room_metadata_of(ctx)))
+        except Exception:  # noqa: BLE001 - before Meet is known, a failure is the browser channel
+            room_says_meet = False
+        if room_says_meet:
+            return ChannelDecision(invalid_reason="room_mirror_mismatch")
         return ChannelDecision()
     try:
         return _validate_meet(ctx, session_id, dispatch)

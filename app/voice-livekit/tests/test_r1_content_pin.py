@@ -282,8 +282,8 @@ import r1_world
 # 48: pin the India money path and calmer instalment note.
 # 49: pin the time-limit, demand and guilt readers and the time-offer notes.
 # 50: IND-REV review fixes: narrow the demand and India money-path readers.
-# 51: M034 S08 Meet line variants (r1_script.MEET_LINES).
-PINNED_CONTENT_SHA256 = "87b7fd8705b094846b88ddbcc07e2c239e8e84582a2b68a52aadd53a2b35dd71"
+# 51: M034 S08 Meet line variants (r1_script.MEET_LINES), with the hello-again disclosure.
+PINNED_CONTENT_SHA256 = "a9237c268e993a8c95aab531ade7189d5b5a0f6e0c122208ad7fde157ae00954"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -922,7 +922,7 @@ class PinTests(unittest.TestCase):
         self.assertGreaterEqual(manifest["revision"], 51)
         script = manifest["script"]
         self.assertEqual(script["meet_lines"], dict(r1_script.MEET_LINES))
-        self.assertEqual(len(script["meet_lines"]), 8)
+        self.assertEqual(len(script["meet_lines"]), 9)
         for meet_id in r1_script.MEET_LINES.values():
             with self.subTest(line=meet_id):
                 self.assertEqual(script["lines"][meet_id], r1_script.LINES[meet_id])

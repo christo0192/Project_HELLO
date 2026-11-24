@@ -879,10 +879,12 @@ class TestDiagnosis5Agenda(unittest.TestCase):
 class TestMeetLines(unittest.TestCase):
     """M034 S08 (``R1_MEET_VOICE_ENABLED``, default off): the Google Meet line variants.
 
-    Eight browser lines get a ``-MEET`` variant that a Meet session speaks (``MEET_LINES``, applied
+    Nine browser lines get a ``-MEET`` variant that a Meet session speaks (``MEET_LINES``, applied
     after ``active_line_id``): the three openings add the recording disclosure (owner: "Dex still
-    discloses he is an AI and that the call is recorded"), and the other five drop the button, link
-    and window wording, because a Meet candidate never sees our page.  No browser text changes.
+    discloses he is an AI and that the call is recorded"), the sound check's hello-again repeats it
+    with the AI disclosure (review S08-2: the candidate said they could not hear the hello), and
+    the other five drop the button, link and window wording, because a Meet candidate never sees
+    our page.  No browser text changes.
     """
 
     # sha256 of the canonical JSON of all 113 LINES on 5ec8b11a (content revision 50), before the
@@ -900,8 +902,15 @@ class TestMeetLines(unittest.TestCase):
         "R1_TRANSITION_REPAIR", "R1_BRIEF_WORDING_V2", "R1_AGENDA_W3", "R1_TRANSITION_PRESENCE_V2",
     )
     OPENINGS = ("L-OPEN", "L-OPEN-HELLO", "L-OPEN-HI")
+    # The sound check's repeat after "I can't hear you": the disclosure again (review S08-2).
+    REPEATS = ("L-OPEN-HELLO-AGAIN",)
     NOT_OPENINGS = (
         "L-TRANSITION-REASK-2", "L-SYSTEM-STOP", "L-CLOSE", "L-CLOSE-SHORT", "L-SIL-NOAUDIO",
+    )
+    # The hello-again's Meet text, word for word (persona-neutral and name-free, like its base).
+    HELLO_AGAIN_MEET = (
+        "Sorry about that. Please check your speaker or headphone volume. Just so you know, I'm an "
+        "AI interviewer and this call is recorded. Can you hear me now?"
     )
     # What the default interviewer (Dex) says to a candidate called Asha: plan section 2, exactly.
     DEX_OPENINGS = {
@@ -963,9 +972,12 @@ class TestMeetLines(unittest.TestCase):
             hashlib.sha256(canonical.encode()).hexdigest(), self.PRE_MEET_LINES_DIGEST
         )
 
-    def test_the_map_names_eight_existing_lines_and_their_meet_ids(self):
+    def test_the_map_names_nine_existing_lines_and_their_meet_ids(self):
         meet = r1_script.MEET_LINES
-        self.assertEqual(set(meet), set(self.OPENINGS) | set(self.NOT_OPENINGS))
+        self.assertEqual(
+            set(meet), set(self.OPENINGS) | set(self.REPEATS) | set(self.NOT_OPENINGS)
+        )
+        self.assertEqual(len(meet), 9)
         for key, value in meet.items():
             with self.subTest(line=key):
                 self.assertIn(key, LINES)
@@ -990,7 +1002,7 @@ class TestMeetLines(unittest.TestCase):
                     with self.subTest(states=states, line=line_id):
                         self.assertEqual(r1_script.active_line_id(line_id), line_id)
 
-    def test_meet_line_id_routes_only_the_eight_keys_and_never_chains(self):
+    def test_meet_line_id_routes_only_the_nine_keys_and_never_chains(self):
         for line_id in LINES:
             with self.subTest(line=line_id):
                 routed = r1_script.meet_line_id(line_id)
@@ -1054,6 +1066,29 @@ class TestMeetLines(unittest.TestCase):
                 with self.subTest(line=meet_id):
                     self.assertEqual(line(meet_id, first_name="Asha"), expected)
                     self.assertIn(meet_id, r1_script.DEX_LINES)
+
+    def test_the_meet_hello_again_repeats_the_ai_and_recording_disclosure(self):
+        # Review S08-2: in Meet the spoken notice is the only one (no consent page), so the repeat
+        # after "I can't hear you" carries both again.  The browser hello-again is unchanged.
+        self.assertEqual(r1_script.meet_line_id("L-OPEN-HELLO-AGAIN"), "L-OPEN-HELLO-AGAIN-MEET")
+        text = LINES["L-OPEN-HELLO-AGAIN-MEET"]
+        self.assertEqual(text, self.HELLO_AGAIN_MEET)
+        self.assertIn("AI interviewer", text)
+        self.assertIn("this call is recorded", text)
+        self.assertTrue(text.endswith("Can you hear me now?"))
+        # The disclosure sentence is the only difference from the browser line.
+        self.assertEqual(
+            text.replace(" Just so you know, I'm an AI interviewer and this call is recorded.", ""),
+            LINES["L-OPEN-HELLO-AGAIN"],
+        )
+        self.assertNotIn("recorded", LINES["L-OPEN-HELLO-AGAIN"])
+        self.assertIn("L-OPEN-HELLO-AGAIN-MEET", NAME_FREE_LINES)
+        self.assertNotIn("L-OPEN-HELLO-AGAIN-MEET", r1_script.DEX_LINES)  # persona-neutral
+        for dex in (None, "1", "0"):
+            with self.subTest(dex=dex), mock.patch.dict(
+                os.environ, self.persona_env(dex), clear=True
+            ):
+                self.assertEqual(line("L-OPEN-HELLO-AGAIN-MEET"), self.HELLO_AGAIN_MEET)
 
     def test_the_other_meet_texts_word_for_word(self):
         for meet_id, expected in self.OTHER_TEXTS.items():

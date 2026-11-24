@@ -11984,7 +11984,8 @@ async def run_r1_session(
     # session).  Off, the job's dispatch is not read at all and this is a browser round exactly as
     # before.  On, only a dispatch that says channel "meet" is a Google Meet round, and one whose
     # binding facts disagree fails closed here, before connecting: it is never handed to the first
-    # standard participant.  Only closed labels are logged (never an identity or a metadata value).
+    # standard participant.  So does a room whose metadata says "meet" without a Meet dispatch.
+    # Only closed labels are logged (never an identity or a metadata value).
     decision = resolve_channel(ctx, session_id, enabled=meet_voice_enabled())
     if decision.invalid_reason is not None:
         _log.error(
