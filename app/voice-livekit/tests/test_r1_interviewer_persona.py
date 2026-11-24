@@ -60,8 +60,8 @@ class TestInterviewerPersona(unittest.TestCase):
     def test_all_lines_and_flag_combinations(self):
         self.assertEqual(set(r1_script.DEX_LINES), IDS)
         flags = ("R1_TRANSITION_REPAIR", "R1_BRIEF_WORDING_V2", "R1_AGENDA_W3",
-                 "R1_TRANSITION_PRESENCE_V2")
-        for states in itertools.product("01", repeat=4):
+                 "R1_TRANSITION_PRESENCE_V2", "R1_AGENDA_W4")
+        for states in itertools.product("01", repeat=len(flags)):
             with mock.patch.dict(os.environ, dict(zip(flags, states)), clear=True):
                 for ident in r1_script.LINES:
                     with self.subTest(states=states, ident=ident):

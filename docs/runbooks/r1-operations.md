@@ -2689,6 +2689,14 @@ its 12 characters hold ten digits in a row (revision 24's do), as the logger dro
   minutes: a few minutes to get to know you, a sales role-play of up to twenty minutes, then time
   for your questions." and W2's first question (L-OPEN-AGENDA-W3, -PLAIN-W3, -CONTINUE-W3).
   Rollback: `fly secrets set R1_AGENDA_W3=0 -a project-hello-voice` (the W2 agenda).
+* **`R1_AGENDA_W4`** (default on, only with `R1_AGENDA_W3`; owner 2026-11-24). Dex read the W3
+  agenda flat, like a text read aloud. The owner picked this wording by ear from four clips in
+  the production voice: "The whole interview takes about thirty minutes. That's a few minutes to
+  get to know you, a sales role-play of up to twenty minutes, and then time for your questions.
+  To start, could you tell me a bit about yourself, and any sales or customer-facing work
+  you've done?" (L-OPEN-AGENDA-W4, -PLAIN-W4, -CONTINUE-W4). The line stays cached; the clips
+  showed the wording, not the REST synthesis, made the difference.
+  Rollback: `fly secrets set R1_AGENDA_W4=0 -a project-hello-voice` (the W3 agenda).
 * **`R1_WRAP_OFFER_VARIANT`** (default on). The second offer to wrap up the role-play is
   L-ASIDE-WRAP-AGAIN ("Christy again, just checking in. Would you like to wrap up the role-play
   here? If not, just carry on with {lead_first_name}."), never L-ASIDE-WRAP word for word. Like

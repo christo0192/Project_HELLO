@@ -420,7 +420,10 @@ import r1_world
 #    (r1_script.MEET_LINES): the recording disclosure in the three openings and the sound check's
 #    hello-again (with the AI disclosure), and no button, link or window wording. No browser text
 #    changed.
-CONTENT_REVISION = 51
+# 52: owner 2026-11-24 (R1_AGENDA_W4): the W4 agenda (L-OPEN-AGENDA-W4, -PLAIN-W4, -CONTINUE-W4;
+#    r1_script.AGENDA_W4_LINES), spoken sentences and a first question ending in "?", picked by
+#    ear from four clips in Dex's production voice. No other text changed.
+CONTENT_REVISION = 52
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -895,6 +898,8 @@ def manifest() -> dict[str, Any]:
             "agenda_w3_lines": dict(r1_script.AGENDA_W3_LINES),
             # Revision 51 (M034 S08, R1_MEET_VOICE_ENABLED).
             "meet_lines": dict(r1_script.MEET_LINES),
+            # Revision 52 (R1_AGENDA_W4).
+            "agenda_w4_lines": dict(r1_script.AGENDA_W4_LINES),
             "transition_quiet_fallback": r1_script.TRANSITION_QUIET_FALLBACK,
             "learner_filler_variants": list(r1_script.LEARNER_FILLER_VARIANTS),
             "learner_filler_short": r1_script.LEARNER_FILLER_SHORT,

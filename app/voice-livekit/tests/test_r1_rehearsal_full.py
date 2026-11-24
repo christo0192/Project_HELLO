@@ -1038,7 +1038,8 @@ class CandidateSimTests(unittest.TestCase):
         )
         self.assertTrue(is_icebreaker_question(agenda))
         self.assertFalse(is_sound_check(agenda))
-        for line_id in ("L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-PLAIN-W2", "L-OPEN-AGENDA-PLAIN-W3"):
+        for line_id in ("L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-PLAIN-W2", "L-OPEN-AGENDA-PLAIN-W3",
+                        "L-OPEN-AGENDA-PLAIN-W4"):
             with self.subTest(line_id=line_id):
                 line = r1_script.line(line_id)
                 self.assertTrue(is_icebreaker_question(line))
@@ -1054,6 +1055,21 @@ class CandidateSimTests(unittest.TestCase):
             "tell me a bit about yourself and the sales or customer-facing work you've done.",
             4.0, 20.0,
         )
+        talker = _CountingTalker()
+        sim = _sim(talker=talker)
+        action = asyncio.run(sim.next_action(_view("opening", [hello, agenda])))
+        self.assertEqual((action.kind, action.act, action.text), ("speak", "icebreaker_answer", "answer 1"))
+        self.assertNotEqual(action.act, "sound_check_answer")
+        self.assertEqual(talker.answers, 1)
+        self.assertEqual(len(sim._ib_questions), 1)
+
+    def test_the_w4_opening_gets_an_icebreaker_answer_not_a_yes(self) -> None:
+        # Owner 2026-11-24 (R1_AGENDA_W4): the first question now ends in "?".
+        import r1_script
+
+        hello = _span("bot", "interviewer", "Hi Alex, I'm Dex, an AI interviewer from Interview Kickstart.",
+                      0.0, 4.0)
+        agenda = _span("bot", "interviewer", r1_script.line("L-OPEN-AGENDA-PLAIN-W4"), 4.0, 20.0)
         talker = _CountingTalker()
         sim = _sim(talker=talker)
         action = asyncio.run(sim.next_action(_view("opening", [hello, agenda])))
