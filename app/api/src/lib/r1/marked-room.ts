@@ -27,6 +27,12 @@ export interface ProvisionMarkedRoomDeps {
    * builds its own client.
    */
   rooms?: (endpoint: LiveKitEndpoint) => RoomServiceClientLike;
+  /**
+   * M034, dark: the Meet bridge's room mirror (the bridge identity), set only by the Meet
+   * exchange. Passed to provisioning LAST and only when present, so the browser exchange's
+   * argument object and its key order are unchanged. Provisioning validates it.
+   */
+  meet?: { candidateIdentity: string };
 }
 
 export async function provisionMarkedRoom(
@@ -39,6 +45,7 @@ export async function provisionMarkedRoom(
     lane: 'r1',
     interviewRoundId: session.interview_round_id,
     ...(deps.rooms ? { rooms: deps.rooms(endpoint) } : {}),
+    ...(deps.meet ? { meet: deps.meet } : {}),
   });
   if (provisioned.ok) return { ok: true, roomName: provisioned.roomName, adopted: provisioned.adopted };
   if (provisioned.code === 'provider_failed') return { ok: false, reason: 'provider_failed' };

@@ -17,7 +17,7 @@ type Db = typeof supabase;
 export const LIVE_SESSION_STATUSES = ['created', 'waiting', 'in_progress'] as const;
 const ROUND_COLUMNS =
   'id, candidate_id, role_id, status, expires_at, attempts_allowed, attempts_counted, starts_used, '
-  + 'consent_locale';
+  + 'consent_locale, channel';
 
 export interface RoundRow {
   id: string;
@@ -33,6 +33,12 @@ export interface RoundRow {
    * PR-CT's audience contract). Owned by the server, never by the client.
    */
   consent_locale: string;
+  /**
+   * How the interview is held: `browser` | `meet` (migration 0142 section 1). Read only by
+   * the candidate router's Meet-channel guard and compared only with `=== 'meet'`, so a row
+   * that lacks it reads as browser. Never returned to the candidate.
+   */
+  channel: string;
 }
 
 /** Look a round up by the link token the candidate holds. Digest only; no plaintext. */

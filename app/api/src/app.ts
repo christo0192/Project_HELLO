@@ -36,6 +36,7 @@ import { r1Router, r1InternalRouter } from './routes/r1.js';
 import { r1RecordingInternalRouter, r1RecordingStaffRouter } from './routes/r1-recording.js';
 import { r1HrRouter } from './routes/r1-hr.js';
 import { r1CandidateRouter } from './routes/r1-candidate.js';
+import { r1MeetBookingsRouter } from './routes/r1-meet-bookings.js';
 import { ashbyCandidateWorkflowRouter } from './routes/ashby-candidate-workflow.js';
 import { scorecardsRouter } from './routes/scorecards.js';
 import {
@@ -47,7 +48,7 @@ import {
 } from './lib/validation.js';
 import { createRequireAuth, isPublicRoute, setAuthSupabaseClient, type MembershipResolver, type TokenVerifier } from './lib/auth.js';
 import { createRateLimitMiddleware, type RateLimitConfig } from './lib/rate-limit.js';
-import { createR1RateLimit, createR1StartRateLimit } from './lib/r1/rate-limit.js';
+import { createR1MeetExchangeRateLimit, createR1RateLimit, createR1StartRateLimit } from './lib/r1/rate-limit.js';
 import { viewerReadOnly } from './lib/rbac.js';
 import { supabase } from './lib/supabase.js';
 import { setAuditSink, createDbAuditSink } from './lib/audit.js';
@@ -406,6 +407,10 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.use('/api/r1', createR1RateLimit(rateWindowSec));
   app.post('/api/r1/preflight', r1StartBody, createR1StartRateLimit(rateWindowSec));
   app.post('/api/r1/attempts', r1StartBody, createR1StartRateLimit(rateWindowSec));
+  // The Meet bridge exchange (M034, dark) gets its own tight bucket, keyed on the
+  // bridge ticket its body names (a digest), else the IP: it neither spends nor is
+  // spent by the link-keyed start bucket. The per-IP bucket above covers it too.
+  app.post('/api/r1/meet/exchange', r1StartBody, createR1MeetExchangeRateLimit(rateWindowSec));
   app.use('/api/screening', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'screening:', useUserKey: true }));
   app.use('/api/assess', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'assess:', useUserKey: true }));
   app.use('/api/resumes', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'resumes:', useUserKey: true }));
@@ -500,6 +505,9 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.use('/api', r1RecordingStaffRouter);
   // Read-only HR read models (availability, usage); see routes/r1-hr.ts.
   app.use('/api', r1HrRouter);
+  // R1 over Google Meet (M034, dark): the HR read of the Meet bookings, viewer+, under
+  // /api/interview-rounds (that prefix's per-user bucket). Reads nothing while Meet is off.
+  app.use('/api', r1MeetBookingsRouter);
   // R1 candidate surface (exact public allowlist entries in lib/auth.ts). Each
   // route authenticates with the link token, or the attempt token + nonce.
   app.use('/api/r1', r1CandidateRouter);

@@ -49,6 +49,11 @@ const fixtures = [
   ['/api/interview-rounds/search', 'post', '200'],
   // R1 review page: one round as a reviewer sees it (viewer+).
   ['/api/interview-rounds/{id}/review', 'get', '200'],
+  // M034 S05 (dark): the Meet bridge's single-use ticket exchange, a public candidate route.
+  ['/api/r1/meet/exchange', 'post', '200'],
+  // M034 S05 (dark): the HR read of the Meet bookings (viewer+), staff routes outside /api/r1.
+  ['/api/interview-rounds/meet-bookings', 'get', '200'],
+  ['/api/interview-rounds/meet-bookings/{id}', 'get', '200'],
 ] as const;
 
 describe('R1 OpenAPI route fixtures', () => {
@@ -111,6 +116,25 @@ describe('R1 candidate surface contract', () => {
     expect(ready).toMatch(/'429'\s*:/);
     expect(ready).toMatch(/'404'\s*:/);
     expect(ready).toMatch(/\bnot_live\b/);
+    // M034 S05: the Meet bridge answers 202 (with a resume token), 425 and 410, and its section
+    // names every code the bridge page tells apart (S07's R1_MEET_EXCHANGE_ERROR_CODES).
+    const meet = sectionFor('/api/r1/meet/exchange');
+    for (const status of ['200', '202', '400', '404', '409', '410', '425', '429', '503']) {
+      expect(meet, status).toMatch(new RegExp(`'${status}'\\s*:`));
+    }
+    for (const code of [
+      'invalid_request',
+      'ticket_unknown',
+      'ticket_already_claimed',
+      'ticket_not_yet_valid',
+      'ticket_expired',
+      'round_not_live',
+      'meet_disabled',
+    ]) {
+      expect(meet, code).toMatch(new RegExp(`\\b${code}\\b`));
+    }
+    expect(meet).toMatch(/\bresume_token\b/);
+    expect(meet).toMatch(/operationId: exchangeR1MeetTicket/);
   });
 
   it('keeps near misses out of the public allowlist (exact method and path only)', () => {
@@ -127,6 +151,11 @@ describe('R1 candidate surface contract', () => {
       ['POST', '/api/internal/r1/attempt-outcome'],
       ['GET', '/api/interview-rounds/x/cancel'],
       ['POST', '/api/r1/consent/withdraw/'],
+      // M034 S05: the Meet bridge exchange is public as exactly POST /api/r1/meet/exchange.
+      ['GET', '/api/r1/meet/exchange'],
+      ['POST', '/api/r1/meet/exchange/'],
+      ['POST', '/api/r1/meet/exchange/extra'],
+      ['POST', '/api/r1/meet'],
     ] as const) {
       expect(isPublicRoute(method, path), `${method} ${path}`).toBe(false);
     }

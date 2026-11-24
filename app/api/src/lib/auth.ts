@@ -618,6 +618,9 @@ export const PUBLIC_ROUTES: { method: string; path: string }[] = [
   { method: 'POST', path: '/api/r1/attempts' },
   { method: 'POST', path: '/api/r1/exchange' },
   { method: 'POST', path: '/api/r1/ready' },
+  // M034 (dark): the Meet bridge exchange authenticates inline with its single-use bridge
+  // ticket before any dependent read or write. Exact method+path only.
+  { method: 'POST', path: '/api/r1/meet/exchange' },
 ];
 
 export function isPublicRoute(method: string, path: string): boolean {

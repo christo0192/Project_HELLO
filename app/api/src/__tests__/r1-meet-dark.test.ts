@@ -1,19 +1,23 @@
 /**
  * M034 S01: the R1-over-Google-Meet modules ship as DARK libraries.
  *
- * S01 shipped libraries only. S03 wires the Recall receivers and the Ashby schedule routing, and
- * nothing else: exactly the importers and imports in `WIRED_IMPORTS`. S05 and S06 must narrow this
- * pin again in the same PR that wires them.
+ * S01 shipped libraries only. S03 wires the Recall receivers and the Ashby schedule routing, S05 the
+ * Meet bridge exchange in the candidate router and the HR read of the Meet bookings
+ * (routes/r1-meet-bookings.ts), and nothing else: exactly the importers and imports in
+ * `WIRED_IMPORTS`. S06 (runtime) must narrow this pin again in the same PR that wires it.
  *
- * What "dark" means here (S01 plan R21, R30, R31; S03 plan R16; D-M034-11):
+ * What "dark" means here (S01 plan R21, R30, R31; S03 plan R16; S05 plan D-S05-18; D-M034-11):
  *  (a) no runtime file outside the three Meet folders (integrations/recall, integrations/google-meet,
  *      lib/r1/meet) imports a module inside them, except each `WIRED_IMPORTS` importer, whose Meet
  *      imports must EQUAL its list (so the allowlist can neither go stale nor widen silently).
  *      Static, side-effect, re-export, dynamic `import()` and `require()` specifiers are resolved
  *      relative to the importing file; type-only imports count too. A second check refuses any Meet
  *      module path written as text (a computed specifier would otherwise slip past the resolver),
- *      outside the wired importers and app.ts (the Recall mount string only; app.ts imports no Meet
- *      module, which a control proves).
+ *      outside the wired importers, app.ts (the Recall mount string and the bridge route of its
+ *      per-ticket limiter) and lib/auth.ts (the bridge route's public entry); neither of those two
+ *      imports a Meet module, which a control proves. The routes stay dark behind R1_MEET_ENABLED:
+ *      the exchange answers 503 meet_disabled before anything is read (r1-meet-exchange.test.ts), and
+ *      the bookings read answers an empty page and reads nothing (r1-meet-bookings-route.test.ts).
  *  (b) no runtime file imports the test tree (`__tests__`, which holds the Meet fakes, the Ashby
  *      schedule fixture and the Svix test signer in `__tests__/support`).
  *  (c) no fly*.toml under app/ names a Meet variable: the flag defaults OFF and the two Recall
@@ -117,8 +121,9 @@ const meetImports = (importer: string, source: string): string[] =>
   relativeTargets(importer, source).filter(inMeet);
 
 /**
- * S03 plan R16: the runtime files outside the Meet folders that may import Meet modules, each with
- * the EXACT repo-relative resolved targets of its Meet imports (type-only imports included).
+ * S03 plan R16 and S05 plan D-S05-18: the runtime files outside the Meet folders that may import Meet
+ * modules, each with the EXACT repo-relative resolved targets of its Meet imports (type-only imports
+ * included).
  */
 const WIRED_IMPORTS: Readonly<Record<string, readonly string[]>> = {
   'app/api/src/routes/ashby-webhook.ts': [
@@ -127,6 +132,17 @@ const WIRED_IMPORTS: Readonly<Record<string, readonly string[]>> = {
     'app/api/src/lib/r1/meet/config.js',
     'app/api/src/lib/r1/meet/receipts.js',
   ],
+  'app/api/src/routes/r1-candidate.ts': [
+    'app/api/src/lib/r1/meet/bridge-store.js',
+    'app/api/src/lib/r1/meet/config.js',
+    'app/api/src/lib/r1/meet/profiles.js',
+    'app/api/src/lib/r1/meet/resume-token.js',
+    'app/api/src/lib/r1/meet/ticket.js',
+  ],
+  'app/api/src/routes/r1-meet-bookings.ts': [
+    'app/api/src/lib/r1/meet/bookings-read.js',
+    'app/api/src/lib/r1/meet/config.js',
+  ],
   'app/api/src/routes/recall-webhook.ts': [
     'app/api/src/integrations/recall/webhook-verify.js',
     'app/api/src/lib/r1/meet/config.js',
@@ -134,11 +150,22 @@ const WIRED_IMPORTS: Readonly<Record<string, readonly string[]>> = {
     'app/api/src/lib/r1/meet/recall-event.js',
   ],
 };
+const AUTH_FILE = path.join(SRC, 'lib', 'auth.ts');
 const APP_FILE = path.join(SRC, 'app.ts');
-/** The one Meet path app.ts may write: the Recall router's mount string. */
+/** The Recall router's mount string (app.ts). */
 const RECALL_MOUNT_LITERAL = "'/api/integrations/recall'";
-/** Files allowed to write a Meet module path as text: the wired importers, plus app.ts (mount only). */
-const PATH_TEXT_ALLOWED: ReadonlySet<string> = new Set([...Object.keys(WIRED_IMPORTS), rel(APP_FILE)]);
+/** The bridge exchange's public route (lib/auth.ts, and app.ts for its per-ticket limiter). */
+const BRIDGE_ROUTE_LITERAL = "'/api/r1/meet/exchange'";
+/** Files that may write a Meet path as text but import no Meet module, with exactly what they may write. */
+const ROUTE_TEXT_ONLY: ReadonlyArray<{ file: string; literals: readonly string[] }> = [
+  { file: AUTH_FILE, literals: [BRIDGE_ROUTE_LITERAL] },
+  { file: APP_FILE, literals: [RECALL_MOUNT_LITERAL, BRIDGE_ROUTE_LITERAL] },
+];
+/** Files allowed to write a Meet module path as text: the wired importers, plus the text-only ones. */
+const PATH_TEXT_ALLOWED: ReadonlySet<string> = new Set([
+  ...Object.keys(WIRED_IMPORTS),
+  ...ROUTE_TEXT_ONLY.map(({ file }) => rel(file)),
+]);
 
 /** The sorted, de-duplicated repo-relative Meet import targets of `importer`. */
 const actualMeetImports = (importer: string, source: string): string[] =>
@@ -188,7 +215,12 @@ describe('M034 S01: the Meet modules are dark libraries', () => {
 
   it('(a) each wired importer imports EXACTLY its listed Meet modules (no stale or silent widening)', () => {
     const wired = Object.keys(WIRED_IMPORTS).sort();
-    expect(wired).toEqual(['app/api/src/routes/ashby-webhook.ts', 'app/api/src/routes/recall-webhook.ts']);
+    expect(wired).toEqual([
+      'app/api/src/routes/ashby-webhook.ts',
+      'app/api/src/routes/r1-candidate.ts',
+      'app/api/src/routes/r1-meet-bookings.ts',
+      'app/api/src/routes/recall-webhook.ts',
+    ]);
     for (const key of wired) {
       const file = path.join(REPO_ROOT, ...key.split('/'));
       expect(OUTSIDE_FILES, key).toContain(file);
@@ -202,13 +234,21 @@ describe('M034 S01: the Meet modules are dark libraries', () => {
     expect(offenders).toEqual([]);
   });
 
-  it('(a) control: app.ts imports no Meet module and names a Meet path only in the Recall mount string', () => {
-    const appText = read(APP_FILE);
-    expect(OUTSIDE_FILES).toContain(APP_FILE);
-    expect(meetImports(APP_FILE, appText)).toEqual([]);
-    expect(appText).toContain(RECALL_MOUNT_LITERAL);
-    expect(MEET_PATH_TEXT.test(appText)).toBe(true);
-    expect(MEET_PATH_TEXT.test(appText.split(RECALL_MOUNT_LITERAL).join(''))).toBe(false);
+  it('(a) control: lib/auth.ts and app.ts import no Meet module and name a Meet path only in their route literals', () => {
+    for (const { file, literals } of ROUTE_TEXT_ONLY) {
+      const text = read(file);
+      expect(OUTSIDE_FILES, rel(file)).toContain(file);
+      expect(meetImports(file, text), rel(file)).toEqual([]);
+      // Each literal is there, and each one alone is what the text scan would catch.
+      for (const literal of literals) {
+        expect(text, rel(file)).toContain(literal);
+        expect(MEET_PATH_TEXT.test(literal), literal).toBe(true);
+      }
+      const stripped = literals.reduce((left, literal) => left.split(literal).join(''), text);
+      expect(MEET_PATH_TEXT.test(stripped), rel(file)).toBe(false);
+    }
+    // lib/auth.ts never names the Recall mount: the receivers are mounted ahead of authentication.
+    expect(read(AUTH_FILE)).not.toContain(RECALL_MOUNT_LITERAL);
   });
 
   it('(a) control: a wired importer that widens its Meet imports, or any other importer, is caught', () => {
@@ -226,6 +266,26 @@ describe('M034 S01: the Meet modules are dark libraries', () => {
     const other = path.join(SRC, 'routes', 'example-importer.ts');
     expect(unwiredMeetImports(other, "import { getR1MeetConfig } from '../lib/r1/meet/config.js';")).toEqual([
       'app/api/src/routes/example-importer.ts -> app/api/src/lib/r1/meet/config.js',
+    ]);
+    // M034 S05: the candidate router and the bookings route are held to their own lists.
+    const router = path.join(SRC, 'routes', 'r1-candidate.ts');
+    expect(unwiredMeetImports(router, widened)).toEqual([
+      'app/api/src/routes/r1-candidate.ts -> app/api/src/integrations/recall/webhook-verify.js',
+      'app/api/src/routes/r1-candidate.ts -> app/api/src/lib/r1/meet/recall-bot.js',
+    ]);
+    expect(actualMeetImports(router, widened)).not.toEqual(
+      [...WIRED_IMPORTS['app/api/src/routes/r1-candidate.ts']!].sort(),
+    );
+    const bookingsRoute = path.join(SRC, 'routes', 'r1-meet-bookings.ts');
+    expect(unwiredMeetImports(bookingsRoute, "import { peekR1MeetTicket } from '../lib/r1/meet/bridge-store.js';")).toEqual([
+      'app/api/src/routes/r1-meet-bookings.ts -> app/api/src/lib/r1/meet/bridge-store.js',
+    ]);
+    // lib/auth.ts and app.ts may write their route strings, never import a Meet module.
+    expect(unwiredMeetImports(AUTH_FILE, "import { getR1MeetConfig } from './r1/meet/config.js';")).toEqual([
+      'app/api/src/lib/auth.ts -> app/api/src/lib/r1/meet/config.js',
+    ]);
+    expect(unwiredMeetImports(APP_FILE, "import { getR1MeetConfig } from './lib/r1/meet/config.js';")).toEqual([
+      'app/api/src/app.ts -> app/api/src/lib/r1/meet/config.js',
     ]);
   });
 

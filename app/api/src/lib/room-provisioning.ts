@@ -16,7 +16,8 @@
  *
  * Invariants:
  *  1. Room metadata is minimal and carries no candidate PII (session id, room
- *     name, correlation id and, for an R1 room, the `lane: r1` routing marker)
+ *     name, correlation id and, for an R1 room, the `lane: r1` routing marker
+ *     and, for a Meet bridge join, the channel and the bridge identity)
  *     — mirrors invites.ts invariant 4.
  *  2. Cloud authoritative egress is started BEFORE the session is published as
  *     joinable. R1 records in-worker and explicitly skips egress because its
@@ -56,6 +57,13 @@
  *     (or re-creates a lapsed one), the `created` -> `waiting` CAS reports a conflict
  *     and the re-read adopts it (`adopted: true`). The R1 exchange relies on this to
  *     re-assert the marked room of a `waiting` attempt on every rejoin.
+ *  7. M034, dark: a Meet bridge join (`meet`, plain values set only by the R1
+ *     exchange for the Meet bridge) adds `channel: meet` and the bridge identity to
+ *     the marked room, after the lane key, so the worker can check them against its
+ *     dispatch. It REQUIRES `lane: 'r1'`, an R1 round session and an identity that
+ *     names this session (`meetBridgeIdentityValid`); anything else fails closed as
+ *     `r1_lane_mismatch` before any provider call. Without `meet` every room, R1
+ *     or not, is byte-identical. This module never imports lib/r1.
  */
 
 import { supabase } from './supabase.js';
@@ -95,15 +103,40 @@ export function roomNameForSession(sessionId: string): string {
   return `screening-${sessionId}`;
 }
 
+/** M034: the Meet bridge participant identity, `meet-<first 8 hex of the session id>`. */
+export const MEET_BRIDGE_IDENTITY_PATTERN = /^meet-[0-9a-f]{8}$/;
+
+/**
+ * M034, dark: is `identity` the Meet bridge identity of THIS session? It must match
+ * `MEET_BRIDGE_IDENTITY_PATTERN` (lower-case hex only) and equal `meet-` plus the first 8
+ * characters of the session id, the rule the R1 exchange mints the bridge token with and
+ * the rule the worker checks before it binds the bridge participant. A non-string, another
+ * session's identity, or a candidate identity is false. Shared by the dispatch metadata
+ * (lib/browser-orchestration.ts) and the room mirror below, so the two cannot drift.
+ */
+export function meetBridgeIdentityValid(sessionId: unknown, identity: unknown): boolean {
+  return typeof sessionId === 'string'
+    && typeof identity === 'string'
+    && MEET_BRIDGE_IDENTITY_PATTERN.test(identity)
+    && identity === `meet-${sessionId.slice(0, 8)}`;
+}
+
 /**
  * Minimal, PII-free room metadata. Denylisted fields (candidate name/email/
  * phone, resume facts, JD/role focus, template, transcript/scoring context,
  * provider secrets, access tokens) are structurally absent.
+ *
+ * `meet` (M034, an R1 room only) appends `channel: 'meet'` and `candidate_identity`
+ * AFTER the lane key: the mirror of the Meet dispatch metadata that the worker checks
+ * before it binds the bridge participant. Ignored for any other lane. Without it the
+ * string is exactly what it was before M034. The caller validates the identity
+ * (`provisionRoomForCreatedSession` refuses a bad one before any provider call).
  */
 export function buildMinimalRoomMetadata(
   sessionId: string,
   roomName: string,
   lane: LiveKitEndpoint['target'] = 'cloud',
+  meet?: { candidateIdentity: string },
 ): string {
   const metadata = {
     session_id: sessionId,
@@ -111,6 +144,9 @@ export function buildMinimalRoomMetadata(
     correlation_id: getCorrelationId() ?? undefined,
     ...(lane === 'r1'
       ? { [R1_ROOM_METADATA_LANE_KEY]: R1_ROOM_METADATA_LANE_VALUE }
+      : {}),
+    ...(lane === 'r1' && meet
+      ? { channel: 'meet', candidate_identity: meet.candidateIdentity }
       : {}),
   };
   return JSON.stringify(metadata);
@@ -162,6 +198,15 @@ export interface ProvisionRoomDeps {
    * every other caller, so the browser and phone rooms are provisioned exactly as before.
    */
   lane?: 'r1';
+  /**
+   * M034, dark: set ONLY by the R1 exchange for a Meet bridge join, with plain values (this
+   * module never imports lib/r1). The marked room then also carries `channel: 'meet'` and
+   * `candidate_identity` (invariant 7). It REQUIRES `lane: 'r1'`, a non-empty
+   * `interviewRoundId` and the identity of THIS session (`meetBridgeIdentityValid`), or
+   * provisioning fails closed as `r1_lane_mismatch` before any provider call. Omitted for
+   * every browser and phone room, whose arguments stay byte-identical.
+   */
+  meet?: { candidateIdentity: string };
 }
 
 /** R1 rooms hold one candidate and one agent; the third seat is head-room (plan 4 step 7). */
@@ -236,7 +281,12 @@ export async function provisionRoomForCreatedSession(
   // only when an R1 round session meets the R1 endpoint (anything else is refused below).
   const r1Exchange = deps.lane === 'r1';
   const r1Lane = r1Exchange ? r1Round : r1Round && r1Endpoint;
-  const metadata = buildMinimalRoomMetadata(sessionId, roomName, r1Lane ? 'r1' : 'cloud');
+  const metadata = buildMinimalRoomMetadata(
+    sessionId,
+    roomName,
+    r1Lane ? 'r1' : 'cloud',
+    deps.meet,
+  );
   const rooms = deps.rooms ?? roomClient(endpoint);
   const db = deps.db ?? supabase;
   const startRecording = deps.startRecording ?? startAuthoritativeRecording;
@@ -246,6 +296,16 @@ export async function provisionRoomForCreatedSession(
     // (an R1 round), never from the endpoint alone. Checked before any provider call.
     // The R1 exchange may use either SFU, but only for an R1 round session.
     if (r1Exchange ? !r1Round : r1LaneMismatch(deps.interviewRoundId, endpoint)) {
+      throw new Error(R1_LANE_MISMATCH_ERROR);
+    }
+    // M034 (invariant 7): a Meet bridge join is the R1 exchange's alone, for an R1 round
+    // session, with this session's bridge identity. Anything else is refused the same way,
+    // before any provider call, so a bad mirror never reaches a room the worker would read.
+    const meetIdentity: unknown = deps.meet?.candidateIdentity;
+    if (
+      deps.meet !== undefined
+      && !(r1Exchange && r1Round && meetBridgeIdentityValid(sessionId, meetIdentity))
+    ) {
       throw new Error(R1_LANE_MISMATCH_ERROR);
     }
     try {

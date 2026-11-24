@@ -276,6 +276,167 @@ paths:
                     type: string
                     enum: [ready, not_deployed, disabled, paused, capacity_exhausted, role_not_configured, config_invalid]
                   hold_minutes: { type: number }
+  /api/interview-rounds/meet-bookings:
+    get:
+      tags: [r1]
+      operationId: listR1MeetBookings
+      summary: R1 bookings over Google Meet, by slot start (viewer+; an interviewer sees only candidates they own; M034, dark)
+      description: 'R1 over Google Meet (M034), dark behind R1_MEET_ENABLED: while Meet is off (R1_ENABLED and a valid Meet configuration are both needed) nothing is read and the answer is 200 with meet_enabled false, bookings empty and next_cursor null. Read rule = the rule of the R1 video, applied as a filter on the read: admin and viewer every booking (one whose Ashby application matched no candidate included), interviewer only a booking whose candidate they own. Each booking carries exactly id, candidate_id, round_id, status, reason, start_at, end_at, created_at, updated_at and version: never the Meet URL, a ticket field, an Ashby id, the attester, the Recall bot, the session or the profile. Sorted by start_at, then id. Filters: status, from (start_at at or after) and to (start_at before), each an ISO 8601 instant with its zone; limit 1 to 100 (default 50). next_cursor is set only when another page follows; pass it back as cursor, unchanged, with the same filters. Not audited (a list read); Cache-Control: no-store.'
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [pending, unmatched_application, unmapped_scheduler, blocked, bot_scheduled, bot_joining, human_present, in_call, completed, cancelled, failed, drained]
+        - name: from
+          in: query
+          required: false
+          description: Bookings whose start_at is at or after this instant (ISO 8601 with its zone).
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          description: Bookings whose start_at is before this instant (exclusive; after from when both are given).
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+        - name: cursor
+          in: query
+          required: false
+          description: The next_cursor of the previous page, unchanged (opaque).
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 'One page. meet_enabled is false (and the page empty) while Meet is off.'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [meet_enabled, bookings, next_cursor]
+                properties:
+                  meet_enabled:
+                    type: boolean
+                  bookings:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: false
+                      required: [id, candidate_id, round_id, status, reason, start_at, end_at, created_at, updated_at, version]
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                        candidate_id:
+                          type: string
+                          format: uuid
+                          nullable: true
+                          description: Null while the Ashby application matched no candidate (status unmatched_application).
+                        round_id:
+                          type: string
+                          format: uuid
+                          nullable: true
+                          description: The R1 round the booking runs, or null before one exists.
+                        status:
+                          type: string
+                          enum: [pending, unmatched_application, unmapped_scheduler, blocked, bot_scheduled, bot_joining, human_present, in_call, completed, cancelled, failed, drained]
+                        reason:
+                          type: string
+                          enum: [dex_absent, cancelled, in_past, not_scheduled, no_attester, no_meet_link, eligible, application_unknown, application_terminal, scheduler_unmapped, created_by_unknown, disabled, paused, candidate_ineligible, role_not_configured, round_active, phone_engagement_active, phone_assessment_pending, capacity_exhausted, consent_template_unavailable, slot_too_far, bot_cap_reached, bot_create_failed, bot_fatal, event_removed, round_cancelled, round_expired, no_show, admission_refused, multiple_humans, attempt_settled, flag_off]
+                        start_at:
+                          type: string
+                          format: date-time
+                        end_at:
+                          type: string
+                          format: date-time
+                        created_at:
+                          type: string
+                          format: date-time
+                        updated_at:
+                          type: string
+                          format: date-time
+                        version:
+                          type: integer
+                          minimum: 0
+                  next_cursor:
+                    type: string
+                    nullable: true
+        '400': { description: 'A query parameter is not one this route takes, a value is malformed, from is not before to, or the cursor is not one this route wrote (invalid_query).' }
+        '403': { description: The caller's account is inactive (access_denied). }
+        '503': { description: 'The read failed or a row was not what the schema allows (service_unavailable): never a partial page.' }
+  /api/interview-rounds/meet-bookings/{id}:
+    get:
+      tags: [r1]
+      operationId: getR1MeetBooking
+      summary: One R1 booking over Google Meet (viewer+; an interviewer must own the candidate; M034, dark)
+      description: 'One booking, with the fields and the read rule of GET /api/interview-rounds/meet-bookings. 404 not_found when it does not exist, when the caller may not see it (an interviewer who does not own its candidate), and always while Meet is off (nothing is read). Cache-Control: no-store.'
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The booking.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [id, candidate_id, round_id, status, reason, start_at, end_at, created_at, updated_at, version]
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  candidate_id:
+                    type: string
+                    format: uuid
+                    nullable: true
+                    description: Null while the Ashby application matched no candidate (status unmatched_application).
+                  round_id:
+                    type: string
+                    format: uuid
+                    nullable: true
+                    description: The R1 round the booking runs, or null before one exists.
+                  status:
+                    type: string
+                    enum: [pending, unmatched_application, unmapped_scheduler, blocked, bot_scheduled, bot_joining, human_present, in_call, completed, cancelled, failed, drained]
+                  reason:
+                    type: string
+                    enum: [dex_absent, cancelled, in_past, not_scheduled, no_attester, no_meet_link, eligible, application_unknown, application_terminal, scheduler_unmapped, created_by_unknown, disabled, paused, candidate_ineligible, role_not_configured, round_active, phone_engagement_active, phone_assessment_pending, capacity_exhausted, consent_template_unavailable, slot_too_far, bot_cap_reached, bot_create_failed, bot_fatal, event_removed, round_cancelled, round_expired, no_show, admission_refused, multiple_humans, attempt_settled, flag_off]
+                  start_at:
+                    type: string
+                    format: date-time
+                  end_at:
+                    type: string
+                    format: date-time
+                  created_at:
+                    type: string
+                    format: date-time
+                  updated_at:
+                    type: string
+                    format: date-time
+                  version:
+                    type: integer
+                    minimum: 0
+        '400': { description: Malformed booking id (invalid_id). }
+        '403': { description: The caller's account is inactive (access_denied). }
+        '404': { description: 'No such booking, not one the caller may see, or Meet is off (not_found).' }
+        '503': { description: 'The read failed or the row was not what the schema allows (service_unavailable).' }
   /api/admin/r1/usage:
     get:
       tags: [r1]
@@ -643,6 +804,8 @@ paths:
           description: Request validation failed.
         '404':
           description: Stable unknown-or-expired link response (r1_link_invalid_or_expired).
+        '409':
+          description: 'round_channel_meet: the round is held in Google Meet at the booked time (interview_rounds.channel = meet), so it never takes the browser path. Answered right after the link is recognised, whatever the switches say (R1_ENABLED, maintenance, r1_settings, the Meet flag). The status body never carries the channel.'
         '503':
           description: Database unavailable (service_unavailable).
   /api/r1/consent-template:
@@ -953,7 +1116,7 @@ paths:
         '404':
           description: Stable unknown-or-expired link (r1_link_invalid_or_expired) or invalid-attempt (r1_attempt_invalid) response.
         '409':
-          description: Refused by admission (r1_busy, consent_required, r1_disabled, r1_paused, r1_capacity_exhausted, starts_exhausted, attempts_exhausted, round_expired, round_not_admissible) or, for a rejoin, because the attempt is no longer live (r1_attempt_not_live). r1_busy also sends a Retry-After header (seconds) equal to retry_after_sec, and, only when admission runs more than one live R1 at once, busy_reason slots_full (every slot in use) or own_session_live (this round already has a live session, round_live).
+          description: Refused by admission (r1_busy, consent_required, r1_disabled, r1_paused, r1_capacity_exhausted, starts_exhausted, attempts_exhausted, round_expired, round_not_admissible) or, for a rejoin, because the attempt is no longer live (r1_attempt_not_live). A round held in Google Meet (interview_rounds.channel = meet) answers round_channel_meet for admission and rejoin alike, right after the link is recognised and before any switch is read; nothing is admitted. r1_busy also sends a Retry-After header (seconds) equal to retry_after_sec, and, only when admission runs more than one live R1 at once, busy_reason slots_full (every slot in use) or own_session_live (this round already has a live session, round_live).
           headers:
             Retry-After:
               description: Sent with r1_busy only. 1800 at a live R1 limit of 1; 300 above it.
@@ -1038,7 +1201,7 @@ paths:
         '404':
           description: One stable answer for an unknown attempt, wrong or expired token, or wrong nonce (r1_attempt_invalid).
         '409':
-          description: Attempt ended (r1_attempt_ended), consent required (consent_required), round not admissible (round_not_admissible), or R1 disabled or paused (r1_disabled, r1_paused).
+          description: Attempt ended (r1_attempt_ended), consent required (consent_required), round not admissible (round_not_admissible), R1 disabled or paused (r1_disabled, r1_paused), or the round is held in Google Meet (round_channel_meet, interview_rounds.channel = meet; answered once the attempt's session and round match, before any room, gate or token).
         '503':
           description: R1 unavailable (r1_unavailable: DeepSeek unhealthy or unconfigured with retry_after_sec, no worker gate on the R1 SFU, or the Cloud fallback while the legacy browser lane is enabled), maintenance, endpoint mismatch (r1_endpoint_mismatch), room unavailable (r1_room_unavailable, including a failed re-assert of a waiting attempt's room), or service unavailable (service_unavailable); the attempt stays valid.
   /api/r1/ready:
@@ -1079,11 +1242,93 @@ paths:
         '404':
           description: One stable answer for an unknown attempt, wrong or expired token, or wrong nonce (r1_attempt_invalid).
         '409':
-          description: The attempt has no live room (not_live), consent was withdrawn (consent_required), the round is not admissible (round_not_admissible), or R1 is disabled (r1_disabled).
+          description: The attempt has no live room (not_live), consent was withdrawn (consent_required), the round is not admissible (round_not_admissible), R1 is disabled (r1_disabled), or the round is held in Google Meet (round_channel_meet, interview_rounds.channel = meet; nothing is relayed).
         '429':
           description: Too many presses for this attempt (r1_ready_rate_limited, with retry_after_sec and a Retry-After header).
         '503':
           description: R1 unavailable (r1_unavailable), the relay could not reach LiveKit (r1_room_unavailable), or service unavailable (service_unavailable).
+  /api/r1/meet/exchange:
+    post:
+      tags: [r1]
+      operationId: exchangeR1MeetTicket
+      summary: Exchange a single-use Meet bridge ticket for an audio-only LiveKit join (M034, dark)
+      description: 'The Meet bridge page (opened by the Recall bot as its output media) trades the ticket from its URL fragment for a room token. Dark behind R1_MEET_ENABLED: off, every call answers 503 meet_disabled before the body is parsed or anything is read. The ticket is single use and stored only as an HMAC digest (domain hello:r1:meet-bridge:v1). Order on a first call: strict body; the digest keys; a read-only look-up of the booking by digest, which answers ticket_unknown, ticket_already_claimed (also raises an alert), round_not_live, ticket_not_yet_valid and ticket_expired without spending the ticket; then the R1 switch, the round (a live Meet round), maintenance, the R1 settings and endpoint (fence 7 on the R1 SFU), the DeepSeek probe and consent (the HR-attested consent counts); only then the claim (r1_meet_claim_ticket, authoritative, single use), so no transient refusal burns the ticket. The round''s own live session is continued, bound to the booking first when it is not yet (a re-arm, or an admission whose bind or answer was lost); with none, the server admits the attempt itself (the nonce never leaves the server) and binds the session to the booking right away (r1_meet_bind_session). A first call never waits for a worker: unless the session is already in progress (a token at once) it answers 202 here, so every slow step runs on a call that can be repeated. The resumed call provisions the marked room (its metadata mirrors channel meet and the bridge identity), runs the worker gate with the Meet dispatch values (no gate, or a disabled one, never yields a token on any endpoint), checks consent again, and mints the token: microphone only, no data, no metadata updates, identity meet-<first 8 of the session id> (no candidate id), 10 minute TTL, signed with the secret of the selected endpoint. Every 202 carries a fresh resume_token (domain hello:r1:meet-resume:v1, 5 minutes); {ticket, resume_token} continues the same booking and session with no second claim and no admission, only the gates again. No answer names the candidate, the round, the booking or the session.'
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [ticket]
+              properties:
+                ticket:
+                  type: string
+                  pattern: '^[A-Za-z0-9_-]{32,128}$'
+                  description: The bridge ticket from the page URL fragment (32 random bytes, base64url, 43 characters).
+                resume_token:
+                  type: string
+                  pattern: '^v1\.[0-9]{1,12}\.[a-f0-9]{64}$'
+                  description: Only on a retry after a 202 that carried one.
+      responses:
+        '200':
+          description: The bridge join. The page makes no further exchange after it.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [url, livekit_token, expires_at]
+                properties:
+                  url:
+                    type: string
+                  livekit_token:
+                    type: string
+                  expires_at:
+                    type: string
+                    format: date-time
+        '202':
+          description: The ticket is claimed and the session is bound (every first call of a session that is not in progress yet), a worker is being prepared, or the room needs another try; retry after retry_after_sec with the same ticket and this resume_token (each 202 carries a fresh one). No token is issued.
+          headers:
+            Retry-After:
+              description: The same value as retry_after_sec.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status, retry_after_sec, resume_token]
+                properties:
+                  status:
+                    type: string
+                    enum: [preparing]
+                  retry_after_sec:
+                    type: integer
+                  resume_token:
+                    type: string
+                    pattern: '^v1\.[0-9]{1,12}\.[a-f0-9]{64}$'
+        '400':
+          description: The body is not exactly {ticket, resume_token?} in their shapes (invalid_request). A body that is not JSON is the app-wide malformed_request.
+        '404':
+          description: No booking holds this ticket (ticket_unknown), or a resume_token that does not verify, or a resume for a ticket that was never claimed (also ticket_unknown).
+        '409':
+          description: The ticket was already claimed (ticket_already_claimed; raises an alert), the booking or its round is not live, the round is no longer admissible, or the bound session ended (round_not_live), consent is missing (consent_required), R1 is disabled or paused (r1_disabled, r1_paused), or admission refused (r1_busy, r1_capacity_exhausted, starts_exhausted, attempts_exhausted). Bodies are exactly {error}; no Retry-After.
+        '410':
+          description: Past the ticket window, or a resume_token older than 5 minutes (ticket_expired).
+        '425':
+          description: Before the ticket window opens (ticket_not_yet_valid).
+        '429':
+          description: Rate limited by the app, before the ticket is claimed - the per-ticket bucket of this route (12 calls per window, keyed on a digest of the ticket, else the client IP) or the per-IP bucket of every candidate route. The body is the shared rate_limit_exceeded envelope; the bridge page retries it.
+          headers:
+            Retry-After:
+              description: Whole seconds until the bucket admits another call.
+              schema:
+                type: integer
+        '503':
+          description: Meet off (meet_disabled, answered first, before anything is read), maintenance (the shared maintenance body), R1 unavailable (r1_unavailable - the worker secret is missing or short, DeepSeek unhealthy, no worker gate for the Meet join on any endpoint, the endpoint is not configured, or the Cloud fallback while the legacy browser lane is enabled), endpoint mismatch (r1_endpoint_mismatch), or service unavailable (service_unavailable). A 503 that spent nothing (before the claim, or on a resume) also carries retry_after_sec in the body and as Retry-After (3, or 30 for DeepSeek); meet_disabled, the maintenance body and any 503 after the claim of a fresh ticket do not.
   # ── Health ──────────────────────────────────────────────────────────
   /api/health:
     get:

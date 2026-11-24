@@ -3,8 +3,8 @@
  *
  * Three steps, in this order:
  *
- *  1. Fence 7 (`r1WorkerGateMissing`): on the R1 SFU with no worker gate, refuse. It is
- *     asked BEFORE anything is provisioned.
+ *  1. Fence 7 (`r1WorkerGateMissing`): on the R1 SFU, and for a Meet join on any endpoint,
+ *     with no worker gate, refuse. It is asked BEFORE anything is provisioned.
  *  2. The M019 shared-name interlock (`sharedNameDispatchSafe`): with per-machine agent
  *     names not enforced, an R1 dispatch to the shared name is safe only while this is the
  *     one live R1 session.
@@ -23,7 +23,7 @@
 
 import type { supabase } from '../supabase.js';
 import type { createLogger } from '../logger.js';
-import type { BrowserWorkerGate } from '../browser-orchestration.js';
+import type { BrowserDispatchMeet, BrowserWorkerGate } from '../browser-orchestration.js';
 import type { LiveKitEndpoint } from '../livekit-endpoints.js';
 import { runR1WorkerGate, type DispatchListerLike, type R1GateVerdict } from './worker-gate.js';
 
@@ -50,14 +50,18 @@ export interface R1JoinGateDeps {
  * (orchestration off, `BROWSER_AGENT_NAME` empty or malformed) a candidate token
  * would be minted for a room no interviewer will ever join. True means "refuse
  * with 503 r1_unavailable", and it must be asked BEFORE anything is provisioned.
- * Cloud is never affected: its unnamed worker auto-dispatches (legacy behaviour).
+ * Cloud is never affected for a browser join: its unnamed worker auto-dispatches
+ * (legacy behaviour). A MEET join (`options.meet`, M034) is affected on every
+ * endpoint: an auto-dispatched job carries no Meet dispatch values, so the worker
+ * would refuse the room or run it as a browser interview.
  * A gate that cannot even be built counts as missing.
  */
 export function r1WorkerGateMissing(
   endpoint: LiveKitEndpoint,
   deps: Pick<R1JoinGateDeps, 'resolveGate' | 'log'>,
+  options: { meet?: boolean } = {},
 ): boolean {
-  if (endpoint.target !== 'r1') return false;
+  if (endpoint.target !== 'r1' && options.meet !== true) return false;
   try {
     if (deps.resolveGate() !== null) return false;
   } catch {
@@ -111,9 +115,20 @@ export async function sharedNameDispatchSafe(
  * Fence 7 is not part of it: call `r1WorkerGateMissing` before provisioning anything, as
  * the browser router does on both paths (inside `laneForNewWork` for a `created` attempt,
  * explicitly for a `waiting` one).
+ *
+ * `meet` (M034, dark) is the Meet exchange's dispatch values (the bridge identity from
+ * `candidateJoinIdentity('meet_bridge', session)` and the profile id). It is forwarded to
+ * `runR1WorkerGate` only when present, so the browser exchange's call is unchanged. A Meet
+ * join fails closed on EVERY endpoint: with no gate, or a `disabled` verdict, nothing would
+ * dispatch the Meet values, and no auto-dispatched job can stand in for that dispatch.
  */
 export async function runR1JoinGate(
-  input: { endpoint: LiveKitEndpoint; sessionId: string; roomName: string },
+  input: {
+    endpoint: LiveKitEndpoint;
+    sessionId: string;
+    roomName: string;
+    meet?: BrowserDispatchMeet;
+  },
   deps: R1JoinGateDeps,
 ): Promise<R1GateVerdict> {
   if (!(await sharedNameDispatchSafe(input.endpoint, input.sessionId, deps))) return 'preparing';
@@ -123,7 +138,9 @@ export async function runR1JoinGate(
     roomName: input.roomName,
     dispatches: () => deps.dispatches(input.endpoint),
     now: deps.now,
-    // The R1 SFU has no unnamed worker to auto-dispatch: a null gate or a `disabled` verdict defers (fence 7).
-    failClosed: input.endpoint.target === 'r1',
+    // The R1 SFU has no unnamed worker to auto-dispatch: a null gate or a `disabled` verdict defers
+    // (fence 7). A Meet join defers the same way on Cloud: only a dispatch carries its values.
+    failClosed: input.endpoint.target === 'r1' || input.meet !== undefined,
+    ...(input.meet ? { meet: input.meet } : {}),
   });
 }

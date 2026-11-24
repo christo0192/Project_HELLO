@@ -266,8 +266,11 @@ function sourceFiles(directory: string): string[] {
  */
 const meetVendorDirs = ['recall', 'google-meet'].map((name) => path.join(src, 'integrations', name));
 const meetVendorSources = meetVendorDirs.flatMap((directory) => sourceFiles(directory));
-/** M034 S03: the Recall webhook receivers (routes/, outside lib/r1, but R1 code: critic C6). */
-const meetRouteSources = [path.join(src, 'routes', 'recall-webhook.ts')];
+/**
+ * The Meet routes (routes/, outside lib/r1, but R1 code: critic C6): the Recall webhook receivers
+ * (M034 S03) and the HR read of the Meet bookings (M034 S05).
+ */
+const meetRouteSources = ['recall-webhook.ts', 'r1-meet-bookings.ts'].map((name) => path.join(src, 'routes', name));
 /** Every Meet file: the vendor modules, lib/r1/meet and the Meet routes. */
 const meetSources = [...meetVendorSources, ...sourceFiles(path.join(src, 'lib', 'r1', 'meet')), ...meetRouteSources];
 const MEET_CONFIG = path.join(src, 'lib', 'r1', 'meet', 'config.ts');
@@ -322,6 +325,10 @@ describe('R1 source fences', () => {
     expect(existsSync(recallRoute)).toBe(true);
     expect(meetSources).toContain(recallRoute);
     expect(r1Sources).toContain(recallRoute);
+    // M034 S05: so is the HR read of the Meet bookings.
+    const bookingsRoute = path.join(src, 'routes', 'r1-meet-bookings.ts');
+    expect(existsSync(bookingsRoute)).toBe(true);
+    expect(meetSources).toContain(bookingsRoute);
     for (const file of meetSources) expect(r1Sources, file).toContain(file);
     // M034 S03 T4: the Ashby receiver's Meet branch is fenced like the rest of R1.
     const ashbyRoute = path.join(src, 'routes', 'ashby-webhook.ts');

@@ -75,6 +75,15 @@
  *     refused, whatever the flag says.
  *
  * Cloud ignores reported names and dispatches the shared name, as before.
+ *
+ * ── MEET BRIDGE DISPATCH (M034, dark) ─────────────────────────────────
+ * The R1 exchange for the Meet bridge passes `meet` (plain values) and the
+ * dispatch metadata becomes `{session_id, channel: 'meet', candidate_identity,
+ * profile}` in that key order, on the first dispatch and the retry alike, so
+ * the worker binds exactly that participant (`browserDispatchMetadata`). A
+ * malformed `meet` dispatches nothing and answers false before any LiveKit
+ * call. Without `meet` the metadata is exactly `{session_id, channel:
+ * 'browser'}`, byte-identical to before M034.
  */
 
 import { env } from './env.js';
@@ -84,7 +93,7 @@ import {
   type EnsureReadyResult,
 } from './worker-orchestration.js';
 import { BROWSER_FLY_APP } from './worker-orchestration-runtime.js';
-import { roomNameForSession } from './room-provisioning.js';
+import { meetBridgeIdentityValid, roomNameForSession } from './room-provisioning.js';
 import { createLogger } from './logger.js';
 import {
   agentDispatchClientFor,
@@ -98,6 +107,45 @@ const log = createLogger('browser-orchestration');
 
 /** A dispatch name is a bounded, opaque slug — never a secret, never PII. */
 const BROWSER_AGENT_NAME_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+
+/** An objective profile id (M034): a bounded lower-case slug, never PII. */
+const MEET_PROFILE_RE = /^[a-z][a-z0-9_]{0,63}$/;
+
+/**
+ * M034, dark: what a Meet bridge dispatch carries besides the session id. Plain
+ * values, set ONLY by the R1 exchange for the Meet bridge: the bridge
+ * participant's identity (`meet-<first 8 hex of the session id>`, the identity
+ * its join token names) and the objective profile id the worker runs.
+ */
+export interface BrowserDispatchMeet {
+  candidateIdentity: string;
+  profile: string;
+}
+
+/**
+ * The dispatch metadata string. Without `meet`: exactly `{session_id, channel:
+ * 'browser'}` (the session id is opaque; no PII), as before M034. With `meet`:
+ * `{session_id, channel: 'meet', candidate_identity, profile}` in that key order,
+ * the mirror of the Meet room metadata (lib/room-provisioning.ts). Null when
+ * `meet` is malformed: an identity that is not this session's bridge identity
+ * (`meetBridgeIdentityValid`) or a profile outside `^[a-z][a-z0-9_]{0,63}$`.
+ */
+export function browserDispatchMetadata(
+  sessionId: string,
+  meet?: BrowserDispatchMeet,
+): string | null {
+  if (meet === undefined) return JSON.stringify({ session_id: sessionId, channel: 'browser' });
+  const identity: unknown = meet?.candidateIdentity;
+  const profile: unknown = meet?.profile;
+  if (!meetBridgeIdentityValid(sessionId, identity)) return null;
+  if (typeof profile !== 'string' || !MEET_PROFILE_RE.test(profile)) return null;
+  return JSON.stringify({
+    session_id: sessionId,
+    channel: 'meet',
+    candidate_identity: identity,
+    profile,
+  });
+}
 
 /**
  * One dispatch as the safeguard reads it. `state.jobs` is populated by the
@@ -150,8 +198,18 @@ export interface BrowserWorkerGate {
    * a value that is not a per-machine name under the shared one, or no value
    * while BROWSER_REQUIRE_MACHINE_AGENT_NAME is on, dispatches nothing and
    * answers false. Cloud ignores it and dispatches the shared name.
+   *
+   * `meet` (M034, dark; the R1 exchange for the Meet bridge only) makes the
+   * metadata of the first dispatch and the retry `{session_id, channel: 'meet',
+   * candidate_identity, profile}` (`browserDispatchMetadata`). A malformed one
+   * dispatches nothing and answers false. Absent, the call is today's.
    */
-  dispatch(input: { sessionId: string; roomName: string; agentName?: string }): Promise<boolean>;
+  dispatch(input: {
+    sessionId: string;
+    roomName: string;
+    agentName?: string;
+    meet?: BrowserDispatchMeet;
+  }): Promise<boolean>;
   /**
    * M019: the name to dispatch for a `ready` verdict, or null when the lease must
    * not be dispatched to (the caller releases the machine and defers). Cloud: the
@@ -546,6 +604,15 @@ export function browserOrchestrationGate(
     },
     async dispatch(input) {
       try {
+        // The browser dispatch carries only the session id (opaque), mirroring
+        // the room metadata already minted by room-provisioning. No PII. A Meet
+        // bridge dispatch (M034) adds the channel, the bridge identity and the
+        // profile; a malformed one is refused here, before any LiveKit call.
+        const metadata = browserDispatchMetadata(input.sessionId, input.meet);
+        if (metadata === null) {
+          log.error('unknown_event', { error_category: 'browser_dispatch_meet_invalid' });
+          return false;
+        }
         const r1 = browserLiveKitEndpoint().target === 'r1';
         // Cloud dispatches the shared name, as on origin/main. R1 dispatches the
         // leased machine's own name when one was resolved (M019), on the first
@@ -553,9 +620,6 @@ export function browserOrchestrationGate(
         const name = r1 ? r1DispatchName(input.agentName) : agentName;
         if (name === null) return false;
         const client = await dispatchClientFor();
-        // The browser dispatch carries only the session id (opaque), mirroring
-        // the room metadata already minted by room-provisioning. No PII.
-        const metadata = JSON.stringify({ session_id: input.sessionId, channel: 'browser' });
         const first = await client.createDispatch(input.roomName, name, { metadata });
         // Cloud (the default target): a single createDispatch and nothing else,
         // exactly as on origin/main — never a listDispatch or deleteDispatch.

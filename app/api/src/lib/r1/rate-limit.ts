@@ -7,7 +7,7 @@
  * spend another lane's allowance, and a burst against R1 cannot throttle the
  * phone surface.
  *
- * Two buckets, fixed here rather than read from the environment so that R1
+ * Three buckets, fixed here rather than read from the environment so that R1
  * adds no API configuration surface (and therefore nothing for a malformed
  * value to break at boot):
  *
@@ -24,6 +24,12 @@
  *    not, could exhaust it and lock everybody out. A request without a
  *    well-formed token has no link to charge and falls back to the IP, which no
  *    real candidate ever uses.
+ *  - the Meet bridge exchange (M034, dark): its own tight bucket, keyed on the
+ *    bridge TICKET its body names (a digest, never the plaintext), else the IP.
+ *    The bridge page makes at most ten exchange calls per ticket (one first
+ *    call and its 202 retries), so twelve per window sits just above what the
+ *    page needs and still bounds a replay. It has its own prefix: it never
+ *    spends, and is never spent by, the link-keyed start bucket.
  */
 
 import type { NextFunction, Request, Response } from 'express';
@@ -70,5 +76,36 @@ export function createR1StartRateLimit(windowSec: number): Middleware {
     prefix: 'r1-start:',
     useUserKey: false,
     getIpOverride: r1StartKey,
+  });
+}
+
+export const R1_MEET_EXCHANGE_LIMIT = 12;
+
+/**
+ * The bridge ticket's shape, restated here so this module stays out of the Meet folder:
+ * `r1-candidate-app.test.ts` pins it equal to the exchange's own ticket pattern.
+ */
+export const R1_MEET_EXCHANGE_TICKET_SHAPE = /^[A-Za-z0-9_-]{32,128}$/;
+
+/**
+ * The bucket a Meet bridge exchange is charged to: the ticket its body names, as a
+ * digest (the plaintext ticket is never stored, not even in memory), else the
+ * client IP. Reads `req.body`, so the JSON parser must run first.
+ */
+export function r1MeetExchangeKey(req: Request): string {
+  const ticket = (req.body as { ticket?: unknown } | undefined)?.ticket;
+  if (typeof ticket === 'string' && R1_MEET_EXCHANGE_TICKET_SHAPE.test(ticket)) {
+    return `ticket:${hashInviteToken(ticket)}`;
+  }
+  return `ip:${getClientIp(req)}`;
+}
+
+/** Per-TICKET bucket for the Meet bridge exchange (mounted on that POST only). */
+export function createR1MeetExchangeRateLimit(windowSec: number): Middleware {
+  return createRateLimitMiddleware({
+    config: { limit: R1_MEET_EXCHANGE_LIMIT, windowSec, maxKeys: 100_000 },
+    prefix: 'r1-meet:',
+    useUserKey: false,
+    getIpOverride: r1MeetExchangeKey,
   });
 }
