@@ -273,6 +273,7 @@
         "R1_TRANSITION_PRESENCE_V2": { "requiredInProduction": false, "secret": false },
         "R1_AGENDA_W3": { "requiredInProduction": false, "secret": false },
         "R1_AGENDA_W4": { "requiredInProduction": false, "secret": false },
+        "R1_SPOKEN_LINES": { "requiredInProduction": false, "secret": false },
         "R1_WRAP_OFFER_VARIANT": { "requiredInProduction": false, "secret": false },
         "R1_ICEBREAKER_REPAIR": { "requiredInProduction": false, "secret": false },
         "R1_NO_AUDIO_LADDER": { "requiredInProduction": false, "secret": false },

@@ -2697,6 +2697,25 @@ its 12 characters hold ten digits in a row (revision 24's do), as the logger dro
   you've done?" (L-OPEN-AGENDA-W4, -PLAIN-W4, -CONTINUE-W4). The line stays cached; the clips
   showed the wording, not the REST synthesis, made the difference.
   Rollback: `fly secrets set R1_AGENDA_W4=0 -a project-hello-voice` (the W3 agenda).
+* **`R1_SPOKEN_LINES`** (default on; owner 2026-11-24, content revision 54). After the W4 agenda
+  the owner asked: "dont make it to open wording only. apply this fix for all scripted line as all
+  of the scripted ones are sounding the same way". Every scripted line that still read like
+  written text is now spoken in the same style: one idea per sentence, no colon lists, semicolons
+  or asides, and a question only as the last thing said. That covers the brief (every thanked
+  form, the bridged brief and the replay), the re-explained replay, both recaps, the pause, re-ask
+  and steer start prompts, the "goal" and "stuck" answers, the coach aside, the end aside, both
+  wrap-up offers, both early-close asides and L-EXIT (`r1_script.SPOKEN_LINES`, 21 `-SP` lines).
+  Facts, placeholders, cue phrases and consent are unchanged: the brief still names the learner,
+  her city, the course, "up to twenty minutes", the preparation guide, the cue "Let's pause the
+  role-play here." and the spoken 'ready', and still ends "Any questions before we start?"; L-EXIT
+  still opens with the cue; a settled bare "yes" still stops (end aside) or wraps up (offers), and
+  the early-close question stays either/or. The change is chosen after every older routing flag,
+  so each older rollback keeps its own text. The line cache keys on the text, so the first
+  sessions on each machine synthesise about 13 name-free lines once (within `R1_SYNTH_PER_MIN`);
+  the thanked brief is per session, as before. Not changed here: L-FAQ-DEFER (it is
+  `r1_world.INTERVIEWER_DEFLECTION`), the learner's lines, and the Meet texts.
+  Rollback: `fly secrets set R1_SPOKEN_LINES=0 -a project-hello-voice` (revision 53's texts byte
+  for byte).
 * **`R1_WRAP_OFFER_VARIANT`** (default on). The second offer to wrap up the role-play is
   L-ASIDE-WRAP-AGAIN ("Christy again, just checking in. Would you like to wrap up the role-play
   here? If not, just carry on with {lead_first_name}."), never L-ASIDE-WRAP word for word. Like
