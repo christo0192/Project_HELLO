@@ -868,8 +868,73 @@ def _declined(folded: str, match: re.Match[str], *, verb_in_match: bool) -> bool
     return bool(_ASK_ECHO.search(before)) and has_refusal(folded[match.end() :])
 
 
+def _ik_offers_on() -> bool:
+    """R1_IK_OFFERS (owner 2026-11-24), read at use: on unless 0/off/false/no."""
+    return os.getenv("R1_IK_OFFERS", "1").strip().lower() not in ("0", "off", "false", "no")
+
+
+# Owner decision 2026-11-24 (R1_IK_OFFERS): IK's interview-preparation program sold as an add-on
+# (or a separate program) at an extra cost is a real IK offer.  Its cost raises the total and is
+# never a discount: ``parse_discounts`` reads no course discount from a total that includes it, and
+# ``r1_negotiation.stated_totals`` reads no website price conflict from such a total.
+_ADDON_NAMED = re.compile(
+    r"\b(?:interview[- ]prep(?:aration)?|add-?ons?|mock[- ]interview (?:program(?:me)?s?|"
+    r"packages?|courses?)|separate (?:program(?:me)?|course|package))\b",
+    re.IGNORECASE,
+)
+_ADDON_AMOUNT = r"\$\s?\d[\d,]*(?:\.\d+)?\s*k?"
+# The add-on's price: "$1000 more", "an extra $1000", "on top ... $1000", "costs $1000" or
+# "for $1000".
+_PAID_ADDON = re.compile(
+    _ADDON_AMOUNT + r"\s*(?:more|extra|additional|on top)\b"
+    r"|\b(?:extra|additional|more|on top)\b[^.?!$]{0,30}" + _ADDON_AMOUNT
+    + r"|\b(?:costs?|priced at|for|at)\s+(?:an?\s+)?(?:extra\s+|additional\s+)?" + _ADDON_AMOUNT,
+    re.IGNORECASE,
+)
+# A free, included or bonus add-on is a free perk, never a paid one.
+_ADDON_FREE = re.compile(
+    r"\b(?:free|complimentary|included|includes|including|comes? with|thrown in|"
+    r"throw(?:s|ing)? in|bonus|waiv\w*|at no (?:extra |additional )?(?:cost|charge)|"
+    r"no (?:extra |additional )?(?:cost|charge))\b",
+    re.IGNORECASE,
+)
+# Someone else's or an old price for it.
+_ADDON_PAST = re.compile(
+    r"\b(?:last (?:year|batch|cohort|time|month)|used to|previously|originally|in the past|"
+    r"(?:others?|people|someone|somebody|students|alumni|they)\s+(?:\w+\s+){0,2}?paid)\b",
+    re.IGNORECASE,
+)
+_ADDON_DISCOUNT_AFTER = re.compile(
+    r"\s*(?:more\s+|extra\s+)?(?:off|discount|reduction|rebate|cashback)\b", re.IGNORECASE
+)
+
+
+def sells_paid_addon(text: object) -> bool:
+    """A statement that sells the interview-prep add-on at an extra cost (R1_IK_OFFERS).
+
+    A sentence that names the add-on ("interview prep", "add-on", "a separate program") and puts a
+    price on it ("for an extra $1,000", "$1,000 more", "the add-on costs $1,000").  Not a question,
+    not an add-on that is free, included or a bonus, not an old or someone else's price, not a
+    negated price, and not a discount ("another $1,000 off if you add interview prep").
+    """
+    for sentence in split_sentences(text):
+        if is_question_like(sentence):
+            continue
+        folded = canonical_amounts(fold(sentence))
+        if (_ADDON_NAMED.search(folded) is None or _ADDON_FREE.search(folded)
+                or _ADDON_PAST.search(folded)):
+            continue
+        for match in _PAID_ADDON.finditer(folded):
+            if _ADDON_DISCOUNT_AFTER.match(folded[match.end():]):
+                continue
+            if not negated_before(folded, match.start()):
+                return True
+    return False
+
+
 def parse_discounts(
-    text: object, *, v3: bool | None = None, reconcile: bool | None = None
+    text: object, *, v3: bool | None = None, reconcile: bool | None = None,
+    ik_offers: bool | None = None,
 ) -> list[DiscountMention]:
     """Dollar discounts the candidate OFFERS, parsed deterministically.
 
@@ -885,7 +950,15 @@ def parse_discounts(
 
     R1_DISCOUNT_TOTAL_RECONCILE implements the owner decision of 2026-11-20: a
     stated deck total resolves one adjacent misheard discount.
+
+    R1_IK_OFFERS (owner 2026-11-24, ``ik_offers``): a paid interview-prep add-on raises the total.
+    In a sentence that names the add-on, a net price of $7,500 or more is no course discount (the
+    total includes the add-on), and a turn that sells the add-on is not reconciled ("$2,000 off and
+    interview prep for $1,000, so $8,000" stays $2,000 off).  A net price below $7,500 is still
+    read: an add-on cannot make more than the deck's $1,500 off any cleaner.
     """
+    if ik_offers is None:
+        ik_offers = _ik_offers_on()
     if reconcile is None:
         reconcile = os.getenv("R1_DISCOUNT_TOTAL_RECONCILE", "1").strip().lower() not in (
             "0", "off", "false", "no"
@@ -902,6 +975,7 @@ def parse_discounts(
         amounts: list[int] = []
         explicit: set[int] = set()
         derived: set[int] = set()
+        addon = ik_offers and _ADDON_NAMED.search(folded) is not None
         for pattern in (_DISC_BEFORE, _DISC_VERB, _NET_OFFER):
             for match in pattern.finditer(folded):
                 value = _amount_usd(match.group(1), match.group(2))
@@ -910,6 +984,8 @@ def parse_discounts(
                 if pattern is _NET_OFFER:
                     if not 4500 <= value < PRICE_USD:
                         continue
+                    if addon and value >= PRICE_USD - DISCOUNT_CAP_USD:
+                        continue  # R1_IK_OFFERS: a total with the add-on is no course net price
                     value = PRICE_USD - value
                 if _declined(folded, match, verb_in_match=pattern is not _DISC_BEFORE):
                     continue
@@ -956,7 +1032,7 @@ def parse_discounts(
         origins[index] = (explicit, derived)
         for value in sorted(set(amounts)):
             mentions.append(DiscountMention(value, conditional, index))
-    if not reconcile:
+    if not reconcile or (ik_offers and sells_paid_addon(text)):
         return mentions
     # Prefer a stated deck discount over a nearby net-offer approximation.
     mentions = [m for m in mentions if not (
@@ -1049,7 +1125,8 @@ def urgency_levers(text: object, *, playbook: bool | None = None) -> tuple[froze
 
 
 def time_limited_offer_in(
-    text: object, *, prior_deck_discount: bool = False, reconcile: bool | None = None
+    text: object, *, prior_deck_discount: bool = False, reconcile: bool | None = None,
+    ik_offers: bool | None = None,
 ) -> bool:
     """Owner 2026-11-20 (R1_INDIA_PLAYBOOK): a deadline tied to a deck discount or net price.
 
@@ -1062,7 +1139,7 @@ def time_limited_offer_in(
         return False
     if urgency_levers(text, playbook=True)[1]:
         return False
-    parsed = {m.usd for m in parse_discounts(text, reconcile=reconcile)}
+    parsed = {m.usd for m in parse_discounts(text, reconcile=reconcile, ik_offers=ik_offers)}
     if parsed - set(DISCOUNTS_USD):
         return False
     figures = {n for s in sentences for n in dollar_amounts(canonical_amounts(s))}
@@ -1084,7 +1161,7 @@ def _waives_only_interest(folded: str, match: re.Match) -> bool:
 def invented_offer_in(
     text: object, *, v2: bool = False, perk_history: bool | None = None,
     discount_v3: bool | None = None, reconcile: bool | None = None,
-    india_playbook: bool | None = None,
+    india_playbook: bool | None = None, ik_offers: bool | None = None,
 ) -> bool:
     """A free extra, a guarantee, or a discount outside the deck's $500/$1000/$1500 set.
 
@@ -1176,7 +1253,9 @@ def invented_offer_in(
         return True
     return any(
         mention.usd not in DISCOUNTS_USD or mention.usd > DISCOUNT_CAP_USD
-        for mention in parse_discounts(text, v3=discount_v3, reconcile=reconcile)
+        for mention in parse_discounts(
+            text, v3=discount_v3, reconcile=reconcile, ik_offers=ik_offers
+        )
     )
 
 
@@ -2224,9 +2303,25 @@ def neutralise_candidate_text(text: object, sentinel: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
+# Owner decision 2026-11-24 (R1_IK_OFFERS): referrals, partner companies and a paid interview-prep
+# add-on are real IK offers.  Validated by an offline judge replay of the owner's session (the
+# referral and paid add-on turns no longer invented; the off-deck price, the promised role and
+# placement, the outcome statistic, a free add-on and a guarantee still are).  Re-run the replay
+# when this wording changes.
+JUDGE_IK_OFFERS_RULE = (
+    " Under IK's own offers these are also NOT invented offers: a referral to hiring or partner "
+    "companies, IK's partner companies or hiring network, and IK's interview preparation "
+    "program sold as an add-on or a separate program at an extra cost. That extra cost raises "
+    "the total and is not a discount: never read it, or a total that includes it, as a "
+    "discount, and the total rule above does not apply to such a total. An add-on offered for "
+    "free is still a free extra, and a referral is no promise of a job: a promised job, role or "
+    "placement is still invented."
+)
+
+
 def build_judge_messages(
     candidate_text: object, learner_last: object, *, seed: str, turn: int, v2: bool = False,
-    reconcile: bool = False, playbook: bool = False
+    reconcile: bool = False, playbook: bool = False, ik_offers: bool = False
 ) -> list[dict[str, str]]:
     """Messages for the shadow judge.  JSON is requested in the prompt, not by a flag."""
     sentinel = sentinel_for(seed, turn)
@@ -2271,6 +2366,8 @@ def build_judge_messages(
             "a monthly figure, and a limited-time offer (today only, early-bird, this cohort) "
             "that uses $500, $1000 or $1500; such a limited-time offer is an urgency_lever."
         )
+    if v2 and ik_offers:
+        system += JUDGE_IK_OFFERS_RULE
     user = (
         f"Learner's last line: {neutralise_candidate_text(learner_last, sentinel)}\n"
         f"{sentinel}\n{neutralise_candidate_text(candidate_text, sentinel)}\n{sentinel}"
@@ -2466,6 +2563,7 @@ class CoverageTracker:
         discipline_v2: bool = False, perk_history: bool = True,
         discount_read_v3: bool = True, strong_v2: bool | None = None,
         total_reconcile: bool | None = None, india_playbook: bool | None = None,
+        ik_offers: bool | None = None,
     ) -> None:
         self.persona = persona
         self.seed = seed
@@ -2481,6 +2579,7 @@ class CoverageTracker:
             os.getenv("R1_INDIA_PLAYBOOK", "1").strip().lower()
             not in ("0", "off", "false", "no")
         )
+        self.ik_offers = ik_offers if ik_offers is not None else _ik_offers_on()
         self._india_plan_turns: set[int] = set()
         self.time_offer_turns: set[int] = set()
         self.last_time_offer_turn: int | None = None
@@ -2533,7 +2632,8 @@ class CoverageTracker:
             canonical = canonical_amounts(expand_shorthand_amounts(sentence))
             discount_amounts = {
                 mention.usd for mention in parse_discounts(
-                    sentence, v3=self.discount_read_v3, reconcile=self.total_reconcile
+                    sentence, v3=self.discount_read_v3, reconcile=self.total_reconcile,
+                    ik_offers=self.ik_offers,
                 )
             }
             self.fee_named |= any(
@@ -2575,16 +2675,20 @@ class CoverageTracker:
         self._turn_had_question[self.turn] = update.question
         value_index = _first_value_sentence(text)
         discounts = parse_discounts(
-            text, v3=self.discount_read_v3, reconcile=self.total_reconcile
+            text, v3=self.discount_read_v3, reconcile=self.total_reconcile,
+            ik_offers=self.ik_offers,
         )
         reverse_candidate = self.total_reconcile and any(
             _NET_OFFER.search(canonical_amounts(sentence)) for sentence in split_sentences(text)
         )
         if (any(m.heard_usd is not None for m in discounts) or
                 (reverse_candidate and discounts != parse_discounts(
-                    text, v3=self.discount_read_v3, reconcile=False))):
+                    text, v3=self.discount_read_v3, reconcile=False,
+                    ik_offers=self.ik_offers))):
             self._reconciled_turns.add(self.turn)
-            previous = parse_discounts(text, v3=self.discount_read_v3, reconcile=False)
+            previous = parse_discounts(
+                text, v3=self.discount_read_v3, reconcile=False, ik_offers=self.ik_offers
+            )
             self._reconcile_explained[self.turn] = (
                 {m.heard_usd for m in discounts if m.heard_usd is not None}
                 | ({m.usd for m in previous} - {m.usd for m in discounts})
@@ -2611,7 +2715,8 @@ class CoverageTracker:
             previous_amounts: list[tuple[int, int, int]] = []
             for index, sentence in enumerate(sentences):
                 offered = {m.usd for m in parse_discounts(
-                    sentence, v3=self.discount_read_v3, reconcile=self.total_reconcile
+                    sentence, v3=self.discount_read_v3, reconcile=self.total_reconcile,
+                    ik_offers=self.ik_offers,
                 )}
                 figures = [(m.start(), m.end(), int(m.group(1).replace(",", "")))
                            for m in re.finditer(r"\$\s*(\d[\d,]*)", sentence)]
@@ -2665,14 +2770,15 @@ class CoverageTracker:
         invented = invented_offer_in(
             text, v2=self.invented_v2, perk_history=self.perk_history,
             discount_v3=self.discount_read_v3, reconcile=self.total_reconcile,
-            india_playbook=self.india_playbook,
+            india_playbook=self.india_playbook, ik_offers=self.ik_offers,
         )
         time_offer = False
         if self.india_playbook:
             prior = any(item["usd"] in DISCOUNTS_USD for item in self.discount_log
                         if item["turn"] != self.turn)
             time_offer = (time_limited_offer_in(text, prior_deck_discount=prior,
-                                               reconcile=self.total_reconcile)
+                                               reconcile=self.total_reconcile,
+                                               ik_offers=self.ik_offers)
                           and not invented and self.turn not in self._stacked_turns)
             if time_offer:
                 self.time_offer_turns.add(self.turn)

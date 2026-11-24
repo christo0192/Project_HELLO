@@ -1426,6 +1426,11 @@ def commitment_spoken_leaks(
         cap = Level.WEAK
         if recorded is not None and isinstance(recorded_turn, (int, float)) and recorded_turn < roleplay_turn:
             cap = max(cap, recorded)
+        callback_turn = commitment.get("callback_turn")
+        if isinstance(callback_turn, (int, float)) and callback_turn < roleplay_turn:
+            # Owner 2026-11-24 (R1_CALLBACK_AFTER_PRESSURE): after her callback agreement she may
+            # confirm or move the call (a MEDIUM sentence), never enrol.
+            cap = max(cap, Level.MEDIUM)
         if commitment.get("upgraded"):
             for earlier in exchanges:
                 if not isinstance(earlier.get("n"), int) or earlier["n"] >= roleplay_turn:

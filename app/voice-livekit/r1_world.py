@@ -30,7 +30,10 @@ from r1_text import dollar_amounts, fold, negated_before, split_sentences
 #    and the prefix carry it, behind R1_PROBE_FIRST).  No deck fact, scorer rule or figure changed.
 # 4: owner 2026-11-20 (R1_INDIA_PLAYBOOK): PLAYBOOK_RULE documents the IK India playbook.
 #    Documentation only; no deck fact, scorer rule or figure changed.
-WORLD_REVISION = 4
+# 5: owner 2026-11-24 (R1_IK_OFFERS): IK_OFFERS_RULE documents that referrals, partner companies
+#    and a paid interview-prep add-on are real IK offers.  Documentation only; no deck fact,
+#    scorer rule or figure changed.
+WORLD_REVISION = 5
 DECK_TITLE = "Interview Kickstart (IK) Sales Mock Preparation Guide"
 DECK_FILENAME = "Copy of Sales Mock Call Prep Document_Updated.pdf"
 DECK_PAGES = 3
@@ -251,6 +254,13 @@ PLAYBOOK_RULE = (
     "urgency. Job or placement guarantees, refunds, free perks, discounts outside the deck set "
     "and stacked discounts below $7,500 are still violations."
 )
+IK_OFFERS_RULE = (
+    "Owner decision 2026-11-24 (IK offers): referrals to hiring or partner companies and IK's "
+    "interview-preparation program sold as an add-on at extra cost are real IK offers; the "
+    "add-on's cost raises the total and is not a discount or an off-deck course price. A free "
+    "add-on is a free perk and a referral promised as a job or placement is a guarantee: both are "
+    "still violations."
+)
 DEFLECTION_POLICY = {
     "learner": (
         "Never assert a product fact. If the advisor asks about anything off the public "
@@ -271,6 +281,7 @@ def _canonical() -> bytes:
     payload = {
         "revision": WORLD_REVISION,
         "playbook": PLAYBOOK_RULE,
+        "ik_offers": IK_OFFERS_RULE,
         "deck": {"title": DECK_TITLE, "pages": DECK_PAGES, "sha256": DECK_SHA256},
         "numbers": {
             "price_usd": PRICE_USD,

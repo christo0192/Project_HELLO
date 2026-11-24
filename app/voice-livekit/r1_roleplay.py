@@ -117,6 +117,8 @@ from enum import Enum
 from typing import Any, Iterable
 
 from r1_commitment import (
+    CALLBACK_FALLBACK_SLOT,
+    CALLBACK_OWN_SLOTS,
     COMMIT_STALL_R_SEC,
     strong_gaps,
     UPGRADE_LINE,
@@ -125,6 +127,7 @@ from r1_commitment import (
     AskKind,
     CommitmentEvidence,
     Level,
+    callback_line,
     classify_learner_commitment,
     commitment_line,
     ask_acts,
@@ -223,6 +226,7 @@ from r1_negotiation import (
     instalments_are_monthly,
     no_commit_spec,
     offer_terms_in,
+    parse_slot,
     question_spec,
 )
 from r1_personas import (
@@ -235,6 +239,9 @@ from r1_personas import (
     is_tangent,
 )
 from r1_prompts import (
+    CALLBACK_DONE_NOTE,
+    CALLBACK_NEXT_STEP_NOTE,
+    NEXT_STEP_NOTE,
     ACK_TURN_CONCERNS_NOTE,
     ACK_TURN_CONCERNS_NOTE_V2,
     ACK_TURN_NOTE,
@@ -1322,6 +1329,14 @@ FLAG_DISCOUNT_TOTAL_RECONCILE = "R1_DISCOUNT_TOTAL_RECONCILE"
 FLAG_INDIA_PLAYBOOK = "R1_INDIA_PLAYBOOK"
 # PROOF-1: exclude learner conditions from concessions; 0 restores the previous reader.
 FLAG_CONCESSION_CONDITION = "R1_CONCESSION_CONDITION"
+# Owner 2026-11-24: after the WEAK line to an advisor who pressured her (an invented offer or a
+# coercive deadline) she still never enrols, but agrees to a reasonable callback time instead of
+# refusing every one; the level on record stays WEAK.  0 restores the previous behaviour.
+FLAG_CALLBACK_AFTER_PRESSURE = "R1_CALLBACK_AFTER_PRESSURE"
+# Owner 2026-11-24 (IK offers): referrals to hiring or partner companies and a paid interview-prep
+# add-on are real IK offers for the shadow judge, and an add-on's cost is never a discount; 0
+# restores the previous judge prompt and readers.
+FLAG_IK_OFFERS = "R1_IK_OFFERS"
 
 # PROOF-1: allow two delayed upgrades from any MEDIUM; 0 restores previous behaviour.
 FLAG_UPGRADE_V2 = "R1_UPGRADE_V2"
@@ -1499,6 +1514,8 @@ _FLAG_READS = {
     FLAG_DISCOUNT_TOTAL_RECONCILE: lambda: os.getenv("R1_DISCOUNT_TOTAL_RECONCILE"),
     FLAG_INDIA_PLAYBOOK: lambda: os.getenv("R1_INDIA_PLAYBOOK"),
     FLAG_CONCESSION_CONDITION: lambda: os.getenv("R1_CONCESSION_CONDITION"),
+    FLAG_CALLBACK_AFTER_PRESSURE: lambda: os.getenv("R1_CALLBACK_AFTER_PRESSURE"),
+    FLAG_IK_OFFERS: lambda: os.getenv("R1_IK_OFFERS"),
     FLAG_PERSONA_TIMELINE_V3: lambda: os.getenv("R1_PERSONA_TIMELINE_V3"),
 }
 
@@ -1834,6 +1851,12 @@ class RolePlayEngine:
         self._discount_read_v3 = flag_on(FLAG_DISCOUNT_READ_V3)
         self._total_reconcile = flag_on(FLAG_DISCOUNT_TOTAL_RECONCILE)
         self._india_playbook = flag_on(FLAG_INDIA_PLAYBOOK)
+        # Owner 2026-11-24 (latched per session, like R1_INDIA_PLAYBOOK): the callback after
+        # pressure, the turn its line was heard and its slot; and the IK offers readers.
+        self._callback_after_pressure = flag_on(FLAG_CALLBACK_AFTER_PRESSURE)
+        self._callback_turn: int | None = None
+        self._callback_slot: str | None = None
+        self._ik_offers = flag_on(FLAG_IK_OFFERS)
         self._turn_time_offer = False
         self._time_offer_notes = 0
         self._concession_condition = flag_on(FLAG_CONCESSION_CONDITION)
@@ -1862,6 +1885,7 @@ class RolePlayEngine:
             discount_read_v3=self._discount_read_v3, strong_v2=self._strong_v2,
             total_reconcile=self._total_reconcile,
             india_playbook=self._india_playbook,
+            ik_offers=self._ik_offers,
         )
         self.tracker.families_planned = families
         self.ledger = GuardLedger()
@@ -2355,10 +2379,36 @@ class RolePlayEngine:
         The stall (WEAK) until a scripted line is on record; afterwards the recorded level, so
         the learner can confirm the call it has already booked ("Great, talk to you Thursday
         then.") instead of being cut off into a guard hit that counts toward the gate.  The
-        scripted lines themselves are never guarded.
+        scripted lines themselves are never guarded.  While ``_callback_open`` (owner 2026-11-24)
+        it is at least MEDIUM, so she can agree to and confirm a callback time; STRONG stays out.
         """
         on_record = self._commitment_level
-        return Level.WEAK if on_record is None else max(Level.WEAK, on_record)
+        cap = Level.WEAK if on_record is None else max(Level.WEAK, on_record)
+        if self._callback_open():
+            # Owner 2026-11-24: she may agree to (and later confirm) a callback time, never more.
+            cap = max(cap, Level.MEDIUM)
+        return cap
+
+    def _callback_open(self) -> bool:
+        """R1_CALLBACK_AFTER_PRESSURE: a pressured advisor has her WEAK line on record.
+
+        She then agrees to a reasonable callback time (the level on record stays WEAK and she never
+        enrols).  Pressure is ``CommitmentEvidence.pressured``'s own reading; her own explicit
+        decline of a call (``call_declined``) still holds.  A WEAK that is only unearned (a terse
+        advisor, too little evidence) keeps the previous behaviour.
+        """
+        return (
+            self._callback_after_pressure
+            and self._commitment_level is Level.WEAK
+            and (self.tracker.invented_offer or self.tracker.coercive_urgency)
+            and not self.negotiation.call_declined()
+        )
+
+    def _callback_next_step_note(self) -> str:
+        """The reminder's next-step note: the callback note while ``_callback_open``."""
+        if self._callback_open():
+            return CALLBACK_NEXT_STEP_NOTE.format(decision_maker=self.persona.decision_maker)
+        return NEXT_STEP_NOTE
 
     def _confirming(self) -> bool:
         """A call or a start is agreed (MEDIUM or STRONG on record): the learner only confirms."""
@@ -5883,6 +5933,10 @@ class RolePlayEngine:
                         self._upgrade_condition_used = True
                 self._notes.append(note or RESOLVED_NOTE)
                 return None
+            if self._callback_open() and (wants is AskKind.CALL or seen.callback is not None):
+                # Owner 2026-11-24 (R1_CALLBACK_AFTER_PRESSURE): a callback ask after the WEAK line
+                # to a pressured advisor gets a callback time, not a refusal; the level stays WEAK.
+                return self._callback_plan(reasons)
             if wants is not None or seen.email_offer or seen.checkin:
                 reasons.append("commitment_on_record")
                 self._notes.append(RESOLVED_NOTE)
@@ -6265,6 +6319,48 @@ class RolePlayEngine:
             scripted=text,
             level=level,
             resolves=True,
+        )
+
+    def _callback_plan(self, reasons: list[str]) -> TurnPlan | None:
+        """R1_CALLBACK_AFTER_PRESSURE: she agrees to a callback time once, then only confirms it.
+
+        The first callback ask after the WEAK line gets the scripted agreement: the advisor's slot
+        when it can be booked (``Negotiation.slot_choice``: a refused, stale or vague-and-just-
+        deferred one is not, a daytime weekday one moves to 7 PM), else her own (the first of
+        ``CALLBACK_OWN_SLOTS`` she did not call difficult), never the MEDIUM line's legacy
+        "Thursday at 7 PM" for a call nobody timed.  It records no commitment level (``level``
+        None, nothing resolved): the WEAK on record stays.  A line nobody heard is agreed again on
+        the next ask.  Once it was heard, a later ask is a free reply with ``CALLBACK_DONE_NOTE``.
+        """
+        negotiation = self.negotiation
+        dm = self.persona.decision_maker
+        if self._callback_turn is not None:
+            reasons.append("callback_on_record")
+            self._notes.append(
+                CALLBACK_DONE_NOTE.format(slot=self._callback_slot, decision_maker=dm)
+            )
+            return None
+        logged = negotiation.chosen_slot  # the negotiation log's slot is the MEDIUM line's
+        # ``picks_own=False``: with no slot the advisor named, the choice is deferred and she
+        # names her own below.
+        choice = negotiation.slot_choice(self.turn, picks_own=False)
+        negotiation.chosen_slot = logged
+        if choice.deferred:
+            slot = next(
+                (own for own in CALLBACK_OWN_SLOTS
+                 if not negotiation.slot_refused(parse_slot(own))),
+                CALLBACK_FALLBACK_SLOT,
+            )
+            source = "own"
+        else:
+            slot = choice.phrase
+            source = "moved" if choice.moved else "advisor"
+        self._callback_slot = slot
+        negotiation.note_response(self.turn, "callback:agreed")
+        return self._plan(
+            TurnMode.SAY_ONLY,
+            [*reasons, "callback_after_pressure", f"callback_slot:{source}"],
+            scripted=callback_line(dm, slot, moved=choice.moved),
         )
 
     def _commit_stall_plan(
@@ -7396,6 +7492,7 @@ class RolePlayEngine:
                 # Review S3R-6 (naturalness): a goodbye's reminder asks for no question.
                 winding=winding and mode is TurnMode.LLM_REPLY,
                 no_answer=no_answer and intent is not None,
+                next_step_note=self._callback_next_step_note(),
             )
             ctx = self.guard_context(
                 mode="reply",
@@ -7767,6 +7864,12 @@ class RolePlayEngine:
         if not scripted_commitment or plan.commitment_level is Level.WEAK:
             if classify_learner_commitment(spoken_text) > cap or has_concession(spoken_text):
                 self._violations += 1
+        if (
+            "callback_after_pressure" in plan.reasons
+            and self._callback_turn is None
+            and spoken_text.strip()
+        ):
+            self._callback_turn = plan.turn  # owner 2026-11-24: the callback agreement was heard
         if spoken_text.strip():
             # SWEEP-1: a heard line; the primary it delivered, if any (lost replies never get here).
             self._heard_primary = next(
@@ -7957,7 +8060,7 @@ class RolePlayEngine:
             seed=self.seed,
             turn=self.turn if turn is None else turn,
             v2=self._invented_v2, reconcile=self._total_reconcile,
-            playbook=self._india_playbook,
+            playbook=self._india_playbook, ik_offers=self._ik_offers,
         )
 
     def apply_judge(self, raw: Any, judged_turn: int) -> bool:
@@ -8114,6 +8217,10 @@ class RolePlayEngine:
                     "upgraded": self._commitment_upgraded,
                     "upgrade_tried": self._upgrade_tried,
                 } if self._commit_upgrade else {}),
+                # Owner 2026-11-24 (R1_CALLBACK_AFTER_PRESSURE): the role-play turn her callback
+                # agreement was heard (logged, never posted; the level above stays WEAK).
+                **({"callback_turn": self._callback_turn}
+                   if self._callback_after_pressure and self._callback_turn is not None else {}),
             },
             "guard": self.ledger.summary(),
             # Which layer of each need was handed to the model on which role-play turn

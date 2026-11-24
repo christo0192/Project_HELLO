@@ -423,7 +423,10 @@ import r1_world
 # 52: owner 2026-11-24 (R1_AGENDA_W4): the W4 agenda (L-OPEN-AGENDA-W4, -PLAIN-W4, -CONTINUE-W4;
 #    r1_script.AGENDA_W4_LINES), spoken sentences and a first question ending in "?", picked by
 #    ear from four clips in Dex's production voice. No other text changed.
-CONTENT_REVISION = 52
+# 53: owner 2026-11-24 (R1_CALLBACK_AFTER_PRESSURE, R1_IK_OFFERS): the callback lines, own slots
+#    and notes after the WEAK line to a pressured advisor; the judge's IK offers sentence and the
+#    paid add-on readers; world revision 5 (IK_OFFERS_RULE, documentation only).
+CONTENT_REVISION = 53
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -1017,6 +1020,13 @@ def manifest() -> dict[str, Any]:
             "demand_bare_pattern": r1_tracker._DEMAND_BARE.pattern,
             "guilt_pattern": r1_tracker._GUILT.pattern,
             "offer_word_pattern": r1_tracker._OFFER_WORD.pattern,
+            # Revision 53 (R1_IK_OFFERS).
+            "judge_ik_offers_rule": r1_tracker.JUDGE_IK_OFFERS_RULE,
+            "addon_named_pattern": r1_tracker._ADDON_NAMED.pattern,
+            "paid_addon_pattern": r1_tracker._PAID_ADDON.pattern,
+            "addon_free_pattern": r1_tracker._ADDON_FREE.pattern,
+            "addon_past_pattern": r1_tracker._ADDON_PAST.pattern,
+            "addon_total_cue_pattern": r1_negotiation._ADDON_TOTAL_CUE.pattern,
             "max_deep_offers": r1_tracker.MAX_DEEP_OFFERS,
             "max_deep_misses": r1_tracker.MAX_DEEP_MISSES,
         },
@@ -1034,6 +1044,11 @@ def manifest() -> dict[str, Any]:
             "defer_line": r1_commitment.MEDIUM_DEFER_LINE,
             "weak_call_line": r1_commitment.WEAK_CALL_LINE,
             "weak_email_done_line": r1_commitment.WEAK_EMAIL_DONE_LINE,
+            # Revision 53 (R1_CALLBACK_AFTER_PRESSURE).
+            "callback_line": r1_commitment.CALLBACK_LINE,
+            "callback_moved_line": r1_commitment.CALLBACK_MOVED_LINE,
+            "callback_own_slots": list(r1_commitment.CALLBACK_OWN_SLOTS),
+            "callback_fallback_slot": r1_commitment.CALLBACK_FALLBACK_SLOT,
             "thin_advisor_mean_words": r1_commitment.THIN_ADVISOR_MEAN_WORDS,
             "thin_min_turns": r1_commitment.THIN_MIN_TURNS,
             "permitted_r_sec": r1_commitment.COMMIT_PERMITTED_R_SEC,
@@ -1178,6 +1193,9 @@ def manifest() -> dict[str, Any]:
             "next_step_note": r1_prompts.NEXT_STEP_NOTE,
             "new_offer_note": r1_prompts.NEW_OFFER_NOTE,
             "resolved_note": r1_prompts.RESOLVED_NOTE,
+            # Revision 53 (R1_CALLBACK_AFTER_PRESSURE).
+            "callback_done_note": r1_prompts.CALLBACK_DONE_NOTE,
+            "callback_next_step_note": r1_prompts.CALLBACK_NEXT_STEP_NOTE,
             "upgrade_condition_note": r1_prompts.UPGRADE_CONDITION_NOTE,
             "checkin_note": r1_prompts.CHECKIN_NOTE,
             "checkin_done_note": r1_prompts.CHECKIN_DONE_NOTE,
