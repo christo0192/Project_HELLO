@@ -51,10 +51,15 @@
  * auto-dispatches, so a null gate (and a `disabled` verdict from the service)
  * must never mint a token: the caller sets `failClosed` and both answer
  * `preparing` (fence 7; the route also refuses 503 `r1_unavailable` before it
- * provisions anything, so this is the second line of defence).
+ * provisions anything, so this is the second line of defence). A Meet join (M034)
+ * sets `failClosed` on every endpoint: an auto-dispatched job carries no Meet values.
  */
 
-import { jobIsLive, type BrowserWorkerGate } from '../browser-orchestration.js';
+import {
+  jobIsLive,
+  type BrowserDispatchMeet,
+  type BrowserWorkerGate,
+} from '../browser-orchestration.js';
 import { isMachineAgentNameUnder } from '../worker-agent-name.js';
 
 /** The part of an `AgentDispatch` the gate reads (the SDK type satisfies it). */
@@ -88,9 +93,16 @@ export interface R1GateInput {
    * R1 SFU: no unnamed worker auto-dispatches there, so "no gate" and a `disabled`
    * verdict can never stand in for a dispatched interviewer. When true both answer
    * `preparing` instead of `proceed`. Cloud (false/omitted) keeps the legacy
-   * behaviour: it proceeds and the unnamed worker auto-dispatches.
+   * behaviour: it proceeds and the unnamed worker auto-dispatches. A Meet join is
+   * true on Cloud too.
    */
   failClosed?: boolean;
+  /**
+   * M034, dark: the Meet bridge's dispatch values, set only by the Meet exchange (through
+   * `runR1JoinGate`). Passed on to `gate.dispatch` only when present, so a browser dispatch
+   * is still exactly `{ sessionId, roomName }` or `{ sessionId, roomName, agentName }`.
+   */
+  meet?: BrowserDispatchMeet;
 }
 
 /**
@@ -226,10 +238,14 @@ async function gateOnce(input: R1GateInput): Promise<R1GateVerdict> {
   }
 
   // 5. Replace any dropped dispatch, then dispatch once. The shared name keeps
-  //    today's call exactly; only a per-machine name is passed on.
+  //    today's call exactly; only a per-machine name is passed on. The Meet bridge's
+  //    values (M034) are appended last, and only when present.
   await deleteJobless(lister, roomName, mine);
+  const meet = input.meet ? { meet: input.meet } : {};
   const dispatched = await gate.dispatch(
-    agentName === gate.agentName ? { sessionId, roomName } : { sessionId, roomName, agentName },
+    agentName === gate.agentName
+      ? { sessionId, roomName, ...meet }
+      : { sessionId, roomName, agentName, ...meet },
   );
   if (dispatched) return 'proceed';
   // The worker is ready but the room could not be given an agent. Release the

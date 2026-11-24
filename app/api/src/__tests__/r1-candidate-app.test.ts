@@ -25,10 +25,14 @@ import { MemoryRateLimitStore, setRateLimitStore } from '../lib/rate-limit.js';
 import {
   R1_CANDIDATE_LIMIT,
   R1_CANDIDATE_START_LIMIT,
+  R1_MEET_EXCHANGE_LIMIT,
+  R1_MEET_EXCHANGE_TICKET_SHAPE,
+  r1MeetExchangeKey,
   r1StartKey,
 } from '../lib/r1/rate-limit.js';
+import { R1_MEET_TICKET_PATTERN } from '../lib/r1/meet/ticket.js';
 import { createFakeDb } from './support/r1-candidate-fake-db.js';
-import { LINK, WORKER_SECRET, seedTables, sha256 } from './support/r1-candidate-harness.js';
+import { LINK, MEET_TICKET, WORKER_SECRET, seedTables, sha256 } from './support/r1-candidate-harness.js';
 
 function appWith(tables = seedTables()) {
   mocks.db.current = createFakeDb({ tables });
@@ -39,9 +43,14 @@ function appWith(tables = seedTables()) {
   });
 }
 
+/** A second, well-formed bridge ticket, built at runtime (no realistic secret in the source). */
+const OTHER_MEET_TICKET = 'mu' + 'q'.repeat(41);
+
 beforeEach(() => {
   process.env.R1_ENABLED = 'true';
   process.env.WORKER_CONTEXT_SECRET = WORKER_SECRET;
+  // M034: the Meet bridge is dark unless a test turns it on; none here does.
+  delete process.env.R1_MEET_ENABLED;
   setRateLimitStore(new MemoryRateLimitStore());
 });
 
@@ -94,6 +103,29 @@ describe('R1 candidate routes through createApp', () => {
     ];
     for (const [method, path] of misses) {
       const response = await (request(app) as any)[method](path).send({});
+      expect(response.status, `${method} ${path}`).toBe(401);
+      expect(response.body.error.type).toBe('authentication_error');
+    }
+  });
+
+  it('M034: the Meet bridge exchange is public by exact path and answers 503 meet_disabled while dark', async () => {
+    const app = appWith();
+    for (const body of [{ ticket: MEET_TICKET }, { ticket: 'short' }, {}]) {
+      const response = await request(app).post('/api/r1/meet/exchange').send(body);
+      expect(response.status, JSON.stringify(body)).toBe(503);
+      expect(response.body).toEqual({ error: 'meet_disabled' });
+      expect(response.headers['cache-control']).toBe('no-store');
+    }
+    // Near misses stay behind recruiter authentication.
+    const misses: Array<[string, string]> = [
+      ['get', '/api/r1/meet/exchange'],
+      ['put', '/api/r1/meet/exchange'],
+      ['post', '/api/r1/meet/exchange/'],
+      ['post', '/api/r1/meet/exchange/extra'],
+      ['post', '/api/r1/meet'],
+    ];
+    for (const [method, path] of misses) {
+      const response = await (request(app) as any)[method](path).send({ ticket: MEET_TICKET });
       expect(response.status, `${method} ${path}`).toBe(401);
       expect(response.body.error.type).toBe('authentication_error');
     }
@@ -252,5 +284,53 @@ describe('R1 rate limiter', () => {
   it('is a fixed, environment-free configuration', () => {
     expect(R1_CANDIDATE_LIMIT).toBe(60);
     expect(R1_CANDIDATE_START_LIMIT).toBe(10);
+    expect(R1_MEET_EXCHANGE_LIMIT).toBe(12);
+  });
+
+  it('M034: charges the Meet bridge exchange to its TICKET: the 13th call is refused, another ticket passes', async () => {
+    const app = appWith();
+    for (let i = 0; i < R1_MEET_EXCHANGE_LIMIT; i += 1) {
+      const response = await request(app).post('/api/r1/meet/exchange').send({ ticket: MEET_TICKET });
+      expect(response.status).toBe(503);
+    }
+    const limited = await request(app).post('/api/r1/meet/exchange').send({ ticket: MEET_TICKET });
+    expect(limited.status).toBe(429);
+    expect(limited.headers['retry-after']).toBeTruthy();
+    expect(limited.headers['x-ratelimit-limit']).toBe(String(R1_MEET_EXCHANGE_LIMIT));
+    expect(limited.body.error.type).toBe('rate_limit_exceeded');
+    // Another ticket is on its own bucket.
+    const other = await request(app).post('/api/r1/meet/exchange').send({ ticket: OTHER_MEET_TICKET });
+    expect(other.status).toBe(503);
+    expect(other.headers['x-ratelimit-remaining']).toBe(String(R1_MEET_EXCHANGE_LIMIT - 1));
+    // The Meet bucket is not the link-keyed start bucket: preflight still answers for the link.
+    const preflight = await request(app).post('/api/r1/preflight').send({ token: LINK });
+    expect(preflight.status).not.toBe(429);
+    expect(preflight.headers['x-ratelimit-limit']).toBe(String(R1_CANDIDATE_START_LIMIT));
+  });
+
+  it('M034: a Meet exchange body with no well-formed ticket is charged to the IP, not to any ticket', async () => {
+    const app = appWith();
+    for (let i = 0; i < R1_MEET_EXCHANGE_LIMIT; i += 1) {
+      const body = i % 2 === 0 ? { ticket: 'short' } : {};
+      expect((await request(app).post('/api/r1/meet/exchange').send(body)).status).toBe(503);
+    }
+    const limited = await request(app).post('/api/r1/meet/exchange').send({ ticket: 'x'.repeat(129) });
+    expect(limited.status).toBe(429);
+    // A well-formed ticket is on its own bucket, whatever the IP spent.
+    const real = await request(app).post('/api/r1/meet/exchange').send({ ticket: MEET_TICKET });
+    expect(real.status).toBe(503);
+    expect(real.headers['x-ratelimit-remaining']).toBe(String(R1_MEET_EXCHANGE_LIMIT - 1));
+  });
+
+  it('M034: never keys the Meet bucket on the plaintext ticket, and uses the same ticket shape as the exchange', () => {
+    const key = r1MeetExchangeKey({ body: { ticket: MEET_TICKET }, ip: '203.0.113.9', socket: {} } as any);
+    expect(key).toBe(`ticket:${sha256(MEET_TICKET)}`);
+    expect(key).not.toContain(MEET_TICKET);
+    for (const body of [{ ticket: 'short' }, { ticket: 'x'.repeat(129) }, { ticket: 'a/'.repeat(20) }, { ticket: 42 }, {}]) {
+      expect(r1MeetExchangeKey({ body, ip: '203.0.113.9', socket: {} } as any), JSON.stringify(body)).toBe('ip:203.0.113.9');
+    }
+    expect(r1MeetExchangeKey({ ip: '203.0.113.9', socket: {} } as any)).toBe('ip:203.0.113.9');
+    expect(R1_MEET_EXCHANGE_TICKET_SHAPE.source).toBe(R1_MEET_TICKET_PATTERN.source);
+    expect(R1_MEET_EXCHANGE_TICKET_SHAPE.flags).toBe(R1_MEET_TICKET_PATTERN.flags);
   });
 });

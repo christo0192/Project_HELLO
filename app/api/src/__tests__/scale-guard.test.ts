@@ -882,6 +882,10 @@ const NOT_DRIVEN: Record<string, string> = {
   '/api/interview-rounds/:id/recording': ONE_RECORD,
   '/api/interview-rounds/:id/review': "one round and one candidate's sessions: each read is keyed by the round or a session, and the transcript and the log page past the row cap",
   '/api/interview-rounds/availability': ONE_RECORD,
+  // M034 S05 (dark): one keyset page of the Meet bookings, at most 100 rows (a limit + 1 read), and
+  // no id-list read; the detail is one booking by id.
+  '/api/interview-rounds/meet-bookings': 'one keyset page of at most 100 bookings (a limit + 1 read), no id-list read',
+  '/api/interview-rounds/meet-bookings/:id': ONE_RECORD,
   '/api/me': ONE_RECORD,
   '/api/notes': ONE_CANDIDATE,
   '/api/notes/rounds/:roundId': "one round of one candidate: read through that candidate's index, and paged past the row cap",

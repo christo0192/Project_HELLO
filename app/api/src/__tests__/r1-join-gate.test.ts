@@ -226,6 +226,25 @@ describe('r1WorkerGateMissing', () => {
     expect(d.log.error).not.toHaveBeenCalled();
   });
 
+  it('7b. a Meet join needs a gate on every endpoint: missing or unbuildable on Cloud is true, logged once', () => {
+    const unbuildable = (): BrowserWorkerGate | null => {
+      throw new Error('gate_unbuildable');
+    };
+    for (const resolve of [() => null, unbuildable]) {
+      const d = deps({ resolveGate: vi.fn(resolve) });
+      expect(r1WorkerGateMissing(cloudLiveKitEndpoint(), d, { meet: true })).toBe(true);
+      expect(d.log.error).toHaveBeenCalledTimes(1);
+      expect(d.log.error).toHaveBeenCalledWith(...logged('r1_worker_gate_missing'));
+    }
+    // With a gate it is never missing, and `meet: false` is the browser question.
+    const present = deps();
+    expect(r1WorkerGateMissing(cloudLiveKitEndpoint(), present, { meet: true })).toBe(false);
+    expect(r1WorkerGateMissing(R1_ENDPOINT, present, { meet: true })).toBe(false);
+    const browser = deps({ resolveGate: vi.fn(() => null) });
+    expect(r1WorkerGateMissing(cloudLiveKitEndpoint(), browser, { meet: false })).toBe(false);
+    expect(browser.resolveGate).not.toHaveBeenCalled();
+  });
+
   it('8. R1 with a gate is false, no log', () => {
     const d = deps();
     expect(r1WorkerGateMissing(R1_ENDPOINT, d)).toBe(false);
@@ -304,6 +323,22 @@ describe('runR1JoinGate', () => {
     const r1Gate = disabled();
     expect(await runR1JoinGate(INPUT_R1, deps({ resolveGate: vi.fn(() => r1Gate) }))).toBe('preparing');
     expect(r1Gate.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('12c. a Meet join fails closed on every endpoint: no gate, or a disabled one, is preparing', async () => {
+    const meet = { candidateIdentity: `meet-${SESSION.slice(0, 8)}`, profile: 'r1_dex_sales' };
+    for (const endpoint of [cloudLiveKitEndpoint(), R1_ENDPOINT]) {
+      const none = deps({ resolveGate: vi.fn(() => null) });
+      expect(await runR1JoinGate({ ...INPUT_R1, endpoint, meet }, none), endpoint.target).toBe('preparing');
+      expect(none.dispatches).not.toHaveBeenCalled();
+
+      const gate = gateWith({ ensureReadyWorker: vi.fn(async () => ({ status: 'disabled' })) });
+      expect(
+        await runR1JoinGate({ ...INPUT_R1, endpoint, meet }, deps({ resolveGate: vi.fn(() => gate) })),
+        endpoint.target,
+      ).toBe('preparing');
+      expect(gate.dispatch).not.toHaveBeenCalled();
+    }
   });
 
   it.each([

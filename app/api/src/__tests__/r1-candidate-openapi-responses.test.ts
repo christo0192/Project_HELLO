@@ -22,6 +22,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import express from 'express';
 import request from 'supertest';
 
 const mocks = vi.hoisted(() => ({
@@ -42,18 +43,23 @@ vi.mock('../lib/recording-egress.js', async (importOriginal) => ({
 }));
 
 import { getAuditSink, setAuditSink } from '../lib/audit.js';
+import { R1_MEET_EXCHANGE_LIMIT, createR1MeetExchangeRateLimit } from '../lib/r1/rate-limit.js';
 import { createReadyLimiter } from '../lib/r1/ready-limiter.js';
 import {
   LINK,
+  MEET_TICKET,
   NOW,
   REQUIRED,
   WORKER_SECRET,
+  addMeetBooking,
   addSession,
   buildHarness,
   grantConsent,
+  seedMeetRound,
   seedTables,
   type Harness,
 } from './support/r1-candidate-harness.js';
+import type { Row } from './support/r1-candidate-fake-db.js';
 import { parseYamlDocument, validateSchema, type YMap } from './support/openapi-schema.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -71,6 +77,8 @@ const ROUTES = [
   '/api/r1/attempts',
   '/api/r1/exchange',
   '/api/r1/ready',
+  // M034 S05 (dark): the Meet bridge's ticket exchange.
+  '/api/r1/meet/exchange',
 ] as const;
 type Route = (typeof ROUTES)[number];
 
@@ -201,6 +209,12 @@ describe('R1 candidate routes: real responses against openapi.yaml', () => {
     expect(granted.body.consent.state).toBe('granted');
     await hit('/api/r1/status', { token: 'nope' }, 400);
     await hit('/api/r1/status', { token: FAKE_LINK }, 404, 'r1_link_invalid_or_expired');
+    // A round held in Google Meet never takes the browser path (M034 S05).
+    const meet = seedTables();
+    meet.interview_rounds![0]!.channel = 'meet';
+    fresh(meet);
+    const inMeet = await hit('/api/r1/status', { token: LINK }, 409, 'round_channel_meet');
+    expect(inMeet.body).toEqual({ error: 'round_channel_meet' });
     fresh(seedTables(), {}, { interview_rounds: { message: 'down' } });
     await hit('/api/r1/status', { token: LINK }, 503, 'service_unavailable');
     finish('/api/r1/status');
@@ -358,6 +372,14 @@ describe('R1 candidate routes: real responses against openapi.yaml', () => {
       : admit(fn, args));
     const own = await hit('/api/r1/attempts', { token: LINK }, 409, 'r1_busy');
     expect(own.body).toEqual({ error: 'r1_busy', retry_after_sec: 300, busy_reason: 'own_session_live' });
+    // A round held in Google Meet never takes the browser path (M034 S05), admission or rejoin.
+    const meet = seedTables();
+    meet.interview_rounds![0]!.channel = 'meet';
+    grantConsent(meet);
+    fresh(meet);
+    const inMeet = await hit('/api/r1/attempts', { token: LINK }, 409, 'round_channel_meet');
+    expect(inMeet.body).toEqual({ error: 'round_channel_meet' });
+    await hit('/api/r1/attempts', { token: LINK, nonce: '9'.repeat(64) }, 409, 'round_channel_meet');
     finish('/api/r1/attempts');
   });
 
@@ -428,6 +450,52 @@ describe('R1 candidate routes: real responses against openapi.yaml', () => {
     expect(limited.body.retry_after_sec).toBeGreaterThan(0);
     expect(limited.headers['retry-after']).toBe(String(limited.body.retry_after_sec));
     finish('/api/r1/ready');
+  });
+
+  it('POST /api/r1/meet/exchange', async () => {
+    const route = '/api/r1/meet/exchange';
+    const meet = (over: Partial<Row> = {}) => {
+      const tables = seedMeetRound(seedTables());
+      addMeetBooking(tables, over);
+      return tables;
+    };
+    fresh(meet(), { meetEnabled: () => true });
+    // The ticket is claimed and the session bound: 202 with a resume token, then the continuation
+    // (which answers 202 again while the worker is still booting).
+    const preparing = await hit(route, { ticket: MEET_TICKET }, 202);
+    h.gate.ensureReadyWorker.mockResolvedValueOnce({ status: 'no_capacity' });
+    await hit(route, { ticket: MEET_TICKET, resume_token: preparing.body.resume_token }, 202);
+    expect(Object.keys(preparing.body)).toEqual(['status', 'retry_after_sec', 'resume_token']);
+    const granted = await hit(route, { ticket: MEET_TICKET, resume_token: preparing.body.resume_token }, 200);
+    expect(Object.keys(granted.body)).toEqual(['url', 'livekit_token', 'expires_at']);
+    // The ticket is spent: a second claim is refused (and alerts).
+    await hit(route, { ticket: MEET_TICKET }, 409, 'ticket_already_claimed');
+    await hit(route, { ticket: 'short' }, 400, 'invalid_request');
+    await hit(route, { ticket: 'mt' + 'q'.repeat(41) }, 404, 'ticket_unknown');
+    fresh(meet({ ticket_not_before: new Date(NOW + 60_000).toISOString() }), { meetEnabled: () => true });
+    await hit(route, { ticket: MEET_TICKET }, 425, 'ticket_not_yet_valid');
+    fresh(meet({ ticket_expires_at: new Date(NOW).toISOString() }), { meetEnabled: () => true });
+    await hit(route, { ticket: MEET_TICKET }, 410, 'ticket_expired');
+    fresh(meet(), { meetEnabled: () => false });
+    const dark = await hit(route, { ticket: MEET_TICKET }, 503, 'meet_disabled');
+    expect(dark.body).toEqual({ error: 'meet_disabled' });
+    // A 503 that spent nothing says when to ask again (S05-R5).
+    fresh(meet(), { meetEnabled: () => true }, { interview_rounds: { message: 'down' } });
+    const hinted = await hit(route, { ticket: MEET_TICKET }, 503, 'service_unavailable');
+    expect(hinted.body).toEqual({ error: 'service_unavailable', retry_after_sec: 3 });
+    // 429 is the app's own limiter, mounted ahead of the router as app.ts mounts it.
+    fresh(meet(), { meetEnabled: () => false });
+    const limited = express();
+    limited.use(express.json());
+    limited.post(route, createR1MeetExchangeRateLimit(60));
+    limited.use(h.app);
+    h.app = limited;
+    const spender = { ticket: 'mt' + 'z'.repeat(41) };
+    for (let i = 0; i < R1_MEET_EXCHANGE_LIMIT; i += 1) await hit(route, spender, 503, 'meet_disabled');
+    const refused = await hit(route, spender, 429);
+    expect(refused.body.error.type).toBe('rate_limit_exceeded');
+    expect(refused.headers['retry-after']).toMatch(/^[0-9]+$/);
+    finish(route);
   });
 });
 

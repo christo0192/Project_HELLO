@@ -14,6 +14,7 @@ import type { BrowserWorkerGate } from '../../lib/browser-orchestration.js';
 import type { DispatchLike } from '../../lib/r1/worker-gate.js';
 import type { R1CandidateDeps, R1RoomClient } from '../../routes/r1-candidate.js';
 import { createR1CandidateRouter } from '../../routes/r1-candidate.js';
+import { r1MeetTicketDigest } from '../../lib/r1/meet/ticket.js';
 import {
   createFakeDb,
   type FakeDb,
@@ -225,7 +226,137 @@ export function rpcDoubles(tables: Tables, ids: () => string) {
         .map((s) => ({ session_id: s.id, status: s.status }));
       return { status: 'ok', withdrawn, live_sessions: live };
     },
+    // M034 S05: the Meet bridge's two booking RPCs, as migration 0142 sections 17 and 15 define
+    // them (the first refusal wins, in the SQL's order; the same writes; the same answers).
+    r1_meet_claim_ticket: (args: { p_ticket_digest?: unknown; p_now?: unknown }) => {
+      if (typeof args.p_ticket_digest !== 'string' || !/^[a-f0-9]{64}$/.test(args.p_ticket_digest)) {
+        return { status: 'invalid_ticket' };
+      }
+      if (typeof args.p_now !== 'string') return { status: 'invalid_request', field: 'now' };
+      const nowMs = Date.parse(args.p_now);
+      const booking = (tables.r1_meet_bookings ?? []).find((b) => b.ticket_digest === args.p_ticket_digest);
+      if (!booking) return { status: 'ticket_unknown' };
+      if (booking.ticket_claimed_at) return { status: 'ticket_already_claimed', booking_id: booking.id };
+      if (!MEET_CLAIMABLE.includes(booking.status)) {
+        return { status: 'booking_not_claimable', booking_id: booking.id, booking_status: booking.status };
+      }
+      if (nowMs < Date.parse(booking.ticket_not_before)) {
+        return { status: 'ticket_not_yet_valid', booking_id: booking.id };
+      }
+      if (nowMs >= Date.parse(booking.ticket_expires_at)) return { status: 'ticket_expired', booking_id: booking.id };
+      const round = tables.interview_rounds!.find((r) => r.id === booking.round_id);
+      if (
+        !round
+        || round.channel !== 'meet'
+        || !['invited', 'in_progress'].includes(round.status)
+        || Date.parse(round.expires_at) <= nowMs
+      ) {
+        return { status: 'round_not_live', booking_id: booking.id, round_id: booking.round_id };
+      }
+      booking.ticket_claimed_at = args.p_now;
+      booking.status = 'in_call';
+      booking.reason = 'eligible';
+      booking.updated_at = args.p_now;
+      return {
+        status: 'ok',
+        booking_id: booking.id,
+        round_id: booking.round_id,
+        candidate_id: booking.candidate_id,
+        objective_profile: booking.objective_profile,
+        ashby_interview_event_id: booking.ashby_interview_event_id,
+        session_id: booking.session_id,
+        start_at: booking.start_at,
+        end_at: booking.end_at,
+      };
+    },
+    r1_meet_bind_session: (args: { p_booking_id?: unknown; p_session_id?: unknown; p_now?: unknown }) => {
+      if (typeof args.p_now !== 'string') return { status: 'invalid_request', field: 'now' };
+      const booking = (tables.r1_meet_bookings ?? []).find((b) => b.id === args.p_booking_id);
+      if (!booking) return { status: 'not_found' };
+      if (booking.status !== 'in_call') {
+        return { status: 'not_in_call', booking_id: booking.id, booking_status: booking.status };
+      }
+      const session = tables.call_sessions!.find((s) => s.id === args.p_session_id);
+      if (!session || !session.interview_round_id || session.interview_round_id !== booking.round_id) {
+        return { status: 'session_mismatch', booking_id: booking.id };
+      }
+      if (booking.session_id === args.p_session_id) {
+        return { status: 'duplicate', booking_id: booking.id, session_id: booking.session_id };
+      }
+      const previous = booking.session_id ?? null;
+      booking.session_id = args.p_session_id;
+      booking.updated_at = args.p_now;
+      return { status: 'ok', booking_id: booking.id, session_id: args.p_session_id, previous_session_id: previous };
+    },
   };
+}
+
+// ── M034 S05: the Meet bridge exchange ──────────────────────────────────
+
+/** The booking statuses a ticket may be claimed in (0142 section 17). */
+const MEET_CLAIMABLE = ['bot_scheduled', 'bot_joining', 'human_present', 'in_call'];
+
+/** A version-4 booking id. */
+export const MEET_BOOKING = '70000000-0000-4000-8000-0000000000f2';
+/** The HR staff member who scheduled the Dex interview in Ashby (a fixture id, not a real one). */
+export const MEET_ATTESTER = '60000000-0000-4000-8000-0000000000f1';
+/** The bridge ticket, built at runtime from low-entropy parts (43 characters, the minted length). */
+export const MEET_TICKET = 'mt' + 'k'.repeat(41);
+
+/** The stored digest of `ticket`, computed by the real lib under the harness worker secret. */
+export function meetTicketDigest(ticket: string = MEET_TICKET): string {
+  const digest = r1MeetTicketDigest(ticket, { WORKER_CONTEXT_SECRET: WORKER_SECRET });
+  if (digest === null) throw new Error('harness: the Meet ticket does not digest');
+  return digest;
+}
+
+/** Make the seeded round a Meet round with its HR-attested consent (0142 sections 1 and 2). */
+export function seedMeetRound(tables: Tables): Tables {
+  tables.interview_rounds![0]!.channel = 'meet';
+  grantConsent(tables, {
+    method: 'hr_attested_ashby',
+    attested_by_external_id: MEET_ATTESTER,
+    attested_at: new Date(NOW - 3_600_000).toISOString(),
+    india_location_attested: true,
+    template_id: TEMPLATE,
+  });
+  return tables;
+}
+
+/**
+ * An armed booking of the seeded round: a human is in the Meet, the slot is now-1 min .. now+40
+ * min, the ticket window now-5 min .. now+55 min, the ticket unclaimed and no session bound.
+ */
+export function addMeetBooking(tables: Tables, over: Partial<Row> = {}): Row {
+  const row: Row = {
+    id: MEET_BOOKING,
+    ashby_interview_event_id: '71000000-0000-4000-8000-0000000000f3',
+    ashby_schedule_id: '72000000-0000-4000-8000-0000000000f4',
+    ashby_application_id: '73000000-0000-4000-8000-0000000000f5',
+    ashby_scheduled_by_user_id: MEET_ATTESTER,
+    candidate_id: CANDIDATE,
+    round_id: ROUND,
+    objective_profile: 'r1_dex_sales',
+    status: 'human_present',
+    reason: 'eligible',
+    version: 0,
+    key_attempt: 0,
+    meet_url: 'https://meet.google.com/abc-defg-hij',
+    start_at: new Date(NOW - 60_000).toISOString(),
+    end_at: new Date(NOW + 40 * 60_000).toISOString(),
+    recall_bot_id: '74000000-0000-4000-8000-0000000000f6',
+    ticket_digest: meetTicketDigest(),
+    ticket_not_before: new Date(NOW - 5 * 60_000).toISOString(),
+    ticket_expires_at: new Date(NOW + 55 * 60_000).toISOString(),
+    ticket_claimed_at: null,
+    ticket_arms: 1,
+    session_id: null,
+    created_at: new Date(NOW - 3_600_000).toISOString(),
+    updated_at: new Date(NOW - 120_000).toISOString(),
+    ...over,
+  };
+  (tables.r1_meet_bookings ??= []).push(row);
+  return row;
 }
 
 export interface Harness {

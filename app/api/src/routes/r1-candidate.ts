@@ -64,6 +64,44 @@
  *     nothing but the two secrets, so one attempt can never signal another's room), and sends one
  *     fixed, pinned message (`R1_READY_PAYLOAD` on `R1_READY_TOPIC`) to the room's interviewer
  *     with the server SDK. Nothing the caller sends is relayed.
+ * 11. A Meet round (`interview_rounds.channel = meet`, migration 0142) never takes the browser
+ *     path: it is held in Google Meet at the booked time. `/status` and `/attempts` (admission
+ *     and the nonce rejoin alike) answer 409 `round_channel_meet` as soon as the link is
+ *     recognised, BEFORE the kill switch, maintenance or the settings are read, so no switch
+ *     (the Meet flag included) changes that answer. `/exchange` and `/ready` answer it right
+ *     after the attempt's session and round are known to belong together (a Meet session's
+ *     nonce never leaves the server, so there this is defence in depth). Nothing is admitted,
+ *     provisioned, dispatched, audited or written. `/preflight`, `/consent`,
+ *     `/consent-template` and `/consent/withdraw` are NOT guarded: a Meet round's link digest
+ *     is unusable (0142), a withdrawal is never gated (invariant 5), and the device check and
+ *     the notice start nothing. The channel is never returned: the guard compares it only with
+ *     `meet` (a row without it reads as browser), so every browser answer is byte-identical.
+ * 12. The Meet bridge (`POST /api/r1/meet/exchange`, M034, dark behind R1_MEET_ENABLED) is the one
+ *     route a Meet round takes. Its secret is a single-use BRIDGE TICKET (32 random bytes in the
+ *     bridge page's URL fragment; the database holds only its HMAC digest in the domain
+ *     `hello:r1:meet-bridge:v1`, keyed from WORKER_CONTEXT_SECRET). Flag off answers 503
+ *     `meet_disabled` before the body is parsed or anything is read. Otherwise, in order: strict
+ *     body; the keys; a READ-ONLY peek of the booking by digest, which decides unknown (404),
+ *     already claimed (409 + alert), not live (409), too early (425) and too late (410) without
+ *     spending the ticket and before any configuration is read (invariant 1); then the kill
+ *     switch, the round (a live Meet round), maintenance, `laneForNewWork` (fence 7 inside),
+ *     DeepSeek health and consent (HR-attested rows count); only then `r1_meet_claim_ticket`,
+ *     authoritative under the booking row lock, so no transient refusal burns the ticket. The
+ *     round's own live session, bound to this booking or not (an admission whose bind or answer
+ *     was lost), is continued; with none, the server admits through `r1_admit_attempt` (the nonce
+ *     is generated and hashed here and never leaves the server) and binds the session with
+ *     `r1_meet_bind_session` right away. A FIRST call never waits for a worker: unless the session
+ *     is already `in_progress` (a token at once) it answers 202 here, so every slow step runs on a
+ *     call that can be repeated. The resumed call mirrors the browser exchange: marked room (with
+ *     the bridge identity mirrored in its metadata), `runR1JoinGate` with the Meet dispatch values
+ *     (fail closed on every endpoint), consent again, and the token from the lib preset
+ *     `meet_bridge` (microphone only, no data channel, no metadata updates, identity
+ *     `meet-<first 8 of the session id>`, no candidate id, 10 minutes). Every 202 carries a FRESH
+ *     stateless resume token (`hello:r1:meet-resume:v1`, 5 minutes) that continues the same
+ *     booking and session with no second claim or admission. A 503 that has spent nothing (before
+ *     the claim, or on a resume) carries `retry_after_sec`; one after the claim of a fresh ticket
+ *     never does. A refusal of an authenticated ticket is one closed log line. Nothing in an answer
+ *     or a log names the candidate, the round, the booking, the session, the ticket or its digest.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -111,6 +149,7 @@ import {
   type Read,
 } from '../lib/r1/consent.js';
 import {
+  LIVE_SESSION_STATUSES,
   effectiveRoundStatus,
   loadAttempt,
   loadLiveSession,
@@ -121,6 +160,7 @@ import {
   loadSettings,
   roundIsActive,
   type RoundRow,
+  type SessionRow,
 } from '../lib/r1/candidate-store.js';
 import {
   R1_CANDIDATE_LOCALE,
@@ -130,9 +170,30 @@ import {
 import { r1DeepSeekHealth } from '../lib/r1/deepseek-health.js';
 import { createReadyLimiter, type ReadyLimiter } from '../lib/r1/ready-limiter.js';
 import type { DispatchListerLike } from '../lib/r1/worker-gate.js';
-import { mintCandidateJoin } from '../lib/r1/candidate-join.js';
+import { candidateJoinIdentity, mintCandidateJoin } from '../lib/r1/candidate-join.js';
 import { provisionMarkedRoom } from '../lib/r1/marked-room.js';
 import { r1WorkerGateMissing, runR1JoinGate, type R1JoinGateDeps } from '../lib/r1/join-gate.js';
+import { getR1MeetConfig } from '../lib/r1/meet/config.js';
+import { getR1MeetProfile, type R1MeetObjectiveProfile } from '../lib/r1/meet/profiles.js';
+import {
+  R1_MEET_TICKET_PATTERN,
+  r1MeetBridgeKeysConfigured,
+  r1MeetTicketDigest,
+} from '../lib/r1/meet/ticket.js';
+import {
+  R1_MEET_RESUME_TOKEN_PATTERN,
+  mintR1MeetResumeToken,
+  verifyR1MeetResumeToken,
+} from '../lib/r1/meet/resume-token.js';
+import {
+  R1_MEET_CLAIMABLE_STATUSES,
+  bindR1MeetSession,
+  claimR1MeetTicket,
+  peekR1MeetTicket,
+  type R1MeetClaimBinding,
+  type R1MeetClaimRefusal,
+  type R1MeetTicketBooking,
+} from '../lib/r1/meet/bridge-store.js';
 
 const log = createLogger('r1-candidate');
 
@@ -180,6 +241,13 @@ export const PREPARING_RETRY_AFTER_SEC = 3;
 export const WITHDRAW_RETRY_AFTER_SEC = 3;
 /** DeepSeek is unhealthy: the probe is cached for 60 s, so retry after half that. */
 export const UNHEALTHY_RETRY_AFTER_SEC = 30;
+/**
+ * The hint a Meet bridge 503 carries while nothing is spent (before the ticket claim, or on a
+ * resume). The bridge page asks again after a hinted 503, inside its own bound, and gives up on one
+ * without (contracts section 9, S07 review entry item 1), so a hint after the claim of a fresh
+ * ticket would make it replay a spent ticket.
+ */
+export const MEET_RETRY_AFTER_SEC = 3;
 const STARTS_PER_LINK = 3;
 /**
  * The "I'm ready" relay (R1-Q cross-PR contract, IMPLEMENTER-RULES.md). The topic and the exact
@@ -222,6 +290,43 @@ const ADMISSION_REFUSALS: Readonly<Record<string, { status: number; error: strin
   r1_role_invalid: { status: 503, error: 'r1_unavailable' },
 };
 
+/**
+ * The same refusals for the Meet bridge's server-side admission (invariant 12, M034 S05 D-S05-10):
+ * a round that is missing, lapsed or not admissible is one `round_not_live` (the bridge page tells
+ * nothing else apart), and a busy answer carries no `Retry-After` and no `busy_reason`, because
+ * every refusal is terminal on the page (it retries only a 202). Frozen.
+ */
+export const MEET_ADMISSION_REFUSALS: Readonly<Record<string, { status: number; error: string }>> =
+  Object.freeze({
+    ...ADMISSION_REFUSALS,
+    round_not_found: { status: 409, error: 'round_not_live' },
+    round_expired: { status: 409, error: 'round_not_live' },
+    round_not_admissible: { status: 409, error: 'round_not_live' },
+  });
+
+/**
+ * The admission refusals this round's OWN live session can cause (0131): it blocks a second start
+ * (`round_live`, or `r1_in_flight` at a limit of one), or it spent the last start. The Meet bridge
+ * then looks for that session and continues it instead of refusing.
+ */
+const MEET_OWN_SESSION_REFUSALS: ReadonlySet<string> = new Set(['round_live', 'r1_in_flight', 'starts_exhausted']);
+
+/**
+ * `r1_meet_claim_ticket` refusals (migration 0142 section 17) as the bridge page's codes. Null is a
+ * server fault (the digest and the clock are checked before the call), answered 503
+ * `service_unavailable` with the `r1_meet_claim_failed` alert.
+ */
+const MEET_CLAIM_REFUSALS: Readonly<Record<R1MeetClaimRefusal, { status: number; error: string } | null>> = {
+  invalid_ticket: null,
+  invalid_request: null,
+  ticket_unknown: { status: 404, error: 'ticket_unknown' },
+  ticket_already_claimed: { status: 409, error: 'ticket_already_claimed' },
+  booking_not_claimable: { status: 409, error: 'round_not_live' },
+  ticket_not_yet_valid: { status: 425, error: 'ticket_not_yet_valid' },
+  ticket_expired: { status: 410, error: 'ticket_expired' },
+  round_not_live: { status: 409, error: 'round_not_live' },
+};
+
 // ── Request schemas ──────────────────────────────────────────────────
 
 const linkToken = z.string().regex(/^[a-f0-9]{64}$/, 'link token is invalid');
@@ -254,6 +359,17 @@ export const r1ExchangeSchema = z
 /** The ready relay takes the exchange's two secrets and nothing else (no room, no payload). */
 export const r1ReadySchema = z
   .object({ attempt_token: z.string().min(1).max(160), nonce: nonceField })
+  .strict();
+/**
+ * The Meet bridge exchange (invariant 12): the single-use ticket from the page URL fragment, and on
+ * a retry after a 202 the resume token that 202 carried. Parsed INSIDE the handler, so any failure
+ * is the bridge page's own `invalid_request` (contracts section 9, S07 item 5).
+ */
+export const r1MeetExchangeSchema = z
+  .object({
+    ticket: z.string().regex(R1_MEET_TICKET_PATTERN),
+    resume_token: z.string().regex(R1_MEET_RESUME_TOKEN_PATTERN).optional(),
+  })
   .strict();
 
 // ── Dependencies (injectable for tests) ──────────────────────────────
@@ -303,6 +419,22 @@ export interface R1CandidateDeps {
   readyRelayTimeoutMs?: number;
   /** BROWSER_REQUIRE_MACHINE_AGENT_NAME (env, off by default); read before an R1 dispatch. */
   requireMachineAgentName?: () => boolean;
+  /**
+   * R1_MEET_ENABLED (M034, dark): `getR1MeetConfig().enabled`, read on every Meet bridge exchange
+   * and nowhere else. Off, that route answers 503 `meet_disabled` before anything is read. Test seam.
+   */
+  meetEnabled?: () => boolean;
+}
+
+/**
+ * What one Meet exchange call (invariant 12) keeps on `res.locals.meetCall`, so the refusals it
+ * shares with the browser routes are worded and logged in one place. Set by that route only.
+ */
+interface MeetCall {
+  /** Nothing is spent yet (before the claim, or on a resume): a 503 says when to ask again. */
+  unspent: boolean;
+  /** The refusal code this call answered, or null (the maintenance envelope has no code). */
+  refusal: string | null;
 }
 
 function defaultSchedule(work: () => void, delayMs: number): void {
@@ -358,6 +490,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
   const schedule = deps.schedule ?? defaultSchedule;
   const readyLimiter = deps.readyLimiter ?? createReadyLimiter();
   const readyTimeoutMs = deps.readyRelayTimeoutMs ?? READY_RELAY_TIMEOUT_MS;
+  const meetEnabled = deps.meetEnabled ?? (() => getR1MeetConfig().enabled);
   const joinGateDeps: R1JoinGateDeps = { db, now, resolveGate, dispatches: dispatchesFor, requireMachineAgentName, log };
 
   // Tokens, nonces and consent state must never be cached by a proxy or browser.
@@ -378,6 +511,15 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
     error: string,
     extra: Record<string, unknown> = {},
   ): void {
+    const meet = res.locals.meetCall as MeetCall | undefined;
+    if (meet) {
+      meet.refusal = error;
+      if (meet.unspent && status === 503 && extra.retry_after_sec === undefined) {
+        res.setHeader('Retry-After', String(MEET_RETRY_AFTER_SEC));
+        res.status(status).json({ error, ...extra, retry_after_sec: MEET_RETRY_AFTER_SEC });
+        return;
+      }
+    }
     res.status(status).json({ error, ...extra });
   }
 
@@ -429,6 +571,16 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       return null;
     }
     return found.value;
+  }
+
+  /**
+   * The Meet-channel guard (invariant 11): true, with the 409 written, when the round is held in
+   * Google Meet, so the caller stops before any switch, admission, room or token.
+   */
+  function meetRound(res: Response, round: RoundRow): boolean {
+    if (round.channel !== 'meet') return false;
+    refuse(res, 409, 'round_channel_meet');
+    return true;
   }
 
   /**
@@ -539,6 +691,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
   router.post('/status', validateBody(r1StatusSchema), route(async (req, res) => {
     const round = await roundFor(req, res);
     if (!round) return;
+    if (meetRound(res, round)) return;
     const at = now();
     const [settings, consent, live, roleTitle] = await Promise.all([
       loadSettings(db),
@@ -1047,6 +1200,8 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
     }
     const round = await roundFor(req, res);
     if (!round) return;
+    // Both branches (admission and the nonce rejoin), before any switch (invariant 11).
+    if (meetRound(res, round)) return;
     if (!enabledOr409(res)) return;
     if (!roundIsActive(round, now())) {
       refuse(res, 409, effectiveRoundStatus(round, now()) === 'expired'
@@ -1242,6 +1397,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       refuse(res, 404, STABLE_ATTEMPT_ERROR);
       return;
     }
+    if (meetRound(res, round)) return;
     if (!(['created', 'waiting', 'in_progress'] as string[]).includes(session.status)) {
       refuse(res, 409, 'r1_attempt_ended');
       return;
@@ -1416,6 +1572,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       refuse(res, 404, STABLE_ATTEMPT_ERROR);
       return;
     }
+    if (meetRound(res, round)) return;
     // The room is the one this attempt's own session names, never anything the caller sent.
     const roomName = roomNameForSession(session.id);
     if (session.external_call_id !== null && session.external_call_id !== roomName) {
@@ -1460,6 +1617,490 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       attempt_number: attempt.value.attempt_number,
     });
     res.status(200).json({ ok: true });
+  }));
+
+  // ── POST /api/r1/meet/exchange (M034, dark; invariant 12) ──────────
+
+  /** R1_MEET_ENABLED off: 503 `meet_disabled` before the body is parsed or anything is read. */
+  function meetExchangeOn(_req: Request, res: Response, next: NextFunction): void {
+    if (meetEnabled()) {
+      next();
+      return;
+    }
+    refuse(res, 503, 'meet_disabled');
+  }
+
+  /**
+   * One closed line for a refusal the holder of a real ticket was given (or a peek that failed): in a
+   * Meet nobody reads the tile, and such a refusal moves no booking. The answered code only, never
+   * the ticket or an id.
+   */
+  function meetRefused(res: Response): void {
+    const call = res.locals.meetCall as MeetCall | undefined;
+    log.warn('unknown_event', {
+      error_category: 'r1_meet_exchange_refused',
+      error_type: call?.refusal ?? 'maintenance_mode',
+    });
+  }
+
+  /** `refuse`, with the line above. */
+  function meetRefuse(res: Response, status: number, error: string): void {
+    refuse(res, status, error);
+    meetRefused(res);
+  }
+
+  /**
+   * A claimed ticket was presented again: a replayed or shared ticket, or a first answer the page
+   * lost. Alert (a closed category, never the ticket, its digest or an id) and refuse.
+   */
+  function meetTicketReplayed(res: Response): void {
+    log.error('unknown_event', { error_category: 'r1_meet_ticket_already_claimed' });
+    refuse(res, 409, 'ticket_already_claimed');
+  }
+
+  /** The booking's round, when it is a live Meet round; else the refusal is written. */
+  async function liveMeetRound(res: Response, roundId: string): Promise<RoundRow | null> {
+    const read = await loadRoundById(db, roundId);
+    if (!read.ok) {
+      refuse(res, 503, 'service_unavailable');
+      return null;
+    }
+    const round = read.value;
+    if (!round || round.channel !== 'meet' || !roundIsActive(round, now())) {
+      refuse(res, 409, 'round_not_live');
+      return null;
+    }
+    return round;
+  }
+
+  /** The booking's objective profile; an id this build does not know fails closed (503 + alert). */
+  function meetProfileFor(res: Response, id: string): R1MeetObjectiveProfile | null {
+    const profile = getR1MeetProfile(id);
+    if (profile) return profile;
+    log.error('unknown_event', { error_category: 'r1_meet_profile_unknown' });
+    refuse(res, 503, 'service_unavailable');
+    return null;
+  }
+
+  /**
+   * Every gate that guards new R1 compute, plus one for the Meet join: with no worker gate, on any
+   * endpoint, nothing would dispatch the Meet values (the browser's Cloud excuse, an unnamed worker
+   * that auto-dispatches, does not hold here). The endpoint, or null with the refusal written.
+   */
+  async function meetNewWork(res: Response): Promise<LiveKitEndpoint | null> {
+    if (!(await maintenanceClear(res))) return null;
+    const endpoint = await laneForNewWork(res);
+    if (!endpoint) return null;
+    if (r1WorkerGateMissing(endpoint, joinGateDeps, { meet: true })) {
+      refuse(res, 503, 'r1_unavailable');
+      return null;
+    }
+    if (!(await healthy())) {
+      refuseUnhealthy(res);
+      return null;
+    }
+    return endpoint;
+  }
+
+  /** A live browser-mode session of `round` whose room, if any, is its own marked room. */
+  function meetSessionUsable(session: SessionRow | null, round: RoundRow): session is SessionRow {
+    return session !== null
+      && (LIVE_SESSION_STATUSES as readonly string[]).includes(session.status)
+      && session.interview_round_id === round.id
+      && session.mode === 'browser'
+      && (session.external_call_id === null || session.external_call_id === roomNameForSession(session.id));
+  }
+
+  /**
+   * The round's live session, when the bridge can continue it. A failed read reads as none:
+   * admission then decides under its own locks, so no second session can start.
+   */
+  async function meetLiveSession(round: RoundRow): Promise<SessionRow | null> {
+    const live = await loadLiveSession(db, round.id);
+    return live.ok && meetSessionUsable(live.value, round) ? live.value : null;
+  }
+
+  /** `r1_meet_bind_session` (D-S05-6); true when bound, else the refusal is written. */
+  async function meetBind(res: Response, bookingId: string, sessionId: string): Promise<boolean> {
+    const bound = await bindR1MeetSession(db, bookingId, sessionId, new Date(now()).toISOString());
+    if (bound.kind === 'ok' || bound.kind === 'duplicate') return true;
+    if (bound.kind === 'refused' && (bound.reason === 'not_in_call' || bound.reason === 'not_found')) {
+      refuse(res, 409, 'round_not_live');
+      return false;
+    }
+    log.error('unknown_event', {
+      error_category: 'r1_meet_bind_failed',
+      error_type: bound.kind === 'refused' ? bound.reason : 'error',
+    });
+    refuse(res, 503, 'service_unavailable');
+    return false;
+  }
+
+  /** The session a claim continues or starts; `row` is null for one this call just admitted. */
+  interface MeetStart {
+    id: string;
+    row: SessionRow | null;
+  }
+
+  /**
+   * Continue the round's live session, binding it first when the booking does not hold it yet. That
+   * is safe: a Meet round's sessions come only from this route (invariant 11 keeps the browser off
+   * it), a round has at most one live session (0116) and one live booking (0142), and the nonce of
+   * that session never left the server.
+   */
+  async function meetContinue(
+    res: Response,
+    binding: R1MeetClaimBinding,
+    live: SessionRow,
+  ): Promise<MeetStart | null> {
+    if (live.id !== binding.sessionId) {
+      if (!(await meetBind(res, binding.bookingId, live.id))) return null;
+      log.warn('unknown_event', { error_category: 'r1_meet_session_adopted' });
+    }
+    return { id: live.id, row: live };
+  }
+
+  /**
+   * Server-side admission for the bridge (D-S05-10, D-S05-22). The nonce exists only because
+   * admission stores its digest: it is generated, hashed and dropped here, never answered, logged or
+   * audited, so the bridge session can never take the browser exchange. `status` is null when no
+   * answer came back; the admission may have committed all the same.
+   */
+  async function meetAdmit(
+    round: RoundRow,
+  ): Promise<{ status: string | null; sessionId: string; attemptNumber: number }> {
+    try {
+      const { data, error } = await db.rpc('r1_admit_attempt', {
+        p_round_id: round.id,
+        p_nonce_digest: hashNonce(generateNonce()),
+      });
+      if (!error && data) {
+        return {
+          status: String(data.status),
+          sessionId: String(data.session_id),
+          attemptNumber: Number(data.attempt_number),
+        };
+      }
+    } catch {
+      /* a rejected call is a lost answer: below */
+    }
+    return { status: null, sessionId: '', attemptNumber: 0 };
+  }
+
+  /**
+   * The session of a claimed booking, or null with the refusal written: the round's live session
+   * when there is one (D-S05-7, and an admission whose bind or answer was lost, so a re-arm always
+   * recovers it), else admission and the bind right after it, with nothing in between (the audit
+   * follows). An admission that this round's own session refused, or whose answer never came, looks
+   * for that session once more: two pages can race here (a re-posted output_media), and admission
+   * itself serialises them.
+   */
+  async function meetStart(
+    req: Request,
+    res: Response,
+    binding: R1MeetClaimBinding,
+    round: RoundRow,
+  ): Promise<MeetStart | null> {
+    const live = await meetLiveSession(round);
+    if (live) return meetContinue(res, binding, live);
+
+    const { status, sessionId, attemptNumber } = await meetAdmit(round);
+    if (status === 'ok') {
+      const bound = await meetBind(res, binding.bookingId, sessionId);
+      await audit(req, 'resource.create', 201, {
+        resource: 'interview_round_attempt',
+        round_id: round.id,
+        attempt_number: attemptNumber,
+      });
+      return bound ? { id: sessionId, row: null } : null;
+    }
+    if (status === null || MEET_OWN_SESSION_REFUSALS.has(status)) {
+      const own = await meetLiveSession(round);
+      if (own) return meetContinue(res, binding, own);
+    }
+    const known = status !== null && Object.prototype.hasOwnProperty.call(MEET_ADMISSION_REFUSALS, status);
+    const refusal = known ? MEET_ADMISSION_REFUSALS[status]! : { status: 503, error: 'service_unavailable' };
+    log.error('unknown_event', {
+      error_category: 'r1_meet_admission_refused',
+      error_type: known ? status : status === null ? 'no_answer' : 'unexpected_status',
+    });
+    refuse(res, refusal.status, refusal.error);
+    return null;
+  }
+
+  /**
+   * The bridge's marked room (lib/r1/marked-room.ts, with the room mirror of the bridge identity).
+   * A provider failure is `retry` (the caller answers 202 with a resume token: the attempt stays
+   * `created` and a retry converges, D-S05-9); a session that can no longer be joined is 409
+   * `round_not_live`. `markedRoomReady` stays the browser exchange's, unchanged.
+   */
+  async function meetRoomReady(
+    res: Response,
+    session: { id: string; interview_round_id: string | null },
+    endpoint: LiveKitEndpoint,
+    meet: { candidateIdentity: string },
+  ): Promise<'ready' | 'retry' | 'refused'> {
+    const room = await provisionMarkedRoom(session, endpoint, {
+      provisionRoom,
+      ...(deps.rooms ? { rooms: roomsFor } : {}),
+      meet,
+    });
+    if (room.ok) return 'ready';
+    if (room.reason === 'provider_failed') return 'retry';
+    refuse(res, 409, 'round_not_live');
+    return 'refused';
+  }
+
+  /** 202 `preparing` with a FRESH resume token for this booking and session (D-S05-8); false when refused. */
+  function meetPreparing(res: Response, bookingId: string, sessionId: string): boolean {
+    const resumeToken = mintR1MeetResumeToken({ bookingId, sessionId }, now());
+    if (!resumeToken) {
+      refuse(res, 503, 'r1_unavailable');
+      return false;
+    }
+    res.setHeader('Retry-After', String(PREPARING_RETRY_AFTER_SEC));
+    res.status(202).json({
+      status: 'preparing',
+      retry_after_sec: PREPARING_RETRY_AFTER_SEC,
+      resume_token: resumeToken,
+    });
+    return true;
+  }
+
+  interface MeetJoin {
+    bookingId: string;
+    round: RoundRow;
+    session: SessionRow;
+    profile: R1MeetObjectiveProfile;
+    /** The endpoint this request's new-work gates resolved, or null (a resume of a started session). */
+    endpoint: LiveKitEndpoint | null;
+  }
+
+  /**
+   * The join, by session status, mirroring the browser exchange (D-S05-11): `created` provisions the
+   * marked room, `waiting` re-asserts it, then the worker gate (always `runR1JoinGate`, never the
+   * bare gate), consent again, and the token from the lib preset `meet_bridge`. `in_progress` mints
+   * at once. A missing worker gate is asked about before any room. False: the refusal is written.
+   */
+  async function meetJoin(res: Response, join: MeetJoin): Promise<boolean> {
+    const { bookingId, round, session, profile } = join;
+    let endpoint = join.endpoint;
+    if (endpoint === null) {
+      try {
+        endpoint = requireBrowserLiveKitConfigured();
+      } catch {
+        refuse(res, 503, 'r1_unavailable');
+        return false;
+      }
+    }
+    const roomName = roomNameForSession(session.id);
+    const identity = candidateJoinIdentity('meet_bridge', session);
+    if (session.status !== 'in_progress') {
+      if (r1WorkerGateMissing(endpoint, joinGateDeps, { meet: true })) {
+        refuse(res, 503, 'r1_unavailable');
+        return false;
+      }
+      if (session.status === 'waiting') await touchWaitingSession(session.id);
+      if (session.status === 'created' || session.external_call_id === roomName) {
+        const room = await meetRoomReady(res, session, endpoint, { candidateIdentity: identity });
+        if (room === 'refused') return false;
+        if (room === 'retry') return meetPreparing(res, bookingId, session.id);
+      }
+      const gate = await runR1JoinGate(
+        { endpoint, sessionId: session.id, roomName, meet: { candidateIdentity: identity, profile: profile.id } },
+        joinGateDeps,
+      );
+      if (gate === 'preparing') return meetPreparing(res, bookingId, session.id);
+      if (!(await consentStillGranted(res, round))) return false;
+    }
+    const minted = await mintCandidateJoin(endpoint, session, roomName, { now, grant: 'meet_bridge' });
+    res.status(200).json({ url: endpoint.url, livekit_token: minted.jwt, expires_at: minted.expiresAt });
+    return true;
+  }
+
+  /**
+   * Everything a first call decides before the single-use claim (D-S05-5), from the read-only peek
+   * and the new-work gates, so a transient refusal costs neither the ticket nor a start and boots no
+   * worker. Null: the refusal is written.
+   */
+  async function meetBeforeClaim(
+    res: Response,
+    booking: R1MeetTicketBooking,
+  ): Promise<{ round: RoundRow; endpoint: LiveKitEndpoint } | null> {
+    const nowMs = now();
+    if (!(R1_MEET_CLAIMABLE_STATUSES as readonly string[]).includes(booking.status)) {
+      refuse(res, 409, 'round_not_live');
+      return null;
+    }
+    if (nowMs < booking.ticketNotBeforeMs) {
+      refuse(res, 425, 'ticket_not_yet_valid');
+      return null;
+    }
+    if (nowMs >= booking.ticketExpiresAtMs) {
+      refuse(res, 410, 'ticket_expired');
+      return null;
+    }
+    // The ticket authenticated: only now may the switches be reported (invariant 1).
+    if (!enabledOr409(res)) return null;
+    const round = await liveMeetRound(res, booking.roundId);
+    if (!round) return null;
+    if (!meetProfileFor(res, booking.objectiveProfile)) return null;
+    const endpoint = await meetNewWork(res);
+    if (!endpoint) return null;
+    if (!(await consentStillGranted(res, round))) return null;
+    return { round, endpoint };
+  }
+
+  /**
+   * A first call: the gates, the claim, the session (continued or admitted) and its bind. It never
+   * waits for a worker: a session that is not `in_progress` yet is answered 202 here, because the
+   * ticket is now spent and an answer lost on the wire could only be repeated with the resume token
+   * this 202 carries. The room, the worker gate and the token follow on the resumed call.
+   */
+  async function meetFirstExchange(
+    req: Request,
+    res: Response,
+    call: MeetCall,
+    booking: R1MeetTicketBooking,
+    digest: string,
+  ): Promise<void> {
+    if (booking.ticketClaimedAtMs !== null) {
+      meetTicketReplayed(res);
+      return;
+    }
+    const open = await meetBeforeClaim(res, booking);
+    if (!open) {
+      meetRefused(res);
+      return;
+    }
+    const { round, endpoint } = open;
+
+    // From here on a 503 carries no hint: a page that asked again would present a spent ticket.
+    call.unspent = false;
+    const claimed = await claimR1MeetTicket(db, digest, new Date(now()).toISOString());
+    if (claimed.kind === 'refused') {
+      if (claimed.reason === 'ticket_already_claimed') {
+        meetTicketReplayed(res);
+        return;
+      }
+      const refusal = MEET_CLAIM_REFUSALS[claimed.reason];
+      if (refusal) {
+        meetRefuse(res, refusal.status, refusal.error);
+        return;
+      }
+    }
+    if (claimed.kind !== 'ok' || claimed.binding.bookingId !== booking.id || claimed.binding.roundId !== round.id) {
+      log.error('unknown_event', { error_category: 'r1_meet_claim_failed' });
+      refuse(res, 503, 'service_unavailable');
+      return;
+    }
+    const binding = claimed.binding;
+    const profile = meetProfileFor(res, binding.objectiveProfile);
+    if (!profile) return;
+
+    const started = await meetStart(req, res, binding, round);
+    if (!started) return;
+    if (started.row?.status === 'in_progress') {
+      await meetJoin(res, { bookingId: binding.bookingId, round, session: started.row, profile, endpoint });
+      return;
+    }
+    meetPreparing(res, binding.bookingId, started.id);
+  }
+
+  /** The gates of a resume, for the session the booking holds. Null: the refusal is written. */
+  async function meetBeforeResume(
+    res: Response,
+    booking: R1MeetTicketBooking,
+    sessionId: string,
+  ): Promise<MeetJoin | null> {
+    if (!enabledOr409(res)) return null;
+    const round = await liveMeetRound(res, booking.roundId);
+    if (!round) return null;
+    const profile = meetProfileFor(res, booking.objectiveProfile);
+    if (!profile) return null;
+    const loaded = await loadSession(db, sessionId);
+    if (!loaded.ok) {
+      refuse(res, 503, 'service_unavailable');
+      return null;
+    }
+    if (!meetSessionUsable(loaded.value, round)) {
+      refuse(res, 409, 'round_not_live');
+      return null;
+    }
+    const session = loaded.value;
+    let endpoint: LiveKitEndpoint | null = null;
+    if (session.status === 'created') {
+      // Still a new start: every gate that guards new R1 compute applies again.
+      endpoint = await meetNewWork(res);
+      if (!endpoint) return null;
+    }
+    if (!(await consentStillGranted(res, round))) return null;
+    return { bookingId: booking.id, round, session, profile, endpoint };
+  }
+
+  /**
+   * A retry after a 202 (D-S05-8): `{ ticket, resume_token }` continues the SAME booking and its
+   * bound session. No claim and no admission: the gates again by session status (S04 review
+   * entry), then the join. The token names no id; it is verified against the booking the ticket
+   * digest found and the session that booking holds.
+   */
+  async function meetResume(res: Response, booking: R1MeetTicketBooking, resumeToken: string): Promise<void> {
+    if (booking.ticketClaimedAtMs === null || booking.sessionId === null) {
+      refuse(res, 404, 'ticket_unknown');
+      return;
+    }
+    if (booking.status !== 'in_call') {
+      meetRefuse(res, 409, 'round_not_live');
+      return;
+    }
+    const verdict = verifyR1MeetResumeToken(
+      resumeToken,
+      { bookingId: booking.id, sessionId: booking.sessionId },
+      now(),
+    );
+    if (verdict === 'invalid') {
+      log.warn('unknown_event', { error_category: 'r1_meet_resume_invalid' });
+      refuse(res, 404, 'ticket_unknown');
+      return;
+    }
+    if (verdict === 'expired' || now() >= booking.ticketExpiresAtMs) {
+      meetRefuse(res, 410, 'ticket_expired');
+      return;
+    }
+    const join = await meetBeforeResume(res, booking, booking.sessionId);
+    if (!join || !(await meetJoin(res, join))) meetRefused(res);
+  }
+
+  router.post('/meet/exchange', meetExchangeOn, route(async (req, res) => {
+    const call: MeetCall = { unspent: true, refusal: null };
+    res.locals.meetCall = call;
+    const parsed = r1MeetExchangeSchema.safeParse(req.body);
+    if (!parsed.success) {
+      refuse(res, 400, 'invalid_request');
+      return;
+    }
+    const body = parsed.data;
+    // The ticket digest and the resume token are keyed from the worker secret: none, no bridge.
+    if (!r1MeetBridgeKeysConfigured()) {
+      refuse(res, 503, 'r1_unavailable');
+      return;
+    }
+    const digest = r1MeetTicketDigest(body.ticket);
+    if (digest === null) {
+      refuse(res, 503, 'r1_unavailable');
+      return;
+    }
+    const peeked = await peekR1MeetTicket(db, digest);
+    if (peeked.kind === 'error') {
+      meetRefuse(res, 503, 'service_unavailable');
+      return;
+    }
+    if (peeked.kind === 'unknown') {
+      refuse(res, 404, 'ticket_unknown');
+      return;
+    }
+    if (body.resume_token !== undefined) await meetResume(res, peeked.booking, body.resume_token);
+    else await meetFirstExchange(req, res, call, peeked.booking, digest);
   }));
 
   return router;

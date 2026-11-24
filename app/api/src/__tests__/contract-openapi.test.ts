@@ -778,7 +778,11 @@ describe('OpenAPI document integrity', () => {
     // (the admin's per-mapping switch). 182 + 4 = 186.
     // M034 S03 adds TWO pre-auth Recall webhook paths (bot status and real-time participant events;
     // inline bodies, no new schema). 186 + 2 = 188.
-    expect(Object.keys(paths).length).toBe(188);
+    // M034 S05 adds ONE public candidate path: POST /api/r1/meet/exchange (inline bodies, no new
+    // schema). 188 + 1 = 189.
+    // M034 S05 adds TWO staff reads: GET /api/interview-rounds/meet-bookings and GET
+    // /api/interview-rounds/meet-bookings/{id} (viewer+, inline bodies, no new schema). 189 + 2 = 191.
+    expect(Object.keys(paths).length).toBe(191);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1320,6 +1324,8 @@ describe('auth boundary vs spec security model', () => {
     'POST /api/r1/attempts',
     'POST /api/r1/exchange',
     'POST /api/r1/ready',
+    // M034 S05 (dark): the Meet bridge exchange authenticates inline with its single-use ticket.
+    'POST /api/r1/meet/exchange',
   ]);
   const grantAuthenticatedPattern = /^POST \/api\/livekit\/\{sessionId\}\/(recording|complete)$/;
 
