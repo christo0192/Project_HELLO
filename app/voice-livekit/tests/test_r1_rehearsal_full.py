@@ -1059,6 +1059,9 @@ class CandidateSimTests(unittest.TestCase):
         sim = _sim(talker=talker)
         action = asyncio.run(sim.next_action(_view("opening", [hello, agenda])))
         self.assertEqual((action.kind, action.act, action.text), ("speak", "icebreaker_answer", "answer 1"))
+        self.assertNotEqual(action.act, "sound_check_answer")
+        self.assertEqual(talker.answers, 1)
+        self.assertEqual(len(sim._ib_questions), 1)
 
     def test_the_w4_opening_gets_an_icebreaker_answer_not_a_yes(self) -> None:
         # Owner 2026-11-24 (R1_AGENDA_W4): the first question now ends in "?".
