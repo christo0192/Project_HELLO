@@ -303,6 +303,13 @@ class UnknownNameTests(unittest.TestCase):
                 "Thanks for walking me through that. Next, let's do a sales"
             ),
             "L-TRANSITION-THANKS-C-W2": "Got it, thank you. Next, let's do a sales role-play.",
+            # Owner 2026-11-24 (R1_SPOKEN_LINES): the spoken briefs.
+            "L-TRANSITION-SP": "Thank you. Next, let's do a sales role-play. I'll play",
+            "L-TRANSITION-THANKS-A-SP": "Thanks. Next, let's do a sales role-play.",
+            "L-TRANSITION-THANKS-B-SP": (
+                "Thanks for walking me through that. Next, let's do a sales"
+            ),
+            "L-TRANSITION-THANKS-C-SP": "Got it, thank you. Next, let's do a sales role-play.",
             "L-CLOSE": (
                 "Thank you for your time today. The hiring team will review your interview and "
                 "get back to you. You can close this window now. Goodbye."
@@ -574,8 +581,10 @@ class TransitionRepairLineTests(unittest.TestCase):
                 self.assertEqual(r1_script.active_line_id(line_id), old)
             self.assertEqual(r1_script.active_line_id("L-WRAP"), "L-WRAP")
         for value in ("1", "on", "", "yes"):
+            # R1_SPOKEN_LINES=0: the S6 ids themselves (the spoken -SP ids are SpokenLinesTests').
             with mock.patch.dict(
-                os.environ, {"R1_TRANSITION_REPAIR": value, "R1_BRIEF_WORDING_V2": "0"}
+                os.environ,
+                {"R1_TRANSITION_REPAIR": value, "R1_BRIEF_WORDING_V2": "0", "R1_SPOKEN_LINES": "0"},
             ):
                 self.assertTrue(r1_script.transition_repair_enabled())
                 for line_id in r1_script.ROLLBACK_LINES:
@@ -800,7 +809,8 @@ class TestDiagnosis4Wording(unittest.TestCase):
         # D5-AGENDA1: the agendas' W2 text is what R1_AGENDA_W3=0 speaks.
         for line_id, reworded in r1_script.WORDING_LINES.items():
             with self.subTest(line_id=line_id):
-                with mock.patch.dict(os.environ, {"R1_AGENDA_W3": "0"}):
+                # R1_SPOKEN_LINES=0: the W2 ids themselves (SpokenLinesTests has the -SP ids).
+                with mock.patch.dict(os.environ, {"R1_AGENDA_W3": "0", "R1_SPOKEN_LINES": "0"}):
                     self.assertEqual(r1_script.active_line_id(line_id), reworded)
                 with mock.patch.dict(os.environ, {"R1_BRIEF_WORDING_V2": "0"}):
                     self.assertEqual(r1_script.active_line_id(line_id), line_id)
@@ -901,6 +911,7 @@ class TestMeetLines(unittest.TestCase):
     )
     ROUTING_FLAGS = (
         "R1_TRANSITION_REPAIR", "R1_BRIEF_WORDING_V2", "R1_AGENDA_W3", "R1_TRANSITION_PRESENCE_V2",
+        "R1_SPOKEN_LINES",
     )
     OPENINGS = ("L-OPEN", "L-OPEN-HELLO", "L-OPEN-HI")
     # The sound check's repeat after "I can't hear you": the disclosure again (review S08-2).
@@ -970,6 +981,8 @@ class TestMeetLines(unittest.TestCase):
         # Revision 52 ADDED the W4 agenda ids (R1_AGENDA_W4); leaving them out keeps the proof
         # that no line that existed on 5ec8b11a changed.
         added_ids = set(r1_script.AGENDA_W4_LINES.values())
+        # Revision 54 ADDED the spoken -SP ids (R1_SPOKEN_LINES); no existing text changed.
+        added_ids |= set(r1_script.SPOKEN_LINES.values())
         browser = {
             key: text for key, text in LINES.items() if key not in meet_ids | added_ids
         }
@@ -995,7 +1008,9 @@ class TestMeetLines(unittest.TestCase):
 
     def test_the_map_is_disjoint_from_the_other_routing_maps(self):
         touched = set(r1_script.MEET_LINES) | set(r1_script.MEET_LINES.values())
-        for name in ("ROLLBACK_LINES", "WORDING_LINES", "AGENDA_W3_LINES", "VARIETY_LINES"):
+        for name in (
+            "ROLLBACK_LINES", "WORDING_LINES", "AGENDA_W3_LINES", "VARIETY_LINES", "SPOKEN_LINES",
+        ):
             other = getattr(r1_script, name)
             with self.subTest(other=name):
                 self.assertEqual(touched & (set(other) | set(other.values())), set())
@@ -1167,3 +1182,478 @@ class TestOwnerAgendaW4(unittest.TestCase):
                     self.assertEqual(r1_script.active_line_id(line_id), line_id + "-W2")
                 with mock.patch.dict(os.environ, {"R1_BRIEF_WORDING_V2": "0"}):
                     self.assertEqual(r1_script.active_line_id(line_id), line_id)
+
+
+class SpokenLinesTests(unittest.TestCase):
+    """Owner 2026-11-24 (``R1_SPOKEN_LINES``, content revision 54): every scripted line in the
+    spoken style the owner picked by ear for the W4 agenda ("dont make it to open wording only.
+    apply this fix for all scripted line as all of the scripted ones are sounding the same way").
+
+    Spoken sentences (never over 25 words), no colon lists, semicolons, dashes or parentheses, and
+    a question only as the last thing said.  Every fact, placeholder, cue phrase and consent
+    meaning is kept.  The -SP ids are new and chosen after every older routing flag, so no existing
+    text changes and ``R1_SPOKEN_LINES=0`` speaks revision 53's texts byte for byte.
+    """
+
+    # sha256 of the canonical JSON of {id: line(active_line_id(id), **values)} over the 125 ids on
+    # 50b4e882 (content revision 53): default flags (Dex), persona p1_career_switcher v1, first name
+    # Asha.  ``R1_SPOKEN_LINES=0`` gives it back exactly.
+    ROLLBACK_DIGEST = "3ac26527c6528b9e9231cd4f66a8a210d4dc31553002f4e7191c014265602130"
+    PRE_EXISTING = 125
+    BODY = (
+        "Next, let's do a sales role-play. I'll play {lead_name} from {lead_city}. She filled in a "
+        "form on our website about the Data Science course a few days ago. You're the Program "
+        "Advisor calling her back. You'll have up to twenty minutes. Treat it like a real call. "
+        "Your goal is to understand her needs and help her decide to enrol. Use the course details "
+        "from your preparation guide. I'll stay in character until I say, 'Let's pause the "
+        "role-play here.' When you want to begin, just say 'ready', and she'll pick up. Any "
+        "questions before we start?"
+    )
+    SCENARIO = BODY.removeprefix("Next, let's do a sales role-play. ")
+    # The reviewed wording, word for word, as written in LINES (Christy; DEX_LINES swaps the name).
+    SPOKEN = {
+        "L-TRANSITION-SP": "Thank you, {first_name}. " + BODY,
+        "L-TRANSITION-THANKS-A-SP": "Thanks, {first_name}. " + BODY,
+        "L-TRANSITION-THANKS-B-SP": "Thanks for walking me through that, {first_name}. " + BODY,
+        "L-TRANSITION-THANKS-C-SP": "Got it, thank you, {first_name}. " + BODY,
+        "L-TRANSITION-BRIDGED-SP": BODY,
+        "L-TRANSITION-AGAIN-SP": "Of course, here it is again. " + SCENARIO,
+        "L-TRANSITION-AGAIN-PLAIN-SP": (
+            "Sure. Think of it as a real sales call. I'll play {lead_name} from {lead_city}. She "
+            "filled in a form about our Data Science course, and you're the Program Advisor "
+            "calling her back. Find out what she needs, and help her decide to enrol. Use your "
+            "preparation guide. You'll have up to twenty minutes. I'll stay in character until I "
+            "say, 'Let's pause the role-play here.' Whenever you're ready, just say 'ready'."
+        ),
+        "L-TRANSITION-RECAP-SP": (
+            "Of course. In short, I'll play {lead_name}. You're the Program Advisor, calling her "
+            "back about the Data Science course. Understand her needs and help her decide to "
+            "enrol, using your preparation guide. Would you like to begin now, or ask me something "
+            "first?"
+        ),
+        "L-TRANSITION-RECAP-2-SP": (
+            "No problem, here's the short version. You're calling {lead_first_name} back about the "
+            "Data Science course she asked about. Understand what she needs and help her decide. "
+            "Say 'ready' when you'd like to start."
+        ),
+        "L-RP-GOAL-SP": (
+            "Treat it like a real call. Understand what she needs, and help her decide to enrol."
+        ),
+        "L-RP-STUCK-SP": (
+            "Just carry on the way you would on a real call. I'll stay in character."
+        ),
+        "L-TRANSITION-ASK-PAUSE-SP": (
+            "If that covers everything, just say 'ready' whenever you like. Shall we begin the "
+            "role-play?"
+        ),
+        "L-TRANSITION-REASK-SP": (
+            "Just say 'ready' when you are, or ask me a question first. Shall we start the "
+            "role-play now?"
+        ),
+        "L-TRANSITION-STEER-SP": (
+            "Let's keep any other questions for the end of the interview. There'll be time for "
+            "them then. Shall we start the role-play now?"
+        ),
+        "L-EXIT-SP": (
+            "Let's pause the role-play here. I'm stepping out of the learner's role now. This is "
+            "Christy, your interviewer, again. Thank you, that's the end of the role-play."
+        ),
+        "L-ASIDE-COACH-SP": (
+            "Quick note from Christy, your interviewer. In this role-play, you're the Program "
+            "Advisor. I'm playing the learner, {lead_name}, who enquired about the Data Science "
+            "course. You're calling her back. Please carry on as you would on a real call."
+        ),
+        "L-ASIDE-END-2-SP": (
+            "This is Christy, your interviewer. If you want to keep going, just carry on with "
+            "{lead_first_name}. Would you like to stop the role-play here and finish the interview?"
+        ),
+        "L-ASIDE-WRAP-SP": (
+            "This is Christy, your interviewer, stepping in for a moment. We're well into the "
+            "role-play now. If you'd rather keep going, just carry on with {lead_first_name}. "
+            "Would you like to wrap it up here?"
+        ),
+        "L-ASIDE-WRAP-AGAIN-SP": (
+            "Christy again, just checking in. If you'd like to keep going, just carry on with "
+            "{lead_first_name}. Would you like to wrap up the role-play here?"
+        ),
+        # Either/or on purpose: the engine reads a bare "yes" to the early-close question as unclear
+        # (review S3R-2) and asks once more, so a yes/no question here would ask "Would you like to
+        # stop?" again after a "Yes."; L-ASIDE-EARLY-CLOSE-2 is either/or for the same reason.
+        "L-ASIDE-EARLY-CLOSE-SP": (
+            "This is Christy, stepping in for a moment. It sounds like you're wrapping up the call "
+            "with {lead_first_name}. Would you like to keep going with her, or stop the role-play "
+            "here?"
+        ),
+        "L-ASIDE-EARLY-CLOSE-TIME-SP": (
+            "This is Christy, stepping in for a moment. It sounds like you're wrapping up the call "
+            "with {lead_first_name}. We still have some time for the role-play. Would you like to "
+            "keep going with her, or stop the role-play here?"
+        ),
+    }
+    # Keyed by the id ``active_line_id`` selects today (the briefs' W2 ids, L-ASIDE-END-2).
+    MAP = {
+        "L-TRANSITION-W2": "L-TRANSITION-SP",
+        "L-TRANSITION-THANKS-A-W2": "L-TRANSITION-THANKS-A-SP",
+        "L-TRANSITION-THANKS-B-W2": "L-TRANSITION-THANKS-B-SP",
+        "L-TRANSITION-THANKS-C-W2": "L-TRANSITION-THANKS-C-SP",
+        "L-TRANSITION-BRIDGED-W2": "L-TRANSITION-BRIDGED-SP",
+        "L-TRANSITION-AGAIN-W2": "L-TRANSITION-AGAIN-SP",
+        "L-TRANSITION-AGAIN-PLAIN": "L-TRANSITION-AGAIN-PLAIN-SP",
+        "L-TRANSITION-RECAP": "L-TRANSITION-RECAP-SP",
+        "L-TRANSITION-RECAP-2": "L-TRANSITION-RECAP-2-SP",
+        "L-RP-GOAL": "L-RP-GOAL-SP",
+        "L-RP-STUCK": "L-RP-STUCK-SP",
+        "L-TRANSITION-ASK-PAUSE": "L-TRANSITION-ASK-PAUSE-SP",
+        "L-TRANSITION-REASK": "L-TRANSITION-REASK-SP",
+        "L-TRANSITION-STEER": "L-TRANSITION-STEER-SP",
+        "L-EXIT": "L-EXIT-SP",
+        "L-ASIDE-COACH": "L-ASIDE-COACH-SP",
+        "L-ASIDE-END-2": "L-ASIDE-END-2-SP",
+        "L-ASIDE-WRAP": "L-ASIDE-WRAP-SP",
+        "L-ASIDE-WRAP-AGAIN": "L-ASIDE-WRAP-AGAIN-SP",
+        "L-ASIDE-EARLY-CLOSE": "L-ASIDE-EARLY-CLOSE-SP",
+        "L-ASIDE-EARLY-CLOSE-TIME": "L-ASIDE-EARLY-CLOSE-TIME-SP",
+    }
+    BRIEFS = (
+        "L-TRANSITION-W2", "L-TRANSITION-THANKS-A-W2", "L-TRANSITION-THANKS-B-W2",
+        "L-TRANSITION-THANKS-C-W2", "L-TRANSITION-BRIDGED-W2", "L-TRANSITION-AGAIN-W2",
+    )
+    NAMED = (
+        "L-EXIT-SP", "L-ASIDE-COACH-SP", "L-ASIDE-END-2-SP", "L-ASIDE-WRAP-SP",
+        "L-ASIDE-WRAP-AGAIN-SP", "L-ASIDE-EARLY-CLOSE-SP", "L-ASIDE-EARLY-CLOSE-TIME-SP",
+    )
+    # Callers that are spoken only behind a non-default flag (their texts are left as they are).
+    FLAG_OFF_ONLY = {
+        "L-OPEN": "R1_OPENING_SOUND_CHECK=0",
+        "L-ASIDE-END": "R1_END_ASIDE_V2=0",
+        "L-ASIDE-LAST-POINT": "R1_LAST_POINT_V2=0",
+    }
+    # Spoken by default, outside this change: the role-play's "Hello? Are you still there?" call,
+    # and L-FAQ-DEFER (r1_world.INTERVIEWER_DEFLECTION, in the world canonical; deferred).
+    EXEMPT = ("L-SIL-RP1", "L-FAQ-DEFER")
+    # Facts and cue phrases a pair must say exactly as often.
+    KEPT = (
+        "'ready'", EXIT_CUE, "Program Advisor", "up to twenty minutes", "preparation guide",
+        "Data Science course", "hiring team", "AI interviewer", "Interview Kickstart", "recorded",
+        "Christy",
+    )
+    OFF = ("0", "off", "false", "no", " OFF ")
+
+    @staticmethod
+    def values(persona_id: str = "p1_career_switcher", variant: str = "v1") -> dict[str, str]:
+        return {**resolve_persona(persona_id, variant=variant).line_values, "first_name": "Asha"}
+
+    @staticmethod
+    def words(text: str) -> int:
+        """Words, with each placeholder counted as one."""
+        return len(re.sub(r"\{[a-z_]+\}", "X", text).split())
+
+    @staticmethod
+    def sentences(text: str) -> list[str]:
+        """Sentences, a quoted cue's closing quote kept with its sentence."""
+        return [part for part in re.split(r"(?<=[.?!])\s+|(?<=[.?!]')\s+", text) if part]
+
+    def style_problems(self, text: str) -> list[str]:
+        problems = [mark for mark in (":", ";", " - ", "–", "—", "(") if mark in text]
+        problems += [
+            f"{len(part.split())} words: {part}"
+            for part in self.sentences(text)
+            if len(part.split()) > 25
+        ]
+        if "?" in text and not text.endswith("?"):
+            problems.append("a question that is not the last thing said")
+        if text.count("?") > 1:
+            problems.append("two questions")
+        return problems
+
+    @staticmethod
+    def targets() -> set[str]:
+        maps = (
+            r1_script.ROLLBACK_LINES, r1_script.WORDING_LINES, r1_script.AGENDA_W3_LINES,
+            r1_script.AGENDA_W4_LINES, r1_script.VARIETY_LINES, r1_script.MEET_LINES,
+            r1_script.SPOKEN_LINES,
+        )
+        return set().union(*(set(item.values()) for item in maps))
+
+    def callers(self) -> list[str]:
+        """The ids a default session names (each routed target is reached through its caller)."""
+        targets = self.targets()
+        return [i for i in LINES if i not in targets and i not in self.FLAG_OFF_ONLY]
+
+    @staticmethod
+    def selected(line_id: str) -> str:
+        """What ``active_line_id`` picks with the spoken lines off (the other flags as they are)."""
+        with mock.patch.dict(os.environ, {"R1_SPOKEN_LINES": "0"}):
+            return r1_script.active_line_id(line_id)
+
+    def test_the_texts_word_for_word(self) -> None:
+        self.assertEqual(r1_script.SPOKEN_LINES, self.MAP)
+        self.assertEqual(set(self.SPOKEN), set(r1_script.SPOKEN_LINES.values()))
+        for line_id, text in self.SPOKEN.items():
+            with self.subTest(line=line_id):
+                self.assertEqual(LINES[line_id], text)
+        self.assertEqual(r1_script.BRIEF_BODY_SP, self.BODY)
+        self.assertEqual(r1_script.BRIEF_SCENARIO_SP, self.SCENARIO)
+        self.assertEqual(
+            r1_script.BRIEF_START_PROMPT_SP,
+            "When you want to begin, just say 'ready', and she'll pick up. Any questions before we "
+            "start?",
+        )
+
+    def test_default_on_and_the_rollback(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(r1_script.spoken_lines_enabled())
+            for line_id in LINES:
+                with self.subTest(line=line_id):
+                    chosen = self.selected(line_id)
+                    self.assertEqual(
+                        r1_script.active_line_id(line_id),
+                        r1_script.SPOKEN_LINES.get(chosen, chosen),
+                    )
+            self.assertEqual(r1_script.active_line_id("L-TRANSITION"), "L-TRANSITION-SP")
+            self.assertEqual(r1_script.active_line_id("L-ASIDE-COACH"), "L-ASIDE-COACH-SP")
+        for value in self.OFF:
+            with self.subTest(value=value), mock.patch.dict(
+                os.environ, {"R1_SPOKEN_LINES": value}, clear=True
+            ):
+                self.assertFalse(r1_script.spoken_lines_enabled())
+                self.assertEqual(r1_script.active_line_id("L-TRANSITION"), "L-TRANSITION-W2")
+                for key in r1_script.SPOKEN_LINES:
+                    self.assertEqual(r1_script.active_line_id(key), key)
+        # Applied after the older routing: each older rollback still speaks its own text.
+        with mock.patch.dict(os.environ, {"R1_TRANSITION_REPAIR": "0"}, clear=True):
+            self.assertEqual(r1_script.active_line_id("L-TRANSITION"), "L-TRANSITION-V20")
+            self.assertEqual(r1_script.active_line_id("L-ASIDE-COACH"), "L-ASIDE-COACH-V20")
+        with mock.patch.dict(os.environ, {"R1_BRIEF_WORDING_V2": "0"}, clear=True):
+            self.assertEqual(r1_script.active_line_id("L-TRANSITION"), "L-TRANSITION")
+            self.assertEqual(r1_script.active_line_id("L-TRANSITION-AGAIN"), "L-TRANSITION-AGAIN")
+        # A raw id still renders its own text: only the choice of id changes.
+        values = self.values()
+        with mock.patch.dict(os.environ, {}, clear=True):
+            for key, spoken in r1_script.SPOKEN_LINES.items():
+                with self.subTest(key=key):
+                    self.assertEqual(
+                        line(key, **values), LINES[key].replace("Christy", "Dex").format(**values)
+                    )
+                    self.assertNotEqual(line(key, **values), line(spoken, **values))
+
+    def test_the_rollback_is_byte_for_byte(self) -> None:
+        values = self.values()
+        old_ids = [i for i in LINES if i not in r1_script.SPOKEN_LINES.values()]
+        self.assertEqual(len(old_ids), self.PRE_EXISTING)
+
+        def rendered(env: dict[str, str]) -> dict[str, str]:
+            with mock.patch.dict(os.environ, env, clear=True):
+                return {i: line(r1_script.active_line_id(i), **values) for i in old_ids}
+
+        def digest(table: dict[str, str]) -> str:
+            canonical = json.dumps(table, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+            return hashlib.sha256(canonical.encode()).hexdigest()
+
+        off, on = rendered({"R1_SPOKEN_LINES": "0"}), rendered({})
+        self.assertEqual(digest(off), self.ROLLBACK_DIGEST)
+        self.assertNotEqual(digest(on), self.ROLLBACK_DIGEST)
+        changed = {i for i in old_ids if on[i] != off[i]}
+        with mock.patch.dict(os.environ, {}, clear=True):
+            expected = {i for i in old_ids if self.selected(i) in r1_script.SPOKEN_LINES}
+        self.assertEqual(changed, expected)
+        self.assertIn("L-TRANSITION-THANKS-A", changed)
+        self.assertNotIn("L-FAQ-DEFER", changed)
+
+    def test_every_default_line_is_spoken_style(self) -> None:
+        for dex in (None, "0"):
+            env = {} if dex is None else {"R1_INTERVIEWER_DEX": dex}
+            with mock.patch.dict(os.environ, env, clear=True):
+                for persona in PERSONAS:
+                    for variant in persona.variants:
+                        values = self.values(persona.id, variant.id)
+                        for line_id in self.callers():
+                            if line_id in self.EXEMPT:
+                                continue
+                            text = line(r1_script.active_line_id(line_id), **values)
+                            with self.subTest(dex=dex, persona=persona.id, line=line_id):
+                                self.assertEqual(self.style_problems(text), [], text)
+        # Not vacuous: with the flag off, the lines that break the style are this change's own.
+        values = self.values()
+        with mock.patch.dict(os.environ, {"R1_SPOKEN_LINES": "0"}, clear=True):
+            failing = {
+                i for i in self.callers()
+                if self.style_problems(line(r1_script.active_line_id(i), **values))
+            }
+            routed = {i for i in self.callers() if self.selected(i) in r1_script.SPOKEN_LINES}
+        self.assertEqual(failing - routed, set(self.EXEMPT))
+        # L-ASIDE-EARLY-CLOSE passed already; it is reworded with its -TIME twin.
+        self.assertEqual(routed - failing, {"L-ASIDE-EARLY-CLOSE"})
+
+    def test_each_pair_keeps_its_facts_placeholders_and_cacheability(self) -> None:
+        for dex in (None, "1", "0"):
+            env = {} if dex is None else {"R1_INTERVIEWER_DEX": dex}
+            with mock.patch.dict(os.environ, env, clear=True):
+                for base, spoken in r1_script.SPOKEN_LINES.items():
+                    with self.subTest(dex=dex, line=base):
+                        self.assertEqual(placeholders(spoken), placeholders(base))
+                        self.assertEqual(is_candidate_free(spoken), is_candidate_free(base))
+                        self.assertEqual(spoken in NAME_FREE_LINES, base in NAME_FREE_LINES)
+                        self.assertEqual(
+                            spoken in CANDIDATE_FREE_LINES, base in CANDIDATE_FREE_LINES
+                        )
+                        self.assertEqual(
+                            spoken in r1_script.DEX_LINES, base in r1_script.DEX_LINES
+                        )
+                        for kept in self.KEPT:
+                            self.assertEqual(
+                                LINES[spoken].count(kept), LINES[base].count(kept), kept
+                            )
+
+    def test_the_briefs_keep_every_fact_and_end_on_the_any_questions_prompt(self) -> None:
+        lead_in = "Next, let's do a sales role-play. "
+        for base in self.BRIEFS:
+            spoken = r1_script.SPOKEN_LINES[base]
+            text = LINES[spoken]
+            with self.subTest(line=spoken):
+                # ``r1_session._ANY_QUESTIONS_BRIEFS``: a bare "yes" is invited, a "no" nudged.
+                self.assertTrue(text.endswith("Any questions before we start?"))
+                self.assertIn(r1_script.BRIEF_GOAL, text)
+                self.assertEqual(text.count("just say 'ready'"), 1)
+                self.assertNotIn("If not", text)
+                for kept in (
+                    "{lead_name}", "{lead_city}", "Data Science course", "calling her back",
+                    "help her decide to enrol", "course details from your preparation guide",
+                    f"'{EXIT_CUE}'", "she'll pick up", "You'll have up to twenty minutes",
+                ):
+                    self.assertIn(kept, text)
+                # The thanks (or the replay's lead-in) is the base's, word for word.
+                self.assertEqual(
+                    text.split("I'll play")[0].replace(lead_in, ""),
+                    LINES[base].split("I'll play")[0].replace(lead_in, ""),
+                )
+                self.assertLessEqual(self.words(text), 105)
+        self.assertNotIn("thank", LINES["L-TRANSITION-BRIDGED-SP"].lower())
+        longest = 0
+        for persona in PERSONAS:
+            for variant in persona.variants:
+                values = resolve_persona(persona.id, variant=variant.id).line_values
+                for base in self.BRIEFS:
+                    text = line(r1_script.SPOKEN_LINES[base], first_name="Mary-Ann", **values)
+                    longest = max(longest, len(text.split()))
+        self.assertLessEqual(longest, 112)
+
+    def test_the_replay_and_the_recaps(self) -> None:
+        recap = LINES["L-TRANSITION-RECAP-SP"]
+        goal = r1_script.BRIEF_GOAL
+        self.assertTrue(recap.endswith(r1_script.RECAP_START_PROMPT))  # its own either/or
+        self.assertIn(goal[:1].upper() + goal[1:], recap)
+        self.assertLessEqual(self.words(recap), 46)
+        for private in ("$", "7,000", "budget", "husband", "worried", "price"):
+            self.assertNotIn(private, recap)
+        again = LINES["L-TRANSITION-AGAIN-PLAIN-SP"]
+        self.assertTrue(again.startswith("Sure. Think of it as a real sales call. I'll play "))
+        self.assertTrue(again.endswith("just say 'ready'."))
+        self.assertNotIn("?", again)
+        recap_2 = LINES["L-TRANSITION-RECAP-2-SP"]
+        self.assertIn("{lead_first_name}", recap_2)
+        self.assertTrue(recap_2.endswith("Say 'ready' when you'd like to start."))
+        self.assertNotIn("?", recap_2)
+        for persona in PERSONAS:
+            for variant in persona.variants:
+                values = self.values(persona.id, variant.id)
+                brief = line("L-TRANSITION-BRIDGED-SP", **values)
+                with self.subTest(persona=persona.id, variant=variant.id):
+                    # ``full_metrics``: a short brief is under 0.6 of the brief's words.
+                    self.assertLess(
+                        len(line("L-TRANSITION-RECAP-SP", **values).split()),
+                        0.6 * len(brief.split()),
+                    )
+                    # D3-BRIEF1: the replay is re-explained, never a brief word for word.
+                    replay = line("L-TRANSITION-AGAIN-PLAIN-SP", **values)
+                    for base in self.BRIEFS:
+                        self.assertNotIn(replay, line(r1_script.SPOKEN_LINES[base], **values))
+
+    def test_the_start_prompts_end_on_their_question(self) -> None:
+        for line_id in (
+            "L-TRANSITION-ASK-PAUSE-SP", "L-TRANSITION-REASK-SP", "L-TRANSITION-STEER-SP",
+        ):
+            text = LINES[line_id]
+            with self.subTest(line=line_id):
+                # A bare "yes" starts (``_YES_NO``), so the yes/no question is said last.
+                self.assertTrue(text.endswith("?"))
+                self.assertEqual(text.count("?"), 1)
+                self.assertNotIn("let's begin", text.lower())
+                self.assertIn(line_id, NAME_FREE_LINES)
+        self.assertIn("'ready'", LINES["L-TRANSITION-ASK-PAUSE-SP"])
+        self.assertIn("'ready'", LINES["L-TRANSITION-REASK-SP"])
+        self.assertNotIn(", or ", LINES["L-TRANSITION-ASK-PAUSE-SP"])
+        self.assertNotIn("hiring team", LINES["L-TRANSITION-STEER-SP"])
+        goal = LINES["L-RP-GOAL-SP"]
+        self.assertLessEqual(len(goal.split()), 20)
+        self.assertNotIn("?", goal)
+
+    def test_the_asides_and_the_exit(self) -> None:
+        exit_line = LINES["L-EXIT-SP"]
+        self.assertTrue(exit_line.startswith(EXIT_CUE + " "))
+        self.assertIn("Christy, your interviewer", exit_line)
+        coach = LINES["L-ASIDE-COACH-SP"]
+        self.assertIn("I'm playing the learner, {lead_name}, who enquired", coach)  # SWEEP-30
+        self.assertNotIn("I'm the learner", coach)
+        # A bare "yes" to these means stop or wrap up, so each ends on that one question.
+        for line_id, question in (
+            ("L-ASIDE-END-2-SP",
+             "Would you like to stop the role-play here and finish the interview?"),
+            ("L-ASIDE-WRAP-SP", "Would you like to wrap it up here?"),
+            ("L-ASIDE-WRAP-AGAIN-SP", "Would you like to wrap up the role-play here?"),
+        ):
+            text = LINES[line_id]
+            with self.subTest(line=line_id):
+                self.assertTrue(text.endswith(question))
+                self.assertNotIn(", or ", text)
+                self.assertIn("carry on with {lead_first_name}", text)
+        self.assertNotEqual(LINES["L-ASIDE-WRAP-SP"], LINES["L-ASIDE-WRAP-AGAIN-SP"])
+        # The early-close question stays either/or (a bare yes is unclear there).
+        for line_id in ("L-ASIDE-EARLY-CLOSE-SP", "L-ASIDE-EARLY-CLOSE-TIME-SP"):
+            self.assertTrue(LINES[line_id].endswith(
+                "Would you like to keep going with her, or stop the role-play here?"
+            ))
+        self.assertIn(
+            "We still have some time for the role-play", LINES["L-ASIDE-EARLY-CLOSE-TIME-SP"]
+        )
+
+    def test_the_map_shape(self) -> None:
+        spoken = r1_script.SPOKEN_LINES
+        self.assertEqual(len(spoken), 21)
+        self.assertEqual(len(set(spoken.values())), len(spoken))
+        others = {
+            name: getattr(r1_script, name)
+            for name in (
+                "ROLLBACK_LINES", "WORDING_LINES", "AGENDA_W3_LINES", "AGENDA_W4_LINES",
+                "VARIETY_LINES", "MEET_LINES",
+            )
+        }
+        with mock.patch.dict(os.environ, {"R1_SPOKEN_LINES": "0"}, clear=True):
+            chosen = {r1_script.active_line_id(i) for i in LINES}
+        for key, value in spoken.items():
+            with self.subTest(line=key):
+                self.assertIn(key, LINES)
+                self.assertIn(value, LINES)
+                self.assertEqual(value, re.sub(r"-W2$", "", key) + "-SP")
+                self.assertNotIn(value, spoken)  # nothing chains
+                self.assertIn(key, chosen)  # a key is what some caller speaks today
+                for name, other in others.items():
+                    # Only reached through this map, after every older one.
+                    self.assertNotIn(value, set(other) | set(other.values()), name)
+        meet = set(r1_script.MEET_LINES) | set(r1_script.MEET_LINES.values())
+        self.assertEqual((set(spoken) | set(spoken.values())) & meet, set())
+        self.assertEqual({i for i in spoken.values() if i in r1_script.DEX_LINES}, set(self.NAMED))
+        with mock.patch.dict(os.environ, {}, clear=True):
+            for line_id in self.NAMED:
+                self.assertIn("Dex", line(line_id, **self.values()))
+                self.assertNotIn("Christy", line(line_id, **self.values()))
+
+    def test_no_spoken_line_names_a_page_a_price_or_a_number(self) -> None:
+        values = self.values()
+        for line_id in r1_script.SPOKEN_LINES.values():
+            text = line(line_id, **values)
+            with self.subTest(line=line_id):
+                self.assertIsNone(TestMeetLines.BANNED.search(text), text)
+                self.assertNotIn("$", text)
+                self.assertNotRegex(text, r"\b\d{2,}\b")
+                self.assertNotIn("{", text)

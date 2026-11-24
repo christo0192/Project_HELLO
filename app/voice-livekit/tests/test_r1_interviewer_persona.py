@@ -1,7 +1,8 @@
 """R1_INTERVIEWER_DEX (owner 2026-11-19): Dex, a male interviewer, in every spoken line.
 
-Pure tests (no livekit): the default renders Dex in exactly the 24 lines that name the interviewer
-(21, plus the three Google Meet openings of M034 S08) and never Christy, the flag off renders content revision 46's Christy texts byte for byte, the
+Pure tests (no livekit): the default renders Dex in exactly the 31 lines that name the interviewer
+(21, plus the three Google Meet openings of M034 S08 and the seven spoken -SP lines of
+R1_SPOKEN_LINES) and never Christy, the flag off renders content revision 46's Christy texts byte for byte, the
 placeholders and cacheability do not change, and the content pin does not depend on the flag.
 It also covers Dex model prompts, agent instructions and voice defaults. No livekit is needed:
 r1_session falls back to Agent = object. Synthetic names only.
@@ -32,7 +33,9 @@ IDS = set('''L-OPEN L-OPEN-HELLO L-OPEN-HI L-EXIT L-ASIDE-COACH L-ASIDE-COACH-V2
 L-ASIDE-END L-ASIDE-WRAP L-ASIDE-EARLY-CLOSE L-ASIDE-EARLY-CLOSE-TIME L-ASIDE-LAST-POINT
 L-EXIT-WRAP L-EXIT-WRAP-2 L-EXIT-WRAP-END L-EXIT-WRAP-TIME L-ASIDE-END-2
 L-ASIDE-EARLY-CLOSE-2 L-ASIDE-WRAP-AGAIN L-MUTE L-MUTE-RP L-SIL-RP2
-L-OPEN-MEET L-OPEN-HELLO-MEET L-OPEN-HI-MEET'''.split())
+L-OPEN-MEET L-OPEN-HELLO-MEET L-OPEN-HI-MEET
+L-EXIT-SP L-ASIDE-COACH-SP L-ASIDE-END-2-SP L-ASIDE-WRAP-SP L-ASIDE-WRAP-AGAIN-SP
+L-ASIDE-EARLY-CLOSE-SP L-ASIDE-EARLY-CLOSE-TIME-SP'''.split())
 VALUES = dict(first_name="Asha", lead_name="Meera Rao", lead_first_name="Meera", lead_city="Pune")
 
 
@@ -60,7 +63,7 @@ class TestInterviewerPersona(unittest.TestCase):
     def test_all_lines_and_flag_combinations(self):
         self.assertEqual(set(r1_script.DEX_LINES), IDS)
         flags = ("R1_TRANSITION_REPAIR", "R1_BRIEF_WORDING_V2", "R1_AGENDA_W3",
-                 "R1_TRANSITION_PRESENCE_V2", "R1_AGENDA_W4")
+                 "R1_TRANSITION_PRESENCE_V2", "R1_AGENDA_W4", "R1_SPOKEN_LINES")
         for states in itertools.product("01", repeat=len(flags)):
             with mock.patch.dict(os.environ, dict(zip(flags, states)), clear=True):
                 for ident in r1_script.LINES:

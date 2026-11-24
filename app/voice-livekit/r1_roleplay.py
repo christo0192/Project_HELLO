@@ -4152,9 +4152,11 @@ class RolePlayEngine:
             TurnMode.SAY_ONLY,
             ["aside_end_request"] + (["end_intent_model"] if by_model else []),
             # D3-ASIDE1 (a) (R1_END_ASIDE_V2): a yes/no question instead of the magic phrase; the
-            # line id (and its answer handling: a settled bare yes confirms) is unchanged.
+            # line id (and its answer handling: a settled bare yes confirms) is unchanged.  Owner
+            # 2026-11-24 (R1_SPOKEN_LINES): rendered through ``active_line_id``, like the session's
+            # ``render_line``, so the warmed clip and the quoted question are what is spoken.
             scripted=script_line(
-                END_ASIDE_TEXT_V2 if flag_on(FLAG_END_ASIDE_V2) else "L-ASIDE-END",
+                active_line_id(END_ASIDE_TEXT_V2 if flag_on(FLAG_END_ASIDE_V2) else "L-ASIDE-END"),
                 **self.persona.line_values,
             ),
             voice="interviewer",
@@ -4376,7 +4378,7 @@ class RolePlayEngine:
         pair = FLOOR_YIELD_SORRY_LINES if cut or live else FLOOR_YIELD_LINES
         line_id = pick_variant(pair, self.seed, self._floor_yields - 1)
         reasons.append("floor_yield")
-        return self._plan(TurnMode.SAY_ONLY, reasons, scripted=script_line(line_id))
+        return self._plan(TurnMode.SAY_ONLY, reasons, scripted=script_line(active_line_id(line_id)))
 
     def _winding_plan(self, reasons: list[str]) -> TurnPlan:
         """S3.2: the advisor is closing the call: one short, warm goodbye in her own words."""
@@ -5415,11 +5417,16 @@ class RolePlayEngine:
         return self._wrap_line_plan(line_id, reasons)
 
     def _wrap_line_plan(self, line_id: str | None, reasons: list[str]) -> TurnPlan:
-        """An interviewer aside of the offer (``line_id`` None: nothing is said, the turn waits)."""
+        """An interviewer aside of the offer (``line_id`` None: nothing is said, the turn waits).
+
+        Owner 2026-11-24 (R1_SPOKEN_LINES): the text is ``active_line_id``'s, as the session's
+        ``render_line`` warms and quotes it; the plan's ``line_id`` (the marker) is the caller's.
+        """
+        spoken = None if line_id is None else active_line_id(line_id)
         return self._plan(
             TurnMode.SAY_ONLY,
             reasons,
-            scripted="" if line_id is None else script_line(line_id, **self.persona.line_values),
+            scripted="" if spoken is None else script_line(spoken, **self.persona.line_values),
             voice="interviewer",
             aside=True,
             line_id=line_id,
@@ -6692,7 +6699,10 @@ class RolePlayEngine:
             reasons.append(f"redirect_probe:{probe.family}")
             self._redirect_probes += 1
             return self._plan(
-                TurnMode.SAY_ONLY, reasons, scripted=script_line(line_id), probe=probe.family
+                TurnMode.SAY_ONLY,
+                reasons,
+                scripted=script_line(active_line_id(line_id)),
+                probe=probe.family,
             )
         text = move.text
         if move.id == F1_ANCHOR:

@@ -11261,9 +11261,11 @@ class TestTransitionConsent(R1TestCase):
         run = await self.start_interview()
         await self.advance_to_transition(run)
         brief = self.spoken_line("L-TRANSITION")
-        # D4-BRIEF2 (R1_BRIEF_WORDING_V2): one start prompt, no instruction before a question.
+        # D4-BRIEF2 (R1_BRIEF_WORDING_V2): one start prompt.  Owner 2026-11-24 (R1_SPOKEN_LINES):
+        # the instruction first and the question last.
         self.assertTrue(brief.endswith(
-            "Any questions before we start? If not, just say 'ready' and she'll pick up."
+            "When you want to begin, just say 'ready', and she'll pick up. Any questions before we "
+            "start?"
         ))
         agent = R1Agent(run.interview)
         for text in (

@@ -426,7 +426,10 @@ import r1_world
 # 53: owner 2026-11-24 (R1_CALLBACK_AFTER_PRESSURE, R1_IK_OFFERS): the callback lines, own slots
 #    and notes after the WEAK line to a pressured advisor; the judge's IK offers sentence and the
 #    paid add-on readers; world revision 5 (IK_OFFERS_RULE, documentation only).
-CONTENT_REVISION = 53
+# 54: owner 2026-11-24 (R1_SPOKEN_LINES): spoken -SP variants of the brief, replay, recaps, start
+#    prompts, two field answers, the coach/end/wrap/early-close asides and L-EXIT
+#    (r1_script.SPOKEN_LINES); no existing text changed.
+CONTENT_REVISION = 54
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -903,6 +906,8 @@ def manifest() -> dict[str, Any]:
             "meet_lines": dict(r1_script.MEET_LINES),
             # Revision 52 (R1_AGENDA_W4).
             "agenda_w4_lines": dict(r1_script.AGENDA_W4_LINES),
+            # Revision 54 (R1_SPOKEN_LINES).
+            "spoken_lines": dict(r1_script.SPOKEN_LINES),
             "transition_quiet_fallback": r1_script.TRANSITION_QUIET_FALLBACK,
             "learner_filler_variants": list(r1_script.LEARNER_FILLER_VARIANTS),
             "learner_filler_short": r1_script.LEARNER_FILLER_SHORT,
