@@ -39,6 +39,8 @@ import type {
 } from '../../src/types';
 import type { R1RecordingPlayback, R1SettingsResponse, R1UsageResponse } from '../../src/lib/r1-types';
 import type { AshbyStageMilestone } from '../../src/lib/ashby-stages';
+import { R1_MEET_BOOKING_STATUSES } from '../../src/lib/r1-meet-bookings-types';
+import type { R1MeetBooking, R1MeetBookingsBody } from '../../src/lib/r1-meet-bookings-types';
 import { ADMIN_USER_ID, PHONE_WINDOW, R1_CANDIDATE_ID, R1_ROUND_ID, SCOPED_REVIEW_LINK_ID, SEEK_ATTEMPT_IDS, STAR_CANDIDATE_ID, funnelSummary, phoneSlots, type Dataset } from './data';
 import { FROZEN_NOW_MS } from './env';
 import { impactCandidates, impactSummary } from './impact';
@@ -87,6 +89,78 @@ function r1QueuePage(query: URLSearchParams, search: string, db: Dataset): MockR
     .sort((a, b) => a.created_at.localeCompare(b.created_at) * (sort === 'oldest' ? 1 : -1));
   const page = Math.min(Number(query.get('page') ?? 1), Math.max(1, Math.ceil(rows.length / size)));
   return ok({ view, sort, page, page_size: size, total: rows.length, rounds: rows.slice((page - 1) * size, page * size), r1_deployed: db.r1.deployed });
+}
+
+/*
+ * Meet bookings (M034 S10), by the API's own rules (app/api/src/routes/r1-meet-bookings.ts and
+ * lib/r1/meet/bookings-read.ts). The query is checked first: an unknown or repeated parameter, a status
+ * outside the twelve, an instant without its zone, a `from` not before `to`, a limit outside 1 to 100 or a
+ * cursor it did not write is a 400 `invalid_query`. Then a server with Meet off answers the empty off body
+ * and reads nothing. Otherwise: status, `from` (inclusive) and `to` (exclusive) on the slot start,
+ * earliest first and then by id, 50 rows unless asked, and an opaque keyset cursor after the last row.
+ * The rows go out as stored, so a spec can slip in a field the API never sends and see the page drop it.
+ */
+const MEET_QUERY_KEYS: ReadonlySet<string> = new Set(['status', 'from', 'to', 'limit', 'cursor']);
+const MEET_STATUSES: ReadonlySet<string> = new Set(R1_MEET_BOOKING_STATUSES);
+const MEET_ZONED_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/;
+const MEET_BOOKING_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MEET_INVALID_QUERY: MockResponse = { status: 400, json: { error: 'invalid_query' } };
+
+/** An absent parameter is null; one that is not a zoned instant is undefined; else its canonical form. */
+function meetInstant(value: string | null): string | null | undefined {
+  if (value === null) return null;
+  const ms = MEET_ZONED_INSTANT.test(value) ? Date.parse(value) : Number.NaN;
+  return Number.isNaN(ms) ? undefined : new Date(ms).toISOString();
+}
+
+/** The API's cursor: base64url of `{"s":<start, canonical>,"i":<id, lower case>}`. */
+export function meetBookingsCursor(row: Pick<R1MeetBooking, 'start_at' | 'id'>): string {
+  const position = { s: new Date(row.start_at).toISOString(), i: row.id.toLowerCase() };
+  return Buffer.from(JSON.stringify(position), 'utf8').toString('base64url');
+}
+
+/** The position a cursor names, or null when it is not exactly one `meetBookingsCursor` writes. */
+function readMeetCursor(value: string): { startMs: number; id: string } | null {
+  try {
+    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as { s?: unknown; i?: unknown };
+    if (typeof parsed.s !== 'string' || typeof parsed.i !== 'string') return null;
+    if (meetBookingsCursor({ start_at: parsed.s, id: parsed.i }) !== value) return null;
+    return { startMs: Date.parse(parsed.s), id: parsed.i };
+  } catch {
+    return null;
+  }
+}
+
+function r1MeetBookingsPage(query: URLSearchParams, db: Dataset): MockResponse {
+  const keys = [...query.keys()];
+  if (keys.some((key) => !MEET_QUERY_KEYS.has(key)) || new Set(keys).size !== keys.length) return MEET_INVALID_QUERY;
+  const status = query.get('status');
+  if (status !== null && !MEET_STATUSES.has(status)) return MEET_INVALID_QUERY;
+  const from = meetInstant(query.get('from'));
+  const to = meetInstant(query.get('to'));
+  if (from === undefined || to === undefined) return MEET_INVALID_QUERY;
+  if (from !== null && to !== null && Date.parse(from) >= Date.parse(to)) return MEET_INVALID_QUERY;
+  const rawLimit = query.get('limit');
+  if (rawLimit !== null && (!/^[1-9][0-9]{0,2}$/.test(rawLimit) || Number(rawLimit) > 100)) return MEET_INVALID_QUERY;
+  const limit = rawLimit === null ? 50 : Number(rawLimit);
+  const rawCursor = query.get('cursor');
+  const cursor = rawCursor === null ? null : readMeetCursor(rawCursor);
+  if (rawCursor !== null && cursor === null) return MEET_INVALID_QUERY;
+
+  if (!db.r1.meet.enabled) return ok({ meet_enabled: false, bookings: [], next_cursor: null } satisfies R1MeetBookingsBody);
+
+  const startOf = (row: R1MeetBooking) => Date.parse(row.start_at);
+  const idOf = (row: R1MeetBooking) => row.id.toLowerCase();
+  const rows = db.r1.meet.bookings
+    .filter((row) => status === null || row.status === status)
+    .filter((row) => from === null || startOf(row) >= Date.parse(from))
+    .filter((row) => to === null || startOf(row) < Date.parse(to))
+    .filter((row) => cursor === null || startOf(row) > cursor.startMs || (startOf(row) === cursor.startMs && idOf(row) > cursor.id))
+    .sort((a, b) => startOf(a) - startOf(b) || (idOf(a) < idOf(b) ? -1 : idOf(a) > idOf(b) ? 1 : 0));
+  const page = rows.slice(0, limit);
+  const last = page[page.length - 1];
+  const nextCursor = rows.length > limit && last !== undefined ? meetBookingsCursor(last) : null;
+  return ok({ meet_enabled: true, bookings: page, next_cursor: nextCursor } satisfies R1MeetBookingsBody);
 }
 
 const nowIso = () => new Date(FROZEN_NOW_MS).toISOString();
@@ -466,6 +540,13 @@ const ROUTES: Array<[string, string, Handler]> = [
 
   // ── R1 (WebRTC sales role-play) ────────────────────────────────────
   ['GET', '/api/interview-rounds/availability', () => ok({ state: 'disabled', hold_minutes: 55 })],
+  // Meet bookings (M034 S10): before every `:id` row, as the API mounts them. `db.r1.meet` holds the state.
+  ['GET', '/api/interview-rounds/meet-bookings', ({ query }, db) => r1MeetBookingsPage(query, db)],
+  ['GET', '/api/interview-rounds/meet-bookings/:id', ({ params }, db) => {
+    if (!MEET_BOOKING_ID.test(params.id)) return { status: 400, json: { error: 'invalid_id' } };
+    const booking = db.r1.meet.enabled ? db.r1.meet.bookings.find((row) => row.id.toLowerCase() === params.id.toLowerCase()) : undefined;
+    return booking ? ok(booking) : { status: 404, json: { error: 'not_found' } };
+  }],
   // A name goes in no URL, so a `q` is refused here as the API refuses it, and a search is a POST's body.
   ['GET', '/api/interview-rounds', ({ query }, db) => (query.has('q') ? { status: 400, json: { error: 'invalid_query' } } : r1QueuePage(query, '', db))],
   ['POST', '/api/interview-rounds/search', ({ query, body }, db) => r1QueuePage(query, String(body?.q ?? '').toLowerCase(), db)],

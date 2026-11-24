@@ -67,6 +67,7 @@ import type {
 } from '../../src/types';
 import type { AshbyStageCatalogStage } from '../../src/lib/ashby-stages';
 import type { R1QueueRound, R1RecordingPlayback, R1ReviewResponse, R1ReviewTurn, R1Round } from '../../src/lib/r1-types';
+import type { R1MeetBooking } from '../../src/lib/r1-meet-bookings-types';
 import { FROZEN_NOW_MS } from './env';
 import { defaultImpactState, type ImpactFixtureState } from './impact';
 
@@ -1604,6 +1605,48 @@ const R1_QUEUE: R1QueueRound[] = [
 ];
 
 /**
+ * Meet bookings (M034 S10, `GET /api/interview-rounds/meet-bookings`): one row for each thing the page
+ * says of a booking, around the frozen "now" (Wed 16 Sep 2026, 12:00 IST). Six fall on today or later,
+ * so the page opens on them; the cancelled one is five days back and shows only once From is cleared.
+ * A spec changes `r1.meet` to reach any state (`enabled: false` is a server with Meet off), and builds
+ * more rows with `r1MeetBooking` (ids stay distinct while `n` does).
+ */
+export function r1MeetBooking(n: number, over: Partial<R1MeetBooking>): R1MeetBooking {
+  return {
+    id: uid('5', 700 + n),
+    candidate_id: null,
+    round_id: null,
+    status: 'pending',
+    reason: 'eligible',
+    start_at: iso(FROZEN_NOW_MS + 3 * HOUR),
+    end_at: iso(FROZEN_NOW_MS + 3 * HOUR + 30 * MIN),
+    created_at: ago(2 * DAY),
+    updated_at: ago(2 * DAY),
+    version: 0,
+    ...over,
+  };
+}
+
+/** A half-hour slot that starts at `startMs`. */
+const meetSlot = (startMs: number) => ({ start_at: iso(startMs), end_at: iso(startMs + 30 * MIN) });
+const meetCandidate = (name: string) => CANDIDATES.find((c) => c.name === name)!.id;
+
+const R1_MEET_BOOKINGS: R1MeetBooking[] = [
+  // Earlier today: held, scored, and behind the one R1 review the harness has.
+  r1MeetBooking(1, { ...meetSlot(FROZEN_NOW_MS - 2.5 * HOUR), status: 'completed', reason: 'attempt_settled', candidate_id: R1_CANDIDATE_ID, round_id: R1_ROUND_ID, version: 1, updated_at: ago(2 * HOUR) }),
+  r1MeetBooking(2, { ...meetSlot(FROZEN_NOW_MS - 1 * HOUR), status: 'failed', reason: 'no_show', candidate_id: meetCandidate('Arjun Rao'), version: 1, updated_at: ago(20 * MIN) }),
+  // Later today: booked, nothing in the way.
+  r1MeetBooking(3, { ...meetSlot(FROZEN_NOW_MS + 3 * HOUR), status: 'pending', reason: 'eligible', candidate_id: STAR_CANDIDATE_ID }),
+  // Tomorrow: two that HR has to sort out in Ashby or HELLO.
+  r1MeetBooking(4, { ...meetSlot(FROZEN_NOW_MS + 22 * HOUR), status: 'unmatched_application', reason: 'application_unknown', created_at: ago(1 * DAY), updated_at: ago(1 * DAY) }),
+  r1MeetBooking(5, { ...meetSlot(FROZEN_NOW_MS + 23 * HOUR), status: 'unmapped_scheduler', reason: 'scheduler_unmapped', candidate_id: meetCandidate('Isha Kulkarni'), created_at: ago(1 * DAY), updated_at: ago(1 * DAY) }),
+  // Three weeks out: too far ahead to set up yet.
+  r1MeetBooking(6, { ...meetSlot(FROZEN_NOW_MS + 20 * DAY + 2 * HOUR), status: 'blocked', reason: 'slot_too_far', candidate_id: meetCandidate('Rahul Bhatia'), updated_at: ago(1 * HOUR) }),
+  // Last week: cancelled in Ashby.
+  r1MeetBooking(7, { ...meetSlot(FROZEN_NOW_MS - 5 * DAY + 3 * HOUR), status: 'cancelled', reason: 'cancelled', candidate_id: meetCandidate('Samuel Okafor'), created_at: ago(9 * DAY), updated_at: ago(6 * DAY) }),
+];
+
+/**
  * The R1 review (`GET /api/interview-rounds/:id/review`). The interview is invented and long enough to
  * show the role-play clock's two marks. The media the mint serves is `R1_REC_LENGTH_SEC` long, so a
  * spec that really seeks uses a turn inside it (`R1_REVIEW_SEEK_SEC`).
@@ -1830,6 +1873,11 @@ export interface Dataset {
     mints: Record<string, Array<Partial<R1RecordingPlayback> | null>>;
     /** The review of `R1_ROUND_ID`. Change it to reach any state of the page. */
     review: R1ReviewResponse;
+    /**
+     * Meet bookings (M034 S10). `enabled: false` is a server with Meet off: the list answers the empty
+     * off body. The rows go out as stored, so a spec can add a field the API must never send.
+     */
+    meet: { enabled: boolean; bookings: R1MeetBooking[] };
   };
   /**
    * Business impact (M031): what the two impact reads answer, from about 400 invented applications
@@ -1861,7 +1909,7 @@ export function createDataset(): Dataset {
     quotas: QUOTAS,
     appointments: APPOINTMENTS,
     ashby: { mappings: MAPPINGS, jobs: JOBS, withheld: 3, workflows: WORKFLOWS, feedbackForm: FEEDBACK_FORM, bindingPreview: BINDING_PREVIEW, stages: STAGES, stagesRead: true },
-    r1: { rounds: R1_ROUNDS, otherRounds: {}, queue: R1_QUEUE, deployed: true, mints: {}, review: R1_REVIEW },
+    r1: { rounds: R1_ROUNDS, otherRounds: {}, queue: R1_QUEUE, deployed: true, mints: {}, review: R1_REVIEW, meet: { enabled: true, bookings: R1_MEET_BOOKINGS } },
     impact: defaultImpactState(),
   });
   return {

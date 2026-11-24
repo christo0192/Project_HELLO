@@ -83,6 +83,8 @@ export const ROUTES: RouteCase[] = [
   // The R1 queue, in each view that has rows of its own.
   { name: 'r1-interviews', path: '/interviews', heading: 'R1 interviews', landmark: 'Naveen Kapoor' },
   { name: 'r1-interviews-all', path: '/interviews?view=all', heading: 'R1 interviews', landmark: 'Tanvi Joshi' },
+  // Meet bookings (M034 S10, dark), as the page opens: from today on. A status word, shown at both widths.
+  { name: 'r1-meet-bookings', path: '/interviews/meet-bookings', heading: 'Meet bookings', landmark: 'No matching candidate' },
   // The R1 review: each tab is its own address, so each is checked and captured.
   { name: 'r1-review-overview', path: `/interviews/${R1_ROUND_ID}?tab=overview`, heading: /Sales Program Advisor role-play/, landmark: 'Check before trusting it' },
   { name: 'r1-review-briefing', path: `/interviews/${R1_ROUND_ID}?tab=briefing`, heading: /Sales Program Advisor role-play/, landmark: 'What the candidate saw' },

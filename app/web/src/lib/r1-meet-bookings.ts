@@ -32,93 +32,27 @@ import {
   istDayStartUtcIso,
 } from './ist-datetime';
 import type { IstDate } from './ist-datetime';
+import { R1_MEET_BOOKING_STATUSES } from './r1-meet-bookings-types';
+import type {
+  R1MeetBooking,
+  R1MeetBookingReason,
+  R1MeetBookingStatus,
+  R1MeetBookingsBody,
+  R1MeetBookingsQuery,
+} from './r1-meet-bookings-types';
+
+// The wire shapes live in a module with no runtime import, so the e2e harness can type its fixture
+// against them; every caller keeps reading them from here.
+export { R1_MEET_BOOKING_REASONS, R1_MEET_BOOKING_STATUSES } from './r1-meet-bookings-types';
+export type {
+  R1MeetBooking,
+  R1MeetBookingReason,
+  R1MeetBookingStatus,
+  R1MeetBookingsBody,
+  R1MeetBookingsQuery,
+} from './r1-meet-bookings-types';
 
 export const R1_MEET_BOOKINGS_PATH = '/api/interview-rounds/meet-bookings';
-
-/** The booking statuses, in the API's order. */
-export const R1_MEET_BOOKING_STATUSES = [
-  'pending',
-  'unmatched_application',
-  'unmapped_scheduler',
-  'blocked',
-  'bot_scheduled',
-  'bot_joining',
-  'human_present',
-  'in_call',
-  'completed',
-  'cancelled',
-  'failed',
-  'drained',
-] as const;
-export type R1MeetBookingStatus = (typeof R1_MEET_BOOKING_STATUSES)[number];
-
-/** The booking reasons, in the API's order. */
-export const R1_MEET_BOOKING_REASONS = [
-  'dex_absent',
-  'cancelled',
-  'in_past',
-  'not_scheduled',
-  'no_attester',
-  'no_meet_link',
-  'eligible',
-  'application_unknown',
-  'application_terminal',
-  'scheduler_unmapped',
-  'created_by_unknown',
-  'disabled',
-  'paused',
-  'candidate_ineligible',
-  'role_not_configured',
-  'round_active',
-  'phone_engagement_active',
-  'phone_assessment_pending',
-  'capacity_exhausted',
-  'consent_template_unavailable',
-  'slot_too_far',
-  'bot_cap_reached',
-  'bot_create_failed',
-  'bot_fatal',
-  'event_removed',
-  'round_cancelled',
-  'round_expired',
-  'no_show',
-  'admission_refused',
-  'multiple_humans',
-  'attempt_settled',
-  'flag_off',
-] as const;
-export type R1MeetBookingReason = (typeof R1_MEET_BOOKING_REASONS)[number];
-
-/** One booking. `status` and `reason` stay plain text: a newer API may know more than this page. */
-export interface R1MeetBooking {
-  id: string;
-  candidate_id: string | null;
-  round_id: string | null;
-  status: string;
-  reason: string;
-  start_at: string;
-  end_at: string;
-  created_at: string;
-  updated_at: string;
-  /** The meeting bot's generation, and not a revision of the row: a status change leaves it as it was. */
-  version: number;
-}
-
-export interface R1MeetBookingsBody {
-  meet_enabled: boolean;
-  bookings: R1MeetBooking[];
-  next_cursor: string | null;
-}
-
-export interface R1MeetBookingsQuery {
-  status?: R1MeetBookingStatus | null;
-  /** Slots starting at or after this instant. */
-  from?: string | null;
-  /** Slots starting before this instant (exclusive). */
-  to?: string | null;
-  /** The `next_cursor` of the page before, unchanged, with the same filters. */
-  cursor?: string | null;
-}
 
 /** The read's path. The API refuses any parameter it does not know, so nothing else is ever sent. */
 export function r1MeetBookingsPath(query: R1MeetBookingsQuery = {}): string {
