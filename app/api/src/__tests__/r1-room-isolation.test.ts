@@ -266,8 +266,10 @@ function sourceFiles(directory: string): string[] {
  */
 const meetVendorDirs = ['recall', 'google-meet'].map((name) => path.join(src, 'integrations', name));
 const meetVendorSources = meetVendorDirs.flatMap((directory) => sourceFiles(directory));
-/** Every Meet file: the vendor modules plus lib/r1/meet. */
-const meetSources = [...meetVendorSources, ...sourceFiles(path.join(src, 'lib', 'r1', 'meet'))];
+/** M034 S03: the Recall webhook receivers (routes/, outside lib/r1, but R1 code: critic C6). */
+const meetRouteSources = [path.join(src, 'routes', 'recall-webhook.ts')];
+/** Every Meet file: the vendor modules, lib/r1/meet and the Meet routes. */
+const meetSources = [...meetVendorSources, ...sourceFiles(path.join(src, 'lib', 'r1', 'meet')), ...meetRouteSources];
 const MEET_CONFIG = path.join(src, 'lib', 'r1', 'meet', 'config.ts');
 
 const r1Sources = [
@@ -275,6 +277,9 @@ const r1Sources = [
   path.join(src, 'routes', 'r1-candidate.ts'),
   ...sourceFiles(path.join(src, 'lib', 'r1')),
   ...meetVendorSources,
+  ...meetRouteSources,
+  // M034 S03: the Ashby receiver routes interview schedules into r1-meet when Meet is on.
+  path.join(src, 'routes', 'ashby-webhook.ts'),
 ];
 
 /** The M034 Meet variables, declared in config/environment.schema.json (api): non-secrets, then credentials. */
@@ -311,7 +316,17 @@ describe('R1 source fences', () => {
     for (const name of ['config.ts', 'profiles.ts']) {
       expect(r1Sources, name).toContain(path.join(src, 'lib', 'r1', 'meet', name));
     }
+    // M034 S03: the Recall receivers are fenced like lib/r1 (no egress, no legacy consent, no
+    // quoted livekit literal).
+    const recallRoute = path.join(src, 'routes', 'recall-webhook.ts');
+    expect(existsSync(recallRoute)).toBe(true);
+    expect(meetSources).toContain(recallRoute);
+    expect(r1Sources).toContain(recallRoute);
     for (const file of meetSources) expect(r1Sources, file).toContain(file);
+    // M034 S03 T4: the Ashby receiver's Meet branch is fenced like the rest of R1.
+    const ashbyRoute = path.join(src, 'routes', 'ashby-webhook.ts');
+    expect(existsSync(ashbyRoute)).toBe(true);
+    expect(r1Sources).toContain(ashbyRoute);
   });
 
   it('never reads or writes the legacy consent tables (fence 7)', () => {
