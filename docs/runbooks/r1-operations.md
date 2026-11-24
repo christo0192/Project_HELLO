@@ -597,8 +597,120 @@ service-role RPCs and four trigger functions. Data classification:
   ```
 
 - **Rollback.** None: 0142 is forward-only, and there is no rollback SQL. While dark, the objects
-  stay unused. Once S03, S05 and S06 are live, the switch is `R1_MEET_ENABLED=false`: S06 drains
-  the bots. Never drop the tables while a booking still holds a bot.
+  stay unused. Once S03, S05 and S06 are live, run the S06 drain FIRST and only then set
+  `R1_MEET_ENABLED=false`: the flag alone does not cancel bots already scheduled in Recall (see
+  "Meet webhook receivers", Rollback). Never drop the tables while a booking still holds a bot.
+
+### Meet webhook receivers (M034 S03, dark)
+
+S03 adds the inbound half of R1 over Google Meet: two Recall.ai receivers
+(`routes/recall-webhook.ts`) and a branch for the two interview-schedule actions in the existing
+Ashby receiver (`routes/ashby-webhook.ts`). Each accepted delivery becomes one row in
+`r1_meet_receipts` and one `r1-meet` job, written together by one `r1_meet_record_receipt` call.
+S03 registers no queue handler: the `r1-meet` worker is S06, and jobs exist only while the flag is
+on. Everything sits behind `R1_MEET_ENABLED` (default off) and `R1_ENABLED`. The job payloads are
+classified in `docs/data-classification.md`, "Job payloads" and the paragraph after it.
+
+- **The two Recall URLs.** Both are mounted before recruiter auth. They are not in `lib/auth.ts`
+  PUBLIC_ROUTES: the only trust boundary is the Svix signature. Both are reached through the web
+  host's `/api/*` rewrite.
+  - `<WEB_ORIGIN>/api/integrations/recall/webhook` is the bot-status endpoint. Create it in the
+    Recall dashboard (region ap-northeast-1) and subscribe it to the nine `bot.*` status events
+    only: `bot.joining_call`, `bot.in_waiting_room`, `bot.in_call_not_recording`,
+    `bot.recording_permission_allowed`, `bot.recording_permission_denied`,
+    `bot.in_call_recording`, `bot.call_ended`, `bot.done`, `bot.fatal`.
+  - `<WEB_ORIGIN>/api/integrations/recall/realtime` is the per-bot real-time endpoint
+    (`participant_events.join` and `participant_events.leave`). Nobody configures it: the bot
+    builder writes it into every bot it creates (`recording_config.realtime_endpoints`, on the
+    first `WEB_ORIGIN` entry).
+
+  Any other event, including an event posted to the other path, is answered 200 `ignored` with
+  no receipt.
+- **One secret.** Both paths are verified with the same workspace verification secret,
+  `RECALL_WEBHOOK_SECRET` (accounts created on or after 2025-12-15 sign every webhook with it).
+  The receiver checks the Svix signature over the exact raw bytes: the `webhook-*` headers or the
+  legacy `svix-*` set, any matching `v1` entry, and a timestamp within 300 s either way. S03 adds
+  no variable.
+- **Flag-off answers, and why.**
+  - Recall: 200 `{"ok":true,"status":"disabled"}` on both paths, answered before the body is
+    read. There is no verification, no database call, no job and no log line. Recall disables an
+    endpoint after about 5 days of failed deliveries (the "hook deadlock", critic C3), so a dark
+    receiver must not answer 503. Creating the dashboard endpoint early is therefore harmless.
+  - Ashby: with the flag off, `interviewScheduleCreate` and `interviewScheduleUpdate` keep
+    today's answer, 400 `unresolvable_id`, with no database call. Every other action is unchanged
+    whether the flag is on or off. Ashby does not retry a 4xx, so a schedule delivered while dark
+    is lost: add the two schedule actions to the Ashby webhook (signed with the existing
+    `ASHBY_WEBHOOK_SECRET`) only after the flag is on.
+  - "Off" means `R1_MEET_ENABLED` unset, empty or exactly `false` (or R1 off). Any other value, or
+    `true` with a bad Meet value (for example a malformed `RECALL_WEBHOOK_SECRET`), makes the Meet
+    configuration `invalid`; the API logs one `[r1-meet-config]` line at first read. An `invalid`
+    configuration is not treated as off by the Ashby receiver: the two schedule actions answer a
+    retryable 503 `{"ok":false,"error":"r1_meet_misconfigured"}` with no database call, whatever R1
+    says, so Ashby redelivers them once the value is fixed (an HR cancellation is never dropped by
+    a non-retried 400). Every other Ashby action is unchanged. The Recall paths still answer 200
+    `disabled` (the contract, and the 5-day disable above), so Recall bot events sent while the
+    configuration is invalid are lost: fix the value promptly.
+- **Do not turn `R1_MEET_ENABLED` on before S06 is deployed: jobs would queue with no consumer.**
+  S06 is the `r1-meet` worker, and every accepted receipt queues an `r1-meet` job. Go-live order:
+  deploy S06, then turn the flag on, then create the Recall dashboard endpoint (the status path,
+  the nine `bot.*` events), then add the two schedule actions to the Ashby webhook.
+- **The forwarding table (Ashby, flag on).** D is the set of events in the delivery whose
+  interviewers include Dex (`R1_MEET_ASHBY_DEX_USER_ID`).
+  - D not empty: one `event` job per Dex event, carrying the S01 decision (`eligible`,
+    `cancelled`, `in_past`, `not_scheduled`, `no_attester` or `no_meet_link`).
+  - D empty, Create: no job, 200 `r1_meet_no_dex_event` (a new schedule has no booking).
+  - D empty, Update with status `Cancelled`: one `schedule` job, decision `cancelled`.
+  - D empty, any other Update: one `schedule` job, decision `dex_absent`, always (HR may have
+    removed Dex, or deleted the Dex event, and S06 must cancel the bot). There is no "long past"
+    exception: an Update lists only the events still in the schedule, so a deleted future Dex event
+    in a schedule whose other events are past is visible only through this job.
+  - A `schedule` job carries no application, stage or scheduler id (it may concern a human-only
+    interview): only the schedule id, the decision, `ashby_updated_at`, `received_at` and the two
+    event-id lists, which is all S06 needs to reconcile the schedule's bookings.
+  - The parse is refused but the schedule still reads `Cancelled`: one `schedule` job, decision
+    `cancelled`, with only the schedule id and its `updatedAt`.
+  - Any other parse refusal: 400 with the closed S01 reason and no database call.
+- **Flag-on answers.**
+
+  | Receiver | HTTP | Code | Meaning |
+  |---|---|---|---|
+  | Recall | 200 | `accepted` / `duplicate` | Receipt inserted, or seen before; a live or finished job exists |
+  | Recall | 200 | `ignored` | No Meet meaning on this path; no receipt |
+  | Recall | 400 | `invalid_json`, `malformed_event`, `malformed_id` | Signed but unusable (Svix retries a 4xx for about a day) |
+  | Recall | 400 / 401 / 403 / 413 | the verifier reason | Bad or missing signature headers, stale timestamp, mismatch, body over 256 KiB (or over the 1 MiB parser bound, same 413 `body_too_large`) |
+  | Ashby | 200 | `r1_meet_accepted` / `r1_meet_duplicate` / `r1_meet_no_dex_event` | Recorded, recorded before, or nothing to do |
+  | Ashby | 400 | the S01 parse reason | For example `malformed_event` or `too_many_events` |
+  | Ashby | 503 | `r1_meet_misconfigured` | The Meet configuration is set but invalid; retryable, nothing recorded |
+  | both | 500 | `receipt_persist_failed`, `receipt_rejected`, `enqueue_incomplete`, `internal_error` | Retryable: the sender redelivers and the dedupe keys converge |
+
+  Log categories (closed codes only, never a body, id, header or secret):
+  `recall_webhook_ingress`, `recall_webhook_rejected`, `recall_webhook_receipt_refused`,
+  `ashby_webhook_r1_meet` and `ashby_webhook_r1_meet_receipt_refused`. A run of
+  `recall_webhook_rejected` with `mismatch` means the secret is wrong.
+- **Read-only checks.** While dark, both queries return no rows:
+
+  ```sql
+  select source, outcome, count(*) from screening_v2.r1_meet_receipts
+   where received_at > now() - interval '1 day' group by 1, 2 order by 1, 2;   -- receipts
+  select payload->>'kind' as kind, status, count(*) from screening_v2.job_queue
+   where name = 'r1-meet' group by 1, 2 order by 1, 2;                          -- r1-meet jobs
+  ```
+
+- **Rollback. Drain first, then turn the flag off.** Turning the flag off does NOT cancel bots
+  already scheduled in Recall (critic C5): they still join at `join_at` and bill. With the flag off
+  nothing would stop them either: the Ashby schedule actions go back to 400 `unresolvable_id`
+  (Ashby does not retry it, so an HR cancellation in that window is lost), the Recall paths answer
+  200 `disabled`, and S06 registers the `r1-meet` handler only while the flag is on, so it does not
+  process anything.
+  1. While the flag is still on, run the S06 drain (it deletes the bots not yet dispatched and
+     sends `leave_call` to the dispatched ones) and confirm that no booking still holds a bot.
+  2. Then set `R1_MEET_ENABLED=false` (exactly `false`, or unset it), or turn R1 off. Both are read
+     on every request, so the change takes effect with no deploy.
+  3. Receipts and jobs already written stay in the queue; S06 handles them only while the flag is
+     on. Ashby schedule changes made while the flag was off are not replayed, so before turning it
+     back on, review the Dex interviews scheduled or cancelled in that window in Ashby.
+
+  Before S06 ships no bot can exist, so the flag can be turned off at any time.
 
 ## Scoring, status effects and the override monitor
 

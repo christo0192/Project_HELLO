@@ -647,6 +647,38 @@ it completes (`reap_completed_jobs`), and a dead-lettered one stays in `job_dlq`
 deletes it after triage. A DSAR erasure therefore also deletes the candidate's pending and
 dead-lettered `r1-meet` rows, found by their booking id or Ashby application id.
 
+**Receiver job payloads (M034 S03).** The S03 webhook receivers write exactly two payload kinds.
+The receipt RPC adds `receipt_id` and `source` to each job.
+
+- `recall_event` (source `recall`, one job per accepted Recall delivery). Keys, in order: `kind`,
+  `event_type`, `recall_bot_id`, `booking_id`, `occurred_at`, `sub_code`, `participant`.
+  `participant` is null for a bot status event. For a participant join or leave it is
+  `{ id, is_host, is_bot }`: `id` is Recall's integer participant id for that call, and the two
+  flags are booleans or null. All of it is Internal. Recall's participant name, email, `platform`
+  and `extra_data` are never read, and neither are the bot's recording or endpoint artifacts.
+- `ashby_schedule` (source `ashby`). There is one job per Dex interview event, or one per
+  schedule when no event has Dex or the schedule is cancelled. Keys, in order: `kind`, `scope`,
+  `ashby_interview_event_id`, `ashby_schedule_id`, `ashby_application_id`,
+  `ashby_interview_stage_id`, `ashby_interview_id`, `ashby_scheduled_by_user_id`,
+  `ashby_updated_at`, `decision`, `start_at`, `end_at`, `meet_url`, `received_at`,
+  `ashby_schedule_event_ids`, `ashby_dex_event_ids`.
+  - `ashby_scheduled_by_user_id` is **Confidential**, as on the booking: it identifies the HR
+    staff member who scheduled the interview.
+  - A `schedule`-scope job (no event of the schedule has Dex, so it may concern a human-only
+    interview) carries no candidate-linked or Confidential id: `ashby_application_id`,
+    `ashby_interview_stage_id` and `ashby_scheduled_by_user_id` are null there, and only the
+    schedule id, the decision, the instants and the two event-id lists remain. Only `event` jobs,
+    which concern a Dex interview, carry the application, stage and scheduler ids.
+  - `meet_url` is the canonical Google Meet URL or null, and is **Confidential**, as on the
+    booking. A link to any other provider is dropped.
+  - The other keys are Internal: opaque ids, closed codes, instants and id lists.
+  - The scheduler's email (Ashby `scheduledBy.email`) never leaves the S01 parser. It is not in a
+    payload, a receipt or a log line, and neither is any name, the event location or `extraData`.
+
+The receipt rows stay body-free: a receipt holds the source, the dedupe key (the Svix
+`webhook-id`, or an `ashby-schedule:` key built from the schedule id, a time stamp and a suffix),
+the event name and an outcome. The receivers log closed codes only.
+
 ## Classification summary
 
 | Level | Count | Examples |

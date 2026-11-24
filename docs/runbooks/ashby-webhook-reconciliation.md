@@ -70,6 +70,21 @@ non-retryable (Ashby will not retry-storm); durable-ingress failure is **500**
 5. `applicationUpdate` is redundant (recorded, not enqueued); `candidateDelete`
    is **capability-gated off** (recorded, not enqueued — reconciliation is the
    safety net). Duplicate deliveries never create a second job.
+6. **Interview-schedule actions (R1 over Google Meet, M034 S03).**
+   - With `R1_MEET_ENABLED` and `R1_ENABLED` both on, `interviewScheduleCreate` and
+     `interviewScheduleUpdate` go to `lib/r1/meet/ashby-schedule-jobs.ts`. This happens after the
+     same signature check and JSON parse.
+   - They are recorded through `r1_meet_record_receipt` (table `r1_meet_receipts`, queue
+     `r1-meet`), not `record_ashby_event_receipt`.
+   - The answers are 200 `r1_meet_accepted`, `r1_meet_duplicate` or `r1_meet_no_dex_event`, 400
+     with a closed parse reason, or a retryable 500.
+   - With the flag off nothing changes: both actions still get 400 `unresolvable_id` with no DB
+     call, because the generic extractor finds no id in them. Subscribe Ashby to them only after
+     the flag is on.
+   - With a Meet configuration that is set but invalid, both actions answer a retryable 503
+     `r1_meet_misconfigured` with no DB call, so Ashby redelivers them once it is fixed.
+   - Every other action never reads the Meet configuration.
+   - Details: `docs/runbooks/r1-operations.md`, "Meet webhook receivers (M034 S03, dark)".
 
 Only a sanitized `{ source }` marker is stored as receipt metadata — never the
 body, signature, secret, or contact data. The queue payload carries opaque ids

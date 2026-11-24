@@ -28,6 +28,7 @@ import { appealsRouter } from './routes/appeals.js';
 import { ashbyWebhookRouter } from './routes/ashby-webhook.js';
 import { phoneWebhookRouter } from './routes/phone-webhook.js';
 import { plivoWebhookRouter } from './routes/plivo-webhook.js';
+import { recallWebhookRouter } from './routes/recall-webhook.js';
 import { ashbyMissionControlRouter } from './routes/ashby-mission-control.js';
 import { ashbyReviewRouter } from './routes/ashby-review.js';
 import { phoneApiRouter } from './routes/phone.js';
@@ -302,6 +303,18 @@ export function createApp(opts: CreateAppOptions = {}) {
   // router carries its OWN scoped urlencoded parser (Plivo posts form-encoded
   // params, and the global JSON parser is mounted far below, after auth).
   app.use('/api/integrations/plivo', plivoWebhookRouter);
+
+  // Inbound Recall.ai webhooks for R1 over Google Meet (M034 S03). Mounted
+  // before recruiter auth for the same reason as the other webhooks: its trust
+  // boundary is the Svix workspace signature verified over the exact raw
+  // request bytes, not a recruiter session. Only the two POSTs exist on the
+  // router (/webhook for bot status, /realtime for participant events), so any
+  // other method/path under this prefix falls through to the auth middleware
+  // and is rejected. Still covered by the global per-IP limiter. Inert until
+  // R1_MEET_ENABLED and R1 are both on: it answers 200 `disabled` with no body
+  // read, verification, database or queue work (a 503 would get the Recall
+  // endpoint disabled before go-live). It reads its own raw body.
+  app.use('/api/integrations/recall', recallWebhookRouter);
 
   // ── Auth middleware: runs after CORS so preflight succeeds ─────
   // Uses DI seam when authDeps is provided (tests).

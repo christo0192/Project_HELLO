@@ -4429,7 +4429,7 @@ paths:
       tags: [ashby]
       operationId: receiveAshbyWebhook
       summary: Receive an Ashby webhook verified by HMAC-SHA256 over the raw body
-      description: Inbound Ashby webhook receiver. The only trust boundary is the Ashby-Signature header verified as an HMAC-SHA256 of the exact raw request bytes before JSON parsing. Not recruiter authenticated. Disabled by default and fails closed until the integration flag and secret are configured. Ashby's signed idless configuration ping is acknowledged without persistence or queue work so webhook create/edit can enable delivery.
+      description: Inbound Ashby webhook receiver. The only trust boundary is the Ashby-Signature header verified as an HMAC-SHA256 of the exact raw request bytes before JSON parsing. Not recruiter authenticated. Disabled by default and fails closed until the integration flag and secret are configured. Ashby's signed idless configuration ping is acknowledged without persistence or queue work so webhook create/edit can enable delivery. When R1 over Google Meet is on (R1_MEET_ENABLED and R1_ENABLED), interviewScheduleCreate and interviewScheduleUpdate are recorded and queued to the r1-meet queue (ids, times and the canonical Meet URL only, never a name or email); otherwise they are handled as before.
       parameters:
         - name: Ashby-Signature
           in: header
@@ -4475,11 +4475,220 @@ paths:
               schema:
                 $ref: '#/components/schemas/AshbyWebhookError'
         '503':
-          description: Integration disabled or secret not configured.
+          description: Integration disabled or secret not configured; or r1_meet_misconfigured, retryable, for interviewScheduleCreate and interviewScheduleUpdate while the R1 over Google Meet configuration is set but invalid.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/AshbyWebhookError'
+
+  # ── Recall.ai webhooks (R1 over Google Meet, M034; pre-auth, dark) ──
+  /api/integrations/recall/webhook:
+    post:
+      tags: [r1]
+      operationId: receiveRecallBotStatusWebhook
+      summary: Receive a Recall.ai bot status webhook verified by the Svix signature over the raw body
+      description: 'Not recruiter authenticated; mounted before auth. The only trust boundary is the Recall.ai (Svix / Standard Webhooks) signature verified over the exact raw request bytes before any JSON parsing, keyed by the workspace verification secret. Dark by default: until R1_MEET_ENABLED and R1_ENABLED are both on, every request is answered 200 with status disabled and no body read, verification, database or queue work (a failing answer would get the Recall endpoint disabled before go-live). When on, a verified delivery is recorded once by its webhook id and queued as one r1-meet job carrying ids and times only (never a participant name, email, platform or extra data); a redelivery answers duplicate. Accepts the nine bot status events bot.joining_call, bot.in_waiting_room, bot.in_call_not_recording, bot.recording_permission_allowed, bot.recording_permission_denied, bot.in_call_recording, bot.call_ended, bot.done and bot.fatal; any other event (participant events included) is answered 200 ignored with no receipt.'
+      parameters:
+        - name: webhook-id
+          in: header
+          required: false
+          description: Svix message id (1 to 128 of A-Z, a-z, 0-9, underscore, dot, colon, hyphen); the de-duplication key. The legacy svix-id, svix-timestamp and svix-signature set is accepted instead when webhook-id is absent.
+          schema:
+            type: string
+        - name: webhook-timestamp
+          in: header
+          required: false
+          description: Unix seconds; must be within 300 seconds of the server clock in either direction (legacy svix-timestamp).
+          schema:
+            type: string
+        - name: webhook-signature
+          in: header
+          required: false
+          description: Space-separated list of v1,<base64 HMAC-SHA256> entries over id.timestamp.raw-body, keyed by the workspace verification secret; any matching v1 entry accepts (legacy svix-signature).
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 'disabled (Meet is off), ignored (no Meet meaning on this path), accepted (recorded and queued) or duplicate (already recorded; durable work exists).'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, status]
+                properties:
+                  ok: { type: boolean }
+                  status: { type: string }
+        '400':
+          description: 'Signed but unusable, or malformed headers (retried by Recall): empty_body, malformed_id (including an id in the Ashby schedule dedupe space), malformed_timestamp, malformed_signature, invalid_json, or malformed_event (an accepted event without a UUID data.bot.id).'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, error]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+        '401':
+          description: 'missing_headers (the webhook-* or svix-* set is incomplete or mixed) or timestamp_out_of_tolerance.'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, error]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+        '403':
+          description: 'mismatch: no v1 signature entry matched.'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, error]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+        '413':
+          description: 'body_too_large: the raw body is over 256 KiB (the verifier bound) or over the 1 MiB parser bound.'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, error]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+        '500':
+          description: 'Durable ingress failed and is retryable: receipt_persist_failed, receipt_rejected, enqueue_incomplete or internal_error.'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, error]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+        '503':
+          description: 'not_configured: the workspace verification secret is unusable (unreachable while the Meet configuration is enabled).'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, error]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+
+  /api/integrations/recall/realtime:
+    post:
+      tags: [r1]
+      operationId: receiveRecallRealtimeWebhook
+      summary: Receive a Recall.ai real-time participant event verified by the Svix signature over the raw body
+      description: 'Not recruiter authenticated; mounted before auth. The only trust boundary is the Recall.ai (Svix / Standard Webhooks) signature verified over the exact raw request bytes before any JSON parsing, keyed by the workspace verification secret. Dark by default: until R1_MEET_ENABLED and R1_ENABLED are both on, every request is answered 200 with status disabled and no body read, verification, database or queue work (a failing answer would get the Recall endpoint disabled before go-live). When on, a verified delivery is recorded once by its webhook id and queued as one r1-meet job carrying ids and times only (never a participant name, email, platform or extra data); a redelivery answers duplicate. Accepts only the real-time events participant_events.join and participant_events.leave, which every Meet bot is configured to post here; any other event (bot status events included) is answered 200 ignored with no receipt.'
+      parameters:
+        - name: webhook-id
+          in: header
+          required: false
+          description: Svix message id (1 to 128 of A-Z, a-z, 0-9, underscore, dot, colon, hyphen); the de-duplication key. The legacy svix-id, svix-timestamp and svix-signature set is accepted instead when webhook-id is absent.
+          schema:
+            type: string
+        - name: webhook-timestamp
+          in: header
+          required: false
+          description: Unix seconds; must be within 300 seconds of the server clock in either direction (legacy svix-timestamp).
+          schema:
+            type: string
+        - name: webhook-signature
+          in: header
+          required: false
+          description: Space-separated list of v1,<base64 HMAC-SHA256> entries over id.timestamp.raw-body, keyed by the workspace verification secret; any matching v1 entry accepts (legacy svix-signature).
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 'disabled (Meet is off), ignored (no Meet meaning on this path), accepted (recorded and queued) or duplicate (already recorded; durable work exists).'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, status]
+                properties:
+                  ok: { type: boolean }
+                  status: { type: string }
+        '400':
+          description: 'Signed but unusable, or malformed headers (retried by Recall): empty_body, malformed_id (including an id in the Ashby schedule dedupe space), malformed_timestamp, malformed_signature, invalid_json, or malformed_event (an accepted event without a UUID data.bot.id).'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, error]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+        '401':
+          description: 'missing_headers (the webhook-* or svix-* set is incomplete or mixed) or timestamp_out_of_tolerance.'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, error]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+        '403':
+          description: 'mismatch: no v1 signature entry matched.'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, error]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+        '413':
+          description: 'body_too_large: the raw body is over 256 KiB (the verifier bound) or over the 1 MiB parser bound.'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, error]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+        '500':
+          description: 'Durable ingress failed and is retryable: receipt_persist_failed, receipt_rejected, enqueue_incomplete or internal_error.'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, error]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+        '503':
+          description: 'not_configured: the workspace verification secret is unusable (unreachable while the Meet configuration is enabled).'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, error]
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
 
   # ── Ashby Mission Control (recruiter/admin authenticated) ───────────
   /api/integrations/ashby/mission-control/mappings:

@@ -1,15 +1,19 @@
 /**
  * M034 S01: the R1-over-Google-Meet modules ship as DARK libraries.
  *
- * S01 ships libraries only. S03 (Recall receivers + Ashby schedule routing), S05 (Meet routes) and
- * S06 (runtime) wire these modules and must replace this pin with a narrower one in the same PR.
+ * S01 shipped libraries only. S03 wires the Recall receivers and the Ashby schedule routing, and
+ * nothing else: exactly the importers and imports in `WIRED_IMPORTS`. S05 and S06 must narrow this
+ * pin again in the same PR that wires them.
  *
- * What "dark" means here (S01 plan R21, R30, R31; D-M034-11):
+ * What "dark" means here (S01 plan R21, R30, R31; S03 plan R16; D-M034-11):
  *  (a) no runtime file outside the three Meet folders (integrations/recall, integrations/google-meet,
- *      lib/r1/meet) imports a module inside them. Static, side-effect, re-export, dynamic `import()`
- *      and `require()` specifiers are resolved relative to the importing file; type-only imports
- *      count too. A second check refuses any Meet module path written as text (a computed
- *      specifier would otherwise slip past the resolver).
+ *      lib/r1/meet) imports a module inside them, except each `WIRED_IMPORTS` importer, whose Meet
+ *      imports must EQUAL its list (so the allowlist can neither go stale nor widen silently).
+ *      Static, side-effect, re-export, dynamic `import()` and `require()` specifiers are resolved
+ *      relative to the importing file; type-only imports count too. A second check refuses any Meet
+ *      module path written as text (a computed specifier would otherwise slip past the resolver),
+ *      outside the wired importers and app.ts (the Recall mount string only; app.ts imports no Meet
+ *      module, which a control proves).
  *  (b) no runtime file imports the test tree (`__tests__`, which holds the Meet fakes, the Ashby
  *      schedule fixture and the Svix test signer in `__tests__/support`).
  *  (c) no fly*.toml under app/ names a Meet variable: the flag defaults OFF and the two Recall
@@ -111,6 +115,43 @@ function relativeTargets(importer: string, source: string): string[] {
 
 const meetImports = (importer: string, source: string): string[] =>
   relativeTargets(importer, source).filter(inMeet);
+
+/**
+ * S03 plan R16: the runtime files outside the Meet folders that may import Meet modules, each with
+ * the EXACT repo-relative resolved targets of its Meet imports (type-only imports included).
+ */
+const WIRED_IMPORTS: Readonly<Record<string, readonly string[]>> = {
+  'app/api/src/routes/ashby-webhook.ts': [
+    'app/api/src/lib/r1/meet/ashby-schedule-jobs.js',
+    'app/api/src/lib/r1/meet/ashby-schedule.js',
+    'app/api/src/lib/r1/meet/config.js',
+    'app/api/src/lib/r1/meet/receipts.js',
+  ],
+  'app/api/src/routes/recall-webhook.ts': [
+    'app/api/src/integrations/recall/webhook-verify.js',
+    'app/api/src/lib/r1/meet/config.js',
+    'app/api/src/lib/r1/meet/receipts.js',
+    'app/api/src/lib/r1/meet/recall-event.js',
+  ],
+};
+const APP_FILE = path.join(SRC, 'app.ts');
+/** The one Meet path app.ts may write: the Recall router's mount string. */
+const RECALL_MOUNT_LITERAL = "'/api/integrations/recall'";
+/** Files allowed to write a Meet module path as text: the wired importers, plus app.ts (mount only). */
+const PATH_TEXT_ALLOWED: ReadonlySet<string> = new Set([...Object.keys(WIRED_IMPORTS), rel(APP_FILE)]);
+
+/** The sorted, de-duplicated repo-relative Meet import targets of `importer`. */
+const actualMeetImports = (importer: string, source: string): string[] =>
+  [...new Set(meetImports(importer, source).map(rel))].sort();
+
+/** `importer -> target` for every Meet import that its `WIRED_IMPORTS` entry (if any) does not list. */
+function unwiredMeetImports(importer: string, source: string): string[] {
+  const allowed = new Set(WIRED_IMPORTS[rel(importer)] ?? []);
+  return meetImports(importer, source)
+    .map(rel)
+    .filter((target) => !allowed.has(target))
+    .map((target) => `${rel(importer)} -> ${target}`);
+}
 const testTreeImports = (importer: string, source: string): string[] =>
   relativeTargets(importer, source).filter((target) => inside(target, TESTS_DIR));
 
@@ -140,16 +181,52 @@ describe('M034 S01: the Meet modules are dark libraries', () => {
     expect(RUNTIME_FILES.some((file) => inside(file, TESTS_DIR))).toBe(false);
   });
 
-  it('(a) no runtime file outside the Meet folders imports a Meet module', () => {
-    const offenders = OUTSIDE_FILES.flatMap((file) =>
-      meetImports(file, read(file)).map((target) => `${rel(file)} -> ${rel(target)}`),
-    );
+  it('(a) no runtime file outside the Meet folders imports a Meet module, except the wired importers', () => {
+    const offenders = OUTSIDE_FILES.flatMap((file) => unwiredMeetImports(file, read(file)));
     expect(offenders).toEqual([]);
   });
 
+  it('(a) each wired importer imports EXACTLY its listed Meet modules (no stale or silent widening)', () => {
+    const wired = Object.keys(WIRED_IMPORTS).sort();
+    expect(wired).toEqual(['app/api/src/routes/ashby-webhook.ts', 'app/api/src/routes/recall-webhook.ts']);
+    for (const key of wired) {
+      const file = path.join(REPO_ROOT, ...key.split('/'));
+      expect(OUTSIDE_FILES, key).toContain(file);
+      expect(actualMeetImports(file, read(file)), key).toEqual([...WIRED_IMPORTS[key]!].sort());
+    }
+  });
+
   it('(a) no runtime file outside the Meet folders names a Meet module path (computed specifiers)', () => {
-    const offenders = OUTSIDE_FILES.filter((file) => MEET_PATH_TEXT.test(read(file))).map(rel);
+    const offenders = OUTSIDE_FILES.filter((file) => !PATH_TEXT_ALLOWED.has(rel(file)) && MEET_PATH_TEXT.test(read(file)))
+      .map(rel);
     expect(offenders).toEqual([]);
+  });
+
+  it('(a) control: app.ts imports no Meet module and names a Meet path only in the Recall mount string', () => {
+    const appText = read(APP_FILE);
+    expect(OUTSIDE_FILES).toContain(APP_FILE);
+    expect(meetImports(APP_FILE, appText)).toEqual([]);
+    expect(appText).toContain(RECALL_MOUNT_LITERAL);
+    expect(MEET_PATH_TEXT.test(appText)).toBe(true);
+    expect(MEET_PATH_TEXT.test(appText.split(RECALL_MOUNT_LITERAL).join(''))).toBe(false);
+  });
+
+  it('(a) control: a wired importer that widens its Meet imports, or any other importer, is caught', () => {
+    const recallRoute = path.join(SRC, 'routes', 'recall-webhook.ts');
+    const widened = [
+      "import { verifyRecallWebhook } from '../integrations/recall/webhook-verify.js';",
+      "import { buildR1MeetRecallBotCreate } from '../lib/r1/meet/recall-bot.js';",
+    ].join('\n');
+    expect(unwiredMeetImports(recallRoute, widened)).toEqual([
+      'app/api/src/routes/recall-webhook.ts -> app/api/src/lib/r1/meet/recall-bot.js',
+    ]);
+    expect(actualMeetImports(recallRoute, widened)).not.toEqual(
+      [...WIRED_IMPORTS['app/api/src/routes/recall-webhook.ts']!].sort(),
+    );
+    const other = path.join(SRC, 'routes', 'example-importer.ts');
+    expect(unwiredMeetImports(other, "import { getR1MeetConfig } from '../lib/r1/meet/config.js';")).toEqual([
+      'app/api/src/routes/example-importer.ts -> app/api/src/lib/r1/meet/config.js',
+    ]);
   });
 
   it('(a) control: every specifier form is caught and resolved relative to the importer', () => {

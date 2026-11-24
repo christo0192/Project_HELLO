@@ -776,7 +776,9 @@ describe('OpenAPI document integrity', () => {
     // interviewer+), GET /api/impact/candidates (the applications behind one figure, scoped like
     // the candidate page), GET /api/impact/exclusions and PUT /api/impact/exclusions/{mappingId}
     // (the admin's per-mapping switch). 182 + 4 = 186.
-    expect(Object.keys(paths).length).toBe(186);
+    // M034 S03 adds TWO pre-auth Recall webhook paths (bot status and real-time participant events;
+    // inline bodies, no new schema). 186 + 2 = 188.
+    expect(Object.keys(paths).length).toBe(188);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1284,6 +1286,10 @@ describe('auth boundary vs spec security model', () => {
     'POST /api/internal/voice-worker/ready-machine',
     // Ashby webhook: HMAC-gated (not recruiter-authenticated), mounted pre-auth.
     'POST /api/integrations/ashby/webhook',
+    // M034 S03 Recall webhooks: Svix-signature-gated (not recruiter-authenticated), mounted pre-auth;
+    // they answer 200 `disabled` while R1 over Meet is dark, never the recruiter 401.
+    'POST /api/integrations/recall/webhook',
+    'POST /api/integrations/recall/realtime',
     // LiveKit phone webhook: JWT-gated (not recruiter-authenticated), mounted
     // pre-auth. Public at this EXACT method+path only; every other method or
     // path under the prefix falls through to the auth middleware.
