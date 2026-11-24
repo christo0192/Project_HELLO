@@ -1204,10 +1204,9 @@ class SpokenLinesTests(unittest.TestCase):
         "Next, let's do a sales role-play. I'll play {lead_name} from {lead_city}. She filled in a "
         "form on our website about the Data Science course a few days ago. You're the Program "
         "Advisor calling her back. You'll have up to twenty minutes. Treat it like a real call. "
-        "Your goal is to understand her needs and help her decide to enrol. Use the course details "
-        "from your preparation guide. I'll stay in character until I say, 'Let's pause the "
-        "role-play here.' When you want to begin, just say 'ready', and she'll pick up. Any "
-        "questions before we start?"
+        "Understand her needs and help her decide to enrol. Use the course details from your "
+        "preparation guide. I'll stay in character until I say, 'Let's pause the role-play here.' "
+        "Just say 'ready' to begin, and she'll pick up. Any questions before we start?"
     )
     SCENARIO = BODY.removeprefix("Next, let's do a sales role-play. ")
     # The reviewed wording, word for word, as written in LINES (Christy; DEX_LINES swaps the name).
@@ -1243,12 +1242,10 @@ class SpokenLinesTests(unittest.TestCase):
             "Just carry on the way you would on a real call. I'll stay in character."
         ),
         "L-TRANSITION-ASK-PAUSE-SP": (
-            "If that covers everything, just say 'ready' whenever you like. Shall we begin the "
-            "role-play?"
+            "If that covers everything, just say 'ready'. Shall we begin the role-play?"
         ),
         "L-TRANSITION-REASK-SP": (
-            "Just say 'ready' when you are, or ask me a question first. Shall we start the "
-            "role-play now?"
+            "Just say 'ready', or ask me a question first. Shall we start the role-play?"
         ),
         "L-TRANSITION-STEER-SP": (
             "Let's keep any other questions for the end of the interview. There'll be time for "
@@ -1269,7 +1266,7 @@ class SpokenLinesTests(unittest.TestCase):
         ),
         "L-ASIDE-WRAP-SP": (
             "This is Christy, your interviewer, stepping in for a moment. We're well into the "
-            "role-play now. If you'd rather keep going, just carry on with {lead_first_name}. "
+            "role-play now. If you want to keep going, just carry on with {lead_first_name}. "
             "Would you like to wrap it up here?"
         ),
         "L-ASIDE-WRAP-AGAIN-SP": (
@@ -1279,15 +1276,17 @@ class SpokenLinesTests(unittest.TestCase):
         # Either/or on purpose: the engine reads a bare "yes" to the early-close question as unclear
         # (review S3R-2) and asks once more, so a yes/no question here would ask "Would you like to
         # stop?" again after a "Yes."; L-ASIDE-EARLY-CLOSE-2 is either/or for the same reason.
+        # Stop first, as there: a bare "No." resumes (``declines_wrap_offer``), so it must read as
+        # "don't stop" (review of revision 54).
         "L-ASIDE-EARLY-CLOSE-SP": (
             "This is Christy, stepping in for a moment. It sounds like you're wrapping up the call "
-            "with {lead_first_name}. Would you like to keep going with her, or stop the role-play "
-            "here?"
+            "with {lead_first_name}. Would you like to stop the role-play here, or keep going with "
+            "her?"
         ),
         "L-ASIDE-EARLY-CLOSE-TIME-SP": (
             "This is Christy, stepping in for a moment. It sounds like you're wrapping up the call "
             "with {lead_first_name}. We still have some time for the role-play. Would you like to "
-            "keep going with her, or stop the role-play here?"
+            "stop the role-play here, or keep going with her?"
         ),
     }
     # Keyed by the id ``active_line_id`` selects today (the briefs' W2 ids, L-ASIDE-END-2).
@@ -1329,7 +1328,13 @@ class SpokenLinesTests(unittest.TestCase):
         "L-ASIDE-LAST-POINT": "R1_LAST_POINT_V2=0",
     }
     # Spoken by default, outside this change: the role-play's "Hello? Are you still there?" call,
-    # and L-FAQ-DEFER (r1_world.INTERVIEWER_DEFLECTION, in the world canonical; deferred).
+    # and L-FAQ-DEFER (deferred).  L-FAQ-DEFER has no ``say`` caller: it is spoken as the model's
+    # reply (the interviewer system prefix, the per-session DeepSeek cache prefix, quotes it to be
+    # said exactly) and as the guard's replacement text, so a flagged variant needs the prefix,
+    # the session, the guard and the rehearsal, not this map.  A full stop in place of its
+    # semicolon would also split it: the guard drops "That's a good question for the hiring team."
+    # after a statement (D5-DEFLECT1, sentence by sentence) and would leave "They'll follow up
+    # with you on it." behind.  A later one-sentence form: ", and they'll follow up with you on it."
     EXEMPT = ("L-SIL-RP1", "L-FAQ-DEFER")
     # Facts and cue phrases a pair must say exactly as often.
     KEPT = (
@@ -1396,8 +1401,7 @@ class SpokenLinesTests(unittest.TestCase):
         self.assertEqual(r1_script.BRIEF_SCENARIO_SP, self.SCENARIO)
         self.assertEqual(
             r1_script.BRIEF_START_PROMPT_SP,
-            "When you want to begin, just say 'ready', and she'll pick up. Any questions before we "
-            "start?",
+            "Just say 'ready' to begin, and she'll pick up. Any questions before we start?",
         )
 
     def test_default_on_and_the_rollback(self) -> None:
@@ -1459,6 +1463,11 @@ class SpokenLinesTests(unittest.TestCase):
         self.assertEqual(changed, expected)
         self.assertIn("L-TRANSITION-THANKS-A", changed)
         self.assertNotIn("L-FAQ-DEFER", changed)
+        # Deferred (see EXEMPT): one sentence, the text the prefix, the guard and the world quote.
+        import r1_world
+
+        self.assertEqual(len(self.sentences(LINES["L-FAQ-DEFER"])), 1)
+        self.assertEqual(LINES["L-FAQ-DEFER"], r1_world.INTERVIEWER_DEFLECTION)
 
     def test_every_default_line_is_spoken_style(self) -> None:
         for dex in (None, "0"):
@@ -1513,9 +1522,13 @@ class SpokenLinesTests(unittest.TestCase):
             with self.subTest(line=spoken):
                 # ``r1_session._ANY_QUESTIONS_BRIEFS``: a bare "yes" is invited, a "no" nudged.
                 self.assertTrue(text.endswith("Any questions before we start?"))
-                self.assertIn(r1_script.BRIEF_GOAL, text)
-                self.assertEqual(text.count("just say 'ready'"), 1)
+                # The goal as the recap says it (capitalised: it starts its sentence).
+                self.assertIn(r1_script.BRIEF_GOAL, text.lower())
+                self.assertEqual(text.lower().count("just say 'ready'"), 1)
                 self.assertNotIn("If not", text)
+                # Review of revision 54: no words that say nothing before the goal or 'ready'.
+                for padding in ("Your goal is to", "When you want to begin"):
+                    self.assertNotIn(padding, text)
                 for kept in (
                     "{lead_name}", "{lead_city}", "Data Science course", "calling her back",
                     "help her decide to enrol", "course details from your preparation guide",
@@ -1536,7 +1549,13 @@ class SpokenLinesTests(unittest.TestCase):
                 for base in self.BRIEFS:
                     text = line(r1_script.SPOKEN_LINES[base], first_name="Mary-Ann", **values)
                     longest = max(longest, len(text.split()))
-        self.assertLessEqual(longest, 112)
+                    # The longest line of every session never grows (int-live-3 M01: ~110 words).
+                    with self.subTest(persona=persona.id, variant=variant.id, line=base):
+                        self.assertLessEqual(
+                            len(text.split()),
+                            len(line(base, first_name="Mary-Ann", **values).split()),
+                        )
+        self.assertLessEqual(longest, 101)
 
     def test_the_replay_and_the_recaps(self) -> None:
         recap = LINES["L-TRANSITION-RECAP-SP"]
@@ -1582,6 +1601,11 @@ class SpokenLinesTests(unittest.TestCase):
                 self.assertIn(line_id, NAME_FREE_LINES)
         self.assertIn("'ready'", LINES["L-TRANSITION-ASK-PAUSE-SP"])
         self.assertIn("'ready'", LINES["L-TRANSITION-REASK-SP"])
+        # Review of revision 54 (D4-BRIEF2's shape): no open-ended timing before a question that
+        # asks to start now.
+        for line_id in ("L-TRANSITION-ASK-PAUSE-SP", "L-TRANSITION-REASK-SP"):
+            for timing in ("whenever", "when you are", "when you're", "take your time"):
+                self.assertNotIn(timing, LINES[line_id].lower(), line_id)
         self.assertNotIn(", or ", LINES["L-TRANSITION-ASK-PAUSE-SP"])
         self.assertNotIn("hiring team", LINES["L-TRANSITION-STEER-SP"])
         goal = LINES["L-RP-GOAL-SP"]
@@ -1607,11 +1631,23 @@ class SpokenLinesTests(unittest.TestCase):
                 self.assertTrue(text.endswith(question))
                 self.assertNotIn(", or ", text)
                 self.assertIn("carry on with {lead_first_name}", text)
+                # Review of revision 54: the carry-on sentence comes before the offer now, so a
+                # "rather" in it would have nothing to compare against.
+                self.assertNotIn("rather", text)
         self.assertNotEqual(LINES["L-ASIDE-WRAP-SP"], LINES["L-ASIDE-WRAP-AGAIN-SP"])
-        # The early-close question stays either/or (a bare yes is unclear there).
+        # The early-close question stays either/or (a bare yes is unclear there), with stop
+        # first, as in L-ASIDE-EARLY-CLOSE-2: the engine reads a bare "No." as keep going.
+        for line_id in (
+            "L-ASIDE-EARLY-CLOSE-SP", "L-ASIDE-EARLY-CLOSE-TIME-SP", "L-ASIDE-EARLY-CLOSE-2",
+        ):
+            text = LINES[line_id]
+            with self.subTest(line=line_id):
+                self.assertLess(text.index("stop the role-play"), text.index("keep going"))
+                self.assertEqual(text.count("?"), 1)
+                self.assertTrue(text.endswith("?"))
         for line_id in ("L-ASIDE-EARLY-CLOSE-SP", "L-ASIDE-EARLY-CLOSE-TIME-SP"):
             self.assertTrue(LINES[line_id].endswith(
-                "Would you like to keep going with her, or stop the role-play here?"
+                "Would you like to stop the role-play here, or keep going with her?"
             ))
         self.assertIn(
             "We still have some time for the role-play", LINES["L-ASIDE-EARLY-CLOSE-TIME-SP"]

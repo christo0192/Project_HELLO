@@ -11265,11 +11265,12 @@ class EarlyCloseAsideTests(unittest.TestCase):
         plan = s.say("Thanks for your time, bye.", 650)
         self.assertTrue(plan.aside)
         self.assertEqual((plan.voice, plan.line_id), ("interviewer", "L-ASIDE-EARLY-CLOSE"))
-        # Owner 2026-11-24 (R1_SPOKEN_LINES): the spoken text, still an either/or question.
+        # Owner 2026-11-24 (R1_SPOKEN_LINES): the spoken text, still an either/or question, with
+        # stop first so that a bare "No." means "don't stop" (it resumes: see below).
         self.assertEqual(
             plan.scripted_text,
             "This is Dex, stepping in for a moment. It sounds like you're wrapping up the call "
-            "with Meera. Would you like to keep going with her, or stop the role-play here?",
+            "with Meera. Would you like to stop the role-play here, or keep going with her?",
         )
         with mock.patch.dict(r1_roleplay.os.environ, {"R1_SPOKEN_LINES": "0"}):
             rollback = done_session().say("Thanks for your time, bye.", 650)
@@ -11359,6 +11360,38 @@ class EarlyCloseAsideTests(unittest.TestCase):
         self.assertIn("continuation:resume", follow.reasons)
         self.assertIn(r1_roleplay.CONTINUE_NOTE, follow.reminder)
         self.assertIsNone(s.eng.continuation_plan(661))  # once
+
+    def test_a_bare_no_to_the_spoken_question_resumes(self):
+        """Review of revision 54 (R1_SPOKEN_LINES): the engine reads a bare "No." as a decline
+        (``declines_wrap_offer``) and resumes, so the spoken question puts stop first ("Would you
+        like to stop the role-play here, or keep going with her?"): "No." is "don't stop"."""
+        cases = (
+            # Below 10:00 by default: L-ASIDE-EARLY-CLOSE-TIME-SP.
+            ({}, 400, "L-ASIDE-EARLY-CLOSE-TIME"),
+            # With the farewell exit off, from 10:00: L-ASIDE-EARLY-CLOSE-SP.
+            ({"R1_FAREWELL_EXIT_V2": "0"}, 650, "L-ASIDE-EARLY-CLOSE"),
+        )
+        for env, r, line_id in cases:
+            with self.subTest(line=line_id), mock.patch.dict(r1_roleplay.os.environ, env):
+                s = done_session()
+                asked = s.say("Thanks for your time, bye.", r)
+                self.assertEqual(asked.line_id, line_id)
+                self.assertEqual(asked.scripted_text, line(line_id + "-SP", **P1.line_values))
+                question = asked.scripted_text.rsplit(". ", 1)[-1]
+                self.assertEqual(
+                    question, "Would you like to stop the role-play here, or keep going with her?"
+                )
+                for answer in ("No.", "No, thanks.", "Nope."):
+                    with self.subTest(answer=answer):
+                        s = done_session()
+                        s.say("Thanks for your time, bye.", r)
+                        plan = s.say(answer, r + 5)
+                        self.assertEqual(plan.mode, TurnMode.SAY_ONLY)
+                        self.assertEqual(plan.line_id, "L-ASIDE-WRAP-RESUME")
+                        self.assertIn("wrap_offer_declined", plan.reasons)
+                        self.assertTrue(plan.continuation)
+                        self.assertFalse(plan.exit_roleplay)
+                        self.assertFalse(s.eng.exit_requested)
 
     def test_with_a_move_still_owed_the_learner_resumes_with_it(self):
         s = Session(engine())

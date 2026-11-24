@@ -289,7 +289,9 @@ import r1_world
 #     2026-11-24, same revision: the judge sentence reads a total with a priced add-on as course
 #     plus add-on and keeps the $7,500 floor; only a stated extra price makes a figure the add-on's.
 # 54: owner 2026-11-24: the spoken -SP lines (R1_SPOKEN_LINES, SPOKEN_LINES); no text changed.
-PINNED_CONTENT_SHA256 = "cbcd037ac04b145424e81677f072d753b67760a7095b8811a51295672c5ccf40"
+#     Its review: stop first in the early-close questions, no "rather" in the wrap offer, no
+#     timing words before the start questions, and the brief no longer than W2's.
+PINNED_CONTENT_SHA256 = "c330b97cb977cc33413d690ea25a16f4c8c566909f3180e1953e151f09f72653"
 
 CONTENT_MODULES = (
     "r1_text",

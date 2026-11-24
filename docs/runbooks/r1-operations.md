@@ -2707,13 +2707,23 @@ its 12 characters hold ten digits in a row (revision 24's do), as the logger dro
   wrap-up offers, both early-close asides and L-EXIT (`r1_script.SPOKEN_LINES`, 21 `-SP` lines).
   Facts, placeholders, cue phrases and consent are unchanged: the brief still names the learner,
   her city, the course, "up to twenty minutes", the preparation guide, the cue "Let's pause the
-  role-play here." and the spoken 'ready', and still ends "Any questions before we start?"; L-EXIT
-  still opens with the cue; a settled bare "yes" still stops (end aside) or wraps up (offers), and
-  the early-close question stays either/or. The change is chosen after every older routing flag,
-  so each older rollback keeps its own text. The line cache keys on the text, so the first
+  role-play here." and the spoken 'ready', and still ends "Any questions before we start?" (and is
+  no longer than the W2 brief); L-EXIT still opens with the cue; a settled bare "yes" still stops
+  (end aside) or wraps up (offers), and the early-close question stays either/or with stop said
+  first ("Would you like to stop the role-play here, or keep going with her?"), as in
+  L-ASIDE-EARLY-CLOSE-2, because a bare "No." resumes the role-play. The start prompts say 'ready'
+  without "whenever you like" before their yes/no question. The change is chosen after every
+  older routing flag, so each older rollback keeps its own text. The line cache keys on the text, so the first
   sessions on each machine synthesise about 13 name-free lines once (within `R1_SYNTH_PER_MIN`);
-  the thanked brief is per session, as before. Not changed here: L-FAQ-DEFER (it is
-  `r1_world.INTERVIEWER_DEFLECTION`), the learner's lines, and the Meet texts.
+  the thanked brief is per session, as before. Not changed here: the learner's lines, the Meet
+  texts, and L-FAQ-DEFER ("That's a good question for the hiring team; they'll follow up with you
+  on it."). That one has no `say` caller: the model says it because the interviewer system prefix
+  (the per-session DeepSeek cache prefix) quotes `r1_world.INTERVIEWER_DEFLECTION` to be said
+  exactly, and the guard speaks the same text as a replacement, so a flagged variant needs the
+  prefix, the session, the guard and the rehearsal, not `SPOKEN_LINES`. Its form must stay one
+  sentence: with a full stop, the guard's D5-DEFLECT1 drop (sentence by sentence) would leave
+  "They'll follow up with you on it." behind. Proposed for the owner: "That's a good question for
+  the hiring team, and they'll follow up with you on it."
   Rollback: `fly secrets set R1_SPOKEN_LINES=0 -a project-hello-voice` (revision 53's texts byte
   for byte).
 * **`R1_WRAP_OFFER_VARIANT`** (default on). The second offer to wrap up the role-play is

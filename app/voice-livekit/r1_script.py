@@ -94,15 +94,18 @@ BRIEF_BODY_2 = BRIEF_LEAD_IN + BRIEF_SCENARIO_2
 # ones are sounding the same way".  The W2 brief in the W4 agenda's spoken style: one idea per
 # sentence, no colon, and the question said last.  The facts, the cue phrase and the 'ready'
 # instruction are W2's word for word, and it still ends "Any questions before we start?", so a bare
-# "yes" is invited and a "no" nudged (``r1_session._ANY_QUESTIONS_BRIEFS``).
+# "yes" is invited and a "no" nudged (``r1_session._ANY_QUESTIONS_BRIEFS``).  No longer than W2's
+# brief: the goal is said as the recap says it, with no "Your goal is to" before it (review of
+# revision 54: the longest line of every session must not grow by words that say nothing).
 BRIEF_START_PROMPT_SP = (
-    "When you want to begin, just say 'ready', and she'll pick up. Any questions before we start?"
+    "Just say 'ready' to begin, and she'll pick up. Any questions before we start?"
 )
 BRIEF_SCENARIO_SP = (
     "I'll play {lead_name} from {lead_city}. She filled in a form on our website about the Data "
     "Science course a few days ago. You're the Program Advisor calling her back. You'll have up to "
-    "twenty minutes. Treat it like a real call. Your goal is to "
-    + BRIEF_GOAL
+    "twenty minutes. Treat it like a real call. "
+    + BRIEF_GOAL[:1].upper()
+    + BRIEF_GOAL[1:]
     + ". Use the course details from your preparation guide. I'll stay in character until I say, "
     "'Let's pause the role-play here.' "
     + BRIEF_START_PROMPT_SP
@@ -677,14 +680,14 @@ LINES: dict[str, str] = {
         "Treat it like a real call. Understand what she needs, and help her decide to enrol."
     ),
     "L-RP-STUCK-SP": "Just carry on the way you would on a real call. I'll stay in character.",
-    # Yes/no start questions (a bare "yes" starts): the instruction first, the question last.
+    # Yes/no start questions (a bare "yes" starts): the instruction first, the question last, and
+    # no "whenever you like" before a question about starting (review of revision 54: D4-BRIEF2's
+    # instruction-then-a-question-that-ignores-it shape).
     "L-TRANSITION-ASK-PAUSE-SP": (
-        "If that covers everything, just say 'ready' whenever you like. Shall we begin the "
-        "role-play?"
+        "If that covers everything, just say 'ready'. Shall we begin the role-play?"
     ),
     "L-TRANSITION-REASK-SP": (
-        "Just say 'ready' when you are, or ask me a question first. Shall we start the role-play "
-        "now?"
+        "Just say 'ready', or ask me a question first. Shall we start the role-play?"
     ),
     "L-TRANSITION-STEER-SP": (
         "Let's keep any other questions for the end of the interview. There'll be time for them "
@@ -708,7 +711,7 @@ LINES: dict[str, str] = {
     ),
     "L-ASIDE-WRAP-SP": (
         "This is Christy, your interviewer, stepping in for a moment. We're well into the "
-        "role-play now. If you'd rather keep going, just carry on with {lead_first_name}. Would "
+        "role-play now. If you want to keep going, just carry on with {lead_first_name}. Would "
         "you like to wrap it up here?"
     ),
     "L-ASIDE-WRAP-AGAIN-SP": (
@@ -716,16 +719,18 @@ LINES: dict[str, str] = {
         "{lead_first_name}. Would you like to wrap up the role-play here?"
     ),
     # Either/or, like L-ASIDE-EARLY-CLOSE-2: the engine reads a bare "yes" to the early-close
-    # question as unclear (review S3R-2) and puts the choice again, so it must offer both.
+    # question as unclear (review S3R-2) and puts the choice again, so it must offer both.  Stop
+    # comes first, as in L-ASIDE-EARLY-CLOSE-2: the engine reads a bare "No." as "keep going"
+    # (``declines_wrap_offer``, then L-ASIDE-WRAP-RESUME), so "no" must mean "don't stop".
     "L-ASIDE-EARLY-CLOSE-SP": (
         "This is Christy, stepping in for a moment. It sounds like you're wrapping up the call "
-        "with {lead_first_name}. Would you like to keep going with her, or stop the role-play "
-        "here?"
+        "with {lead_first_name}. Would you like to stop the role-play here, or keep going with "
+        "her?"
     ),
     "L-ASIDE-EARLY-CLOSE-TIME-SP": (
         "This is Christy, stepping in for a moment. It sounds like you're wrapping up the call "
         "with {lead_first_name}. We still have some time for the role-play. Would you like to "
-        "keep going with her, or stop the role-play here?"
+        "stop the role-play here, or keep going with her?"
     ),
 }
 
