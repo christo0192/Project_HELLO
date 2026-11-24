@@ -328,6 +328,7 @@
         "R1_WRAPUP_ONE_MENTION": { "requiredInProduction": false, "secret": false },
         "R1_WRAPUP_NEXT_ROUND": { "requiredInProduction": false, "secret": false },
         "R1_PRICE_MEMORY": { "requiredInProduction": false, "secret": false },
+        "R1_MEET_VOICE_ENABLED": { "requiredInProduction": false, "secret": false },
         "R1_COME_BACK": { "requiredInProduction": false, "secret": false },
         "R1_PERSONA_TIMELINE_V2": { "requiredInProduction": false, "secret": false },
         "R1_CALL_OPENING": { "requiredInProduction": false, "secret": false },

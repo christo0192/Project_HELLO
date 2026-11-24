@@ -30,6 +30,12 @@ SESSION_ID = "5b2a34cb-a912-4c68-a2c2-79ccdc1dcdd1"
 ROOM = f"screening-{SESSION_ID}"
 MARKED = '{"session_id": "x", "lane": "r1"}'
 UNMARKED = '{"session_id": "x"}'
+# M034 S08: a Google Meet round is an ordinary R1 room whose metadata also mirrors the channel
+# and the bridge identity; the phone predicates share the ``channel`` key, so pin that "meet"
+# is neither a phone nor a preflight room and routes like any other marked R1 room.
+MEET_MARKED = (
+    '{"session_id": "x", "lane": "r1", "channel": "meet", "candidate_identity": "meet-00000000"}'
+)
 _ENV_KEYS = ("PHONE_AGENT_NAME", "BROWSER_AGENT_NAME", "WORKER_ORCHESTRATION", "R1_LANE_MODE")
 
 
@@ -129,6 +135,39 @@ class TestR1EntrypointRouting(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(self.run_r1.await_args.args[0], ctx)
                 self.assertEqual(ctx.shutdowns, [])
                 self.assertEqual(ctx.deleted, [])
+
+    async def test_a_meet_marked_room_routes_like_any_marked_r1_room(self) -> None:
+        for mode in ("r1_only", " r1_only "):
+            with self.subTest(mode=mode):
+                self.run_r1.reset_mock()
+                os.environ["R1_LANE_MODE"] = mode
+                ctx = RefuseContext(MEET_MARKED)
+                await self.agent.entrypoint(ctx)
+                self.run_r1.assert_awaited_once()
+                self.assertIs(self.run_r1.await_args.args[0], ctx)
+                self.assertEqual(ctx.shutdowns, [])
+                self.assertEqual(ctx.deleted, [])
+
+    async def test_a_meet_marked_room_with_the_gate_closed_is_refused(self) -> None:
+        for mode in (None, "off", "garbage"):
+            with self.subTest(mode=mode):
+                self.log.reset_mock()
+                self.run_r1.reset_mock()
+                if mode is None:
+                    os.environ.pop("R1_LANE_MODE", None)
+                else:
+                    os.environ["R1_LANE_MODE"] = mode
+                ctx = RefuseContext(MEET_MARKED)
+                await self.agent.entrypoint(ctx)  # no connect(): AttributeError if reached
+                self.assert_refused(ctx, "marked_room_mode_off")
+
+    def test_a_meet_room_is_neither_a_phone_nor_a_preflight_room(self) -> None:
+        phone = fixtures.phone
+        self.assertFalse(phone.is_phone_room(ROOM, MEET_MARKED))
+        self.assertFalse(phone.is_preflight_room(MEET_MARKED))
+        # Control: the same predicates do see their own channels.
+        self.assertTrue(phone.is_phone_room(ROOM, '{"channel": "phone"}'))
+        self.assertTrue(phone.is_preflight_room('{"channel": "preflight", "schema": 1}'))
 
     async def test_an_unmarked_room_with_the_gate_closed_stays_on_the_legacy_path(self) -> None:
         for mode in (None, "off", "garbage"):

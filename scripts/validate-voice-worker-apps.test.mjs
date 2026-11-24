@@ -164,6 +164,9 @@ const NEG = [
   ["browser sets R1_STT_MODEL even empty", GOOD_BROWSER.replace("[env]\n", '[env]\n  R1_STT_MODEL = ""\n'), GOOD_PHONE],
   ["phone sets R1_TTS_PROFILE", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  R1_TTS_PROFILE = "v4"\n')],
   ["phone sets R1_STT_MODEL", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  R1_STT_MODEL = "saaras:v4"\n')],
+  // M034 S08: the Meet channel's worker flag is a Fly secret only, never [env] on either app.
+  ["browser sets R1_MEET_VOICE_ENABLED in fly.toml", GOOD_BROWSER.replace("[env]\n", '[env]\n  R1_MEET_VOICE_ENABLED = "1"\n'), GOOD_PHONE],
+  ["phone sets R1_MEET_VOICE_ENABLED", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  R1_MEET_VOICE_ENABLED = "1"\n')],
   ["browser sets R1_VIDEO_X264_PRESET in fly.toml", GOOD_BROWSER.replace("[env]\n", '[env]\n  R1_VIDEO_X264_PRESET = "veryfast"\n'), GOOD_PHONE],
   ["browser sets R1_VIDEO_X264_PRESET even at its default", GOOD_BROWSER.replace("[env]\n", '[env]\n  R1_VIDEO_X264_PRESET = "superfast"\n'), GOOD_PHONE],
   ["phone sets R1_VIDEO_X264_PRESET", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  R1_VIDEO_X264_PRESET = "superfast"\n')],

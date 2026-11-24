@@ -1,7 +1,7 @@
 """R1_INTERVIEWER_DEX (owner 2026-11-19): Dex, a male interviewer, in every spoken line.
 
-Pure tests (no livekit): the default renders Dex in exactly the 21 lines that name the interviewer
-and never Christy, the flag off renders content revision 46's Christy texts byte for byte, the
+Pure tests (no livekit): the default renders Dex in exactly the 24 lines that name the interviewer
+(21, plus the three Google Meet openings of M034 S08) and never Christy, the flag off renders content revision 46's Christy texts byte for byte, the
 placeholders and cacheability do not change, and the content pin does not depend on the flag.
 It also covers Dex model prompts, agent instructions and voice defaults. No livekit is needed:
 r1_session falls back to Agent = object. Synthetic names only.
@@ -31,7 +31,8 @@ import r1_turn_reader
 IDS = set('''L-OPEN L-OPEN-HELLO L-OPEN-HI L-EXIT L-ASIDE-COACH L-ASIDE-COACH-V20
 L-ASIDE-END L-ASIDE-WRAP L-ASIDE-EARLY-CLOSE L-ASIDE-EARLY-CLOSE-TIME L-ASIDE-LAST-POINT
 L-EXIT-WRAP L-EXIT-WRAP-2 L-EXIT-WRAP-END L-EXIT-WRAP-TIME L-ASIDE-END-2
-L-ASIDE-EARLY-CLOSE-2 L-ASIDE-WRAP-AGAIN L-MUTE L-MUTE-RP L-SIL-RP2'''.split())
+L-ASIDE-EARLY-CLOSE-2 L-ASIDE-WRAP-AGAIN L-MUTE L-MUTE-RP L-SIL-RP2
+L-OPEN-MEET L-OPEN-HELLO-MEET L-OPEN-HI-MEET'''.split())
 VALUES = dict(first_name="Asha", lead_name="Meera Rao", lead_first_name="Meera", lead_city="Pune")
 
 
