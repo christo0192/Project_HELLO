@@ -350,7 +350,9 @@ describe('a slot, in India time', () => {
     // ICU versions disagree about the comma after the weekday, and about nothing else here.
     expect(slot.day).toMatch(/^Tue,? 24 Nov 2026$/);
     expect(slot.time).toBe('14:30–15:00 IST');
-    expect(slot.text).toBe(`${slot.day}, 14:30–15:00 IST`);
+    // A link's name says "to": a screen reader reads an en dash as a pause or not at all (ist-datetime).
+    expect(slot.text).toBe(`${slot.day}, 14:30 to 15:00 IST`);
+    expect(slot.text).not.toContain('–');
   });
 
   it('takes its day and year from India, not from UTC', () => {
@@ -368,7 +370,9 @@ describe('a slot, in India time', () => {
   });
 
   it('crosses no midnight when only UTC does', () => {
-    expect(meetBookingSlot('2026-11-24T23:30:00.000Z', '2026-11-25T00:15:00.000Z').time).toBe('05:00–05:45 IST');
+    const slot = meetBookingSlot('2026-11-24T23:30:00.000Z', '2026-11-25T00:15:00.000Z');
+    expect(slot.time).toBe('05:00–05:45 IST');
+    expect(slot.text).toBe(`${slot.day}, 05:00 to 05:45 IST`);
   });
 
   it('says so when a time cannot be read, and never prints Invalid Date', () => {
@@ -419,6 +423,19 @@ describe('the filters in the address', () => {
 
   it('reads an empty From as no lower bound, and an empty To as no upper bound', () => {
     expect(filtersOf('from=&to=')).toEqual({ status: null, from: null, to: null });
+  });
+
+  it('reads no From with a To before today as no lower bound: a From nobody chose never refuses a To', () => {
+    expect(filtersOf('to=2026-11-23')).toEqual({ status: null, from: null, to: '2026-11-23' });
+    expect(filtersOf('status=failed&to=2026-09-01')).toEqual({ status: 'failed', from: null, to: '2026-09-01' });
+    // A To of today or later leaves the From the page opens on.
+    expect(filtersOf(`to=${TODAY}`)).toEqual({ status: null, from: TODAY, to: TODAY });
+    expect(filtersOf('to=2026-11-30')).toEqual({ status: null, from: TODAY, to: '2026-11-30' });
+    // A From that was chosen, or emptied, is kept as it is.
+    expect(filtersOf('from=2026-11-24&to=2026-11-23')).toEqual({ status: null, from: '2026-11-24', to: '2026-11-23' });
+    expect(filtersOf('from=&to=2026-11-23')).toEqual({ status: null, from: null, to: '2026-11-23' });
+    // A From the page cannot read is absent, so it yields to the To as well.
+    expect(filtersOf('from=nonsense&to=2026-11-23')).toEqual({ status: null, from: null, to: '2026-11-23' });
   });
 
   it.each(['tomorrow', '2026-02-30', '2026-11', '24-11-2026', '2019-12-31', '2100-01-01', '9999-12-31', '0001-01-01'])(
@@ -502,8 +519,19 @@ describe('the request the filters make', () => {
     expect(meetDateError({ status: null, from: '2026-11-24', to: '2026-11-25' })).toBeNull();
     expect(meetDateError({ status: null, from: null, to: '2020-01-01' })).toBeNull();
     expect(meetDateError({ status: null, from: '2099-12-31', to: null })).toBeNull();
-    // A To in the past, with the From the page opens on.
-    expect(meetDateError(filtersOf('to=2026-11-23'))).toBe(error);
+    // A To in the past against a From that was chosen.
+    expect(meetDateError(filtersOf('from=2026-11-24&to=2026-11-23'))).toBe(error);
+    // A To in the past with no From in the address: nobody chose today, so nothing is refused.
+    expect(meetDateError(filtersOf('to=2026-11-23'))).toBeNull();
+  });
+
+  it('asks for everything up to a past To when no From was chosen', () => {
+    expect(meetBookingsQuery(filtersOf('to=2026-11-23'))).toEqual({
+      status: null,
+      from: null,
+      to: '2026-11-23T18:30:00.000Z',
+      cursor: null,
+    });
   });
 });
 
@@ -514,10 +542,30 @@ describe('one more page', () => {
     expect(merged).toEqual([other('1'), other('2'), other('3'), other('4')]);
   });
 
-  it('puts the copy just read in the old one’s place, so no booking shows twice', () => {
+  it('keeps the copy just read, so no booking shows twice, and puts it where its slot now falls', () => {
     const moved = other('1', { start_at: '2026-12-01T09:00:00.000Z', end_at: '2026-12-01T09:30:00.000Z' });
     const merged = mergeMeetBookings([other('1'), other('2')], [other('3'), moved]);
-    expect(merged).toEqual([moved, other('2'), other('3')]);
+    expect(merged).toEqual([other('2'), other('3'), moved]);
+  });
+
+  it('stays earliest first, as the count line says, when a booking was moved later between two reads', () => {
+    const at = (hhmm: string) => `2026-11-24T${hhmm}:00.000Z`;
+    const slot = (n: string, start: string, end: string) => other(n, { start_at: at(start), end_at: at(end) });
+    // Page one runs to 09:30 UTC (15:00 IST); then A is moved from 04:30 to 14:30 UTC in Ashby.
+    const shown = [slot('1', '04:30', '05:00'), slot('2', '05:30', '06:00'), slot('3', '09:30', '10:00')];
+    const movedA = slot('1', '14:30', '15:00');
+    const next = [slot('4', '10:30', '11:00'), movedA, slot('5', '15:30', '16:00')];
+    const merged = mergeMeetBookings(shown, next);
+    expect(merged.map((booking) => booking.id.slice(-1))).toEqual(['2', '3', '4', '1', '5']);
+    expect(merged[3]).toBe(movedA);
+    const starts = merged.map((booking) => Date.parse(booking.start_at));
+    expect(starts).toEqual([...starts].sort((a, b) => a - b));
+  });
+
+  it('breaks a tie on the slot by id, as the API orders them, whatever the letter case', () => {
+    const upper = other('b'.toUpperCase());
+    const merged = mergeMeetBookings([other('c')], [other('a'), upper]);
+    expect(merged.map((booking) => booking.id.slice(-1))).toEqual(['a', 'B', 'c']);
   });
 
   it('takes the copy just read whatever its version: that counts bots, not changes to the row', () => {

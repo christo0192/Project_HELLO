@@ -213,9 +213,11 @@ describe('a row', () => {
     const [line] = bodyRows();
     const cells = within(line).getAllByRole('cell');
     expect(cells).toHaveLength(4);
-    expect(slot.text).toMatch(/^Wed,? 25 Nov 2026, 14:30–15:00 IST$/);
+    // The link's name says "to", which a screen reader speaks; the cell keeps the dash, which the eye reads.
+    expect(slot.text).toMatch(/^Wed,? 25 Nov 2026, 14:30 to 15:00 IST$/);
     expect(cells[0]).toHaveTextContent(slot.day);
     expect(cells[0]).toHaveTextContent('14:30–15:00 IST');
+    for (const link of within(cells[1]).getAllByRole('link')) expect(link.textContent).not.toContain('–');
     const candidate = within(cells[1]).getByRole('link', { name: `Open candidate for ${slot.text}` });
     expect(candidate).toHaveAttribute('href', `/candidates/${CANDIDATE}?tab=r1`);
     const review = within(cells[1]).getByRole('link', { name: `Open R1 review for ${slot.text}` });
@@ -511,8 +513,22 @@ describe('the filters', () => {
     expect(asked()).toBe(1);
   });
 
-  it('says a To before the From on its field, shows no list and asks nothing, until they agree', async () => {
+  it('a To before today with no From chosen asks for everything up to it, and empties the From box', async () => {
     open();
+    await table();
+    expect(fromField()).toHaveValue('2026-11-24');
+    typeDate(toField(), '2026-11-20');
+    await waitFor(() => expect(lastAsked()).toEqual({ status: null, from: null, to: '2026-11-20T18:30:00.000Z', cursor: null }));
+    expect(address()).toBe('/interviews/meet-bookings?to=2026-11-20');
+    expect(fromField()).toHaveValue('');
+    expect(screen.queryByText('The To date is before the From date.')).toBeNull();
+    expect(toField()).not.toHaveAttribute('aria-invalid');
+    await table();
+    expect(asked()).toBe(2);
+  });
+
+  it('says a To before the From on its field, shows no list and asks nothing, until they agree', async () => {
+    open('?from=2026-11-24');
     await table();
     typeDate(toField(), '2026-11-20');
     const message = await screen.findByText('The To date is before the From date.');
@@ -744,6 +760,24 @@ describe('the pages', () => {
     await waitFor(() => expect(bodyRows()).toHaveLength(3));
     expect(countLine()).toHaveTextContent('Showing 3 bookings');
     expect(bodyRows()[1]).toHaveTextContent('Status: Cancelled');
+  });
+
+  it('keeps the list earliest first when a booking came back moved to a later slot', async () => {
+    const at = (hhmm: string) => `2026-11-25T${hhmm}:00.000Z`;
+    const slotted = (n: number, start: string, end: string) => row(n, { start_at: at(start), end_at: at(end) });
+    mockApi.listR1MeetBookings
+      .mockResolvedValueOnce(body({ bookings: [slotted(1, '04:30', '05:00'), slotted(2, '05:30', '06:00')], next_cursor: 'cursor-1' }))
+      // Booking 1 was moved from 10:00 to 16:00 IST in Ashby between the two reads.
+      .mockResolvedValueOnce(body({ bookings: [slotted(3, '07:30', '08:00'), slotted(1, '10:30', '11:00')] }));
+    open();
+    await table();
+    await userEvent.click(loadMoreButton());
+    await waitFor(() => expect(countLine()).toHaveTextContent(/^Showing 3 bookings, earliest first\.$/));
+    expect(bodyRows().map((line) => within(line).getAllByRole('cell')[0].textContent)).toEqual([
+      expect.stringContaining('11:00–11:30 IST'),
+      expect.stringContaining('13:00–13:30 IST'),
+      expect.stringContaining('16:00–16:30 IST'),
+    ]);
   });
 
   it('keeps the rows up and the button busy while the page is on its way, and asks for it once', async () => {

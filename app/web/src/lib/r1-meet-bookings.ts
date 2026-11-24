@@ -205,7 +205,10 @@ export const R1_MEET_STATUS_OPTIONS: ReadonlyArray<{ value: R1MeetBookingStatus 
 export interface MeetBookingSlot {
   day: string;
   time: string;
-  /** Both, for a link's own name. */
+  /**
+   * Both, for a link's own name, with the range said with "to": a screen reader announces an en dash as a
+   * pause or not at all, which would turn the slot into two bare times (as `formatIstBandLabel` says).
+   */
   text: string;
 }
 
@@ -224,7 +227,9 @@ export function meetBookingSlot(startIso: string, endIso: string): MeetBookingSl
   const time = crossesMidnight
     ? `${formatIstTime(startIso)} to ${dayWithYear(endDate)}, ${formatIstTime(endIso)}`
     : formatIstTimeRange(startIso, endIso);
-  return { day, time, text: `${day}, ${time}` };
+  // `formatIstTimeRange` joins its two times with its one en dash; the eye keeps it, the name says "to".
+  const spoken = crossesMidnight ? time : time.replace('–', ' to ');
+  return { day, time, text: `${day}, ${spoken}` };
 }
 
 const STAMP: Intl.DateTimeFormatOptions = {
@@ -264,17 +269,21 @@ export function isMeetFilterDate(value: unknown): value is IstDate {
 
 /**
  * The filters an address names. No `from` is today (the API sorts the earliest slot first, so without
- * it the page would open on the oldest history) and an empty one is no lower bound. Anything this page
- * cannot read is read as absent, never as an error.
+ * it the page would open on the oldest history) and an empty one is no lower bound. No `from` with a
+ * `to` before today is no lower bound as well: a From nobody chose never refuses a To somebody did, so
+ * "To = yesterday" lists everything up to yesterday. Anything this page cannot read is read as absent,
+ * never as an error.
  */
 export function meetFiltersFrom(params: URLSearchParams, today: IstDate): MeetFilters {
   const status = params.get('status');
   const from = params.get('from');
-  const to = params.get('to');
+  const rawTo = params.get('to');
+  const to = isMeetFilterDate(rawTo) ? rawTo : null;
+  const implicitFrom = to !== null && to < today ? null : today;
   return {
     status: isMeetStatus(status) ? status : null,
-    from: from === '' ? null : isMeetFilterDate(from) ? from : today,
-    to: isMeetFilterDate(to) ? to : null,
+    from: from === '' ? null : isMeetFilterDate(from) ? from : implicitFrom,
+    to,
   };
 }
 
@@ -303,8 +312,23 @@ export function meetBookingsQuery(filters: MeetFilters, cursor: string | null = 
 }
 
 /**
- * One more page after what is shown. A booking rescheduled between two reads can come back on a later
- * page: the copy just read is the newer one and takes the old one's place, so no booking shows twice.
+ * The API's one order: the slot's start, then the id. Postgres compares a uuid as its bytes, which is the
+ * order of its lower-case hex. Every row passed the reader, so its start is a readable instant.
+ */
+function bySlot(left: R1MeetBooking, right: R1MeetBooking): number {
+  const apart = Date.parse(left.start_at) - Date.parse(right.start_at);
+  if (apart !== 0 && !Number.isNaN(apart)) return apart;
+  const a = left.id.toLowerCase();
+  const b = right.id.toLowerCase();
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * One more page after what is shown, earliest first as the count line says. A booking rescheduled
+ * between two reads can come back on a later page: the copy just read is the newer one and replaces the
+ * old one, so no booking shows twice, and it goes where its new slot falls. A booking moved to before the
+ * pages already read is on no later page, so it keeps the slot it was read with until the list is read
+ * again (a keyset page cannot know of it).
  */
 export function mergeMeetBookings(
   shown: readonly R1MeetBooking[],
@@ -312,5 +336,5 @@ export function mergeMeetBookings(
 ): R1MeetBooking[] {
   const byId = new Map(shown.map((booking) => [booking.id, booking]));
   for (const booking of next) byId.set(booking.id, booking);
-  return [...byId.values()];
+  return [...byId.values()].sort(bySlot);
 }

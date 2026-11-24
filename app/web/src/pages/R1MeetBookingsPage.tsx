@@ -4,7 +4,8 @@
  *   /interviews/meet-bookings?status=blocked&from=2026-11-24&to=2026-11-30
  *
  * It opens on every status, from today in India on, earliest slot first, which is the API's only order. An
- * empty `from` is no lower bound. Both days count, and are India days wherever the browser is
+ * empty `from` is no lower bound, and so is no `from` with a `to` before today (a From nobody chose never
+ * refuses a To). Both days count, and are India days wherever the browser is
  * (lib/r1-meet-bookings). The API decides who sees which booking (`GET /api/interview-rounds/meet-bookings`).
  *
  * The server decides whether Meet is on, and this page only prints what it answered: there is nothing to
