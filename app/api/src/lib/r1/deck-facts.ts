@@ -9,22 +9,33 @@
  * given to the learner model.
  *
  * The owner decision of 2026-11-20 adds code-owned India playbook scorer guidance,
- * not a deck fact; it is gated by R1_INDIA_PLAYBOOK.
+ * not a deck fact; it is gated by R1_INDIA_PLAYBOOK. The owner decision of 2026-11-24 adds the
+ * code-owned IK offers guidance (referrals, partner companies, a paid interview-prep add-on),
+ * gated by R1_IK_OFFERS.
  *
  * Every number below is copied from the deck; do not add a fact the deck does not state.
  */
 
 import { createHash } from 'node:crypto';
-import { r1IndiaPlaybookEnabled } from './config.js';
+import { r1IkOffersEnabled, r1IndiaPlaybookEnabled } from './config.js';
 
-export { r1IndiaPlaybookEnabled };
+export { r1IkOffersEnabled, r1IndiaPlaybookEnabled };
 
 export const R1_DECK_FACTS_VERSION = 'r1-deck-facts-2026-10.1';
 export const R1_DECK_FACTS_VERSION_INDIA = 'r1-deck-facts-2026-11.1';
+/** India playbook and IK offers (the default). */
+export const R1_DECK_FACTS_VERSION_IK = 'r1-deck-facts-2026-11.2';
+/** IK offers without the India playbook. */
+export const R1_DECK_FACTS_VERSION_IK_ONLY = 'r1-deck-facts-2026-11.3';
 
-/** Audit version: 2026-11.1 when the India playbook is on. */
+/**
+ * Audit version for the four flag combinations: 2026-10.1 neither, 2026-11.1 the India playbook
+ * only, 2026-11.2 both (the default), 2026-11.3 IK offers only.
+ */
 export function r1DeckFactsVersion(source: NodeJS.ProcessEnv = process.env): string {
-  return r1IndiaPlaybookEnabled(source) ? R1_DECK_FACTS_VERSION_INDIA : R1_DECK_FACTS_VERSION;
+  const india = r1IndiaPlaybookEnabled(source);
+  if (r1IkOffersEnabled(source)) return india ? R1_DECK_FACTS_VERSION_IK : R1_DECK_FACTS_VERSION_IK_ONLY;
+  return india ? R1_DECK_FACTS_VERSION_INDIA : R1_DECK_FACTS_VERSION;
 }
 
 /** Code-owned playbook guidance, not a deck fact. */
@@ -40,6 +51,17 @@ export const R1_INDIA_PLAYBOOK_TEXT =
   'ignoring the learner\'s questions. Speech-to-text can mishear a discount figure: when the ' +
   'advisor states a total of $8,500, $8,000 or $7,500, read the discount as the matching ' +
   '$500, $1,000 or $1,500, even if the transcript or the administration log shows another figure.';
+
+/** Code-owned IK offers guidance (owner decision 2026-11-24), not a deck fact. */
+export const R1_IK_OFFERS_TEXT =
+  'IK OFFERS (owner decision 2026-11-24): referrals to hiring or partner companies, IK\'s partner ' +
+  'companies or hiring network, and IK\'s interview-preparation program sold as an add-on or a ' +
+  'separate program at an extra cost are real IK offers: never treat them as invented, ' +
+  'unsupported or a violation. An add-on\'s extra cost raises the total; it is never a discount, ' +
+  'a stacked discount or an off-deck price. Judge any discount on the course price alone, and ' +
+  'never read a discount from a stated total that includes an add-on. Still violations: an ' +
+  'add-on given for free (a free perk), and a referral or partner company presented as a ' +
+  'guaranteed job, role or placement.';
 
 /** Deck page 2: "Listed Price Details: $9000", "Applicable Discounts: $500, $1000, $1500". */
 export const R1_LIST_PRICE_USD = 9000;
@@ -88,18 +110,19 @@ export const R1_DECK_UNSTATED_TEXT =
   'of a job or refund, or an invented freebie is a violation.';
 
 /** The block embedded in the scorer prompt. */
-export function r1DeckFactsBlockFor(indiaPlaybook: boolean): string {
+export function r1DeckFactsBlockFor(indiaPlaybook: boolean, ikOffers = false): string {
   return [
     ...R1_DECK_FACTS_TEXT.map((fact) => `- ${fact}`),
     '',
     R1_DECK_UNSTATED_TEXT,
     ...(indiaPlaybook ? ['', R1_INDIA_PLAYBOOK_TEXT] : []),
+    ...(ikOffers ? ['', R1_IK_OFFERS_TEXT] : []),
   ].join('\n');
 }
 
 /** Flag-aware wrapper for the scorer prompt block. */
 export function r1DeckFactsBlock(source: NodeJS.ProcessEnv = process.env): string {
-  return r1DeckFactsBlockFor(r1IndiaPlaybookEnabled(source));
+  return r1DeckFactsBlockFor(r1IndiaPlaybookEnabled(source), r1IkOffersEnabled(source));
 }
 
 export function r1DeckFactsSha(source: NodeJS.ProcessEnv = process.env): string {

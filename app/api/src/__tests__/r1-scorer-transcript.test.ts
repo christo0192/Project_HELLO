@@ -134,6 +134,22 @@ describe('masking', () => {
     }
   });
 
+  it('masks the callback lines after pressure with any slot (owner decision 2026-11-24)', () => {
+    // r1_commitment.CALLBACK_LINE and CALLBACK_MOVED_LINE: no API change, the "let's book a call"
+    // frame already hides them, as it hides the MEDIUM line.
+    for (const line of [
+      "Okay, let's book a call tonight, once I've talked to my father.",
+      "Okay, let's book a call tomorrow evening, once I've talked to my husband.",
+      "Okay, let's book a call this weekend, once I've talked to my wife.",
+      "Okay, let's book a call later this week, once I've talked to my father.",
+      "Okay, let's book a call on Thursday at 7 PM, once I've talked to my husband.",
+      "Evenings are easier for me, so let's book a call tomorrow at 7 PM, once I've talked to my father.",
+    ]) {
+      expect(maskCommitmentLines(line), line).toBe(R1_COMMITMENT_MASK);
+      expect(maskCommitmentLines(`Hmm, okay. ${line}`), line).toBe(`Hmm, okay. ${R1_COMMITMENT_MASK}`);
+    }
+  });
+
   it('masks every cut of the MEDIUM line from "let\'s book a call" on, whatever its slot (ship restore round 1)', () => {
     // Production's own line always says "on Thursday at 7 PM", so its frame masked every cut after the
     // slot (48 of 48).  The MEDIUM line now carries the advisor's slot (or a deferred booking), so the

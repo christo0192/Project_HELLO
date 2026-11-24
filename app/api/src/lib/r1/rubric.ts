@@ -38,7 +38,8 @@ export const R1_RUBRIC_VERSION = 'r1-rubric-2026-10.2';
  * deliberately NOT `SCORING_PROMPT_TEMPLATE_VERSION` (prompts.ts:9 stays unchanged).
  * The India playbook prompt variant keeps this version. Stored `versions.deck_facts` and audit
  * `deck_facts_version` distinguish it (r1-deck-facts-2026-11.1) from the previous variant
- * (r1-deck-facts-2026-10.1).
+ * (r1-deck-facts-2026-10.1). The IK offers variant (owner decision 2026-11-24, R1_IK_OFFERS)
+ * keeps it too: r1-deck-facts-2026-11.2 with the India playbook (the default), 2026-11.3 without.
  */
 export const R1_SCORING_PROMPT_VERSION = 'r1-scoring-2026-10.1';
 

@@ -21,7 +21,7 @@ import { cleanLogRows, interviewRows, r1Scorecard } from './support/r1-scorer.js
 
 const SENTINEL = 'f'.repeat(18);
 
-function build(overrides: { rows?: ReturnType<typeof interviewRows>; logRows?: ReturnType<typeof cleanLogRows>; indiaPlaybook?: boolean; deckFacts?: string } = {}) {
+function build(overrides: { rows?: ReturnType<typeof interviewRows>; logRows?: ReturnType<typeof cleanLogRows>; indiaPlaybook?: boolean; ikOffers?: boolean; deckFacts?: string } = {}) {
   const turns = maskR1Turns(toR1Turns(overrides.rows ?? interviewRows()), "Ava O'Neil");
   const log = parseR1AdministrationLog(overrides.logRows ?? cleanLogRows());
   return buildR1ScorerPrompt({
@@ -32,6 +32,7 @@ function build(overrides: { rows?: ReturnType<typeof interviewRows>; logRows?: R
     stats: computeTranscriptStats(turns),
     deckFacts: overrides.deckFacts ?? r1DeckFactsBlock(),
     indiaPlaybook: overrides.indiaPlaybook,
+    ikOffers: overrides.ikOffers,
     sentinel: SENTINEL,
   });
 }
@@ -56,6 +57,26 @@ describe('R1 scorer prompt', () => {
     expect(on.indexOf(bullet)).toBeGreaterThan(on.indexOf('- Count the metric'));
     expect(on.indexOf(bullet)).toBeLessThan(on.indexOf('- "rationale" must cite specifics'));
     expect(on.replace(bullet + '\n', '')).toBe(off);
+  });
+
+  it('adds only the exact IK offers rule when enabled (owner decision 2026-11-24)', () => {
+    const bullet = '- Apply IK OFFERS in the prep-guide facts: never lower a score for a referral to hiring or ' +
+    'partner companies or for an interview-prep add-on sold at an extra cost; for "Negotiation & ' +
+    'discount discipline" an add-on\'s price is not a discount and not an invented freebie, and the ' +
+    'discount is judged on the course price alone. A free add-on is still an invented freebie, and ' +
+    'a referral promised as a job or placement is still a guaranteed job.';
+    const deckFacts = r1DeckFactsBlock({ R1_INDIA_PLAYBOOK: '0', R1_IK_OFFERS: '0' });
+    const defaultPrompt = build({ deckFacts });
+    const off = build({ deckFacts, ikOffers: false });
+    const on = build({ deckFacts, ikOffers: true });
+    expect(defaultPrompt).toBe(off);
+    expect(defaultPrompt.split('RULES:')[1]).not.toContain('IK OFFERS');
+    expect(on).toContain(bullet + '\n');
+    expect(on.indexOf(bullet)).toBeGreaterThan(on.indexOf('- Count the metric'));
+    expect(on.indexOf(bullet)).toBeLessThan(on.indexOf('- "rationale" must cite specifics'));
+    expect(on.replace(bullet + '\n', '')).toBe(off);
+    const both = build({ deckFacts, indiaPlaybook: true, ikOffers: true });
+    expect(both.indexOf('- Apply the IK INDIA SALES PLAYBOOK')).toBeLessThan(both.indexOf(bullet));
   });
 
   it('labels the learner as simulated and never evidence, and the candidate as the advisor', () => {
