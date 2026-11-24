@@ -417,13 +417,23 @@ export type R1BusyReason = 'slots_full' | 'own_session_live';
 
 /**
  * A refusal from `/api/r1/*`. It IS an `ApiError` (every check by class and code still holds);
- * it only adds the busy reason, the one body field beyond the code that the page acts on.
+ * it only adds the body fields beyond the code that a page acts on: the busy reason, and the
+ * refusal's `retry_after_sec` (a whole number of seconds from 0 to 600, else null), which the
+ * Meet bridge waits on before it asks again (r1-meet.ts). The `Retry-After` header is not read:
+ * cross-origin, the page cannot see it.
  */
 export class R1ApiError extends ApiError {
   readonly busyReason: R1BusyReason | null;
-  constructor(message: string, status: number, busyReason: R1BusyReason | null = null) {
+  readonly retryAfterSec: number | null;
+  constructor(
+    message: string,
+    status: number,
+    busyReason: R1BusyReason | null = null,
+    retryAfterSec: number | null = null,
+  ) {
     super(message, status);
     this.busyReason = busyReason;
+    this.retryAfterSec = retryAfterSec;
   }
 }
 
@@ -481,7 +491,12 @@ async function send(
     data = null;
   }
   if (!response.ok) {
-    throw new R1ApiError(errorCode(data, response.status), response.status, busyReason(data));
+    throw new R1ApiError(
+      errorCode(data, response.status),
+      response.status,
+      busyReason(data),
+      retryAfterSeconds(record(data)?.retry_after_sec),
+    );
   }
   return data;
 }
@@ -596,7 +611,7 @@ export function parseExchange(data: unknown): R1ExchangeResult {
   };
 }
 
-/** The 202's `retry_after_sec`: a whole number of seconds from 0 to 600, else null. */
+/** A `retry_after_sec` (a 202's, or a refusal's): a whole number of seconds from 0 to 600, else null. */
 function retryAfterSeconds(value: unknown): number | null {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 600
     ? value
@@ -605,12 +620,14 @@ function retryAfterSeconds(value: unknown): number | null {
 
 /**
  * The Meet bridge exchange. A 202 (`status: 'preparing'`) must carry `resume_token`, or the page
- * could only retry with the claimed ticket; a 200 must carry the room URL and token. Only the
- * declared fields are copied: anything else the server adds (a name, a session id) never
- * reaches the page.
+ * could only retry with the claimed ticket; a 200 must carry the room URL and token, and either no
+ * `status` or `status: 'ready'`. Any other status fails closed, even beside a room grant: a later
+ * server's "not yet" must never connect the bridge. Only the declared fields are copied: anything
+ * else the server adds (a name, a session id) never reaches the page.
  */
 export function parseMeetExchange(data: unknown): R1MeetExchangeResult {
   const body = requireRecord(data);
+  if (body.status !== undefined && body.status !== 'ready' && body.status !== 'preparing') malformed();
   if (body.status === 'preparing') {
     return {
       status: 'preparing',

@@ -137,6 +137,15 @@ describe('every stage', () => {
       unmount();
     }
   });
+
+  it('blames nobody for a lost connection: it may be the bridge\'s own network', () => {
+    // Everyone in the Meet reads this tile, and the drop may be on the Recall bot's side.
+    renderTile({ stage: { name: 'ended', reason: 'disconnected' } });
+    expect(
+      screen.getByRole('heading', { level: 1, name: 'The interview connection ended' }),
+    ).toBeVisible();
+    expect(R1_MEET_TILE_COPY.ended.disconnected.title).not.toMatch(/interviewer/i);
+  });
 });
 
 describe('the live tile', () => {

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 type Handler = (...args: unknown[]) => void;
 
@@ -99,6 +99,7 @@ import {
   createR1MeetRoom,
   R1_MEET_AUDIO_CAPTURE_OPTIONS,
   R1_MEET_AUDIO_PUBLISH_OPTIONS,
+  R1_MEET_NO_AGENT_GRACE_MS,
   type R1MeetRoomHandlers,
 } from './r1-meet-room';
 
@@ -316,6 +317,174 @@ describe('connect and publish', () => {
     expect(track.stop).toHaveBeenCalledTimes(1);
     expect(handlers.onEnded).toHaveBeenCalledTimes(1);
     expect(handlers.onEnded).toHaveBeenCalledWith('agent_ended');
+  });
+});
+
+describe('a connect that fails reports no ending (the page shows that it could not join)', () => {
+  it('lets the failure reach the page when the room reports Disconnected before connect rejects', async () => {
+    // livekit-client's failed first connect emits Disconnected (the state is still Connecting),
+    // then rejects: that is a room never joined, not an interview whose connection ended.
+    let fail!: (error: unknown) => void;
+    config.connectGate = new Promise<void>((_resolve, reject) => {
+      fail = reject;
+    });
+    const { controller, audio, handlers } = setup();
+    const connecting = controller.connect('wss://x.invalid', 't', audio);
+    currentRoom().emit('disconnected', undefined);
+    fail(new Error('could not establish signal connection'));
+    await expect(connecting).rejects.toThrow('could not establish signal connection');
+    expect(handlers.onEnded).not.toHaveBeenCalled();
+    expect(currentRoom().localParticipant.publishTrack).not.toHaveBeenCalled();
+  });
+
+  it('fails the connect when the room was lost while connecting, even if connect resolves', async () => {
+    const gate = deferred();
+    config.connectGate = gate.promise;
+    const { controller, audio, handlers } = setup();
+    const connecting = controller.connect('wss://x.invalid', 't', audio);
+    currentRoom().emit('disconnected', SIGNAL_CLOSE);
+    gate.resolve();
+    await expect(connecting).rejects.toThrow('r1_meet_room_lost_while_connecting');
+    expect(handlers.onEnded).not.toHaveBeenCalled();
+    expect(currentRoom().localParticipant.publishTrack).not.toHaveBeenCalled();
+    expect(currentRoom().startAudio).not.toHaveBeenCalled();
+  });
+
+  it('still reports a loss once joined, even while publishing, as a lost connection', async () => {
+    const gate = deferred();
+    config.connectGate = gate.promise;
+    const { controller, audio, handlers } = setup();
+    const connecting = controller.connect('wss://x.invalid', 't', audio);
+    const room = currentRoom();
+    room.localParticipant.publishTrack.mockImplementation(async () => {
+      room.emit('disconnected', SIGNAL_CLOSE);
+      throw new Error('publish failed');
+    });
+    gate.resolve();
+    await expect(connecting).rejects.toThrow('publish failed');
+    expect(handlers.onEnded).toHaveBeenCalledTimes(1);
+    expect(handlers.onEnded).toHaveBeenCalledWith('disconnected');
+  });
+});
+
+describe('no interviewer in the room: the bridge leaves after a grace (the SFU must idle)', () => {
+  const agent = (identity: string) => ({ kind: 4, identity, attributes: {} });
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('pins the grace at two minutes', () => {
+    expect(R1_MEET_NO_AGENT_GRACE_MS).toBe(120_000);
+  });
+
+  it('leaves once, as a lost connection, when no interviewer joins within the grace', async () => {
+    const { controller, audio, track, handlers } = setup();
+    await controller.connect('wss://x.invalid', 't', audio);
+    const room = currentRoom();
+    vi.advanceTimersByTime(R1_MEET_NO_AGENT_GRACE_MS - 1);
+    expect(room.disconnect).not.toHaveBeenCalled();
+    expect(handlers.onEnded).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    // The fake's disconnect() emits Disconnected synchronously: still one ending.
+    expect(room.disconnect).toHaveBeenCalledTimes(1);
+    expect(track.stop).toHaveBeenCalledTimes(1);
+    expect(handlers.onEnded).toHaveBeenCalledTimes(1);
+    expect(handlers.onEnded).toHaveBeenCalledWith('disconnected');
+    vi.advanceTimersByTime(R1_MEET_NO_AGENT_GRACE_MS * 3);
+    expect(handlers.onEnded).toHaveBeenCalledTimes(1);
+    expect(room.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('never leaves while an interviewer is in the room', async () => {
+    const { controller, audio, handlers } = setup();
+    await controller.connect('wss://x.invalid', 't', audio);
+    const room = currentRoom();
+    vi.advanceTimersByTime(R1_MEET_NO_AGENT_GRACE_MS - 1_000);
+    room.emit('participantConnected', agent('interviewer'));
+    vi.advanceTimersByTime(R1_MEET_NO_AGENT_GRACE_MS * 10);
+    expect(room.disconnect).not.toHaveBeenCalled();
+    expect(handlers.onEnded).not.toHaveBeenCalled();
+  });
+
+  it('counts an interviewer already in the room when the bridge connects', async () => {
+    const { controller, audio, handlers } = setup();
+    const connecting = controller.connect('wss://x.invalid', 't', audio);
+    currentRoom().remoteParticipants.set('agent', AGENT);
+    await connecting;
+    vi.advanceTimersByTime(R1_MEET_NO_AGENT_GRACE_MS * 2);
+    expect(currentRoom().disconnect).not.toHaveBeenCalled();
+    expect(handlers.onEnded).not.toHaveBeenCalled();
+  });
+
+  it('starts the grace when the last interviewer leaves, and drops it when one comes back', async () => {
+    const { controller, audio, handlers } = setup();
+    await controller.connect('wss://x.invalid', 't', audio);
+    const room = currentRoom();
+    room.emit('participantConnected', agent('a'));
+    room.emit('participantConnected', agent('b'));
+    room.emit('participantDisconnected', agent('a'));
+    // One interviewer is still there: no grace.
+    vi.advanceTimersByTime(R1_MEET_NO_AGENT_GRACE_MS * 2);
+    expect(handlers.onEnded).not.toHaveBeenCalled();
+
+    room.emit('participantDisconnected', agent('b'));
+    vi.advanceTimersByTime(R1_MEET_NO_AGENT_GRACE_MS - 1);
+    room.emit('participantConnected', agent('b'));
+    vi.advanceTimersByTime(R1_MEET_NO_AGENT_GRACE_MS * 2);
+    expect(handlers.onEnded).not.toHaveBeenCalled();
+
+    // Someone who is not the interviewer neither starts nor stops the grace.
+    room.emit('participantDisconnected', agent('b'));
+    room.emit('participantConnected', { kind: 0, identity: 'intruder', attributes: {} });
+    vi.advanceTimersByTime(R1_MEET_NO_AGENT_GRACE_MS);
+    expect(room.disconnect).toHaveBeenCalledTimes(1);
+    expect(handlers.onEnded).toHaveBeenCalledTimes(1);
+    expect(handlers.onEnded).toHaveBeenCalledWith('disconnected');
+  });
+
+  it('reads the grace running out after the interviewer announced aborted as a technical stop', async () => {
+    const { controller, audio, handlers } = setup();
+    await controller.connect('wss://x.invalid', 't', audio);
+    const room = currentRoom();
+    room.emit('participantConnected', { kind: 4, identity: 'agent', attributes: { phase: 'roleplay' } });
+    announce(room, 'aborted');
+    room.emit('participantDisconnected', agent('agent'));
+    vi.advanceTimersByTime(R1_MEET_NO_AGENT_GRACE_MS);
+    expect(handlers.onEnded).toHaveBeenCalledTimes(1);
+    expect(handlers.onEnded).toHaveBeenCalledWith('aborted');
+  });
+
+  it('runs no grace once the interview has ended, or after the page went', async () => {
+    const ended = setup();
+    await ended.controller.connect('wss://x.invalid', 't', ended.audio);
+    currentRoom().emit('disconnected', SIGNAL_CLOSE);
+    vi.advanceTimersByTime(R1_MEET_NO_AGENT_GRACE_MS * 2);
+    expect(ended.handlers.onEnded).toHaveBeenCalledTimes(1);
+    expect(currentRoom().disconnect).not.toHaveBeenCalled();
+
+    const gone = setup();
+    await gone.controller.connect('wss://x.invalid', 't', gone.audio);
+    gone.controller.dispose();
+    vi.advanceTimersByTime(R1_MEET_NO_AGENT_GRACE_MS * 2);
+    expect(gone.handlers.onEnded).not.toHaveBeenCalled();
+    expect(currentRoom().disconnect).toHaveBeenCalledTimes(1);
+
+    const lost = setup();
+    const gate = deferred();
+    config.connectGate = gate.promise;
+    const connecting = lost.controller.connect('wss://x.invalid', 't', lost.audio);
+    currentRoom().emit('disconnected', SIGNAL_CLOSE);
+    gate.resolve();
+    await connecting.catch(() => undefined);
+    vi.advanceTimersByTime(R1_MEET_NO_AGENT_GRACE_MS * 2);
+    expect(lost.handlers.onEnded).not.toHaveBeenCalled();
+    expect(currentRoom().disconnect).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 

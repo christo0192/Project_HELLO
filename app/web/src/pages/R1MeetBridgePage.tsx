@@ -33,7 +33,8 @@ import { isLeadCardVisible, type R1Phase } from '../lib/r1/r1-phase';
  *   - Capture before exchange (D-S07-7): the browser check and the meeting-audio capture come
  *     first, so a browser or audio failure spends no ticket and boots no worker.
  *   - The only API call is `r1Api.meetExchange`, sent through the bounded runner of r1-meet.ts
- *     (at most ten calls, never less than 3 s apart; every refusal is terminal and quiet). Under
+ *     (at most ten calls, never less than 3 s apart; a short-lived refusal answered before the
+ *     ticket is claimed is asked again inside that bound, every other one is terminal and quiet). Under
  *     StrictMode's double effect it still starts exactly once: a second exchange would be
  *     refused as already claimed.
  *   - The server's Meet switch off (503 `meet_disabled`) idles the tile; every other failure

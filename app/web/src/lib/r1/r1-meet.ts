@@ -6,12 +6,20 @@
  * The bridge page runs inside the Recall bot's headless Chrome, so nobody is there to press
  * "try again", and every exchange can boot an interview worker (critic C5). So:
  *
- *   - Only two things are asked again: a 202 `preparing` (the worker is booting) and a network
- *     failure (fetch rejected, or 502/504 from the proxy). Every other answer is terminal and
- *     quiet: the page shows one tile and makes no further call.
+ *   - Asked again: a 202 `preparing` (the worker is booting), a network failure (fetch rejected,
+ *     or 502/504 from the proxy), and a short-lived refusal the server answers BEFORE it claims
+ *     the ticket (contract section 9, S04 order steps 1 to 7, so a retry spends no ticket, no
+ *     start and boots no worker): a 429, a 503 that says when to ask again (`retry_after_sec`,
+ *     the DeepSeek probe), and maintenance (`http_503`, also what a proxy 503 reads as). Once a
+ *     202 has handed out a `resume_token`, every 503 but `meet_disabled` is asked again too: the
+ *     continuation claims and admits nothing (S07 review finding S07-R1). Every other answer is
+ *     terminal and quiet: the page shows one tile and makes no further call. A 503 with no hint
+ *     on a FRESH ticket stays terminal, because it may come after the claim (`r1_room_unavailable`,
+ *     an invalid role's `r1_unavailable`), where the ticket alone would be refused as claimed.
  *   - At most `R1_MEET_EXCHANGE_MAX_CALLS` calls, with the waits of `R1_MEET_EXCHANGE_WAITS_MS`
- *     between them (never less than 3 s). The server's `retry_after_sec` can lengthen a wait,
- *     never shorten it, and never past `R1_MEET_RETRY_AFTER_CAP_MS`.
+ *     between them (never less than 3 s). The server's `retry_after_sec` (a 202's, or a
+ *     retried refusal's) can lengthen a wait, never shorten it, and never past
+ *     `R1_MEET_RETRY_AFTER_CAP_MS`.
  *   - The call COUNT is the primary bound (the e2e harness freezes the clock); the deadline of
  *     `R1_MEET_EXCHANGE_DEADLINE_MS` after the first call is the secondary one, read from the
  *     injected monotonic clock.
@@ -24,7 +32,7 @@
  */
 
 import { ApiError } from '../api-client';
-import type { R1MeetExchangeResult, R1MeetRoomGrant } from './r1-api';
+import { R1ApiError, type R1MeetExchangeResult, type R1MeetRoomGrant } from './r1-api';
 
 /** Why the bridge gave up, as the tile's `data-reason` names it. */
 export type R1MeetFailure =
@@ -34,7 +42,6 @@ export type R1MeetFailure =
   | 'expired'
   | 'round_closed'
   | 'unavailable'
-  | 'rate_limited'
   | 'timeout'
   | 'malformed';
 
@@ -66,8 +73,31 @@ export type R1MeetExchangeVerdict =
 const RETRIED_STATUSES: readonly number[] = [0, 502, 504];
 const INVALID_STATUSES: readonly number[] = [400, 401, 403, 404];
 
-/** What one failed exchange call means for the bridge. */
-export function classifyMeetExchangeError(error: unknown): R1MeetExchangeVerdict {
+/** The refusal's own `retry_after_sec`, when the server sent one (see `R1ApiError`). */
+function refusalHintSeconds(error: unknown): number | null {
+  return error instanceof R1ApiError ? error.retryAfterSec : null;
+}
+
+/**
+ * A short-lived refusal worth asking again inside the same bound (S07-R1). A 429 and maintenance
+ * (`http_503`) are answered before the ticket is claimed; a 503 carrying `retry_after_sec` is the
+ * server saying when to ask again (the DeepSeek probe, also before the claim). With a resume
+ * token held, every 503 qualifies: the continuation claims and admits nothing.
+ */
+function isTransientRefusal(error: ApiError, resumeHeld: boolean): boolean {
+  if (error.status === 429) return true;
+  if (error.status !== 503) return false;
+  return resumeHeld || error.message === 'http_503' || refusalHintSeconds(error) !== null;
+}
+
+/**
+ * What one failed exchange call means for the bridge. `resumeHeld` says whether the call presented
+ * a `resume_token` (a continuation after a 202), which makes every 503 safe to ask again.
+ */
+export function classifyMeetExchangeError(
+  error: unknown,
+  resumeHeld = false,
+): R1MeetExchangeVerdict {
   if (!(error instanceof ApiError)) return { kind: 'failed', reason: 'unavailable' };
   const code = error.message;
   if (code === R1_MEET_DISABLED_CODE) return { kind: 'disabled' };
@@ -76,11 +106,12 @@ export function classifyMeetExchangeError(error: unknown): R1MeetExchangeVerdict
   }
   if (code === 'r1_malformed_response') return { kind: 'failed', reason: 'malformed' };
   if (RETRIED_STATUSES.includes(error.status)) return { kind: 'retry' };
-  if (error.status === 429) return { kind: 'failed', reason: 'rate_limited' };
+  if (isTransientRefusal(error, resumeHeld)) return { kind: 'retry' };
   if (error.status === 410) return { kind: 'failed', reason: 'expired' };
   if (error.status === 425) return { kind: 'failed', reason: 'not_yet' };
   if (INVALID_STATUSES.includes(error.status)) return { kind: 'failed', reason: 'invalid' };
-  // Maintenance (503 `http_503`), a 500, an unknown 409: nothing the bridge can clear.
+  // A 500, an unknown 409 (r1_busy after the claim), a hintless 503 on a fresh ticket: nothing
+  // the bridge can clear by asking again with the ticket alone.
   return { kind: 'failed', reason: 'unavailable' };
 }
 
@@ -129,23 +160,24 @@ export async function runMeetExchange(deps: R1MeetExchangeDeps): Promise<R1MeetE
     if (isCancelled()) return CANCELLED;
     if (startedAt === null) startedAt = now();
     let result: R1MeetExchangeResult | null = null;
+    /** The server's hint for the next wait, in seconds, from a 202 or a retried refusal. */
+    let hintSec: number | null = null;
     try {
       result = await exchange(ticket, resumeToken);
     } catch (error) {
       if (isCancelled()) return CANCELLED;
-      const verdict = classifyMeetExchangeError(error);
+      const verdict = classifyMeetExchangeError(error, resumeToken !== null);
       if (verdict.kind !== 'retry') return verdict;
+      hintSec = refusalHintSeconds(error);
     }
     if (isCancelled()) return CANCELLED;
-    let floorMs = 0;
     if (result !== null) {
       if (result.status === 'ready') return { kind: 'ready', grant: result };
       resumeToken = result.resume_token;
-      if (result.retry_after_sec !== null) {
-        floorMs = Math.min(result.retry_after_sec * 1_000, R1_MEET_RETRY_AFTER_CAP_MS);
-      }
+      hintSec = result.retry_after_sec;
       onPreparing?.();
     }
+    const floorMs = hintSec === null ? 0 : Math.min(hintSec * 1_000, R1_MEET_RETRY_AFTER_CAP_MS);
     if (call >= R1_MEET_EXCHANGE_MAX_CALLS) break;
     const waitMs = Math.max(R1_MEET_EXCHANGE_WAITS_MS[call - 1] as number, floorMs);
     if (now() - startedAt + waitMs > R1_MEET_EXCHANGE_DEADLINE_MS) break;

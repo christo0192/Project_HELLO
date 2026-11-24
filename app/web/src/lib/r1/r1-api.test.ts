@@ -373,6 +373,28 @@ describe('r1Api.meetExchange (the Meet bridge, M034 S07)', () => {
       status: 0,
     });
   });
+
+  it('carries the refusal\'s retry_after_sec (the hint the bridge waits on), and nothing it cannot read', async () => {
+    // The DeepSeek probe refusal: 503 r1_unavailable with the hint in the body (the Retry-After
+    // header is not readable cross-origin, so the body is the source).
+    mockFetch(reply(503, { error: 'r1_unavailable', retry_after_sec: 30 }));
+    const probe = await r1Api.meetExchange(TICKET, null).catch((e: unknown) => e);
+    expect(probe).toBeInstanceOf(R1ApiError);
+    expect(probe).toMatchObject({ message: 'r1_unavailable', status: 503, retryAfterSec: 30 });
+
+    mockFetch(reply(429, { error: 'rate_limited', retry_after_sec: 0 }));
+    expect(await r1Api.meetExchange(TICKET, null).catch((e: unknown) => e)).toMatchObject({
+      status: 429,
+      retryAfterSec: 0,
+    });
+
+    for (const hint of [undefined, null, -1, 1.5, 601, '30', true]) {
+      mockFetch(reply(503, { error: 'r1_unavailable', retry_after_sec: hint }));
+      const error = await r1Api.meetExchange(TICKET, null).catch((e: unknown) => e);
+      expect((error as R1ApiError).retryAfterSec, String(hint)).toBeNull();
+    }
+    expect(new R1ApiError('r1_unavailable', 503).retryAfterSec).toBeNull();
+  });
 });
 
 describe('parseMeetExchange (fail closed, copies only the declared fields)', () => {
@@ -431,6 +453,16 @@ describe('parseMeetExchange (fail closed, copies only the declared fields)', () 
     expect(() => parseMeetExchange({ status: 'busy' })).toThrow(malformed);
     for (const body of [null, 'ok', [], 3]) {
       expect(() => parseMeetExchange(body), String(body)).toThrow(malformed);
+    }
+  });
+
+  it('fails closed on a status it does not know, even beside a room grant', () => {
+    // Only an absent status or `ready` is a grant: a later server's "not yet" must not connect.
+    for (const status of ['queued', 'READY', 'Preparing', 'ready ', '', null, 0, false, {}]) {
+      expect(
+        () => parseMeetExchange({ status, url: 'wss://x', livekit_token: 'k' }),
+        JSON.stringify(status),
+      ).toThrow(malformed);
     }
   });
 

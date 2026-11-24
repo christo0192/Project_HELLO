@@ -30,9 +30,20 @@
  *   - Whether the interviewer is in the room is reported separately from the phase, by counting
  *     AGENT-kind identities (a rejoining agent stays one).
  *   - There is NO mute, NO leave, NO data method and NO video here: nobody presses anything on
- *     the tile. The bridge leaves only on the agent's word, a lost room, or the page going away
- *     (`dispose`, which reports nothing). A full disconnect is terminal: there is no client
- *     rejoin (livekit-client's own reconnect handles blips).
+ *     the tile. The bridge leaves only on the agent's word, a lost room, no interviewer in the
+ *     room for `R1_MEET_NO_AGENT_GRACE_MS`, or the page going away (`dispose`, which reports
+ *     nothing). A full disconnect is terminal: there is no client rejoin (livekit-client's own
+ *     reconnect handles blips).
+ *   - No interviewer, no bridge (S07 review finding S07-R3): from the moment the meeting audio is
+ *     published with no AGENT-kind participant in the room, and from the moment the last one
+ *     leaves, a grace runs; an interviewer joining drops it. When it runs out the bridge leaves
+ *     the room itself and reports a lost connection (`aborted` if that was the last phase). Left
+ *     alone, the bridge would stream the meeting audio, DTX off, into a room no interviewer will
+ *     join for as long as Recall keeps the page open, and the R1 SFU could never idle-stop.
+ *   - A connect that fails is the page's to report (its "cannot join" tile), not an ending:
+ *     livekit-client emits Disconnected for a failed first connect before it rejects, so a
+ *     Disconnected while connecting is held back, and `connect` rejects if the room was lost
+ *     even though the connect itself resolved.
  *   - There is NO completion call and no recorder. The R1 worker owns the recording and the
  *     terminal write; the bridge only leaves the room.
  *
@@ -84,6 +95,16 @@ export const R1_MEET_AUDIO_PUBLISH_OPTIONS: TrackPublishOptions = Object.freeze(
   dtx: false,
 });
 
+/**
+ * How long the bridge stays in the room with no interviewer in it before it leaves (S07-R3). The
+ * worker gate has a worker on its way when the exchange answers 200, so a join takes seconds;
+ * two minutes also covers an interviewer that drops and comes back.
+ */
+export const R1_MEET_NO_AGENT_GRACE_MS = 120_000;
+
+/** The error `connect` rejects with when the room was lost while connecting. */
+const LOST_WHILE_CONNECTING = 'r1_meet_room_lost_while_connecting';
+
 /** Capture the meeting audio the bot's Chrome exposes as its microphone. */
 export function captureMeetAudio(): Promise<LocalAudioTrack> {
   return createLocalAudioTrack(R1_MEET_AUDIO_CAPTURE_OPTIONS);
@@ -129,16 +150,47 @@ export function createR1MeetRoom(
   let finished = false;
   let currentPhase: R1Phase | null = null;
   const agents = new Set<unknown>();
+  /** Between `room.connect` starting and settling: a Disconnected then is a failed connect. */
+  let connecting = false;
+  let lostWhileConnecting = false;
+  /** True once the meeting audio is published: only then does the no-interviewer grace run. */
+  let joined = false;
+  let graceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function stopGrace(): void {
+    if (graceTimer === null) return;
+    clearTimeout(graceTimer);
+    graceTimer = null;
+  }
+
+  /** Start the no-interviewer grace when the bridge is in the room alone (and none is running). */
+  function armGrace(): void {
+    if (!joined || finished || agents.size > 0 || graceTimer !== null) return;
+    graceTimer = setTimeout(() => {
+      graceTimer = null;
+      leaveWithoutInterviewer();
+    }, R1_MEET_NO_AGENT_GRACE_MS);
+  }
 
   /** Claim the single ending. Everything that ends the interview goes through this first. */
   function claimEnd(): boolean {
     if (finished) return false;
     finished = true;
+    stopGrace();
     return true;
   }
 
   function finish(reason: R1MeetEndReason): void {
     if (claimEnd()) handlers.onEnded(reason);
+  }
+
+  /** The grace ran out: leave the room, release the audio, and report it once. */
+  function leaveWithoutInterviewer(): void {
+    // Claimed before leaving, so the room's own Disconnected is not a second ending.
+    if (!claimEnd()) return;
+    void room?.disconnect();
+    audio?.stop();
+    handlers.onEnded(currentPhase === 'aborted' ? 'aborted' : 'disconnected');
   }
 
   /** Count a participant in or out; only AGENT-kind participants are ever counted. */
@@ -149,6 +201,8 @@ export function createR1MeetRoom(
     if (present) agents.add(key);
     else agents.delete(key);
     const after = agents.size > 0;
+    if (after) stopGrace();
+    else armGrace();
     if (before !== after && !finished) handlers.onAgentPresent(after);
   }
 
@@ -235,6 +289,11 @@ export function createR1MeetRoom(
       },
     );
     target.on(RoomEvent.Disconnected, (cause?: DisconnectReason) => {
+      // A failed first connect emits Disconnected before it rejects: the page reports that one.
+      if (connecting) {
+        lostWhileConnecting = true;
+        return;
+      }
       finish(reasonForDisconnect(cause));
     });
   }
@@ -245,17 +304,27 @@ export function createR1MeetRoom(
       const next = new Room(R1_ROOM_OPTIONS);
       room = next;
       wire(next);
-      await next.connect(url, token);
+      connecting = true;
+      try {
+        await next.connect(url, token);
+      } finally {
+        connecting = false;
+      }
       // Ended or disposed while connecting: publish nothing into a room that is going away.
       if (finished) return;
+      // Lost while connecting, yet the connect resolved: never joined, so no ending to report.
+      if (lostWhileConnecting) throw new Error(LOST_WHILE_CONNECTING);
       await next.localParticipant.publishTrack(meetingAudio, R1_MEET_AUDIO_PUBLISH_OPTIONS);
       if (finished) return;
       startPlayback(next);
       syncAgents(next);
+      joined = true;
+      armGrace();
     },
 
     dispose() {
       finished = true;
+      stopGrace();
       room?.removeAllListeners();
       void room?.disconnect();
       audio?.stop();

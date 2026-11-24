@@ -288,8 +288,8 @@ describe('the exchange', () => {
     ['ticket_not_yet_valid', 425, 'not_yet'],
     ['ticket_expired', 410, 'expired'],
     ['round_not_live', 409, 'round_closed'],
-    ['http_503', 503, 'unavailable'],
-    ['rate_limited', 429, 'rate_limited'],
+    // A hintless 503 on a fresh ticket may come after the claim: terminal.
+    ['service_unavailable', 503, 'unavailable'],
     ['http_500', 500, 'unavailable'],
     ['some_new_conflict', 409, 'unavailable'],
     ['r1_malformed_response', 200, 'malformed'],
@@ -325,6 +325,22 @@ describe('the exchange', () => {
     await findH1(R1_MEET_TILE_COPY.live.title);
     expect(h.created[0].controller.connect).toHaveBeenCalledWith('wss://lk.invalid', 'room-token', track);
     expect(document.documentElement.innerHTML).not.toContain(RESUME);
+  });
+
+  it('asks again after a short-lived refusal answered before the claim, waiting on its hint', async () => {
+    // The DeepSeek probe (503 r1_unavailable, retry_after_sec 30), then a rate limit: the ticket
+    // is still unspent, so the bridge asks again with it alone instead of a dead tile.
+    h.meetExchange
+      .mockRejectedValueOnce(new R1ApiError('r1_unavailable', 503, null, 30))
+      .mockRejectedValueOnce(new R1ApiError('rate_limited', 429))
+      .mockResolvedValueOnce(GRANT);
+    openPage();
+    await findH1(R1_MEET_TILE_COPY.live.title);
+    expect(h.meetExchange).toHaveBeenCalledTimes(3);
+    expect(h.meetExchange).toHaveBeenNthCalledWith(2, TICKET, null);
+    expect(h.meetExchange).toHaveBeenNthCalledWith(3, TICKET, null);
+    expect(h.sleeps).toEqual([30_000, 5_000]);
+    expect(track.stop).not.toHaveBeenCalled();
   });
 
   it('retries a network failure within the same budget', async () => {

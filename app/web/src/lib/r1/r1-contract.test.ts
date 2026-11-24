@@ -547,11 +547,16 @@ function meetCodeProblems(specText: string, sources: readonly string[]): string[
   return problems;
 }
 
-/** The pending codes `source` answers (quotes) that `spec` does not name. */
-function pendingCodesUndocumented(source: string, spec: string): string[] {
-  return R1_PENDING_SERVER_ERROR_CODES.filter(
-    (code) => source.includes(`'${code}'`) && !new RegExp(`\\b${code}\\b`).test(spec),
-  );
+/**
+ * The pending codes some API source answers (quotes, in any quote style) that `spec` does not
+ * name. Every non-test source is walked, not only r1-candidate.ts: S05 may keep the string in a
+ * lib constant that the router answers by name, and the check must switch on all the same.
+ */
+function pendingCodesUndocumented(sources: readonly string[], spec: string): string[] {
+  return R1_PENDING_SERVER_ERROR_CODES.filter((code) => {
+    const quoted = new RegExp(`(['"\`])${code}\\1`);
+    return sources.some((source) => quoted.test(source)) && !new RegExp(`\\b${code}\\b`).test(spec);
+  });
 }
 
 describe('the error codes the web acts on are the ones the server answers', () => {
@@ -593,21 +598,35 @@ describe('the error codes the web acts on are the ones the server answers', () =
       .toEqual([]);
   });
 
-  it('checks a code awaiting the server against the candidate spec the moment r1-candidate.ts answers it', () => {
+  it('checks a code awaiting the server against the candidate spec the moment any API source answers it', () => {
     // While the server does not answer a pending code there is nothing to check; once it does,
     // the candidate spec must name it, exactly as for every code the page already acts on.
-    expect(pendingCodesUndocumented(SERVER_SOURCE, CANDIDATE_SPEC)).toEqual([]);
-  });
+    const sources = apiSourceFiles().map((file) => readFileSync(file, 'utf8'));
+    expect(sources.length).toBeGreaterThan(10);
+    expect(pendingCodesUndocumented(sources, CANDIDATE_SPEC)).toEqual([]);
+  }, 30_000);
 
   it('would notice a pending code the server answers but the spec does not name', () => {
-    const answering = "refuse(res, 409, 'round_channel_meet');";
+    const answering = ["refuse(res, 409, 'round_channel_meet');"];
     const naming = '409: round_channel_meet (the round takes place in Google Meet)';
-    expect(pendingCodesUndocumented("refuse(res, 409, 'r1_busy');", '')).toEqual([]);
+    expect(pendingCodesUndocumented(["refuse(res, 409, 'r1_busy');"], '')).toEqual([]);
     expect(pendingCodesUndocumented(answering, '409: r1_busy')).toEqual(['round_channel_meet']);
     expect(pendingCodesUndocumented(answering, naming)).toEqual([]);
     expect(pendingCodesUndocumented(answering, '409: round_channel_meet_v2')).toEqual([
       'round_channel_meet',
     ]);
+    // A lib constant the router answers by name switches the check on too, in any quote style.
+    const viaConstant = [
+      'export const R1_ROUND_CHANNEL_MEET = "round_channel_meet";',
+      'refuse(res, 409, R1_ROUND_CHANNEL_MEET);',
+    ];
+    expect(pendingCodesUndocumented(viaConstant, '409: r1_busy')).toEqual(['round_channel_meet']);
+    expect(pendingCodesUndocumented(['const code = `round_channel_meet`;'], '')).toEqual([
+      'round_channel_meet',
+    ]);
+    expect(pendingCodesUndocumented(viaConstant, naming)).toEqual([]);
+    // A longer name is not the code.
+    expect(pendingCodesUndocumented(["'round_channel_meet_v2'"], '')).toEqual([]);
   });
 
   it('would notice a code that is no longer there', () => {

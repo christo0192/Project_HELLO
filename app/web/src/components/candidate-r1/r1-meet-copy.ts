@@ -50,8 +50,12 @@ export const R1_MEET_TILE_COPY = Object.freeze({
       title: 'The interview stopped because of a technical problem',
       body: 'This will not count against you. The hiring team will be in touch.',
     }),
+    /**
+     * Blames nobody: the drop may be the bridge's own (the Recall bot's network), the interviewer
+     * may never have joined, and everyone in the Meet, the hiring side included, reads this.
+     */
     disconnected: Object.freeze({
-      title: "The interviewer's connection ended",
+      title: 'The interview connection ended',
       body: 'The hiring team will be in touch.',
     }),
   }) satisfies Readonly<Record<R1MeetEndReason, R1MeetTileText>>,

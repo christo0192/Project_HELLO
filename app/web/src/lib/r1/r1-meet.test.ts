@@ -53,21 +53,51 @@ describe('classifyMeetExchangeError', () => {
     ['network_unreachable', 0, { kind: 'retry' }],
     ['http_502', 502, { kind: 'retry' }],
     ['http_504', 504, { kind: 'retry' }],
-    ['http_429', 429, { kind: 'failed', reason: 'rate_limited' }],
+    // A refusal the server answers before it claims the ticket: asked again inside the bound.
+    ['http_429', 429, { kind: 'retry' }],
     ['http_410', 410, { kind: 'failed', reason: 'expired' }],
     ['http_425', 425, { kind: 'failed', reason: 'not_yet' }],
     ['http_400', 400, { kind: 'failed', reason: 'invalid' }],
     ['http_401', 401, { kind: 'failed', reason: 'invalid' }],
     ['http_403', 403, { kind: 'failed', reason: 'invalid' }],
     ['http_404', 404, { kind: 'failed', reason: 'invalid' }],
-    // Maintenance reads `http_503`: terminal, never retried (each call can boot a worker).
-    ['http_503', 503, { kind: 'failed', reason: 'unavailable' }],
+    // Maintenance reads `http_503` (and so does a proxy 503): answered before the claim, retried.
+    ['http_503', 503, { kind: 'retry' }],
+    // A 503 with no hint that may come after the claim: terminal while no resume token is held.
     ['service_unavailable', 503, { kind: 'failed', reason: 'unavailable' }],
+    ['r1_unavailable', 503, { kind: 'failed', reason: 'unavailable' }],
+    ['r1_room_unavailable', 503, { kind: 'failed', reason: 'unavailable' }],
     ['http_500', 500, { kind: 'failed', reason: 'unavailable' }],
     ['something_new', 409, { kind: 'failed', reason: 'unavailable' }],
     ['http_418', 418, { kind: 'failed', reason: 'unavailable' }],
   ])('reads %s (%d) as %j', (code, status, expected) => {
     expect(verdict(code, status)).toEqual(expected);
+  });
+
+  it('retries a 503 that says when to ask again (the DeepSeek probe), and only a 503', () => {
+    const hinted = (code: string, status: number, seconds: number) =>
+      classifyMeetExchangeError(new R1ApiError(code, status, null, seconds));
+    expect(hinted('r1_unavailable', 503, 30)).toEqual({ kind: 'retry' });
+    expect(hinted('r1_unavailable', 503, 0)).toEqual({ kind: 'retry' });
+    expect(hinted('service_unavailable', 503, 5)).toEqual({ kind: 'retry' });
+    // A hint on another status changes nothing: r1_busy (409) is spent after the claim.
+    expect(hinted('r1_busy', 409, 300)).toEqual({ kind: 'failed', reason: 'unavailable' });
+    expect(hinted('http_500', 500, 30)).toEqual({ kind: 'failed', reason: 'unavailable' });
+    // The named codes win over any hint.
+    expect(hinted('meet_disabled', 503, 30)).toEqual({ kind: 'disabled' });
+    expect(hinted('ticket_already_claimed', 409, 30)).toEqual({ kind: 'failed', reason: 'claimed' });
+  });
+
+  it('retries every 503 but the switch once a resume token is held (the continuation claims nothing)', () => {
+    const resumed = (code: string, status: number) =>
+      classifyMeetExchangeError(new R1ApiError(code, status), true);
+    for (const code of ['service_unavailable', 'r1_unavailable', 'r1_room_unavailable', 'http_503']) {
+      expect(resumed(code, 503), code).toEqual({ kind: 'retry' });
+    }
+    expect(resumed('meet_disabled', 503)).toEqual({ kind: 'disabled' });
+    expect(resumed('round_not_live', 409)).toEqual({ kind: 'failed', reason: 'round_closed' });
+    expect(resumed('r1_busy', 409)).toEqual({ kind: 'failed', reason: 'unavailable' });
+    expect(resumed('http_500', 500)).toEqual({ kind: 'failed', reason: 'unavailable' });
   });
 
   it('reads an exchange code by name, whatever status carries it', () => {
@@ -317,15 +347,63 @@ describe('runMeetExchange', () => {
     ['ticket_not_yet_valid', 425, 'not_yet'],
     ['ticket_expired', 410, 'expired'],
     ['round_not_live', 409, 'round_closed'],
-    ['http_503', 503, 'unavailable'],
+    ['service_unavailable', 503, 'unavailable'],
+    ['r1_unavailable', 503, 'unavailable'],
     ['http_500', 500, 'unavailable'],
-    ['http_429', 429, 'rate_limited'],
+    ['r1_busy', 409, 'unavailable'],
     ['r1_malformed_response', 500, 'malformed'],
   ])('stops after one call, without a wait, on %s (%d)', async (code, status, reason) => {
     const h = harness([new R1ApiError(code, status), READY]);
     await expect(runMeetExchange(h.deps)).resolves.toEqual({ kind: 'failed', reason });
     expect(h.calls).toHaveLength(1);
     expect(h.sleeps).toEqual([]);
+  });
+
+  it('asks again after the DeepSeek probe refusal, waiting at least its hint, with the ticket alone', async () => {
+    // Answered before the claim (contract section 9, S04 order step 6): the ticket is unspent.
+    const h = harness([new R1ApiError('r1_unavailable', 503, null, 30), READY]);
+    await expect(runMeetExchange(h.deps)).resolves.toEqual({ kind: 'ready', grant: READY });
+    expect(h.calls).toEqual([null, null]);
+    expect(h.sleeps).toEqual([30_000]);
+    expect(h.preparingSeen()).toBe(0);
+  });
+
+  it('asks again after maintenance and a rate limit, on the schedule, a hint lengthening a wait', async () => {
+    const h = harness([
+      new R1ApiError('http_503', 503),
+      new R1ApiError('rate_limited', 429, null, 10),
+      new R1ApiError('http_429', 429, null, 600),
+      READY,
+    ]);
+    await expect(runMeetExchange(h.deps)).resolves.toEqual({ kind: 'ready', grant: READY });
+    expect(h.calls).toEqual([null, null, null, null]);
+    // 3 s; max(5 s, 10 s); max(10 s, 600 s capped at 30 s).
+    expect(h.sleeps).toEqual([3_000, 10_000, 30_000]);
+  });
+
+  it('gives up within the same bound when the outage outlasts it', async () => {
+    const h = harness([new R1ApiError('r1_unavailable', 503, null, 30)]);
+    await expect(runMeetExchange(h.deps)).resolves.toEqual({ kind: 'failed', reason: 'timeout' });
+    // Calls at 0, 30, ..., 180 s: seven calls; an eighth would start 210 s after the first.
+    expect(h.calls).toHaveLength(7);
+    expect(h.sleeps.every((ms) => ms === R1_MEET_RETRY_AFTER_CAP_MS)).toBe(true);
+
+    const limited = harness([new R1ApiError('http_429', 429)]);
+    await expect(runMeetExchange(limited.deps)).resolves.toEqual({ kind: 'failed', reason: 'timeout' });
+    expect(limited.calls).toHaveLength(R1_MEET_EXCHANGE_MAX_CALLS);
+    expect(limited.sleeps).toEqual([...R1_MEET_EXCHANGE_WAITS_MS]);
+  });
+
+  it('retries an unhinted 503 only as a continuation, presenting the resume token it holds', async () => {
+    // Fresh ticket: the 503 may come after the claim, so a retry would be refused as claimed.
+    const fresh = harness([new R1ApiError('r1_room_unavailable', 503), READY]);
+    await expect(runMeetExchange(fresh.deps)).resolves.toEqual({ kind: 'failed', reason: 'unavailable' });
+    expect(fresh.calls).toEqual([null]);
+
+    const resumed = harness([preparing('resume-a'), new R1ApiError('r1_room_unavailable', 503), READY]);
+    await expect(runMeetExchange(resumed.deps)).resolves.toEqual({ kind: 'ready', grant: READY });
+    expect(resumed.calls).toEqual([null, 'resume-a', 'resume-a']);
+    expect(resumed.sleeps).toEqual([3_000, 5_000]);
   });
 
   it('stops at once on a terminal refusal after a 202, with no further call', async () => {
@@ -386,7 +464,14 @@ describe('runMeetExchange', () => {
     for (const hint of hints) {
       for (const cost of costs) {
         const h = harness(
-          [(call) => (call % 3 === 0 ? network() : preparing(`resume-${call}`, hint))],
+          [
+            (call) => {
+              if (call % 3 === 0) return network();
+              if (call % 4 === 0) return new R1ApiError('r1_unavailable', 503, null, hint);
+              if (call % 5 === 0) return new R1ApiError('http_429', 429, null, hint);
+              return preparing(`resume-${call}`, hint);
+            },
+          ],
           { callCostMs: cost },
         );
         await expect(runMeetExchange(h.deps)).resolves.toEqual({ kind: 'failed', reason: 'timeout' });
