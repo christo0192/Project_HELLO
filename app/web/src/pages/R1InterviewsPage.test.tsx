@@ -432,6 +432,25 @@ describe('when the read fails', () => {
   });
 });
 
+describe('the way to the Meet bookings', () => {
+  it('is a link beside the heading, and asks nothing of its own', async () => {
+    open();
+    const link = screen.getByRole('link', { name: 'Meet bookings' });
+    expect(link).toHaveAttribute('href', '/interviews/meet-bookings');
+    expect(link.parentElement).toContainElement(screen.getByRole('heading', { level: 1, name: 'R1 interviews' }));
+    await screen.findByRole('link', { name: 'Ava Example' });
+    expect(mockApi.listR1Queue).toHaveBeenCalledTimes(1);
+  });
+
+  it('is there while the queue loads, with nothing in it and when it fails', async () => {
+    mockApi.listR1Queue.mockRejectedValue(new Error('service_unavailable'));
+    open();
+    expect(screen.getByRole('link', { name: 'Meet bookings' })).toBeInTheDocument();
+    await screen.findByRole('alert');
+    expect(screen.getByRole('link', { name: 'Meet bookings' })).toBeInTheDocument();
+  });
+});
+
 describe('accessibility', () => {
   it('has no axe violations with rows, and with none', async () => {
     const { container, unmount } = open();

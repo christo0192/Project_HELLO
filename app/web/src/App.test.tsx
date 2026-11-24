@@ -78,6 +78,12 @@ vi.mock('./pages/PhoneCalendarPage', () => ({
 vi.mock('./pages/BusinessImpactPage', () => ({
   BusinessImpactPage: () => <div data-testid="page-impact">Business impact</div>,
 }));
+vi.mock('./pages/R1MeetBookingsPage', () => ({
+  R1MeetBookingsPage: () => <div data-testid="page-meet-bookings">Meet bookings</div>,
+}));
+vi.mock('./pages/R1ReviewPage', () => ({
+  R1ReviewPage: () => <div data-testid="page-r1-review">R1 review</div>,
+}));
 
 function renderApp(initialEntry = '/dashboard') {
   // App owns its <BrowserRouter>; drive the URL through the history API.
@@ -246,6 +252,35 @@ describe('App route wiring', () => {
     renderApp('/impact');
     expect(await screen.findByText(/Recruiter sign-in/i)).toBeInTheDocument();
     expect(screen.queryByTestId('page-impact')).not.toBeInTheDocument();
+  });
+
+  /*
+    Meet bookings (M034): every staff role, as R1 interviews is, and the API decides which bookings. It
+    sits above the review's `:roundId`, so the path is this page's and not a review of a round so named.
+  */
+  it.each([
+    ['an admin', authedAdmin],
+    ['an interviewer', authedInterviewer],
+    ['a viewer', authedViewer],
+  ])('renders Meet bookings at /interviews/meet-bookings for %s, and not the review', async (_who, sign) => {
+    sign();
+    renderApp('/interviews/meet-bookings?status=blocked');
+    expect(await screen.findByTestId('page-meet-bookings')).toBeInTheDocument();
+    expect(screen.queryByTestId('page-r1-review')).not.toBeInTheDocument();
+    expect(screen.getByRole('navigation', { name: 'Main navigation' })).toBeInTheDocument();
+  });
+
+  it('still renders the review of a round at /interviews/:roundId', async () => {
+    renderApp('/interviews/round-1');
+    expect(await screen.findByTestId('page-r1-review')).toBeInTheDocument();
+    expect(screen.queryByTestId('page-meet-bookings')).not.toBeInTheDocument();
+  });
+
+  it('sends an unauthenticated visitor at /interviews/meet-bookings to /login', async () => {
+    unauthenticated();
+    renderApp('/interviews/meet-bookings');
+    expect(await screen.findByText(/Recruiter sign-in/i)).toBeInTheDocument();
+    expect(screen.queryByTestId('page-meet-bookings')).not.toBeInTheDocument();
   });
 
   it('redirects unknown protected paths to /dashboard when authenticated', async () => {
