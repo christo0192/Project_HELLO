@@ -53,7 +53,7 @@ import { SCORE_MAX, type RoleScorecardVersion } from '../lib/scorecards/contract
 import { ScorecardValidationError } from '../lib/scorecards/domain.js';
 import { parseR1AdministrationLog, type R1AdminLogRow } from '../lib/r1/admin-log.js';
 import {
-  r1DeckFactsBlockFor, r1DeckFactsVersion, r1IndiaPlaybookEnabled,
+  r1DeckFactsBlockFor, r1DeckFactsVersion, r1IkOffersEnabled, r1IndiaPlaybookEnabled,
 } from '../lib/r1/deck-facts.js';
 import { createR1Infer, r1ScoringModel } from '../lib/r1/deepseek-runner.js';
 import { parseEvidenceRef } from '../lib/r1/evidence.js';
@@ -592,6 +592,7 @@ export async function runR1Assessment(
       });
     }
     const indiaPlaybook = r1IndiaPlaybookEnabled();
+    const ikOffers = r1IkOffersEnabled();
     const outcome = await scoreR1Transcript(
       { infer: options.infer ?? createR1Infer(), sentinel: options.sentinel },
       {
@@ -600,8 +601,9 @@ export async function runR1Assessment(
         turns: loaded.turns,
         log: loaded.log,
         stats,
-        deckFacts: r1DeckFactsBlockFor(indiaPlaybook),
+        deckFacts: r1DeckFactsBlockFor(indiaPlaybook, ikOffers),
         indiaPlaybook,
+        ikOffers,
         thresholds: settings.thresholds,
       },
     );

@@ -33,7 +33,8 @@ from r1_world import (
 # Revision 3 (M032 S2P, SWEEP-17 item 8): the policy no longer says she knows the price and the
 # duration (documentation only; the card and the prefix carry it behind R1_PROBE_FIRST).
 # Revision 4 (R1_INDIA_PLAYBOOK): pin the owner playbook documentation.
-PINNED_WORLD_SHA256 = "7e23aa887125189243b059a16a50adac3a03a84526a2e0cc5e144b2ae14aa1af"
+# Revision 5 (R1_IK_OFFERS): pin the owner IK offers documentation.
+PINNED_WORLD_SHA256 = "63f90e43308813e9da88c58d681b3ef294e0060a2867769e7ed34140cd21a223"
 
 
 class DeckFactsTests(unittest.TestCase):
@@ -168,6 +169,13 @@ class PinTests(unittest.TestCase):
         self.assertIn(r1_world.PLAYBOOK_RULE.encode(), r1_world._canonical())
         before = r1_world.hashlib.sha256(r1_world._canonical()).hexdigest()
         with patch.object(r1_world, "PLAYBOOK_RULE", "changed"):
+            self.assertNotEqual(before, r1_world.hashlib.sha256(r1_world._canonical()).hexdigest())
+
+    def test_ik_offers_rule_is_pinned(self):
+        from unittest.mock import patch
+        self.assertIn(r1_world.IK_OFFERS_RULE.encode(), r1_world._canonical())
+        before = r1_world.hashlib.sha256(r1_world._canonical()).hexdigest()
+        with patch.object(r1_world, "IK_OFFERS_RULE", "changed"):
             self.assertNotEqual(before, r1_world.hashlib.sha256(r1_world._canonical()).hexdigest())
 
     def test_world_sha_is_pinned(self):

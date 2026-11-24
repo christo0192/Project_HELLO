@@ -90,6 +90,27 @@ BRIEF_SCENARIO_2 = (
     + BRIEF_START_PROMPT_2
 )
 BRIEF_BODY_2 = BRIEF_LEAD_IN + BRIEF_SCENARIO_2
+# Owner 2026-11-24 (R1_SPOKEN_LINES): "apply this fix for all scripted line as all of the scripted
+# ones are sounding the same way".  The W2 brief in the W4 agenda's spoken style: one idea per
+# sentence, no colon, and the question said last.  The facts, the cue phrase and the 'ready'
+# instruction are W2's word for word, and it still ends "Any questions before we start?", so a bare
+# "yes" is invited and a "no" nudged (``r1_session._ANY_QUESTIONS_BRIEFS``).  No longer than W2's
+# brief: the goal is said as the recap says it, with no "Your goal is to" before it (review of
+# revision 54: the longest line of every session must not grow by words that say nothing).
+BRIEF_START_PROMPT_SP = (
+    "Just say 'ready' to begin, and she'll pick up. Any questions before we start?"
+)
+BRIEF_SCENARIO_SP = (
+    "I'll play {lead_name} from {lead_city}. She filled in a form on our website about the Data "
+    "Science course a few days ago. You're the Program Advisor calling her back. You'll have up to "
+    "twenty minutes. Treat it like a real call. "
+    + BRIEF_GOAL[:1].upper()
+    + BRIEF_GOAL[1:]
+    + ". Use the course details from your preparation guide. I'll stay in character until I say, "
+    "'Let's pause the role-play here.' "
+    + BRIEF_START_PROMPT_SP
+)
+BRIEF_BODY_SP = BRIEF_LEAD_IN + BRIEF_SCENARIO_SP
 # D4-TRANS-Q1 (R1_TRANSITION_ANSWERS): what Christy's answer to a comment or complaint before the
 # role-play says when the guard left nothing of it (then the start question follows).
 TRANSITION_QUIET_FALLBACK = "Fair enough."
@@ -620,6 +641,97 @@ LINES: dict[str, str] = {
     # M032 S6 (SWEEP-28): Christy's scripted reply to "Can you give me a minute?" in the
     # getting-to-know-you part (R1_ICEBREAKER_REPAIR); it is not counted as an answer.
     "L-IB-HOLD": "Of course, take a moment. I'm here when you're ready.",
+    # Owner 2026-11-24 (R1_SPOKEN_LINES; content revision 54): "dont make it to open wording only.
+    # apply this fix for all scripted line as all of the scripted ones are sounding the same way".
+    # The W4 agenda's spoken style for every scripted line that still read like written text:
+    # short sentences with one idea each, no colon lists, semicolons or asides, and a question only
+    # as the last thing said.  Spoken in place of the id ``active_line_id`` picks today
+    # (``SPOKEN_LINES``); each keeps its base's facts, placeholders, cue phrases and answer kind,
+    # and the ids above keep their texts for the rollback.
+    "L-TRANSITION-SP": BRIEF_THANKS + BRIEF_BODY_SP,
+    "L-TRANSITION-THANKS-A-SP": "Thanks, {first_name}. " + BRIEF_BODY_SP,
+    "L-TRANSITION-THANKS-B-SP": (
+        "Thanks for walking me through that, {first_name}. " + BRIEF_BODY_SP
+    ),
+    "L-TRANSITION-THANKS-C-SP": "Got it, thank you, {first_name}. " + BRIEF_BODY_SP,
+    "L-TRANSITION-BRIDGED-SP": BRIEF_BODY_SP,
+    "L-TRANSITION-AGAIN-SP": BRIEF_AGAIN + BRIEF_SCENARIO_SP,
+    "L-TRANSITION-AGAIN-PLAIN-SP": (
+        "Sure. Think of it as a real sales call. I'll play {lead_name} from {lead_city}. She "
+        "filled in a form about our Data Science course, and you're the Program Advisor calling "
+        "her back. Find out what she needs, and help her decide to enrol. Use your preparation "
+        "guide. You'll have up to twenty minutes. I'll stay in character until I say, 'Let's "
+        "pause the role-play here.' Whenever you're ready, just say 'ready'."
+    ),
+    # Still the recap's either/or question (CR-1), and well under 0.6 of the brief's words.
+    "L-TRANSITION-RECAP-SP": (
+        "Of course. In short, I'll play {lead_name}. You're the Program Advisor, calling her back "
+        "about the Data Science course. "
+        + BRIEF_GOAL[:1].upper()
+        + BRIEF_GOAL[1:]
+        + ", using your preparation guide. " + RECAP_START_PROMPT
+    ),
+    "L-TRANSITION-RECAP-2-SP": (
+        "No problem, here's the short version. You're calling {lead_first_name} back about the "
+        "Data Science course she asked about. Understand what she needs and help her decide. Say "
+        "'ready' when you'd like to start."
+    ),
+    "L-RP-GOAL-SP": (
+        "Treat it like a real call. Understand what she needs, and help her decide to enrol."
+    ),
+    "L-RP-STUCK-SP": "Just carry on the way you would on a real call. I'll stay in character.",
+    # Yes/no start questions (a bare "yes" starts): the instruction first, the question last, and
+    # no "whenever you like" before a question about starting (review of revision 54: D4-BRIEF2's
+    # instruction-then-a-question-that-ignores-it shape).
+    "L-TRANSITION-ASK-PAUSE-SP": (
+        "If that covers everything, just say 'ready'. Shall we begin the role-play?"
+    ),
+    "L-TRANSITION-REASK-SP": (
+        "Just say 'ready', or ask me a question first. Shall we start the role-play?"
+    ),
+    "L-TRANSITION-STEER-SP": (
+        "Let's keep any other questions for the end of the interview. There'll be time for them "
+        "then. Shall we start the role-play now?"
+    ),
+    # The first sentence is still EXIT_CUE.
+    "L-EXIT-SP": (
+        "Let's pause the role-play here. I'm stepping out of the learner's role now. This is "
+        "Christy, your interviewer, again. Thank you, that's the end of the role-play."
+    ),
+    "L-ASIDE-COACH-SP": (
+        "Quick note from Christy, your interviewer. In this role-play, you're the Program Advisor. "
+        "I'm playing the learner, {lead_name}, who enquired about the Data Science course. You're "
+        "calling her back. Please carry on as you would on a real call."
+    ),
+    # A settled bare "yes" stops (L-ASIDE-END-2) or wraps up (the offers), so that yes/no
+    # question is now the last thing said; carrying on with the learner is still the other answer.
+    "L-ASIDE-END-2-SP": (
+        "This is Christy, your interviewer. If you want to keep going, just carry on with "
+        "{lead_first_name}. Would you like to stop the role-play here and finish the interview?"
+    ),
+    "L-ASIDE-WRAP-SP": (
+        "This is Christy, your interviewer, stepping in for a moment. We're well into the "
+        "role-play now. If you want to keep going, just carry on with {lead_first_name}. Would "
+        "you like to wrap it up here?"
+    ),
+    "L-ASIDE-WRAP-AGAIN-SP": (
+        "Christy again, just checking in. If you'd like to keep going, just carry on with "
+        "{lead_first_name}. Would you like to wrap up the role-play here?"
+    ),
+    # Either/or, like L-ASIDE-EARLY-CLOSE-2: the engine reads a bare "yes" to the early-close
+    # question as unclear (review S3R-2) and puts the choice again, so it must offer both.  Stop
+    # comes first, as in L-ASIDE-EARLY-CLOSE-2: the engine reads a bare "No." as "keep going"
+    # (``declines_wrap_offer``, then L-ASIDE-WRAP-RESUME), so "no" must mean "don't stop".
+    "L-ASIDE-EARLY-CLOSE-SP": (
+        "This is Christy, stepping in for a moment. It sounds like you're wrapping up the call "
+        "with {lead_first_name}. Would you like to stop the role-play here, or keep going with "
+        "her?"
+    ),
+    "L-ASIDE-EARLY-CLOSE-TIME-SP": (
+        "This is Christy, stepping in for a moment. It sounds like you're wrapping up the call "
+        "with {lead_first_name}. We still have some time for the role-play. Would you like to "
+        "stop the role-play here, or keep going with her?"
+    ),
 }
 
 # Owner 2026-11-19, R1_INTERVIEWER_DEX: swap the name in each Christy line.
@@ -709,9 +821,38 @@ AGENDA_W4_LINES = {
 }
 # D4-TRANS-PRESENT1 (``R1_TRANSITION_PRESENCE_V2``): the pickup bridge that hears the press.
 VARIETY_LINES = {"L-PICKUP-BRIDGE": "L-PICKUP-BRIDGE-2"}
+# Owner 2026-11-24 (``R1_SPOKEN_LINES``): the spoken text of each id that ``active_line_id``
+# selects today, applied AFTER that selection, so every older rollback flag still speaks its own
+# text, and the flag off speaks revision 53's texts byte for byte.  Markers, the warm-up order,
+# start questions and the transcript keep the caller's id; each -SP text keeps its base's
+# placeholders, so ``is_candidate_free`` of the caller stays right for the text it renders.  No
+# value is a key (nothing chains), and neither side is in ``MEET_LINES``.  Nothing mutates it.
+SPOKEN_LINES: dict[str, str] = {
+    "L-TRANSITION-W2": "L-TRANSITION-SP",
+    "L-TRANSITION-THANKS-A-W2": "L-TRANSITION-THANKS-A-SP",
+    "L-TRANSITION-THANKS-B-W2": "L-TRANSITION-THANKS-B-SP",
+    "L-TRANSITION-THANKS-C-W2": "L-TRANSITION-THANKS-C-SP",
+    "L-TRANSITION-BRIDGED-W2": "L-TRANSITION-BRIDGED-SP",
+    "L-TRANSITION-AGAIN-W2": "L-TRANSITION-AGAIN-SP",
+    "L-TRANSITION-AGAIN-PLAIN": "L-TRANSITION-AGAIN-PLAIN-SP",
+    "L-TRANSITION-RECAP": "L-TRANSITION-RECAP-SP",
+    "L-TRANSITION-RECAP-2": "L-TRANSITION-RECAP-2-SP",
+    "L-RP-GOAL": "L-RP-GOAL-SP",
+    "L-RP-STUCK": "L-RP-STUCK-SP",
+    "L-TRANSITION-ASK-PAUSE": "L-TRANSITION-ASK-PAUSE-SP",
+    "L-TRANSITION-REASK": "L-TRANSITION-REASK-SP",
+    "L-TRANSITION-STEER": "L-TRANSITION-STEER-SP",
+    "L-EXIT": "L-EXIT-SP",
+    "L-ASIDE-COACH": "L-ASIDE-COACH-SP",
+    "L-ASIDE-END-2": "L-ASIDE-END-2-SP",
+    "L-ASIDE-WRAP": "L-ASIDE-WRAP-SP",
+    "L-ASIDE-WRAP-AGAIN": "L-ASIDE-WRAP-AGAIN-SP",
+    "L-ASIDE-EARLY-CLOSE": "L-ASIDE-EARLY-CLOSE-SP",
+    "L-ASIDE-EARLY-CLOSE-TIME": "L-ASIDE-EARLY-CLOSE-TIME-SP",
+}
 # M034 S08 (``R1_MEET_VOICE_ENABLED``, default off): the ids whose Meet text a Google Meet session
 # speaks.  Applied by the session after ``active_line_id``; markers, the warm-up, the cache and the
-# transcript keep the left-hand ids.  Keys and values are disjoint from the four maps above, so
+# transcript keep the left-hand ids.  Keys and values are disjoint from the six maps above, so
 # ``active_line_id`` never remaps either side, and no value is itself a key.  Nothing mutates it.
 MEET_LINES: dict[str, str] = {
     "L-OPEN": "L-OPEN-MEET",
@@ -802,6 +943,18 @@ def agenda_w4_enabled() -> bool:
     )
 
 
+def spoken_lines_enabled() -> bool:
+    """``R1_SPOKEN_LINES`` (default on; owner 2026-11-24): every scripted line in the W4 agenda's
+    spoken style ("apply this fix for all scripted line as all of the scripted ones are sounding
+    the same way"): the briefs, the replay and recaps, the start prompts, two field answers, the
+    coach, end, wrap and early-close asides and the exit line (``SPOKEN_LINES``), with the same
+    facts, placeholders, cue phrases and consent rules.  Read at use.  Off speaks content revision
+    53's texts byte for byte.  Rollback:
+    ``fly secrets set R1_SPOKEN_LINES=0 -a project-hello-voice``.
+    """
+    return (os.getenv("R1_SPOKEN_LINES") or "1").strip().lower() not in _OFF_VALUES
+
+
 def transition_answers_enabled() -> bool:
     """``R1_TRANSITION_ANSWERS`` (default on, only with ``R1_TRANSITION_REPAIR``; M032 diagnosis 4,
     D4-TRANS-Q1): a short question about the role-play (who is who, which course, how long, prices,
@@ -819,7 +972,16 @@ def transition_answers_enabled() -> bool:
 def active_line_id(line_id: str) -> str:
     """The id whose text is spoken for ``line_id`` now (``ROLLBACK_LINES`` while S6 is off, the
     reworded agenda and brief while ``R1_BRIEF_WORDING_V2`` is on, and the varied pickup bridge
-    while ``R1_TRANSITION_PRESENCE_V2`` is)."""
+    while ``R1_TRANSITION_PRESENCE_V2`` is), then its spoken text while ``R1_SPOKEN_LINES`` is on
+    (``SPOKEN_LINES``, applied after that choice, so each older rollback keeps its own text)."""
+    chosen = _selected_line_id(line_id)
+    if spoken_lines_enabled():
+        return SPOKEN_LINES.get(chosen, chosen)  # owner 2026-11-24
+    return chosen
+
+
+def _selected_line_id(line_id: str) -> str:
+    """``active_line_id`` before the spoken lines: the routing of content revision 53."""
     if line_id in ROLLBACK_LINES and not transition_repair_enabled():
         return ROLLBACK_LINES[line_id]
     if line_id in AGENDA_W4_LINES and agenda_w4_enabled():

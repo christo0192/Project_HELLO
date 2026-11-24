@@ -36,7 +36,7 @@ from r1_negotiation import (
 from r1_personas import PERSONAS, resolve_persona
 from r1_prompts import CHARACTER_BREAK_NOTE
 from r1_roleplay import RolePlayEngine, TurnMode
-from r1_script import LEARNER_FILLER_VARIANTS, line
+from r1_script import LEARNER_FILLER_VARIANTS, active_line_id, line
 from r1_scheduler import (
     COMMIT_STALL,
     EARLY_CLOSE_BEFORE_SEC,
@@ -1913,7 +1913,9 @@ class CharacterBreakTests(unittest.TestCase):
         self.assertEqual(plan.mode, TurnMode.SAY_ONLY)
         self.assertTrue(plan.aside)
         self.assertEqual(plan.voice, "interviewer")
-        self.assertEqual(plan.scripted_text, line("L-ASIDE-COACH", **P1.line_values))
+        self.assertEqual(
+            plan.scripted_text, line(active_line_id("L-ASIDE-COACH"), **P1.line_values)
+        )
         # M032 S6 (SWEEP-30): Christy is PLAYING the learner; never "I'm the learner ... She".
         self.assertIn("I'm playing the learner, Meera Iyer, who enquired", plan.scripted_text)
         self.assertNotIn("I'm the learner", plan.scripted_text)
@@ -2592,7 +2594,9 @@ class EndRequestTests(unittest.TestCase):
         )
         self.assertTrue(first.aside)
         self.assertEqual(first.line_id, "L-ASIDE-COACH")
-        self.assertEqual(first.scripted_text, line("L-ASIDE-COACH", **P1.line_values))
+        self.assertEqual(
+            first.scripted_text, line(active_line_id("L-ASIDE-COACH"), **P1.line_values)
+        )
         again = s.say("Oh, I thought I am the one buying here.", 120)
         self.assertFalse(again.aside)  # one-off: the learner deflects in character
         self.assertEqual(again.character_break, "coach")
@@ -7272,7 +7276,9 @@ class WrapUpOfferEngineTests(unittest.TestCase):
         self.assertEqual(
             (plan.aside, plan.line_id, plan.voice), (True, "L-ASIDE-WRAP", "interviewer")
         )
-        self.assertEqual(plan.scripted_text, line("L-ASIDE-WRAP", **P1.line_values))
+        self.assertEqual(
+            plan.scripted_text, line(active_line_id("L-ASIDE-WRAP"), **P1.line_values)
+        )
         self.assertIn("wrap_offer:commitment_resolved", plan.reasons)
         self.assertTrue(s.eng.wrap_question_open)
         self.assertEqual(s.eng.open_question_line, "L-ASIDE-WRAP")
@@ -7390,9 +7396,12 @@ class WrapUpOfferEngineTests(unittest.TestCase):
             second = s.say("Okay, great.", self.R + 5 + cool)
             self.assertEqual((second.aside, second.line_id), (True, "L-ASIDE-WRAP-AGAIN"))
             self.assertEqual(
-                second.scripted_text, line("L-ASIDE-WRAP-AGAIN", **P1.line_values)
+                second.scripted_text,
+                line(active_line_id("L-ASIDE-WRAP-AGAIN"), **P1.line_values),
             )
-            self.assertNotEqual(second.scripted_text, line("L-ASIDE-WRAP", **P1.line_values))
+            self.assertNotEqual(
+                second.scripted_text, line(active_line_id("L-ASIDE-WRAP"), **P1.line_values)
+            )
             self.assertEqual(s.eng.open_question_line, "L-ASIDE-WRAP-AGAIN")
             again = s.say("Sorry?", self.R + 8 + cool, repair=True)
             self.assertEqual(again.line_id, "L-ASIDE-WRAP-AGAIN")
@@ -7409,7 +7418,7 @@ class WrapUpOfferEngineTests(unittest.TestCase):
                 s = self.offered()
                 s.say("No.", self.R + 5)
                 self.assertEqual(s.say("Okay, great.", self.R + 5 + cool).line_id, "L-ASIDE-WRAP")
-        text = line("L-ASIDE-WRAP-AGAIN", **P1.line_values)
+        text = line(active_line_id("L-ASIDE-WRAP-AGAIN"), **P1.line_values)
         self.assertNotIn(", or ", text)  # not an either/or: a bare "yes" still means wrap up
         self.assertIn(P1.line_values["lead_first_name"], text)
 
@@ -11256,8 +11265,17 @@ class EarlyCloseAsideTests(unittest.TestCase):
         plan = s.say("Thanks for your time, bye.", 650)
         self.assertTrue(plan.aside)
         self.assertEqual((plan.voice, plan.line_id), ("interviewer", "L-ASIDE-EARLY-CLOSE"))
+        # Owner 2026-11-24 (R1_SPOKEN_LINES): the spoken text, still an either/or question, with
+        # stop first so that a bare "No." means "don't stop" (it resumes: see below).
         self.assertEqual(
             plan.scripted_text,
+            "This is Dex, stepping in for a moment. It sounds like you're wrapping up the call "
+            "with Meera. Would you like to stop the role-play here, or keep going with her?",
+        )
+        with mock.patch.dict(r1_roleplay.os.environ, {"R1_SPOKEN_LINES": "0"}):
+            rollback = done_session().say("Thanks for your time, bye.", 650)
+        self.assertEqual(
+            rollback.scripted_text,
             "This is Dex, stepping in for a moment. It sounds like you're wrapping up the call "
             "with Meera. You're welcome to keep going with her, or if you'd rather stop the "
             "role-play here, just say so.",
@@ -11342,6 +11360,38 @@ class EarlyCloseAsideTests(unittest.TestCase):
         self.assertIn("continuation:resume", follow.reasons)
         self.assertIn(r1_roleplay.CONTINUE_NOTE, follow.reminder)
         self.assertIsNone(s.eng.continuation_plan(661))  # once
+
+    def test_a_bare_no_to_the_spoken_question_resumes(self):
+        """Review of revision 54 (R1_SPOKEN_LINES): the engine reads a bare "No." as a decline
+        (``declines_wrap_offer``) and resumes, so the spoken question puts stop first ("Would you
+        like to stop the role-play here, or keep going with her?"): "No." is "don't stop"."""
+        cases = (
+            # Below 10:00 by default: L-ASIDE-EARLY-CLOSE-TIME-SP.
+            ({}, 400, "L-ASIDE-EARLY-CLOSE-TIME"),
+            # With the farewell exit off, from 10:00: L-ASIDE-EARLY-CLOSE-SP.
+            ({"R1_FAREWELL_EXIT_V2": "0"}, 650, "L-ASIDE-EARLY-CLOSE"),
+        )
+        for env, r, line_id in cases:
+            with self.subTest(line=line_id), mock.patch.dict(r1_roleplay.os.environ, env):
+                s = done_session()
+                asked = s.say("Thanks for your time, bye.", r)
+                self.assertEqual(asked.line_id, line_id)
+                self.assertEqual(asked.scripted_text, line(line_id + "-SP", **P1.line_values))
+                question = asked.scripted_text.rsplit(". ", 1)[-1]
+                self.assertEqual(
+                    question, "Would you like to stop the role-play here, or keep going with her?"
+                )
+                for answer in ("No.", "No, thanks.", "Nope."):
+                    with self.subTest(answer=answer):
+                        s = done_session()
+                        s.say("Thanks for your time, bye.", r)
+                        plan = s.say(answer, r + 5)
+                        self.assertEqual(plan.mode, TurnMode.SAY_ONLY)
+                        self.assertEqual(plan.line_id, "L-ASIDE-WRAP-RESUME")
+                        self.assertIn("wrap_offer_declined", plan.reasons)
+                        self.assertTrue(plan.continuation)
+                        self.assertFalse(plan.exit_roleplay)
+                        self.assertFalse(s.eng.exit_requested)
 
     def test_with_a_move_still_owed_the_learner_resumes_with_it(self):
         s = Session(engine())
@@ -13687,12 +13737,22 @@ class EndAsideV2Tests(unittest.TestCase):
         s.say(OPENER, 20)
         plan = s.say("You can disconnect the call.", 300)
         self.assertEqual(plan.line_id, "L-ASIDE-END")
+        # Owner 2026-11-24 (R1_SPOKEN_LINES): the yes/no question is the last thing said.
+        self.assertEqual(
+            plan.scripted_text,
+            "This is Dex, your interviewer. If you want to keep going, just carry on with Meera. "
+            "Would you like to stop the role-play here and finish the interview?",
+        )
+        self.assertNotIn("please say", plan.scripted_text)
+        with d3_flags(R1_SPOKEN_LINES="0"):
+            s = Session(engine())
+            s.say(OPENER, 20)
+            plan = s.say("You can disconnect the call.", 300)
         self.assertEqual(
             plan.scripted_text,
             "This is Dex, your interviewer. Would you like to stop the role-play here and "
             "finish the interview? Just say yes, or carry on with Meera.",
         )
-        self.assertNotIn("please say", plan.scripted_text)
         with d3_flags(R1_END_ASIDE_V2="0"):
             s = Session(engine())
             s.say(OPENER, 20)
@@ -16352,3 +16412,47 @@ class DiscountTotalReconcileEngineTests(unittest.TestCase):
                     prompt = eng.judge_messages("hi", "hi")[0]["content"]
                     self.assertEqual("If the candidate states a total of $8500" in prompt,
                                      value == "1")
+
+
+class SpokenLinesEngineTests(unittest.TestCase):
+    """Owner 2026-11-24 (R1_SPOKEN_LINES): the engine renders an interviewer aside through
+    ``active_line_id``, as the session's ``render_line`` does when it warms the clip, quotes the
+    open question to the end-intent model and the simulator reads the aside, so all of them see
+    the text that is spoken (a cached clip, not a live synthesis of other words)."""
+
+    ASIDES = (
+        "L-ASIDE-WRAP", "L-ASIDE-WRAP-AGAIN", "L-ASIDE-WRAP-RESUME", "L-ASIDE-EARLY-CLOSE",
+        "L-ASIDE-EARLY-CLOSE-TIME", "L-ASIDE-EARLY-CLOSE-2", "L-ASIDE-HANGUP",
+        "L-ASIDE-LAST-POINT", "L-ASIDE-LAST-POINT-2",
+    )
+
+    def test_the_end_aside_and_the_offers_speak_the_active_text(self):
+        for value in ("1", "0"):
+            with self.subTest(spoken=value), d3_flags(R1_SPOKEN_LINES=value):
+                s = Session(engine())
+                s.say(OPENER, 20)
+                plan = s.say("You can disconnect the call.", 300)
+                self.assertEqual(plan.line_id, "L-ASIDE-END")
+                self.assertEqual(
+                    plan.scripted_text, line(active_line_id("L-ASIDE-END-2"), **P1.line_values)
+                )
+                for line_id in self.ASIDES:
+                    with self.subTest(line=line_id):
+                        aside = s.eng._wrap_line_plan(line_id, ["test"])
+                        self.assertEqual(aside.line_id, line_id)  # the marker keeps the caller id
+                        self.assertEqual(
+                            aside.scripted_text, line(active_line_id(line_id), **P1.line_values)
+                        )
+        with d3_flags(R1_END_ASIDE_V2="0"):
+            s = Session(engine())
+            s.say(OPENER, 20)
+            plan = s.say("You can disconnect the call.", 300)
+        self.assertEqual(plan.scripted_text, line("L-ASIDE-END", **P1.line_values))
+
+    def test_the_spoken_offer_differs_from_revision_53s(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        offer = s.eng._wrap_line_plan("L-ASIDE-WRAP", ["test"]).scripted_text
+        self.assertEqual(offer, line("L-ASIDE-WRAP-SP", **P1.line_values))
+        self.assertTrue(offer.endswith("Would you like to wrap it up here?"))
+        self.assertNotEqual(offer, line("L-ASIDE-WRAP", **P1.line_values))

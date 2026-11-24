@@ -16,8 +16,11 @@ import {
   r1ScorecardMatchesRubric,
 } from '../lib/r1/rubric.js';
 import {
+  R1_IK_OFFERS_TEXT,
   R1_INDIA_PLAYBOOK_TEXT,
+  r1IkOffersEnabled,
   r1IndiaPlaybookEnabled,
+  r1DeckFactsBlockFor,
   r1DeckFactsVersion,
   R1_DECK_FACTS_TEXT,
   R1_DECK_FACTS_VERSION,
@@ -172,7 +175,7 @@ describe('R1 deck facts (owner decision: the deck is the only product source)', 
     for (const text of [R1_INDIA_PLAYBOOK_TEXT, 'no-cost EMI', '0% interest', 'limited-time offer']) {
       expect(block).toContain(text);
     }
-    expect(block.endsWith(R1_INDIA_PLAYBOOK_TEXT)).toBe(true);
+    expect(r1DeckFactsBlock({ R1_IK_OFFERS: '0' }).endsWith(R1_INDIA_PLAYBOOK_TEXT)).toBe(true);
     expect(block).toContain(
       'even if the transcript or the administration log shows another figure.',
     );
@@ -184,8 +187,51 @@ describe('R1 deck facts (owner decision: the deck is the only product source)', 
     }
     expect(() => r1IndiaPlaybookEnabled()).not.toThrow();
     expect(r1IndiaPlaybookEnabled({ R1_INDIA_PLAYBOOK: 42 } as unknown as NodeJS.ProcessEnv)).toBe(true);
-    expect(r1DeckFactsVersion({})).toBe('r1-deck-facts-2026-11.1');
-    expect(r1DeckFactsVersion({ R1_INDIA_PLAYBOOK: '0' })).toBe('r1-deck-facts-2026-10.1');
+    expect(r1DeckFactsVersion({ R1_IK_OFFERS: '0' })).toBe('r1-deck-facts-2026-11.1');
+    expect(r1DeckFactsVersion({ R1_INDIA_PLAYBOOK: '0', R1_IK_OFFERS: '0' })).toBe('r1-deck-facts-2026-10.1');
+  });
+
+  it('defaults to the IK offers guidance (owner decision 2026-11-24) and honours all flag values', () => {
+    const block = r1DeckFactsBlock({});
+    expect(block).toContain(R1_IK_OFFERS_TEXT);
+    expect(block.endsWith(R1_IK_OFFERS_TEXT)).toBe(true);
+    expect(block.indexOf(R1_INDIA_PLAYBOOK_TEXT)).toBeLessThan(block.indexOf(R1_IK_OFFERS_TEXT));
+    for (const text of ['partner companies', 'interview-preparation program', 'add-on given for free',
+      'guaranteed job, role or placement']) {
+      expect(R1_IK_OFFERS_TEXT).toContain(text);
+    }
+    // Review 2026-11-24: a total with a priced add-on implies a larger course discount, never none,
+    // and the $7,500 floor holds, add-on or not.
+    for (const text of [
+      'A stated total that includes a priced add-on is the course price plus the add-on\'s price',
+      'read the course price as that total minus the add-on\'s price',
+      'the course price must be $9,000, $8,500, $8,000 or $7,500',
+      'A course price below $7,500 is still an off-deck discount and a violation, add-on or not.',
+      'is a free perk plus whatever discount that total itself shows',
+    ]) {
+      expect(R1_IK_OFFERS_TEXT).toContain(text);
+    }
+    expect(R1_IK_OFFERS_TEXT).not.toContain('never read a discount from a stated total');
+    expect(r1DeckFactsBlock({ R1_INDIA_PLAYBOOK: '0' }).endsWith(R1_IK_OFFERS_TEXT)).toBe(true);
+    for (const value of ['0', 'off', 'false', 'no', ' OFF ', 'No']) {
+      expect(r1DeckFactsBlock({ R1_IK_OFFERS: value })).not.toContain('IK OFFERS');
+      expect(r1IkOffersEnabled({ R1_IK_OFFERS: value })).toBe(false);
+    }
+    for (const value of ['1', 'on', '', 'yes', 'true', 'junk']) {
+      expect(r1IkOffersEnabled({ R1_IK_OFFERS: value })).toBe(true);
+    }
+    expect(() => r1IkOffersEnabled()).not.toThrow();
+    expect(r1IkOffersEnabled({ R1_IK_OFFERS: 42 } as unknown as NodeJS.ProcessEnv)).toBe(true);
+    expect(r1DeckFactsBlockFor(true)).toBe(r1DeckFactsBlock({ R1_IK_OFFERS: '0' }));
+    expect(r1DeckFactsBlockFor(true, true)).toBe(r1DeckFactsBlock({}));
+    expect(r1DeckFactsBlockFor(false, true)).toBe(r1DeckFactsBlock({ R1_INDIA_PLAYBOOK: '0' }));
+  });
+
+  it('maps all four flag combinations to their own audit version', () => {
+    expect(r1DeckFactsVersion({})).toBe('r1-deck-facts-2026-11.2');
+    expect(r1DeckFactsVersion({ R1_IK_OFFERS: '0' })).toBe('r1-deck-facts-2026-11.1');
+    expect(r1DeckFactsVersion({ R1_INDIA_PLAYBOOK: '0' })).toBe('r1-deck-facts-2026-11.3');
+    expect(r1DeckFactsVersion({ R1_INDIA_PLAYBOOK: '0', R1_IK_OFFERS: '0' })).toBe('r1-deck-facts-2026-10.1');
   });
 
   it('copies the deck facts and flags what the deck does not state', () => {
@@ -229,10 +275,17 @@ describe('R1 provenance and pins', () => {
     expect(R1_RUBRIC_VERSION).toBe('r1-rubric-2026-10.2');
     expect(R1_DECK_FACTS_VERSION).toBe('r1-deck-facts-2026-10.1');
     expect(r1RubricSha()).toBe('b761b69cd498ea2d737bd669fc5a627ad9c82561bc19d0093ab60a928029605a');
-    expect(r1DeckFactsSha({ R1_INDIA_PLAYBOOK: '0' })).toBe('58709110831e5a54f373d864403b1d8fcb124cb237cc9bd155784bb2f66f45f5');
+    expect(r1DeckFactsSha({ R1_INDIA_PLAYBOOK: '0', R1_IK_OFFERS: '0' })).toBe('58709110831e5a54f373d864403b1d8fcb124cb237cc9bd155784bb2f66f45f5');
     // This pin covers the India playbook text.
-    expect(r1DeckFactsSha({})).toBe(
+    expect(r1DeckFactsSha({ R1_IK_OFFERS: '0' })).toBe(
       '9154a5716fb723254c9960487914cf460fce888a6bf65630244cbc6a2ef31493',
+    );
+    // These pins cover the IK offers text (owner decision 2026-11-24), with and without India.
+    expect(r1DeckFactsSha({})).toBe(
+      '07b83bd5fd37ff5caf5bf5f6b3a247a89a4b5ad43f8f6bd10671433e2888c9cc',
+    );
+    expect(r1DeckFactsSha({ R1_INDIA_PLAYBOOK: '0' })).toBe(
+      '23fcdd0d69d48110c5e5c0f212df9c22ac1b30be5bae648a68a6dbfebd4ba44a',
     );
   });
 });

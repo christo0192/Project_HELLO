@@ -111,6 +111,27 @@ WEAK_CALL_LINE = (
 # agreed, after the farewell).  Its second sentence is the one the scorer-side mask hides
 # (transcript.ts).
 WEAK_EMAIL_DONE_LINE = "Let me think about it. I'll read through the email and get back to you."
+# Owner 2026-11-24 (R1_CALLBACK_AFTER_PRESSURE).  After the WEAK line to an advisor who pressured
+# her (an invented offer or a coercive deadline) she still never enrols, but when he asks when to
+# call back she agrees to a reasonable time instead of refusing every one.  The recorded level stays
+# WEAK: the booking is a separate record (``r1_roleplay``).  Each line is one sentence with "let's
+# book a call", which the scorer-side mask hides (app/api/src/lib/r1/transcript.ts), and none
+# names a slot she called difficult (``r1_negotiation.refused_slot``) or a goodbye.
+CALLBACK_LINE = "Okay, let's book a call {slot}, once I've talked to my {decision_maker}."
+# The callback line when the advisor proposed a daytime weekday slot and she moves it to 7 PM.
+CALLBACK_MOVED_LINE = (
+    "Evenings are easier for me, so let's book a call {slot}, once I've talked to my "
+    "{decision_maker}."
+)
+# Her own slot when the advisor named none she can book, the first she did not call difficult.
+CALLBACK_OWN_SLOTS = ("tomorrow evening", "this weekend")
+CALLBACK_FALLBACK_SLOT = "later this week"
+
+
+def callback_line(decision_maker: str, slot: str, *, moved: bool = False) -> str:
+    """The callback agreement for ``slot`` (``moved``: a daytime proposal moved to the evening)."""
+    template = CALLBACK_MOVED_LINE if moved else CALLBACK_LINE
+    return template.format(decision_maker=decision_maker, slot=slot)
 
 
 def commitment_line(
@@ -168,6 +189,8 @@ def is_commitment_line(text: object, decision_maker: str) -> bool:
         commitment_line(Level.WEAK, decision_maker),
         commitment_line(Level.WEAK, decision_maker, call=True),
         commitment_line(Level.WEAK, decision_maker, emailed=True),
+        callback_line(decision_maker, DEFAULT_SLOT),
+        callback_line(decision_maker, DEFAULT_SLOT, moved=True),
     )
     return any(fuzzy_contains(text, variant) for variant in variants)
 

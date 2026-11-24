@@ -108,6 +108,8 @@ export interface R1ScoreInput {
   readonly stats: R1TranscriptStats;
   readonly deckFacts: string;
   readonly indiaPlaybook?: boolean;
+  /** Owner decision 2026-11-24 (R1_IK_OFFERS): the IK offers bullet in the scorer prompt. */
+  readonly ikOffers?: boolean;
   readonly thresholds: R1Thresholds;
 }
 
@@ -440,6 +442,7 @@ export async function scoreR1Transcript(
     stats: input.stats,
     deckFacts: input.deckFacts,
     indiaPlaybook: input.indiaPlaybook,
+    ikOffers: input.ikOffers,
     sentinel: deps.sentinel,
   });
   // Run 0: any failure (provider or validation) propagates here and no further run starts.

@@ -164,6 +164,20 @@ RESOLVED_NOTE = (
     "- You have already told the advisor where you stand on the next step. Do not repeat it, "
     "change it or add to it: react briefly to what they just said and let them wrap up."
 )
+# Owner 2026-11-24 (R1_CALLBACK_AFTER_PRESSURE): after the WEAK line to an advisor who pressured
+# her, NEXT_STEP_NOTE's "never agree to a call, a day, a time" becomes this (she still never enrols,
+# but she gives a callback time instead of refusing every one), and once the callback is booked a
+# later call ask gets CALLBACK_DONE_NOTE instead of RESOLVED_NOTE.
+CALLBACK_NEXT_STEP_NOTE = (
+    "- Never agree to enrol or pay. If the advisor asks when they can call you back, you may "
+    "agree to a reasonable time after you have talked to your {decision_maker}, or suggest one "
+    "yourself; do not refuse to give any time at all."
+)
+CALLBACK_DONE_NOTE = (
+    "- You already agreed to a call {slot}, once you have talked to your {decision_maker}. If "
+    "they bring it up again, confirm it in a few words, or agree if they suggest another "
+    "reasonable time. Never agree to enrol or pay."
+)
 # A reaction is how something lands for YOU (a feeling, a worry, a short question), never a course
 # detail said back: "I like that the classes are recorded" is a product statement, which the output
 # guard blocks as an invented fact and counts toward the gate's three-hit limit (R1-Q round 1).
@@ -1602,6 +1616,7 @@ def turn_reminder(
     role_confusion: str = "",
     come_back: bool = False,
     no_answer: bool = False,
+    next_step_note: str = NEXT_STEP_NOTE,
 ) -> str:
     """The ephemeral note for a learner reply (a free reply, or an intent the worker owes).
 
@@ -1737,7 +1752,7 @@ def turn_reminder(
             f"is not easy to say. The facts are {facts}. Work these words in naturally: "
             f"{stems}. Do not read the facts out like a list."
         )
-    lines.append(NEXT_STEP_NOTE)
+    lines.append(next_step_note)
     lines.append(NO_REPEAT_REASK_NOTE if come_back else NO_REPEAT_NOTE)
     if style_note:
         lines.append(style_note)

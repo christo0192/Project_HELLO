@@ -648,6 +648,19 @@ describe('scoreOneR1Run in isolation', () => {
   });
 });
 
+describe('IK offers scorer input (owner decision 2026-11-24)', () => {
+  it('passes the rule to inference only when enabled', async () => {
+    for (const enabled of [true, false, undefined]) {
+      const seen: string[] = [];
+      await scoreR1Transcript({
+        infer: async (prompt) => { seen.push(prompt); return modelAnswer(rows, allScores(3)); },
+        runs: 1,
+      }, { ...input(), deckFacts: 'facts', ikOffers: enabled });
+      expect(seen[0]!.includes('- Apply IK OFFERS')).toBe(enabled === true);
+    }
+  });
+});
+
 describe('India playbook scorer input', () => {
   it('passes the rule to inference only when enabled', async () => {
     for (const enabled of [true, undefined]) {

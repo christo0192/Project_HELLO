@@ -64,7 +64,7 @@ from r1_text import (
     parse_amount,
     split_sentences,
 )
-from r1_tracker import _TIME_LIMIT, parse_discounts, time_limited_offer_in
+from r1_tracker import _TIME_LIMIT, parse_discounts, sells_paid_addon, time_limited_offer_in
 from r1_world import NET_PRICES_USD, PRICE_USD
 
 # A turn longer than this is read from its end: closing proposals come last, and a hostile
@@ -3220,6 +3220,13 @@ def _india_playbook_on() -> bool:
     )
 
 
+def _ik_offers_on() -> bool:
+    """R1_IK_OFFERS (owner 2026-11-24), read at use: on unless 0/off/false/no."""
+    return os.getenv("R1_IK_OFFERS", "1").strip().lower() not in (
+        "0", "off", "false", "no"
+    )
+
+
 def _total_reconcile_on() -> bool:
     return os.getenv("R1_DISCOUNT_TOTAL_RECONCILE", "1").strip().lower() not in (
         "0", "off", "false", "no"
@@ -3570,6 +3577,14 @@ def _later_total(lowered: str, start: int, end: int) -> bool:
     )
 
 
+# Owner 2026-11-24 (R1_IK_OFFERS): a total in a sentence that follows the paid add-on's price ("We
+# can add interview prep for an extra $1,000.  So your total comes to $10,000.").
+_ADDON_TOTAL_CUE = re.compile(
+    r"\b(?:total|altogether|in all|all in|comes? to|brings? it to|that makes|so it'?s)\b",
+    re.IGNORECASE,
+)
+
+
 def stated_totals(text: object) -> list[int]:
     """The course totals at or above the list price the advisor names in ``text`` (SWEEP-21).
 
@@ -3577,11 +3592,21 @@ def stated_totals(text: object) -> list[int]:
     the same total spread out ("the same $9,000 over nine months").  A later-price threat or another
     batch's price, the price after a deadline ("Tomorrow it's back to $9000"), a value, a saving, an
     add-on, a salary, a refused or negated figure and someone else's price are none.  Ints only, in
-    the order said.
+    the order said.  R1_IK_OFFERS (owner 2026-11-24): neither is a total that includes the paid
+    interview-prep add-on (a sentence that sells it, or a total right after one that did), so it
+    raises no website or rise check.
     """
     found: list[int] = []
-    for sentence in split_sentences(_tail(text)):
+    sentences = split_sentences(_tail(text))
+    ik_offers = _ik_offers_on()
+    for index, sentence in enumerate(sentences):
         if later_price_threat(sentence, PRICE_USD):
+            continue
+        if ik_offers and (
+            sells_paid_addon(sentence)
+            or (index > 0 and _ADDON_TOTAL_CUE.search(sentence) is not None
+                and sells_paid_addon(sentences[index - 1]))
+        ):
             continue
         for clause in _clauses(sentence):
             for piece in _pieces(clause):

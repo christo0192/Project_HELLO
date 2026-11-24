@@ -5828,7 +5828,10 @@ class TestDiagnosis4Transition(unittest.IsolatedAsyncioTestCase):
     async def test_the_reworded_brief_keeps_consent(self) -> None:
         rig = await self.rig()
         brief = rig.interview.render_line(rig.interview._brief_line)
-        self.assertTrue(brief.endswith("If not, just say 'ready' and she'll pick up."))
+        # Owner 2026-11-24 (R1_SPOKEN_LINES): the 'ready' instruction, then the question last.
+        self.assertTrue(brief.endswith(
+            "Just say 'ready' to begin, and she'll pick up. Any questions before we start?"
+        ))
         for text in ("No questions.", "No."):
             with self.subTest(text=text):
                 rig = await self.rig()

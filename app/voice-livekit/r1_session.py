@@ -4928,6 +4928,15 @@ class R1Interview:
             turn_index=turn,
             option_count=len(commitment["asks"]),
         )
+        if commitment.get("callback_turn") is not None:
+            # Owner 2026-11-24 (R1_CALLBACK_AFTER_PRESSURE): the callback she agreed to after the
+            # WEAK line to a pressured advisor (the level above stays WEAK).
+            _log.info(
+                "unknown_event",
+                error_type="r1_fidelity_callback",
+                error_category="after_pressure",
+                turn_index=transcript_turns.get(commitment["callback_turn"]),
+            )
         if "strong_gaps" in admin:
             for label in admin["strong_gaps"] or ["none"]:
                 _log.info(

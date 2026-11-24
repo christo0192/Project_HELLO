@@ -32,3 +32,13 @@ export function r1IndiaPlaybookEnabled(source: NodeJS.ProcessEnv = process.env):
   const raw: unknown = source === process.env ? process.env.R1_INDIA_PLAYBOOK : source?.R1_INDIA_PLAYBOOK;
   return typeof raw !== 'string' || !R1_INDIA_PLAYBOOK_OFF.has(raw.trim().toLowerCase());
 }
+
+/**
+ * Owner decision 2026-11-24 (IK offers): referrals to hiring or partner companies and a paid
+ * interview-prep add-on are real IK offers for the R1 post-session scorer. On when unset, blank or
+ * any value other than 0/off/false/no (trimmed, any case). Never throws; read lazily, never by env.ts.
+ */
+export function r1IkOffersEnabled(source: NodeJS.ProcessEnv = process.env): boolean {
+  const raw: unknown = source === process.env ? process.env.R1_IK_OFFERS : source?.R1_IK_OFFERS;
+  return typeof raw !== 'string' || !R1_INDIA_PLAYBOOK_OFF.has(raw.trim().toLowerCase());
+}

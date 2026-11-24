@@ -39,6 +39,8 @@ export interface BuildR1ScorerPromptInput {
   readonly deckFacts: string;
   /** Enables India playbook rules; defaults to false for the original prompt. */
   readonly indiaPlaybook?: boolean;
+  /** Enables the IK offers rule (owner decision 2026-11-24); defaults to false. */
+  readonly ikOffers?: boolean;
   /** Test seam: a fixed sentinel. Production leaves it unset (random per call). */
   readonly sentinel?: string;
 }
@@ -159,6 +161,17 @@ const INDIA_BULLET =
   'A discount is tied only when the advisor makes it part of the EMI or the limited-time offer. ' +
   'An unconditional discount is not tied just because EMI is also mentioned.';
 
+// Review 2026-11-24: the course price is a total with a priced add-on minus that price, and the
+// $7,500 floor holds, add-on or not.
+const IK_BULLET =
+  '- Apply IK OFFERS in the prep-guide facts: never lower a score for a referral to hiring or ' +
+  'partner companies or for an interview-prep add-on sold at a stated extra price; for ' +
+  '"Negotiation & discount discipline" an add-on\'s price is not a discount and not an invented ' +
+  'freebie, and the discount is judged on the course price alone (a total with a priced add-on ' +
+  'minus the add-on\'s price). A course price below $7,500 is still an off-deck discount, add-on ' +
+  'or not. A free or included add-on is still an invented freebie, and a referral promised as a ' +
+  'job or placement is still a guaranteed job.';
+
 export function buildR1ScorerPrompt(input: BuildR1ScorerPromptInput): string {
   const metricBlocks = input.metrics.map(formatMetric).join('\n\n');
   const idList = input.metrics.map((metric) => metric.id).join(', ');
@@ -210,7 +223,7 @@ RULES:
 - Every "evidenceRefs" entry MUST be written "T<turn number>: <excerpt>". The turn number is the number after "T" at the start of a transcript line. The excerpt MUST be copied verbatim from that line, at most 80 characters (hard limit 100).
 - A reference may cite ONLY a CANDIDATE line (labelled "Candidate" or "Candidate (as Program Advisor)") in one of the phases listed for that metric. NEVER cite an "Interviewer" line or a "Learner (simulated by the AI; never evidence)" line. Use at most 5 entries per metric. Use [] ONLY for a score of 1 or 2 (or insufficient_evidence): a score of 3 or 4 MUST cite at least one CANDIDATE line.
 - Count the metric's countable behaviours from the candidate's turns; use the administration log for what the learner revealed and which objections were raised. Score only objections that were actually raised.
-${input.indiaPlaybook === true ? INDIA_BULLET + '\n' : ''}- "rationale" must cite specifics from the candidate's turns, not generic praise. Never copy personal identifiers into "rationale": no phone numbers, email addresses, postal addresses, ID numbers or names of third parties.
+${input.indiaPlaybook === true ? INDIA_BULLET + '\n' : ''}${input.ikOffers === true ? IK_BULLET + '\n' : ''}- "rationale" must cite specifics from the candidate's turns, not generic praise. Never copy personal identifiers into "rationale": no phone numbers, email addresses, postal addresses, ID numbers or names of third parties.
 - "score" must be a JSON integer, not a string. For an insufficient_evidence metric "score" MUST be JSON null.
 - "rationale" MUST be at most 900 characters (hard limit 1000).
 

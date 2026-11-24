@@ -403,6 +403,10 @@ describe('R1 source fences', () => {
       // Owner decision 2026-11-20 (India sales playbook for the post-session scorer): declared
       // in config/environment.schema.json (api) and read ONLY by lib/r1/config.ts.
       'R1_INDIA_PLAYBOOK',
+      // Owner decision 2026-11-24 (referrals, partners and a paid interview-prep add-on are real
+      // IK offers): declared in config/environment.schema.json (api) and read ONLY by
+      // lib/r1/config.ts, like R1_INDIA_PLAYBOOK.
+      'R1_IK_OFFERS',
       // M034 Meet surface, declared in config/environment.schema.json (api) and read ONLY by
       // lib/r1/meet/config.ts (pinned by the next test).
       ...MEET_ENV_NAMES,

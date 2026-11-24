@@ -2602,6 +2602,30 @@ class AsideQuestionTests(unittest.TestCase):
         self.assertEqual(aside_question_of(rt, self._render("L-ASIDE-WRAP")), "wrap")
         self.assertEqual(aside_question_of(rt, self._render("L-ASIDE-END")), "end")
 
+    def test_the_spoken_asides_keep_their_keys(self) -> None:
+        # Owner 2026-11-24 (R1_SPOKEN_LINES): the session renders, and the engine speaks, the -SP
+        # text of the end, wrap and early-close questions; each is still read as its question.
+        from types import SimpleNamespace
+
+        import r1_script
+        from rehearsal.full import ASIDE_QUESTIONS, aside_question_of
+
+        class Names(dict):
+            def __missing__(self, key: str) -> str:
+                return "Asha"
+
+        def render(line_id: str) -> str:
+            spoken = r1_script.active_line_id(line_id)
+            return r1_script.persona_text(spoken).format_map(Names())
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            rt = SimpleNamespace(interview=SimpleNamespace(render_line=render))
+            for key, line_id in ASIDE_QUESTIONS:
+                with self.subTest(line=line_id):
+                    self.assertEqual(aside_question_of(rt, render(line_id)), key)
+            self.assertNotEqual(render("L-ASIDE-WRAP"), self._render("L-ASIDE-WRAP"))
+            self.assertTrue(render("L-ASIDE-WRAP").endswith("Would you like to wrap it up here?"))
+
 
 class DexPersonaTests(unittest.TestCase):
     RECORD = {

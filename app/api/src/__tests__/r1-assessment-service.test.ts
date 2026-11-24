@@ -88,7 +88,7 @@ describe('a valid gated score', () => {
     });
     expect(row.raw.r1.administration_quality).toMatchObject({ status: 'ok', failures: [] });
     expect(row.raw.r1.versions).toMatchObject({
-      scorer: 'r1-scoring-2026-10.1', rubric: 'r1-rubric-2026-10.2', deck_facts: 'r1-deck-facts-2026-11.1',
+      scorer: 'r1-scoring-2026-10.1', rubric: 'r1-rubric-2026-10.2', deck_facts: 'r1-deck-facts-2026-11.2',
     });
     // The phone scorer's template version is not used: R1 has its own provenance version.
     expect(validateProvenance(row.provenance).valid).toBe(true);
@@ -118,7 +118,7 @@ describe('a valid gated score', () => {
     expect(attach!.args.p_audit).toMatchObject({
       scorer_version: 'r1-scoring-2026-10.1',
       rubric_version: 'r1-rubric-2026-10.2',
-      deck_facts_version: 'r1-deck-facts-2026-11.1',
+      deck_facts_version: 'r1-deck-facts-2026-11.2',
       outcome: 'scored',
       thresholds: { advance: 65, hold: 45, settings_updated_at: '2026-10-06T09:00:00+00:00' },
       gate_passed: true,
@@ -675,7 +675,7 @@ describe('idempotent re-run', () => {
         });
         expect(result.reused).toBe(true);
         expect(db.rpcCalls[0]!.args.p_audit.deck_facts_version).toBe(
-          version || 'r1-deck-facts-2026-11.1',
+          version || 'r1-deck-facts-2026-11.2',
         );
       }
     } finally {
@@ -1022,6 +1022,7 @@ describe('India playbook service flag', () => {
     try {
       for (const enabled of [true, false]) {
         vi.stubEnv('R1_INDIA_PLAYBOOK', enabled ? undefined : '0');
+        vi.stubEnv('R1_IK_OFFERS', '0');
         const { db } = setup(tablesWithInterview());
         const infer = goodInfer();
         await runR1Assessment(SESSION_ID, { client: db.client, infer, now: () => NOW });
@@ -1031,6 +1032,36 @@ describe('India playbook service flag', () => {
         expect(facts.includes('IK INDIA SALES PLAYBOOK')).toBe(enabled);
         expect(rules.includes('IK INDIA SALES PLAYBOOK')).toBe(enabled);
         const version = enabled ? 'r1-deck-facts-2026-11.1' : 'r1-deck-facts-2026-10.1';
+        expect(db.tables.assessments![0]!.raw.r1.versions.deck_facts).toBe(version);
+        expect(db.rpcCalls[0]!.args.p_audit.deck_facts_version).toBe(version);
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+});
+
+describe('IK offers service flag (owner decision 2026-11-24)', () => {
+  it('keeps facts, rule and stored versions aligned for every flag combination', async () => {
+    const cases = [
+      { india: true, ik: true, version: 'r1-deck-facts-2026-11.2' },
+      { india: true, ik: false, version: 'r1-deck-facts-2026-11.1' },
+      { india: false, ik: true, version: 'r1-deck-facts-2026-11.3' },
+      { india: false, ik: false, version: 'r1-deck-facts-2026-10.1' },
+    ];
+    try {
+      for (const { india, ik, version } of cases) {
+        vi.stubEnv('R1_INDIA_PLAYBOOK', india ? undefined : '0');
+        vi.stubEnv('R1_IK_OFFERS', ik ? undefined : '0');
+        const { db } = setup(tablesWithInterview());
+        const infer = goodInfer();
+        await runR1Assessment(SESSION_ID, { client: db.client, infer, now: () => NOW });
+        const prompt = infer.mock.calls[0]![0];
+        const facts = prompt.split('PREP-GUIDE FACTS (the only product facts')[1]!.split('OUTPUT CONTRACT')[0]!;
+        const rules = prompt.split('RULES:')[1]!;
+        expect(facts.includes('IK OFFERS (owner decision 2026-11-24)')).toBe(ik);
+        expect(rules.includes('- Apply IK OFFERS')).toBe(ik);
+        expect(rules.includes('IK INDIA SALES PLAYBOOK')).toBe(india);
         expect(db.tables.assessments![0]!.raw.r1.versions.deck_facts).toBe(version);
         expect(db.rpcCalls[0]!.args.p_audit.deck_facts_version).toBe(version);
       }
