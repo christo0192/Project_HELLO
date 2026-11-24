@@ -868,7 +868,8 @@ class TestDiagnosis5Agenda(unittest.TestCase):
     def test_the_flag_picks_the_text(self) -> None:
         for line_id in self.IDS:
             with self.subTest(line_id=line_id):
-                self.assertEqual(r1_script.active_line_id(line_id), line_id + "-W3")
+                with mock.patch.dict(os.environ, {"R1_AGENDA_W4": "0"}):
+                    self.assertEqual(r1_script.active_line_id(line_id), line_id + "-W3")
                 with mock.patch.dict(os.environ, {"R1_AGENDA_W3": "0"}):
                     self.assertEqual(r1_script.active_line_id(line_id), line_id + "-W2")
                 with mock.patch.dict(os.environ, {"R1_BRIEF_WORDING_V2": "0"}):
@@ -966,7 +967,12 @@ class TestMeetLines(unittest.TestCase):
 
     def test_no_browser_text_changed(self):
         meet_ids = set(r1_script.MEET_LINES.values())
-        browser = {key: text for key, text in LINES.items() if key not in meet_ids}
+        # Revision 52 ADDED the W4 agenda ids (R1_AGENDA_W4); leaving them out keeps the proof
+        # that no line that existed on 5ec8b11a changed.
+        added_ids = set(r1_script.AGENDA_W4_LINES.values())
+        browser = {
+            key: text for key, text in LINES.items() if key not in meet_ids | added_ids
+        }
         canonical = json.dumps(browser, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
         self.assertEqual(
             hashlib.sha256(canonical.encode()).hexdigest(), self.PRE_MEET_LINES_DIGEST
@@ -1106,3 +1112,58 @@ class TestMeetLines(unittest.TestCase):
         self.assertIn("L-SIL-NOAUDIO-MEET", NAME_FREE_LINES)
         for banned in ("lost", "connection", "count", "still with me"):
             self.assertNotIn(banned, noaudio)
+
+class TestOwnerAgendaW4(unittest.TestCase):
+    """Owner 2026-11-24 (R1_AGENDA_W4): the W3 agenda sounded read aloud in Dex's voice; the owner
+    picked spoken sentences and a first question ending in "?" from four production-voice clips."""
+
+    IDS = ("L-OPEN-AGENDA", "L-OPEN-AGENDA-PLAIN", "L-OPEN-AGENDA-CONTINUE")
+    PICKED = (
+        "Let's get started. The whole interview takes about thirty minutes. That's a few minutes "
+        "to get to know you, a sales role-play of up to twenty minutes, and then time for your "
+        "questions. To start, could you tell me a bit about yourself, and any sales or "
+        "customer-facing work you've done?"
+    )
+
+    def test_the_plain_agenda_is_the_owners_pick_word_for_word(self) -> None:
+        self.assertEqual(r1_script.LINES["L-OPEN-AGENDA-PLAIN-W4"], self.PICKED)
+        self.assertEqual(r1_script.line("L-OPEN-AGENDA-PLAIN-W4"), self.PICKED)
+
+    def test_the_other_agendas_share_the_heard_line_and_the_carry_on(self) -> None:
+        body = self.PICKED.removeprefix("Let's get started. ")
+        self.assertEqual(r1_script.LINES["L-OPEN-AGENDA-W4"], "Lovely, thanks. " + body)
+        self.assertEqual(
+            r1_script.LINES["L-OPEN-AGENDA-CONTINUE-W4"],
+            "Lovely, thanks. " + r1_script.OPEN_AGENDA_4 + r1_script.OPEN_CARRY_ON,
+        )
+
+    def test_spoken_shape(self) -> None:
+        for line_id in r1_script.AGENDA_W4_LINES.values():
+            with self.subTest(line_id=line_id):
+                text = r1_script.LINES[line_id]
+                self.assertNotIn(":", text)
+                self.assertIn("about thirty minutes", text)
+                self.assertIn("up to twenty minutes", text)
+                self.assertNotIn("I can hear you", text)
+                self.assertTrue(r1_script.is_candidate_free(line_id))
+                for sentence in re.split(r"(?<=[.?!])\s+", text):
+                    self.assertLessEqual(len(sentence), 150, sentence)
+        for line_id in ("L-OPEN-AGENDA-W4", "L-OPEN-AGENDA-PLAIN-W4"):
+            self.assertTrue(r1_script.LINES[line_id].endswith("?"))
+
+    def test_default_on_and_the_rollbacks(self) -> None:
+        for line_id in self.IDS:
+            with self.subTest(line_id=line_id):
+                with mock.patch.dict(os.environ, {}, clear=True):
+                    self.assertTrue(r1_script.agenda_w4_enabled())
+                    self.assertEqual(r1_script.active_line_id(line_id), line_id + "-W4")
+                for value in ("0", "off", "false", "no"):
+                    with mock.patch.dict(os.environ, {"R1_AGENDA_W4": value}):
+                        self.assertFalse(r1_script.agenda_w4_enabled())
+                        self.assertEqual(r1_script.active_line_id(line_id), line_id + "-W3")
+                # W4 rides on W3: the older rollbacks keep their documented texts.
+                with mock.patch.dict(os.environ, {"R1_AGENDA_W3": "0", "R1_AGENDA_W4": "1"}):
+                    self.assertFalse(r1_script.agenda_w4_enabled())
+                    self.assertEqual(r1_script.active_line_id(line_id), line_id + "-W2")
+                with mock.patch.dict(os.environ, {"R1_BRIEF_WORDING_V2": "0"}):
+                    self.assertEqual(r1_script.active_line_id(line_id), line_id)

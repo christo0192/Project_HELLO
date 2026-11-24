@@ -135,6 +135,18 @@ OPEN_AGENDA_3 = (
     "The whole interview takes about thirty minutes: a few minutes to get to know you, a sales "
     "role-play of up to twenty minutes, then time for your questions. "
 )
+# Owner 2026-11-24 (R1_AGENDA_W4): Dex read the W3 agenda flat, like a text read aloud. Of four
+# clips in the production voice the owner picked the spoken wording: no colon list, "That's"
+# ties the parts to the whole, and the first question is a real question ending in "?". The
+# owner's durations are kept word for word; the clip was the cached (REST) line, as served.
+OPEN_AGENDA_4 = (
+    "The whole interview takes about thirty minutes. That's a few minutes to get to know you, a "
+    "sales role-play of up to twenty minutes, and then time for your questions. "
+)
+OPEN_FIRST_QUESTION_4 = (
+    "To start, could you tell me a bit about yourself, and any sales or customer-facing work "
+    "you've done?"
+)
 
 LINES: dict[str, str] = {
     "L-OPEN": (
@@ -172,6 +184,11 @@ LINES: dict[str, str] = {
     "L-OPEN-AGENDA-W3": OPEN_HEARD_3 + OPEN_AGENDA_3 + OPEN_FIRST_QUESTION_2,
     "L-OPEN-AGENDA-PLAIN-W3": OPEN_PLAIN + OPEN_AGENDA_3 + OPEN_FIRST_QUESTION_2,
     "L-OPEN-AGENDA-CONTINUE-W3": OPEN_HEARD_3 + OPEN_AGENDA_3 + OPEN_CARRY_ON,
+    # Owner 2026-11-24 (R1_AGENDA_W4): the agenda as spoken sentences and a real first question
+    # (``AGENDA_W4_LINES``); the heard line and the carry-on are W3's.
+    "L-OPEN-AGENDA-W4": OPEN_HEARD_3 + OPEN_AGENDA_4 + OPEN_FIRST_QUESTION_4,
+    "L-OPEN-AGENDA-PLAIN-W4": OPEN_PLAIN + OPEN_AGENDA_4 + OPEN_FIRST_QUESTION_4,
+    "L-OPEN-AGENDA-CONTINUE-W4": OPEN_HEARD_3 + OPEN_AGENDA_4 + OPEN_CARRY_ON,
     # M032 S6 item 5 and SWEEP-30: the brief, from the shared body above.
     "L-TRANSITION": BRIEF_THANKS + BRIEF_BODY,
     # M032 diagnosis 3 (D3-ICE1, R1_REACTION_VARIETY): the brief with one of three thanks in place
@@ -684,6 +701,12 @@ AGENDA_W3_LINES = {
     "L-OPEN-AGENDA-PLAIN": "L-OPEN-AGENDA-PLAIN-W3",
     "L-OPEN-AGENDA-CONTINUE": "L-OPEN-AGENDA-CONTINUE-W3",
 }
+# Owner 2026-11-24 (``R1_AGENDA_W4``, only with ``R1_AGENDA_W3``): the agendas' fourth wording.
+AGENDA_W4_LINES = {
+    "L-OPEN-AGENDA": "L-OPEN-AGENDA-W4",
+    "L-OPEN-AGENDA-PLAIN": "L-OPEN-AGENDA-PLAIN-W4",
+    "L-OPEN-AGENDA-CONTINUE": "L-OPEN-AGENDA-CONTINUE-W4",
+}
 # D4-TRANS-PRESENT1 (``R1_TRANSITION_PRESENCE_V2``): the pickup bridge that hears the press.
 VARIETY_LINES = {"L-PICKUP-BRIDGE": "L-PICKUP-BRIDGE-2"}
 # M034 S08 (``R1_MEET_VOICE_ENABLED``, default off): the ids whose Meet text a Google Meet session
@@ -766,6 +789,19 @@ def agenda_w3_enabled() -> bool:
     )
 
 
+def agenda_w4_enabled() -> bool:
+    """``R1_AGENDA_W4`` (default on, only with ``R1_AGENDA_W3``; owner 2026-11-24): the opening
+    agenda in spoken sentences ("The whole interview takes about thirty minutes. That's a few
+    minutes to get to know you, a sales role-play of up to twenty minutes, and then time for your
+    questions.") and a first question that ends in "?".  The owner picked it by ear from four
+    clips in Dex's production voice.  Read at use.  Rollback:
+    ``fly secrets set R1_AGENDA_W4=0 -a project-hello-voice`` (revision 50's W3 agenda).
+    """
+    return agenda_w3_enabled() and (
+        (os.getenv("R1_AGENDA_W4") or "1").strip().lower() not in _OFF_VALUES
+    )
+
+
 def transition_answers_enabled() -> bool:
     """``R1_TRANSITION_ANSWERS`` (default on, only with ``R1_TRANSITION_REPAIR``; M032 diagnosis 4,
     D4-TRANS-Q1): a short question about the role-play (who is who, which course, how long, prices,
@@ -786,6 +822,8 @@ def active_line_id(line_id: str) -> str:
     while ``R1_TRANSITION_PRESENCE_V2`` is)."""
     if line_id in ROLLBACK_LINES and not transition_repair_enabled():
         return ROLLBACK_LINES[line_id]
+    if line_id in AGENDA_W4_LINES and agenda_w4_enabled():
+        return AGENDA_W4_LINES[line_id]  # owner 2026-11-24
     if line_id in AGENDA_W3_LINES and agenda_w3_enabled():
         return AGENDA_W3_LINES[line_id]  # D5-AGENDA1
     if line_id in WORDING_LINES and brief_wording_v2_enabled():

@@ -12001,13 +12001,14 @@ class TestTheOpeningWithoutHearingCheck(R1TestCase):
     async def test_default_opening_reaches_icebreaker_without_input(self):
         with mock.patch.dict(os.environ, {"R1_OPENING_SOUND_CHECK": "1",
                                         "R1_OPENING_NO_HEARING_CHECK": "1",
-                                        "R1_BRIEF_WORDING_V2": "1", "R1_AGENDA_W3": "1"}):
+                                        "R1_BRIEF_WORDING_V2": "1", "R1_AGENDA_W3": "1",
+                                        "R1_AGENDA_W4": "1"}):
             with self.capture_logs() as logs:
                 run = await self.opening()
                 await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
             hello = run.interview.render_line("L-OPEN-HI")
             agenda = run.interview.render_line("L-OPEN-AGENDA-PLAIN")
-            self.assertEqual(agenda, r1_script.LINES["L-OPEN-AGENDA-PLAIN-W3"])
+            self.assertEqual(agenda, r1_script.LINES["L-OPEN-AGENDA-PLAIN-W4"])
             self.assertEqual(run.session.spoken, [hello, agenda])
             self.assertNotIn("?", hello)
             self.assertEqual(run.session.generated, [])

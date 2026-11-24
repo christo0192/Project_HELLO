@@ -283,7 +283,8 @@ import r1_world
 # 49: pin the time-limit, demand and guilt readers and the time-offer notes.
 # 50: IND-REV review fixes: narrow the demand and India money-path readers.
 # 51: M034 S08 Meet line variants (r1_script.MEET_LINES), with the hello-again disclosure.
-PINNED_CONTENT_SHA256 = "a9237c268e993a8c95aab531ade7189d5b5a0f6e0c122208ad7fde157ae00954"
+# 52: the owner's W4 agenda (R1_AGENDA_W4, AGENDA_W4_LINES), picked by ear 2026-11-24.
+PINNED_CONTENT_SHA256 = "178852f19278967987cba297fc2c840745b510334f2f345a410cc939acf12d5f"
 
 CONTENT_MODULES = (
     "r1_text",
