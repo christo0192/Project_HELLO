@@ -79,6 +79,7 @@ const MissionControlPage = lazyPage(
 const R1SettingsPage = lazyPage(() => import('./pages/R1SettingsPage'), 'R1SettingsPage');
 const R1ReviewPage = lazyPage(() => import('./pages/R1ReviewPage'), 'R1ReviewPage');
 const R1InterviewsPage = lazyPage(() => import('./pages/R1InterviewsPage'), 'R1InterviewsPage');
+const R1MeetBookingsPage = lazyPage(() => import('./pages/R1MeetBookingsPage'), 'R1MeetBookingsPage');
 const PhoneCalendarPage = lazyPage(
   () => import('./pages/PhoneCalendarPage'),
   'PhoneCalendarPage',
@@ -182,6 +183,8 @@ export default function App() {
             <Route path="/candidates/:id" element={<CandidateDetailPage />} />
             {/* Every staff role: the API answers by the rule of the R1 video. */}
             <Route path="/interviews" element={<R1InterviewsPage />} />
+            {/* Every staff role here too: the same rule. It ranks above the review's `:roundId`. */}
+            <Route path="/interviews/meet-bookings" element={<R1MeetBookingsPage />} />
             <Route path="/interviews/:roundId" element={<R1ReviewPage />} />
             <Route path="/sessions/:sessionId" element={<SessionDetailPage />} />
             <Route path="/screening/:sessionId" element={<ScreeningPage />} />

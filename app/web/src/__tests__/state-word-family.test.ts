@@ -36,6 +36,7 @@ import {
 } from '../components/talent/status';
 import { humanizeEnum } from '../lib/humanize';
 import { R1_STATUS_LABEL, r1StatusLabel, r1StatusTone } from '../lib/r1';
+import { R1_MEET_BOOKING_STATUSES, meetBookingTerm } from '../lib/r1-meet-bookings';
 import { r1RecordingStateCopy } from '../lib/r1-recording';
 import type { R1RecordingSummary } from '../lib/r1-types';
 
@@ -213,6 +214,27 @@ const VOCABULARIES: readonly Vocabulary[] = [
     term: (state) => ({ word: humanizeEnum(state), tone: auditResultTone(state) }),
     families: { success: 'ready', failure: 'unresolved', pending: 'moving' },
   },
+  {
+    name: 'Meet booking',
+    term: (state) => {
+      const { label, tone } = meetBookingTerm(state);
+      return { word: label, tone };
+    },
+    families: {
+      pending: 'moving',
+      unmatched_application: 'unresolved',
+      unmapped_scheduler: 'unresolved',
+      blocked: 'unresolved',
+      bot_scheduled: 'moving',
+      bot_joining: 'moving',
+      human_present: 'moving',
+      in_call: 'moving',
+      completed: 'ready',
+      cancelled: 'closed',
+      failed: 'unresolved',
+      drained: 'closed',
+    },
+  },
 ];
 
 const vocabulary = (name: string): Vocabulary => {
@@ -253,6 +275,7 @@ describe('each state has its family', () => {
     ['engagement', PHONE_STATE_ORDER],
     ['appointment', PHONE_STATUS_ORDER],
     ['R1 round', Object.keys(R1_STATUS_LABEL)],
+    ['Meet booking', R1_MEET_BOOKING_STATUSES],
   ] as const)('leaves no %s out of this table', (name, states) => {
     expect(Object.keys(vocabulary(name).families).sort()).toEqual([...states].sort());
   });
@@ -321,6 +344,7 @@ describe('the same state under different words agrees', () => {
         ['appointment', 'fulfilled'],
         ['Ashby lifecycle', 'completed'],
         ['Ashby operation', 'succeeded'],
+        ['Meet booking', 'completed'],
       ],
     ],
     [
@@ -348,6 +372,7 @@ describe('the same state under different words agrees', () => {
         ['Ashby operation', 'cancelled'],
         ['Ashby terminal state', 'withdrawn'],
         ['Ashby terminal state', 'manual_stage_cancel'],
+        ['Meet booking', 'cancelled'],
       ],
     ],
     [
@@ -363,5 +388,12 @@ describe('the same state under different words agrees', () => {
     ],
   ] as const)('%s is %s', (_meaning, family, states) => {
     for (const [name, state] of states) expect(familyOf(name, state), `${name} ${state}`).toBe(family);
+  });
+
+  // The one word a Meet booking takes from its reason, so the tables above never see it.
+  it('a Meet booking says Failed only for a fault on our side, as every other screen does', () => {
+    const fault = meetBookingTerm('failed', 'bot_fatal');
+    expect(fault.label.toLowerCase()).toBe(vocabulary('session').term('failed').word.toLowerCase());
+    expect(FAMILY_OF[fault.tone]).toBe('danger');
   });
 });

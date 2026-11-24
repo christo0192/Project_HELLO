@@ -15,6 +15,9 @@
  * A fact reads here as it does on the candidate's R1 tab and the review: a status, a recording and a
  * verdict each take their family (design/tones), from the same maps. "Not scored" and a withheld result
  * claim nothing, so they have no hue. A row's result is the AI's, and the column says so.
+ *
+ * A round held over Google Meet carries a "Via Meet" chip and its status never talks of a link
+ * (`roundStatusWord`); a row without `channel: 'meet'` is exactly as before.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useSearchParams } from 'react-router-dom';
@@ -39,6 +42,7 @@ import {
 import { CandidateInput, Tag } from '../components/design/candidate';
 import { FAMILY_CLASSES, stateTextClass, verdictFamily } from '../components/design/tones';
 import { VerdictMark } from '../components/r1-review/VerdictBlock';
+import { ViaMeetTag } from '../components/r1/ViaMeetTag';
 import { CandidateShell } from '../components/talent/CandidateShell';
 import { candidateDisplayName } from '../components/talent/ResumeReviewBadge';
 import { formatDate, formatDateTime, formatRelative } from '../lib/datetime';
@@ -125,6 +129,7 @@ function QueueRow({ round, listSearch }: { round: R1QueueRound; listSearch: stri
           {name}
         </Link>
         {round.is_staff_dry_run && <span className="ml-2"><Tag>Staff dry run</Tag></span>}
+        <ViaMeetTag channel={round.channel} className="ml-2" />
         {/* The columns this width has no room for, in one line. */}
         <p className="mt-0.5 text-meta text-ink-tertiary md:hidden">
           <span className={statusShade}>{status}</span>
@@ -315,7 +320,15 @@ export function R1InterviewsPage() {
 
   return (
     <CandidateShell variant="inset">
-      <h1 className="text-title text-ink">R1 interviews</h1>
+      <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+        <h1 className="text-title text-ink">R1 interviews</h1>
+        <Link
+          to="/interviews/meet-bookings"
+          className="textlink inline-flex min-h-6 items-center text-label font-medium text-ink focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--ink)]"
+        >
+          Meet bookings
+        </Link>
+      </div>
 
       <p data-testid="queue-summary" className="mt-3 flex min-h-9 items-baseline gap-2 text-sm text-ink">
         {answer ? (

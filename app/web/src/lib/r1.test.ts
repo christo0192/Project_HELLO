@@ -15,8 +15,10 @@ import {
   formatMinutes,
   isAvailabilityRefusal,
   isLiveRound,
+  isMeetRound,
   isReadingStale,
   needsConfirmation,
+  openUntilLead,
   parseDashboardMinutes,
   percentOf,
   poolGatesSends,
@@ -666,5 +668,40 @@ describe('r1ResultLine', () => {
     expect(r1ResultLine([])).toBeNull();
     expect(r1ResultLine([round({})])).toBeNull();
     expect(r1ResultLine([round({ recommendation: 'hold', overall: 58, scores_withheld: true })])).toBeNull();
+  });
+});
+
+describe('a round held over Google Meet', () => {
+  it('is one only when the channel is exactly meet', () => {
+    expect(isMeetRound({ channel: 'meet' })).toBe(true);
+    expect(isMeetRound({ channel: 'browser' })).toBe(false);
+    expect(isMeetRound({ channel: null })).toBe(false);
+    expect(isMeetRound({})).toBe(false);
+    expect(isMeetRound(round())).toBe(false);
+    // A value a newer API might send that this page does not know reads as a browser round.
+    expect(isMeetRound({ channel: 'Meet' })).toBe(false);
+    expect(isMeetRound({ channel: 'zoom' })).toBe(false);
+  });
+
+  it('is never offered a reissue, because it has no link and the database refuses one', () => {
+    expect(canReissue({ status: 'invited', channel: 'meet' })).toBe(false);
+    expect(canReissue({ status: 'in_progress', channel: 'meet' })).toBe(false);
+    for (const channel of ['browser', null, undefined] as const) {
+      expect(canReissue({ status: 'invited', channel })).toBe(true);
+    }
+  });
+
+  it('can still be cancelled while live, and granted its retake', () => {
+    expect(canCancel({ status: 'invited' })).toBe(true);
+    expect(canCancel(round({ status: 'in_progress', channel: 'meet' }))).toBe(true);
+    expect(canGrantRetake(round({ status: 'completed', attempts_counted: 1, channel: 'meet' }))).toBe(true);
+  });
+
+  it('says it is open until its expiry, where a browser round says its link is valid', () => {
+    expect(openUntilLead({ channel: 'meet' })).toBe('Open until');
+    expect(openUntilLead({ channel: 'browser' })).toBe('Link valid until');
+    expect(openUntilLead({ channel: null })).toBe('Link valid until');
+    expect(openUntilLead({})).toBe('Link valid until');
+    expect(openUntilLead(round())).toBe('Link valid until');
   });
 });

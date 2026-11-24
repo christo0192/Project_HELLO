@@ -20,7 +20,7 @@
 import { activeTurnAt } from '../components/talent/sessionLegs';
 import { isEvidenceInsufficient } from './evidence-hold';
 import { RECOMMENDATION_LABELS } from './recommendation-labels';
-import { linkLapsed, r1StatusLabel } from './r1';
+import { isMeetRound, linkLapsed, r1StatusLabel } from './r1';
 import { r1RecordingStateCopy, turnMediaSec, viewState } from './r1-recording';
 import type { Note } from '../types';
 import type {
@@ -500,15 +500,19 @@ export function shownRoundStatus(
 
 /**
  * Where a round stands, in a word, on a queue row, on the candidate's R1 tab and on the review. An
- * in_progress round with nobody in it is an open link.
+ * in_progress round with nobody in it is an open link. A Meet round has no link, so it reads "Not
+ * started" before anyone joins and "Open" when nobody is in it; every other word is the same.
  */
 export function roundStatusWord(
-  round: Pick<R1ReviewRound, 'status'> & { expires_at: string | null },
+  round: Pick<R1ReviewRound, 'status' | 'channel'> & { expires_at: string | null },
   attempts: readonly Pick<R1ReviewAttempt, 'in_progress'>[],
   nowMs: number,
 ): string {
   const status = shownRoundStatus(round, attempts, nowMs);
-  return status === 'in_progress' && !roundIsRunning(attempts) ? 'Link open' : r1StatusLabel(status);
+  const meet = isMeetRound(round);
+  if (status === 'in_progress' && !roundIsRunning(attempts)) return meet ? 'Open' : 'Link open';
+  if (status === 'invited' && meet) return 'Not started';
+  return r1StatusLabel(status);
 }
 
 /**

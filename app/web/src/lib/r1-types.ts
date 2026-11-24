@@ -10,6 +10,9 @@
 /** `interview_rounds.status` (0115 CHECK). */
 export type R1RoundStatus = 'invited' | 'in_progress' | 'completed' | 'expired' | 'cancelled';
 
+/** `interview_rounds.channel` (0142): how the candidate joins, our browser link or Google Meet. */
+export type R1RoundChannel = 'browser' | 'meet';
+
 /** `interview_rounds.recommendation` (0115 CHECK). Written by the scorer (PR-5). */
 export type R1Recommendation = 'advance' | 'hold' | 'reject';
 
@@ -200,6 +203,8 @@ export interface R1ReviewRound {
   is_staff_dry_run: boolean;
   created_at: string;
   created_by: string;
+  /** How the candidate joins (0142). Absent until the API sends it, and read as a browser round then. */
+  channel?: R1RoundChannel | null;
 }
 
 export interface R1ReviewResponse {
@@ -276,6 +281,8 @@ export interface R1Round {
   created_by?: string;
   /** One entry per attempt. Absent from an older API, and when the list could not read them. */
   attempts?: R1ListedAttempt[];
+  /** How the candidate joins (0142). Absent until the API sends it, and read as a browser round then. */
+  channel?: R1RoundChannel | null;
 }
 
 export interface R1RoundsResponse {
@@ -327,6 +334,8 @@ export interface R1QueueRound {
   is_staff_dry_run: boolean;
   created_at: string;
   attempts: R1ListedAttempt[];
+  /** How the candidate joins (0142). Absent until the API sends it, and read as a browser round then. */
+  channel?: R1RoundChannel | null;
 }
 
 export interface R1QueueResponse {

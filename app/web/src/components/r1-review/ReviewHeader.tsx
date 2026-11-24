@@ -8,6 +8,8 @@
  * who sent the round: the API's own rule, so nobody is offered a button that can only answer 403.
  * Cancelling is the safe direction, and it is an audited override. Once the API has said yes the
  * chip and the button go, whether or not the re-read that follows can get through.
+ *
+ * A round held over Google Meet carries a "Via Meet" chip, and its status chip never talks of a link.
  */
 import { useRef, useState } from 'react';
 import type { ReactNode } from 'react';
@@ -19,7 +21,8 @@ import { api } from '../../api';
 import { plainErrorText } from '../../lib/api-error-copy';
 import { formatDateTime, formatRelative } from '../../lib/datetime';
 import { r1RecordingStateCopy, attemptLabels } from '../../lib/r1-recording';
-import { r1StatusTone } from '../../lib/r1';
+import { isMeetRound, r1StatusTone } from '../../lib/r1';
+import { ViaMeetTag } from '../r1/ViaMeetTag';
 import { rejectionPendingUntil, roundStatusWord, shownRoundStatus } from '../../lib/r1-review';
 import type { R1ReviewAttempt, R1ReviewResponse } from '../../lib/r1-types';
 
@@ -129,6 +132,11 @@ export function ReviewHeader({ review, candidateName, attempt, mayCancelRejectio
           </Chip>
         )}
         {round.is_staff_dry_run && <Chip>Staff dry run</Chip>}
+        {isMeetRound(round) && (
+          <li>
+            <ViaMeetTag channel={round.channel} />
+          </li>
+        )}
         {pending && (
           <li className="flex items-center gap-2">
             <Tag>Rejection pending until {formatDateTime(round.pending_reject_until)}</Tag>

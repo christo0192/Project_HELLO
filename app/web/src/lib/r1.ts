@@ -22,6 +22,12 @@
  *    act on it; anyone else would get a 403 for every click.
  *  - Availability is a hint. `ready` does not promise a send will succeed;
  *    the capacity RPC decides, and its refusals are mapped here too.
+ *  - A Meet round (`channel: 'meet'`, 0142) has no candidate link: the
+ *    candidate joins the Google Meet booked in Ashby. So it is never offered a
+ *    reissue (the database refuses one) and its words never talk of a link.
+ *    Only exactly `'meet'` counts: a round without `channel` (every staff read
+ *    today), null, `'browser'` or a value this page does not know reads as a
+ *    browser round, unchanged.
  */
 import type {
   R1AvailabilityState,
@@ -107,9 +113,25 @@ export function linkLapsed(round: Pick<R1Round, 'status'> & { expires_at: string
   return isLiveRound(round) && round.expires_at !== null && Date.parse(round.expires_at) <= nowMs;
 }
 
-/** Reissue replaces the link, which only exists while nothing has started. */
-export function canReissue(round: Pick<R1Round, 'status'>): boolean {
-  return round.status === 'invited';
+/**
+ * Whether the candidate joins this round through Google Meet. Only exactly `'meet'` says so: the field is
+ * absent until the API sends it, and anything else reads as a browser round.
+ */
+export function isMeetRound(round: { channel?: string | null }): boolean {
+  return round.channel === 'meet';
+}
+
+/**
+ * Reissue replaces the link, which only exists while nothing has started. A Meet round has no link to
+ * replace, and the database refuses its reissue.
+ */
+export function canReissue(round: Pick<R1Round, 'status' | 'channel'>): boolean {
+  return round.status === 'invited' && !isMeetRound(round);
+}
+
+/** The words before a live round's expiry: a browser round's link lapses, a Meet round just closes. */
+export function openUntilLead(round: { channel?: string | null }): string {
+  return isMeetRound(round) ? 'Open until' : 'Link valid until';
 }
 
 /** Cancelling is possible while the round is live; it releases the reserved minutes. */

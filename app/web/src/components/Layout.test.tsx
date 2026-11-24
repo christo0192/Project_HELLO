@@ -459,6 +459,16 @@ describe('the R1 interviews item', () => {
     expect(pageTitleFor('/interviews')).toBe('R1 interviews');
     expect(pageTitleFor('/interviews/round-1')).toBe('R1 review');
   });
+
+  it('stays marked on Meet bookings, which has a name and no item of its own', async () => {
+    answered(true, 1);
+    renderLayout('/interviews/meet-bookings');
+    const link = await screen.findByRole('link', { name: 'R1 interviews' });
+    expect(link).toHaveAttribute('aria-current', 'page');
+    expect(screen.queryByRole('link', { name: 'Meet bookings' })).toBeNull();
+    expect(pageTitleFor('/interviews/meet-bookings')).toBe('Meet bookings');
+    await waitFor(() => expect(document.title).toBe('Meet bookings · HELLO'));
+  });
 });
 
 describe('Layout: the tab title', () => {
