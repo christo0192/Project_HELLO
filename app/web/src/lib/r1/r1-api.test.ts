@@ -11,9 +11,11 @@ import {
   parseAttempt,
   parseConsentTemplate,
   parseExchange,
+  parseMeetExchange,
   parsePreflight,
   parseStatus,
   R1_FINAL_REFUSAL_CODES,
+  R1_PENDING_SERVER_ERROR_CODES,
   R1_ROUTES,
   R1_SERVER_ERROR_CODES,
   R1ApiError,
@@ -77,6 +79,7 @@ describe('R1 route table', () => {
       attempts: '/api/r1/attempts',
       exchange: '/api/r1/exchange',
       ready: '/api/r1/ready',
+      meetExchange: '/api/r1/meet/exchange',
     });
   });
 });
@@ -303,6 +306,183 @@ describe('r1Api requests', () => {
   });
 });
 
+describe('r1Api.meetExchange (the Meet bridge, M034 S07)', () => {
+  const TICKET = 'meet-ticket-not-a-secret-0123456789abcdef';
+  const RESUME = 'resume-not-a-secret';
+  const READY = { url: 'wss://lk.invalid', livekit_token: 'room-token', expires_at: '2026-10-07T00:10:00Z' };
+
+  beforeEach(() => {
+    getSession.mockReset();
+    (globalThis as { __resetNetworkCount?: () => void }).__resetNetworkCount?.();
+  });
+
+  it('sends only the ticket on a first call, in a credential-free, uncached POST body', async () => {
+    const fetchMock = mockFetch(reply(200, READY));
+    await expect(r1Api.meetExchange(TICKET, null)).resolves.toEqual({ status: 'ready', ...READY });
+    const { url, init, body } = lastCall(fetchMock);
+    expect(url.endsWith('/api/r1/meet/exchange')).toBe(true);
+    expect(url).not.toContain(TICKET);
+    expect(url).not.toContain('?');
+    expect(init.method).toBe('POST');
+    expect(init.credentials).toBe('omit');
+    expect(init.cache).toBe('no-store');
+    expect(init.referrerPolicy).toBe('no-referrer');
+    expect(body).toEqual({ ticket: TICKET });
+    const headerNames = Object.keys(init.headers as Record<string, string>);
+    expect(headerNames.map((name) => name.toLowerCase())).not.toContain('authorization');
+    expect(getSession).not.toHaveBeenCalled();
+  });
+
+  it('adds the resume token on a retry, and nothing else', async () => {
+    const fetchMock = mockFetch(reply(202, { status: 'preparing', retry_after_sec: 3, resume_token: RESUME }));
+    await expect(r1Api.meetExchange(TICKET, RESUME)).resolves.toEqual({
+      status: 'preparing',
+      resume_token: RESUME,
+      retry_after_sec: 3,
+    });
+    const { url, body } = lastCall(fetchMock);
+    expect(body).toEqual({ ticket: TICKET, resume_token: RESUME });
+    expect(url).not.toContain(RESUME);
+  });
+
+  it('never sends an empty resume token', async () => {
+    const fetchMock = mockFetch(reply(200, READY));
+    await r1Api.meetExchange(TICKET, '');
+    expect(lastCall(fetchMock).body).toEqual({ ticket: TICKET });
+  });
+
+  it.each([
+    [503, 'meet_disabled'],
+    [404, 'ticket_unknown'],
+    [409, 'ticket_already_claimed'],
+    [425, 'ticket_not_yet_valid'],
+    [410, 'ticket_expired'],
+    [409, 'round_not_live'],
+    [400, 'invalid_request'],
+  ])('rejects a %d %s with its machine code only', async (status, code) => {
+    mockFetch(reply(status, { error: code, message: 'internal detail' }));
+    const error = await r1Api.meetExchange(TICKET, null).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ message: code, status });
+  });
+
+  it('rejects with status 0 when the network is down', async () => {
+    mockFetch(new TypeError('Failed to fetch'));
+    await expect(r1Api.meetExchange(TICKET, null)).rejects.toMatchObject({
+      message: 'network_unreachable',
+      status: 0,
+    });
+  });
+
+  it('carries the refusal\'s retry_after_sec (the hint the bridge waits on), and nothing it cannot read', async () => {
+    // The DeepSeek probe refusal: 503 r1_unavailable with the hint in the body (the Retry-After
+    // header is not readable cross-origin, so the body is the source).
+    mockFetch(reply(503, { error: 'r1_unavailable', retry_after_sec: 30 }));
+    const probe = await r1Api.meetExchange(TICKET, null).catch((e: unknown) => e);
+    expect(probe).toBeInstanceOf(R1ApiError);
+    expect(probe).toMatchObject({ message: 'r1_unavailable', status: 503, retryAfterSec: 30 });
+
+    mockFetch(reply(429, { error: 'rate_limited', retry_after_sec: 0 }));
+    expect(await r1Api.meetExchange(TICKET, null).catch((e: unknown) => e)).toMatchObject({
+      status: 429,
+      retryAfterSec: 0,
+    });
+
+    for (const hint of [undefined, null, -1, 1.5, 601, '30', true]) {
+      mockFetch(reply(503, { error: 'r1_unavailable', retry_after_sec: hint }));
+      const error = await r1Api.meetExchange(TICKET, null).catch((e: unknown) => e);
+      expect((error as R1ApiError).retryAfterSec, String(hint)).toBeNull();
+    }
+    expect(new R1ApiError('r1_unavailable', 503).retryAfterSec).toBeNull();
+  });
+});
+
+describe('parseMeetExchange (fail closed, copies only the declared fields)', () => {
+  const malformed = expect.objectContaining({ message: 'r1_malformed_response' });
+
+  it('reads a 200 as the room grant', () => {
+    expect(
+      parseMeetExchange({ url: 'wss://x', livekit_token: 'k', expires_at: '2026-10-07T00:10:00.000Z' }),
+    ).toEqual({
+      status: 'ready',
+      url: 'wss://x',
+      livekit_token: 'k',
+      expires_at: '2026-10-07T00:10:00.000Z',
+    });
+    expect(parseMeetExchange({ status: 'ready', url: 'wss://x', livekit_token: 'k' })).toEqual({
+      status: 'ready',
+      url: 'wss://x',
+      livekit_token: 'k',
+      expires_at: null,
+    });
+  });
+
+  it('reads a 202 preparing with its resume token and hint', () => {
+    expect(parseMeetExchange({ status: 'preparing', retry_after_sec: 3, resume_token: 'r' })).toEqual({
+      status: 'preparing',
+      resume_token: 'r',
+      retry_after_sec: 3,
+    });
+  });
+
+  it('refuses a 202 preparing without a resume token (the page could only replay the claimed ticket)', () => {
+    for (const resume of [undefined, null, '', 7, {}]) {
+      expect(
+        () => parseMeetExchange({ status: 'preparing', retry_after_sec: 3, resume_token: resume }),
+        String(resume),
+      ).toThrow(malformed);
+    }
+  });
+
+  it('reads retry_after_sec only as a whole number of seconds from 0 to 600', () => {
+    const hint = (value: unknown) =>
+      (parseMeetExchange({ status: 'preparing', resume_token: 'r', retry_after_sec: value }) as {
+        retry_after_sec: number | null;
+      }).retry_after_sec;
+    expect(hint(0)).toBe(0);
+    expect(hint(600)).toBe(600);
+    for (const bad of [undefined, null, -1, 601, 2.5, '3', Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(hint(bad), String(bad)).toBeNull();
+    }
+  });
+
+  it('refuses a 200 without the room URL or token', () => {
+    expect(() => parseMeetExchange({ livekit_token: 'k' })).toThrow(malformed);
+    expect(() => parseMeetExchange({ url: 'wss://x' })).toThrow(malformed);
+    expect(() => parseMeetExchange({ status: 'ready', url: '', livekit_token: 'k' })).toThrow(malformed);
+    expect(() => parseMeetExchange({ status: 'busy' })).toThrow(malformed);
+    for (const body of [null, 'ok', [], 3]) {
+      expect(() => parseMeetExchange(body), String(body)).toThrow(malformed);
+    }
+  });
+
+  it('fails closed on a status it does not know, even beside a room grant', () => {
+    // Only an absent status or `ready` is a grant: a later server's "not yet" must not connect.
+    for (const status of ['queued', 'READY', 'Preparing', 'ready ', '', null, 0, false, {}]) {
+      expect(
+        () => parseMeetExchange({ status, url: 'wss://x', livekit_token: 'k' }),
+        JSON.stringify(status),
+      ).toThrow(malformed);
+    }
+  });
+
+  it('never surfaces a field it does not declare (a name, a session id, display data)', () => {
+    const extra = {
+      display: { lead_name: 'Meera Iyer', course: 'x' },
+      candidate_name: 'Asha Rao',
+      session_id: 's-1',
+      room: 'r1-room',
+      identity: 'meet-1234abcd',
+      timing: { max_minutes: 20 },
+    };
+    const ready = parseMeetExchange({ url: 'wss://x', livekit_token: 'k', ...extra });
+    expect(Object.keys(ready).sort()).toEqual(['expires_at', 'livekit_token', 'status', 'url']);
+    const preparing = parseMeetExchange({ status: 'preparing', resume_token: 'r', ...extra });
+    expect(Object.keys(preparing).sort()).toEqual(['resume_token', 'retry_after_sec', 'status']);
+    expect(JSON.stringify([ready, preparing])).not.toMatch(/Asha|Meera|s-1|r1-room|meet-1234abcd/);
+  });
+});
+
 describe('response validation (fail closed)', () => {
   it('maps PR-3 status wire fields onto the page model', () => {
     expect(parseStatus(STATUS)).toEqual({
@@ -317,7 +497,23 @@ describe('response validation (fail closed)', () => {
       format: { duration_minutes: 20 },
       availability: 'open',
       audience: 'candidate',
+      channel: 'browser',
     });
+  });
+
+  it('reads the channel: absent or null is a browser round, and anything unknown fails closed', () => {
+    const channelOf = (channel: unknown) => parseStatus({ ...STATUS, channel }).channel;
+    // Today's server sends no channel at all.
+    expect(parseStatus(STATUS).channel).toBe('browser');
+    expect(channelOf(undefined)).toBe('browser');
+    expect(channelOf(null)).toBe('browser');
+    expect(channelOf('browser')).toBe('browser');
+    expect(channelOf('meet')).toBe('meet');
+    for (const bad of ['phone', 'Meet', 'meet ', '', 1, true, {}, ['meet']]) {
+      expect(() => channelOf(bad), String(bad)).toThrow(
+        expect.objectContaining({ message: 'r1_malformed_response' }),
+      );
+    }
   });
 
   it('keeps the four consent states apart: declined and withdrawn are not "required"', () => {
@@ -375,6 +571,7 @@ describe('response validation (fail closed)', () => {
       can_start: null,
       live_attempt: null,
       audience: 'candidate',
+      channel: 'browser',
     });
   });
 
@@ -529,6 +726,17 @@ describe('classifyR1Error', () => {
     }
   });
 
+  it('recognises a Google Meet round (a code awaiting the server), whatever status carries it', () => {
+    expect([...R1_PENDING_SERVER_ERROR_CODES]).toEqual(['round_channel_meet']);
+    for (const status of [409, 503, 500, 404]) {
+      expect(kind('round_channel_meet', status), String(status)).toBe('meet_round');
+    }
+    expect(classifyR1Error(new R1ApiError('round_channel_meet', 409))).toBe('meet_round');
+    // It is not one of the codes the server answers today.
+    expect(R1_SERVER_ERROR_CODES).not.toContain('round_channel_meet');
+    expect(kind('round_channel_meet_v2', 409)).toBe('unknown');
+  });
+
   it('treats a malformed response as unknown, not as the link being bad', () => {
     expect(kind('r1_malformed_response', 500)).toBe('unknown');
   });
@@ -552,6 +760,7 @@ describe('isFinalRefusal', () => {
     expect(final('r1_link_invalid_or_expired', 404)).toBe(true);
     expect(final('http_410', 410)).toBe(true);
     expect(final('http_400', 400)).toBe(true);
+    expect(final('round_channel_meet', 409)).toBe(true);
   });
 
   it('is false for what clears: a rate limit, an outage, a dropped network, a disabled lane', () => {

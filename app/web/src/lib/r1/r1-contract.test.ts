@@ -1,5 +1,5 @@
-import { existsSync, readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { relative, resolve } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../supabase', () => ({ supabase: { auth: { getSession: vi.fn() } } }));
@@ -8,10 +8,12 @@ import {
   parseAttempt,
   parseConsentTemplate,
   parseExchange,
+  parseMeetExchange,
   parsePreflight,
   parseStatus,
   R1_CONTRACT,
   R1_FINAL_REFUSAL_CODES,
+  R1_PENDING_SERVER_ERROR_CODES,
   R1_ROUTES,
   R1_SERVER_ERROR_CODES,
   R1_STATUS_VOCABULARY,
@@ -19,6 +21,7 @@ import {
   type R1RouteContract,
   type R1RouteName,
 } from './r1-api';
+import { R1_MEET_EXCHANGE_ERROR_CODES } from './r1-meet';
 
 /**
  * The web side of the R1 wire contract (plan section 8.3), reconciled with PR-3's
@@ -40,6 +43,8 @@ import {
 
 const LINK = 'a'.repeat(64);
 const NONCE = 'n'.repeat(32);
+const TICKET = 'meet-ticket-not-a-secret_0123456789ABCDEFxy';
+const RESUME = 'resume-not-a-secret';
 const NAMES = Object.keys(R1_ROUTES) as R1RouteName[];
 
 // ── Layer 1: the client sends what the contract declares ──────────────────────
@@ -70,6 +75,7 @@ const FULL_RESPONSES: Record<R1RouteName, unknown> = {
     role_title: 'Sales Program Advisor',
     format: { duration_minutes: 20, camera_required: true, includes_role_play: true },
     audience: 'candidate',
+    channel: 'browser',
   },
   consentTemplate: {
     version: 'v1',
@@ -102,6 +108,15 @@ const FULL_RESPONSES: Record<R1RouteName, unknown> = {
     attempt_id: 's',
   },
   ready: { ok: true },
+  // Every declared field at once (a real 200 has no resume token and a real 202 no room token).
+  meetExchange: {
+    status: 'ready',
+    url: 'wss://lk.invalid',
+    livekit_token: 'token',
+    expires_at: '2026-10-07T00:10:00Z',
+    retry_after_sec: 3,
+    resume_token: RESUME,
+  },
 };
 
 interface Invocation {
@@ -132,6 +147,10 @@ const INVOCATIONS: Record<R1RouteName, Invocation[]> = {
   ],
   exchange: [{ label: 'exchange', run: () => r1Api.exchange('attempt', NONCE) }],
   ready: [{ label: 'ready', run: () => r1Api.ready('attempt', NONCE) }],
+  meetExchange: [
+    { label: 'first call', run: () => r1Api.meetExchange(TICKET, null) },
+    { label: 'retry after a 202', run: () => r1Api.meetExchange(TICKET, RESUME) },
+  ],
 };
 
 describe('r1-api sends what R1_CONTRACT declares', () => {
@@ -160,6 +179,8 @@ describe('r1-api sends what R1_CONTRACT declares', () => {
         expect(url.endsWith(contract.path)).toBe(true);
         expect(url).not.toContain('?');
         expect(url).not.toContain(LINK);
+        expect(url).not.toContain(TICKET);
+        expect(url).not.toContain(RESUME);
         const keys = Object.keys(JSON.parse(String(init.body)) as object);
         for (const field of contract.request) {
           expect(keys, `${name} sends ${field}`).toContain(field);
@@ -190,6 +211,7 @@ const PARSERS: Partial<Record<R1RouteName, Parser>> = {
   preflight: parsePreflight,
   attempts: parseAttempt,
   exchange: parseExchange,
+  meetExchange: parseMeetExchange,
 };
 
 describe('the parse functions read exactly the declared response fields', () => {
@@ -321,16 +343,35 @@ function successResponses(operation: string[]): string[] {
  * lands; the pending allowance simply stops being used.
  *
  *   ready: "I'm ready" during the role-play briefing (R1-Q: the server relays it to the worker).
+ *   meetExchange: the Meet bridge's ticket exchange (M034 S05 serves it; the bridge page makes no
+ *     call without a ticket, and nothing mints one until S05/S06 ship).
  */
-const PENDING_ON_SERVER: ReadonlySet<R1RouteName> = new Set<R1RouteName>(['ready']);
+const PENDING_ON_SERVER: ReadonlySet<R1RouteName> = new Set<R1RouteName>(['ready', 'meetExchange']);
+
+type PendingFields = Readonly<Partial<Record<R1RouteName, readonly string[]>>>;
+
+/**
+ * Optional response fields the web reads on a route the server HAS shipped, but that the server
+ * does not send yet. Same rule as `PENDING_ON_SERVER`, one level down: while the spec does not
+ * document the field it is not a problem (the parser reads it as absent), and the moment the spec
+ * documents it the field is checked like any other. It never excuses a required field.
+ *
+ *   status.channel: `browser` | `meet` (M034 S05 emits it for Google Meet rounds).
+ */
+const PENDING_FIELDS_ON_SERVER: PendingFields = Object.freeze({
+  status: Object.freeze(['channel']),
+});
 
 /**
  * Everything wrong between `specText` and R1_CONTRACT, as readable lines. A route in `pending`
- * that the spec does not document yet is not a problem; one it does document is checked.
+ * that the spec does not document yet is not a problem; one it does document is checked. An
+ * optional response field in `pendingFields` that the spec does not document yet is not a
+ * problem either; one it does document is checked.
  */
 function contractProblems(
   specText: string,
   pending: ReadonlySet<R1RouteName> = new Set(),
+  pendingFields: PendingFields = {},
 ): string[] {
   const spec = splitLines(specText);
   const paths = nested(spec, 'paths', 0) ?? [];
@@ -371,7 +412,7 @@ function contractProblems(
     // An optional field the page reads must still be one the server can send: a field the
     // spec's closed (additionalProperties: false) schema does not list is a dead contract.
     for (const field of contract.responseOptional) {
-      if (!hasProperty(responseText, field)) {
+      if (!hasProperty(responseText, field) && !(pendingFields[name] ?? []).includes(field)) {
         problems.push(`${where}: response lacks optional ${field}`);
       }
     }
@@ -384,33 +425,53 @@ const REAL_SPEC = readFileSync(SPEC_PATH, 'utf8');
 /** True once PR-3 (or anything) documents a candidate route under /api/r1/. */
 const SPEC_DOCUMENTS_R1_CANDIDATE_ROUTES = /^ {2}\/api\/r1\//m.test(REAL_SPEC);
 
+/** The text of the `/api/r1/status` path block of a spec, or '' when it has none. */
+function statusOperation(specText: string): string {
+  const spec = splitLines(specText);
+  return (nested(nested(spec, 'paths', 0) ?? [], '/api/r1/status', 2) ?? []).join('\n');
+}
+
+/** The sorted `enum` of a string property declared as `name:` / `type: string` / `enum: [...]`. */
+function documentedEnum(operation: string, property: string): string[] | null {
+  const match = new RegExp(
+    `\\b${property}:\\s*\\n\\s*type: string\\s*\\n\\s*enum: \\[([^\\]]*)\\]`,
+  ).exec(operation);
+  return match ? match[1].split(',').map((item) => item.trim()).sort() : null;
+}
+
+/** True when a block declares `property:` as a key of its own line (not inside prose). */
+function documentsProperty(operation: string, property: string): boolean {
+  return new RegExp(`^\\s+${property}:`, 'm').test(operation);
+}
+
 describe('openapi.yaml documents the R1 candidate contract', () => {
   it.skipIf(!SPEC_DOCUMENTS_R1_CANDIDATE_ROUTES)(
     'documents every route, request field and required response field the web relies on ' +
       '(SKIPPED while PR-3 has not documented /api/r1/*: the contract is UNVERIFIED)',
     () => {
-      expect(contractProblems(REAL_SPEC, PENDING_ON_SERVER)).toEqual([]);
+      expect(contractProblems(REAL_SPEC, PENDING_ON_SERVER, PENDING_FIELDS_ON_SERVER)).toEqual([]);
     },
   );
 
   it.skipIf(!SPEC_DOCUMENTS_R1_CANDIDATE_ROUTES)(
     'accepts exactly the status vocabularies the spec documents (an unknown one fails closed)',
     () => {
-      const spec = splitLines(REAL_SPEC);
-      const operation = (nested(nested(spec, 'paths', 0) ?? [], '/api/r1/status', 2) ?? []).join(
-        '\n',
-      );
-      const documented = (property: string): string[] | null => {
-        const match = new RegExp(
-          `\\b${property}:\\s*\\n\\s*type: string\\s*\\n\\s*enum: \\[([^\\]]*)\\]`,
-        ).exec(operation);
-        return match ? match[1].split(',').map((item) => item.trim()).sort() : null;
-      };
+      const operation = statusOperation(REAL_SPEC);
+      const documented = (property: string) => documentedEnum(operation, property);
       expect(documented('round_status')).toEqual([...R1_STATUS_VOCABULARY.round_status].sort());
       expect(documented('availability')).toEqual([...R1_STATUS_VOCABULARY.availability].sort());
       expect(documented('state')).toEqual([...R1_STATUS_VOCABULARY.consent_state].sort());
     },
   );
+
+  it('accepts exactly the channel vocabulary the spec documents, the moment it documents one', () => {
+    // Pending on the server (M034 S05): until the status response documents `channel`, the page
+    // reads an absent one as `browser` and this pins what it will accept.
+    expect([...R1_STATUS_VOCABULARY.channel]).toEqual(['browser', 'meet']);
+    const operation = statusOperation(REAL_SPEC);
+    if (!documentsProperty(operation, 'channel')) return;
+    expect(documentedEnum(operation, 'channel')).toEqual(['browser', 'meet']);
+  });
 
   it('finds the real spec, and tells candidate routes from the admin and worker ones', () => {
     expect(REAL_SPEC).toContain('openapi: 3.0.3');
@@ -437,6 +498,66 @@ const CANDIDATE_SPEC = (() => {
   const to = REAL_SPEC.indexOf('\n  /api/health:');
   return from > -1 && to > from ? REAL_SPEC.slice(from, to) : '';
 })();
+
+/**
+ * The Meet exchange is served by its own router (M034 S05), not r1-candidate.ts, so its codes are
+ * looked for in every non-test source under app/api/src.
+ */
+const API_SOURCE_ROOT = resolve(process.cwd(), '..', 'api', 'src');
+
+/** Every non-test `.ts` file under `dir` (no `__tests__` folder, no `*.test.ts`). */
+function apiSourceFiles(dir: string = API_SOURCE_ROOT): string[] {
+  if (!existsSync(dir)) return [];
+  const files: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = resolve(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name !== '__tests__' && entry.name !== 'node_modules') files.push(...apiSourceFiles(path));
+    } else if (entry.name.endsWith('.ts') && !entry.name.endsWith('.test.ts')) {
+      files.push(path);
+    }
+  }
+  return files;
+}
+
+/** The `/api/r1/meet/exchange` path block of a spec plus the schemas it references, or null. */
+function meetExchangeDoc(specText: string): string | null {
+  const spec = splitLines(specText);
+  const block = nested(nested(spec, 'paths', 0) ?? [], R1_ROUTES.meetExchange, 2);
+  return block ? closure(spec, block) : null;
+}
+
+/**
+ * Every Meet exchange code the page tells apart that a spec documenting the route does not name
+ * there, or that no API source quotes. Nothing while the spec does not document the route.
+ */
+function meetCodeProblems(specText: string, sources: readonly string[]): string[] {
+  const doc = meetExchangeDoc(specText);
+  if (doc === null) return [];
+  const problems: string[] = [];
+  for (const code of R1_MEET_EXCHANGE_ERROR_CODES) {
+    if (!new RegExp(`\\b${code}\\b`).test(doc)) {
+      problems.push(`${R1_ROUTES.meetExchange}: the spec does not name ${code}`);
+    }
+    const quoted = new RegExp(`(['"\`])${code}\\1`);
+    if (!sources.some((source) => quoted.test(source))) {
+      problems.push(`${code}: no app/api/src source answers it`);
+    }
+  }
+  return problems;
+}
+
+/**
+ * The pending codes some API source answers (quotes, in any quote style) that `spec` does not
+ * name. Every non-test source is walked, not only r1-candidate.ts: S05 may keep the string in a
+ * lib constant that the router answers by name, and the check must switch on all the same.
+ */
+function pendingCodesUndocumented(sources: readonly string[], spec: string): string[] {
+  return R1_PENDING_SERVER_ERROR_CODES.filter((code) => {
+    const quoted = new RegExp(`(['"\`])${code}\\1`);
+    return sources.some((source) => quoted.test(source)) && !new RegExp(`\\b${code}\\b`).test(spec);
+  });
+}
 
 describe('the error codes the web acts on are the ones the server answers', () => {
   it('pins the three codes the page relies on most, by name', () => {
@@ -471,6 +592,43 @@ describe('the error codes the web acts on are the ones the server answers', () =
     },
   );
 
+  it('keeps the codes awaiting the server to the one named, apart from those it answers', () => {
+    expect([...R1_PENDING_SERVER_ERROR_CODES]).toEqual(['round_channel_meet']);
+    expect(R1_PENDING_SERVER_ERROR_CODES.filter((code) => R1_SERVER_ERROR_CODES.includes(code)))
+      .toEqual([]);
+  });
+
+  it('checks a code awaiting the server against the candidate spec the moment any API source answers it', () => {
+    // While the server does not answer a pending code there is nothing to check; once it does,
+    // the candidate spec must name it, exactly as for every code the page already acts on.
+    const sources = apiSourceFiles().map((file) => readFileSync(file, 'utf8'));
+    expect(sources.length).toBeGreaterThan(10);
+    expect(pendingCodesUndocumented(sources, CANDIDATE_SPEC)).toEqual([]);
+  }, 30_000);
+
+  it('would notice a pending code the server answers but the spec does not name', () => {
+    const answering = ["refuse(res, 409, 'round_channel_meet');"];
+    const naming = '409: round_channel_meet (the round takes place in Google Meet)';
+    expect(pendingCodesUndocumented(["refuse(res, 409, 'r1_busy');"], '')).toEqual([]);
+    expect(pendingCodesUndocumented(answering, '409: r1_busy')).toEqual(['round_channel_meet']);
+    expect(pendingCodesUndocumented(answering, naming)).toEqual([]);
+    expect(pendingCodesUndocumented(answering, '409: round_channel_meet_v2')).toEqual([
+      'round_channel_meet',
+    ]);
+    // A lib constant the router answers by name switches the check on too, in any quote style.
+    const viaConstant = [
+      'export const R1_ROUND_CHANNEL_MEET = "round_channel_meet";',
+      'refuse(res, 409, R1_ROUND_CHANNEL_MEET);',
+    ];
+    expect(pendingCodesUndocumented(viaConstant, '409: r1_busy')).toEqual(['round_channel_meet']);
+    expect(pendingCodesUndocumented(['const code = `round_channel_meet`;'], '')).toEqual([
+      'round_channel_meet',
+    ]);
+    expect(pendingCodesUndocumented(viaConstant, naming)).toEqual([]);
+    // A longer name is not the code.
+    expect(pendingCodesUndocumented(["'round_channel_meet_v2'"], '')).toEqual([]);
+  });
+
   it('would notice a code that is no longer there', () => {
     const answered = (code: string, source: string) => source.includes(`'${code}'`);
     expect(answered('r1_attempt_not_live', "refuse(res, 409, 'r1_attempt_not_live');")).toBe(true);
@@ -478,6 +636,75 @@ describe('the error codes the web acts on are the ones the server answers', () =
     const named = (code: string, text: string) => new RegExp(`\\b${code}\\b`).test(text);
     expect(named('round_expired', '409: round_expired, round_not_admissible')).toBe(true);
     expect(named('round_expired', '409: round_expired_early')).toBe(false);
+  });
+
+  it('names and answers every Meet exchange code the page tells apart, the moment the spec documents the route', () => {
+    // Pending on the server (M034 S05): while the spec does not document the route, this pins the
+    // seven codes of contract section 4; once it does, each must be named for the route and
+    // quoted by some API source, or a renamed code would turn a precise tile into the generic one.
+    expect([...R1_MEET_EXCHANGE_ERROR_CODES].sort()).toEqual([
+      'invalid_request',
+      'meet_disabled',
+      'round_not_live',
+      'ticket_already_claimed',
+      'ticket_expired',
+      'ticket_not_yet_valid',
+      'ticket_unknown',
+    ]);
+    if (meetExchangeDoc(REAL_SPEC) === null) return;
+    const sources = apiSourceFiles().map((file) => readFileSync(file, 'utf8'));
+    expect(meetCodeProblems(REAL_SPEC, sources)).toEqual([]);
+  });
+
+  it('walks only the non-test API sources for the Meet exchange codes', () => {
+    const files = apiSourceFiles().map((file) => relative(API_SOURCE_ROOT, file).replace(/\\/g, '/'));
+    expect(files).toContain('routes/r1-candidate.ts');
+    expect(files.filter((file) => /\.test\.ts$|(^|\/)__tests__\//.test(file))).toEqual([]);
+    expect(files.every((file) => file.endsWith('.ts'))).toBe(true);
+  });
+
+  it('would notice a Meet exchange code the documented route does not name or no source answers', () => {
+    const codes = [...R1_MEET_EXCHANGE_ERROR_CODES];
+    const spec = (named: readonly string[], elsewhere: readonly string[] = []) =>
+      [
+        'openapi: 3.0.3',
+        'paths:',
+        '  /api/r1/exchange:',
+        '    post:',
+        `      description: 'refusals: ${elsewhere.join(', ')}'`,
+        '  /api/r1/meet/exchange:',
+        '    post:',
+        '      responses:',
+        "        '409':",
+        `          description: 'refusals: ${named.join(', ')}'`,
+        '  /api/health:',
+        '    get: {}',
+        '',
+      ].join('\n');
+    const answering = [codes.map((code) => `refuse(res, 409, '${code}');`).join('\n')];
+    // Undocumented route: nothing to check yet, whatever the sources say.
+    expect(meetCodeProblems('openapi: 3.0.3\npaths:\n  /api/health:\n    get: {}\n', [])).toEqual([]);
+    expect(meetCodeProblems(spec(codes), answering)).toEqual([]);
+    // Double quotes and template literals answer a code too.
+    expect(meetCodeProblems(spec(codes), [codes.map((code) => `"${code}" \`${code}\``).join(' ')]))
+      .toEqual([]);
+    expect(meetCodeProblems(spec(without(codes, 'ticket_expired')), answering)).toEqual([
+      '/api/r1/meet/exchange: the spec does not name ticket_expired',
+    ]);
+    // Named only on another route is not named for this one.
+    expect(meetCodeProblems(spec(without(codes, 'round_not_live'), ['round_not_live']), answering))
+      .toEqual(['/api/r1/meet/exchange: the spec does not name round_not_live']);
+    // A longer name is not the code.
+    expect(
+      meetCodeProblems(spec([...without(codes, 'ticket_unknown'), 'ticket_unknown_v2']), answering),
+    ).toEqual(['/api/r1/meet/exchange: the spec does not name ticket_unknown']);
+    const unanswered = [answering[0].replace("'meet_disabled'", "'meet_off'")];
+    expect(meetCodeProblems(spec(codes), unanswered)).toEqual([
+      'meet_disabled: no app/api/src source answers it',
+    ]);
+    expect(meetCodeProblems(spec(codes), ['ticket_unknown_v2', "'ticket_unknown_v2'"])).toHaveLength(
+      codes.length,
+    );
   });
 
   it('declares no field the spec does not document (the attempts `lead` was one)', () => {
@@ -682,7 +909,81 @@ describe('the contract checker', () => {
     ]);
   });
 
-  it('keeps the pending allowance to the one route that is awaiting the server', () => {
-    expect([...PENDING_ON_SERVER]).toEqual(['ready']);
+  it('lets the Meet exchange be undocumented while the server has not shipped it, and checks it once documented', () => {
+    const undocumented = syntheticSpec((name, parts) => {
+      if (name === 'meetExchange') parts.documented = false;
+    });
+    expect(contractProblems(undocumented)).toEqual([
+      'POST /api/r1/meet/exchange: path is not documented',
+    ]);
+    expect(contractProblems(undocumented, PENDING_ON_SERVER)).toEqual([]);
+    const noResume = syntheticSpec((name, parts) => {
+      if (name === 'meetExchange') parts.request = without(parts.request, 'resume_token');
+    });
+    expect(contractProblems(noResume, PENDING_ON_SERVER)).toEqual([
+      'POST /api/r1/meet/exchange: request lacks optional resume_token',
+    ]);
+    const noResumeInAnswer = syntheticSpec((name, parts) => {
+      if (name === 'meetExchange') parts.response = without(parts.response, 'resume_token');
+    });
+    expect(contractProblems(noResumeInAnswer, PENDING_ON_SERVER)).toEqual([
+      'POST /api/r1/meet/exchange: response lacks optional resume_token',
+    ]);
+  });
+
+  it('keeps the pending allowance to the routes awaiting the server', () => {
+    expect([...PENDING_ON_SERVER]).toEqual(['ready', 'meetExchange']);
+  });
+
+  it('lets an optional field the server has not shipped yet be undocumented, and nothing else', () => {
+    const spec = syntheticSpec((name, parts) => {
+      if (name === 'status') parts.response = without(parts.response, 'channel');
+    });
+    expect(contractProblems(spec)).toEqual(['POST /api/r1/status: response lacks optional channel']);
+    expect(contractProblems(spec, new Set(), PENDING_FIELDS_ON_SERVER)).toEqual([]);
+    // Pending covers only the field named, on the route named.
+    const other = syntheticSpec((name, parts) => {
+      if (name === 'status') parts.response = without(without(parts.response, 'channel'), 'audience');
+    });
+    expect(contractProblems(other, new Set(), PENDING_FIELDS_ON_SERVER)).toEqual([
+      'POST /api/r1/status: response lacks optional audience',
+    ]);
+    expect(contractProblems(spec, new Set(), { attempts: ['channel'] })).toEqual([
+      'POST /api/r1/status: response lacks optional channel',
+    ]);
+  });
+
+  it('never lets a pending field excuse a required one', () => {
+    const spec = syntheticSpec((name, parts) => {
+      if (name !== 'status') return;
+      parts.response = without(parts.response, 'round_status');
+      parts.required = without(parts.required, 'round_status');
+    });
+    expect(contractProblems(spec, new Set(), { status: ['round_status'] })).toEqual([
+      'POST /api/r1/status: response lacks round_status',
+    ]);
+  });
+
+  it('checks a pending field like any other the moment the spec documents it', () => {
+    // The synthetic spec documents every declared field, `status.channel` included: no problem,
+    // with or without the allowance, so the allowance is simply no longer used.
+    expect(contractProblems(syntheticSpec(), new Set(), PENDING_FIELDS_ON_SERVER)).toEqual([]);
+    // Once documented, its enum must be exactly what the parser accepts (the vocabulary test).
+    const documented = [
+      '        channel:',
+      '          type: string',
+      '          enum: [meet, browser]',
+    ].join('\n');
+    expect(documentsProperty(documented, 'channel')).toBe(true);
+    expect(documentedEnum(documented, 'channel')).toEqual(['browser', 'meet']);
+    expect(documentedEnum(documented.replace('meet, browser', 'browser, meet, phone'), 'channel'))
+      .not.toEqual(['browser', 'meet']);
+    // Prose that mentions the word is not a declaration.
+    expect(documentsProperty("        description: 'the channel: browser or meet'", 'channel'))
+      .toBe(false);
+  });
+
+  it('keeps the field-level pending allowance to the one field awaiting the server', () => {
+    expect(PENDING_FIELDS_ON_SERVER).toEqual({ status: ['channel'] });
   });
 });

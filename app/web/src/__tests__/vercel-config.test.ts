@@ -120,6 +120,8 @@ describe('app/web/vercel.json', () => {
         '/candidates/11111111-1111-4111-8111-111111111111',
         '/mfa/enroll',
         '/privacy-notice',
+        // The Meet bridge the Recall bot loads (its ticket rides in the fragment, never sent).
+        '/candidate/r1/meet',
         // A route that merely starts with the word is not an asset.
         '/assets',
         '/assets-old/x.js',

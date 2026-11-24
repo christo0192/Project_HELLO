@@ -12,11 +12,12 @@
  * fields are snake_case, like every other route.
  *
  * Invariants:
- *   - The link token and the attempt token travel in the JSON body, never in a
- *     URL, a header or a log line.
- *   - Requests are credential-free: the R1 routes authenticate by link token,
- *     so the recruiter's Supabase bearer must never be attached (a recruiter
- *     previewing a link in the same browser would otherwise leak it).
+ *   - The link token, the attempt token, the Meet bridge ticket and its resume
+ *     token travel in the JSON body, never in a URL, a header or a log line.
+ *   - Requests are credential-free: the R1 routes authenticate by link token
+ *     (or, for the Meet bridge, by its ticket), so the recruiter's Supabase
+ *     bearer must never be attached (a recruiter previewing a link in the same
+ *     browser would otherwise leak it).
  *   - Responses are validated and normalised here. A response that does not
  *     have the expected shape fails closed as `r1_malformed_response`; the
  *     pages never see raw server JSON.
@@ -34,6 +35,7 @@ export const R1_ROUTES = Object.freeze({
   attempts: '/api/r1/attempts',
   exchange: '/api/r1/exchange',
   ready: '/api/r1/ready',
+  meetExchange: '/api/r1/meet/exchange',
 });
 
 /**
@@ -94,6 +96,9 @@ export const R1_CONTRACT: Readonly<Record<R1RouteName, R1RouteContract>> = Objec
       'starts_remaining',
       'live_attempt',
       'can_start',
+      // Pending on the server until M034 S05 (Meet rounds): absent reads `browser`. The contract
+      // test allows it to be undocumented until the spec documents it, then checks it like any field.
+      'channel',
     ],
   }),
   consentTemplate: route('consentTemplate', {
@@ -158,6 +163,22 @@ export const R1_CONTRACT: Readonly<Record<R1RouteName, R1RouteContract>> = Objec
     response: [],
     responseOptional: [],
   }),
+  // The Meet bridge page (M034 S07; `.gsd/milestones/M034/contracts/meet-contracts.md` sections 4
+  // and 9, decision D-S07-10). The Recall bot's Output Media opens `/candidate/r1/meet#t=<ticket>`;
+  // the page trades the ticket for a room token. `ticket` goes on every call. The ticket is
+  // single-use (the server claims it BEFORE admission), so a retry after a 202 presents the
+  // `resume_token` that 202 carried instead of claiming again; a 202 without one is malformed.
+  // The 200 uses the browser exchange's own names. Nothing about the candidate is declared or
+  // read: room and identity are inside the token, the lead name comes only from the interviewer's
+  // `leadname` attribute, the course facts are static and the timer is the role-play clock.
+  // Pending on the server until M034 S05 (the contract test allows the path to be undocumented
+  // until the spec documents it, then checks it like every other route).
+  meetExchange: route('meetExchange', {
+    request: ['ticket'],
+    requestOptional: ['resume_token'],
+    response: ['url', 'livekit_token'],
+    responseOptional: ['status', 'retry_after_sec', 'resume_token', 'expires_at'],
+  }),
 });
 
 export type R1RoundState = 'invited' | 'in_progress' | 'completed' | 'expired' | 'cancelled';
@@ -189,6 +210,14 @@ const CONSENT_STATES: readonly string[] = ['granted', 'required', 'declined', 'w
 export type R1Audience = 'candidate' | 'staff';
 
 /**
+ * Where the interview takes place: this page (`browser`), or a Google Meet call the hiring team
+ * scheduled (`meet`, M034), which this page never starts.
+ */
+export type R1Channel = 'browser' | 'meet';
+
+const CHANNELS: readonly string[] = ['browser', 'meet'];
+
+/**
  * The closed vocabularies `parseStatus` accepts. A value outside them fails closed, so a
  * server that grows a new one would show every candidate the "unavailable" screen;
  * `r1-contract.test.ts` pins these to the enums `openapi.yaml` documents.
@@ -197,6 +226,7 @@ export const R1_STATUS_VOCABULARY = Object.freeze({
   round_status: ROUND_STATES,
   availability: AVAILABILITIES,
   consent_state: CONSENT_STATES,
+  channel: CHANNELS,
 });
 
 /**
@@ -223,6 +253,11 @@ export interface R1Status {
   availability: R1Availability;
   /** `staff` for an internal dry run (its closing screens speak for the project team). */
   audience: R1Audience;
+  /**
+   * `meet` when the interview takes place in Google Meet (the page then starts nothing); absent
+   * from an older API reads `browser`.
+   */
+  channel: R1Channel;
 }
 
 export interface R1ConsentItem {
@@ -295,6 +330,27 @@ export interface R1RoomGrant {
 /** `POST /api/r1/exchange`: 200 with a room token, or 202 while the worker boots. */
 export type R1ExchangeResult = R1RoomGrant | { status: 'preparing' };
 
+/** `POST /api/r1/meet/exchange` 200: the room token for the Meet bridge, and nothing else. */
+export interface R1MeetRoomGrant {
+  status: 'ready';
+  url: string;
+  livekit_token: string;
+  expires_at: string | null;
+}
+
+/**
+ * `POST /api/r1/meet/exchange` 202 while the worker boots. `resume_token` continues the SAME
+ * claimed ticket on the next call (the ticket alone would be refused as already claimed).
+ */
+export interface R1MeetPreparing {
+  status: 'preparing';
+  resume_token: string;
+  /** The server's hint in whole seconds (0..600), or null when it gave none or an odd one. */
+  retry_after_sec: number | null;
+}
+
+export type R1MeetExchangeResult = R1MeetRoomGrant | R1MeetPreparing;
+
 export type R1ErrorKind =
   | 'busy'
   | 'attempt_not_live'
@@ -306,6 +362,8 @@ export type R1ErrorKind =
   | 'rate_limited'
   | 'unavailable'
   | 'network'
+  // The round takes place in Google Meet: this page starts nothing for it (M034).
+  | 'meet_round'
   | 'unknown';
 
 type Json = Record<string, unknown>;
@@ -359,13 +417,23 @@ export type R1BusyReason = 'slots_full' | 'own_session_live';
 
 /**
  * A refusal from `/api/r1/*`. It IS an `ApiError` (every check by class and code still holds);
- * it only adds the busy reason, the one body field beyond the code that the page acts on.
+ * it only adds the body fields beyond the code that a page acts on: the busy reason, and the
+ * refusal's `retry_after_sec` (a whole number of seconds from 0 to 600, else null), which the
+ * Meet bridge waits on before it asks again (r1-meet.ts). The `Retry-After` header is not read:
+ * cross-origin, the page cannot see it.
  */
 export class R1ApiError extends ApiError {
   readonly busyReason: R1BusyReason | null;
-  constructor(message: string, status: number, busyReason: R1BusyReason | null = null) {
+  readonly retryAfterSec: number | null;
+  constructor(
+    message: string,
+    status: number,
+    busyReason: R1BusyReason | null = null,
+    retryAfterSec: number | null = null,
+  ) {
     super(message, status);
     this.busyReason = busyReason;
+    this.retryAfterSec = retryAfterSec;
   }
 }
 
@@ -423,7 +491,12 @@ async function send(
     data = null;
   }
   if (!response.ok) {
-    throw new R1ApiError(errorCode(data, response.status), response.status, busyReason(data));
+    throw new R1ApiError(
+      errorCode(data, response.status),
+      response.status,
+      busyReason(data),
+      retryAfterSeconds(record(data)?.retry_after_sec),
+    );
   }
   return data;
 }
@@ -456,6 +529,10 @@ export function parseStatus(data: unknown): R1Status {
   if (!CONSENT_STATES.includes(consentState)) malformed();
   const format = record(body.format);
   const minutes = format ? optionalCount(format.duration_minutes) : null;
+  // Absent (a server that predates Meet rounds) reads `browser`; an unknown value fails closed
+  // like every other enum, never as a browser round the page would then try to start.
+  const rawChannel = body.channel ?? 'browser';
+  if (typeof rawChannel !== 'string' || !CHANNELS.includes(rawChannel)) malformed();
   return {
     state: state as R1RoundState,
     attempts_left: attemptsLeft as number,
@@ -469,6 +546,7 @@ export function parseStatus(data: unknown): R1Status {
     availability: availability as R1Availability,
     // Anything but the staff notice reads as a candidate: the stricter wording.
     audience: body.audience === 'staff' ? 'staff' : 'candidate',
+    channel: rawChannel as R1Channel,
   };
 }
 
@@ -533,6 +611,38 @@ export function parseExchange(data: unknown): R1ExchangeResult {
   };
 }
 
+/** A `retry_after_sec` (a 202's, or a refusal's): a whole number of seconds from 0 to 600, else null. */
+function retryAfterSeconds(value: unknown): number | null {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 600
+    ? value
+    : null;
+}
+
+/**
+ * The Meet bridge exchange. A 202 (`status: 'preparing'`) must carry `resume_token`, or the page
+ * could only retry with the claimed ticket; a 200 must carry the room URL and token, and either no
+ * `status` or `status: 'ready'`. Any other status fails closed, even beside a room grant: a later
+ * server's "not yet" must never connect the bridge. Only the declared fields are copied: anything
+ * else the server adds (a name, a session id) never reaches the page.
+ */
+export function parseMeetExchange(data: unknown): R1MeetExchangeResult {
+  const body = requireRecord(data);
+  if (body.status !== undefined && body.status !== 'ready' && body.status !== 'preparing') malformed();
+  if (body.status === 'preparing') {
+    return {
+      status: 'preparing',
+      resume_token: requireString(body.resume_token),
+      retry_after_sec: retryAfterSeconds(body.retry_after_sec),
+    };
+  }
+  return {
+    status: 'ready',
+    url: requireString(body.url),
+    livekit_token: requireString(body.livekit_token),
+    expires_at: optionalString(body.expires_at),
+  };
+}
+
 const call = (name: R1RouteName, body: Json): Promise<unknown> =>
   send(R1_CONTRACT[name].method, R1_CONTRACT[name].path, body);
 
@@ -585,6 +695,18 @@ export const r1Api = {
   ready: async (attemptToken: string, nonce: string): Promise<void> => {
     await call('ready', { attempt_token: attemptToken, nonce });
   },
+
+  /**
+   * Trade the Meet bridge ticket for a room token. `resumeToken` is sent only on a retry after a
+   * 202 that supplied one. The bounded retry schedule lives in `r1-meet.ts` (`runMeetExchange`).
+   */
+  meetExchange: async (ticket: string, resumeToken: string | null): Promise<R1MeetExchangeResult> =>
+    parseMeetExchange(
+      await call('meetExchange', {
+        ticket,
+        ...(resumeToken ? { resume_token: resumeToken } : {}),
+      }),
+    ),
 };
 
 /**
@@ -613,11 +735,31 @@ const ERROR_KINDS: Readonly<Record<string, R1ErrorKind>> = Object.freeze({
 /** The server error codes `classifyR1Error` recognises by name. */
 export const R1_SERVER_ERROR_CODES: readonly string[] = Object.freeze(Object.keys(ERROR_KINDS));
 
+/**
+ * Codes the server will answer once M034 S05 ships, and what each means to the page. They are
+ * kept apart from `ERROR_KINDS` because `r1-candidate.ts` does not answer them yet;
+ * `r1-contract.test.ts` checks each against the candidate spec the moment `r1-candidate.ts`
+ * answers it.
+ *
+ *   round_channel_meet: the round takes place in Google Meet (409 from status and attempts).
+ */
+const PENDING_ERROR_KINDS: Readonly<Record<string, R1ErrorKind>> = Object.freeze({
+  round_channel_meet: 'meet_round',
+});
+
+/** The pending server error codes `classifyR1Error` already recognises by name. */
+export const R1_PENDING_SERVER_ERROR_CODES: readonly string[] = Object.freeze(
+  Object.keys(PENDING_ERROR_KINDS),
+);
+
 /** Map any thrown value to the small closed set the pages know how to explain. */
 export function classifyR1Error(error: unknown): R1ErrorKind {
   if (!(error instanceof ApiError)) return 'unknown';
   if (Object.prototype.hasOwnProperty.call(ERROR_KINDS, error.message)) {
     return ERROR_KINDS[error.message] as R1ErrorKind;
+  }
+  if (Object.prototype.hasOwnProperty.call(PENDING_ERROR_KINDS, error.message)) {
+    return PENDING_ERROR_KINDS[error.message] as R1ErrorKind;
   }
   if (error.status === 0) return 'network';
   if (error.status === 410) return 'link_expired';
@@ -636,9 +778,10 @@ export const R1_FINAL_REFUSAL_CODES: readonly string[] = Object.freeze(['round_n
 
 /**
  * The server refused this request for a reason that will not go away (the round has lapsed or
- * closed, the attempt is no longer live, the consent is withdrawn, or it does not know the
- * link or nonce), so repeating it only spends the link's rate limit. False for a rate limit, an
- * outage and a dropped network: those clear, and a retry is the right answer to them.
+ * closed, the attempt is no longer live, the consent is withdrawn, the round takes place in
+ * Google Meet, or it does not know the link or nonce), so repeating it only spends the link's
+ * rate limit. False for a rate limit, an outage and a dropped network: those clear, and a retry
+ * is the right answer to them.
  */
 export function isFinalRefusal(error: unknown): boolean {
   switch (classifyR1Error(error)) {
@@ -646,6 +789,7 @@ export function isFinalRefusal(error: unknown): boolean {
     case 'link_invalid':
     case 'attempt_not_live':
     case 'consent_required':
+    case 'meet_round':
       return true;
     default:
       return error instanceof ApiError && R1_FINAL_REFUSAL_CODES.includes(error.message);

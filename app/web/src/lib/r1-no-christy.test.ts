@@ -17,7 +17,7 @@ function walk(directory: string): string[] {
 const root = process.cwd();
 const directories = ['src/components/candidate-r1', 'src/components/r1-review', 'src/components/r1'];
 const singles = ['src/lib/r1-review.ts', 'src/pages/R1InterviewsPage.tsx', 'src/pages/R1JoinPage.tsx',
-  'src/pages/R1ReviewPage.tsx', 'src/pages/R1SettingsPage.tsx'];
+  'src/pages/R1ReviewPage.tsx', 'src/pages/R1SettingsPage.tsx', 'src/pages/R1MeetBridgePage.tsx'];
 
 describe('R1 shipped copy', () => {
   it('strips comments while preserving code and URLs', () => {

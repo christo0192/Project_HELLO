@@ -9,9 +9,18 @@
 import type { Page, TestInfo } from '@playwright/test';
 import { expect, type R1Harness } from './candidate-harness';
 import { horizontalOverflow } from './layout';
-import { R1_ATTEMPT_TOKEN, R1_FRESH_ATTEMPT_TOKEN, R1_LINK_TOKEN } from './r1-candidate-api';
+import {
+  R1_ATTEMPT_TOKEN,
+  R1_FRESH_ATTEMPT_TOKEN,
+  R1_LINK_TOKEN,
+  R1_MEET_RESUME_TOKEN,
+  R1_MEET_TICKET,
+} from './r1-candidate-api';
 
 export const TOKEN_HASH = `#${R1_LINK_TOKEN}`;
+/** The fragment the Recall bot's Output Media URL carries to the Meet bridge (contract section 9 item 2). */
+export const MEET_TICKET_HASH = `#t=${R1_MEET_TICKET}`;
+export const MEET_BRIDGE_PATH = '/candidate/r1/meet';
 export const NONCE_KEY = 'r1.attempt.nonce';
 
 /**
@@ -92,6 +101,45 @@ export function expectCandidateHygiene(r1: R1Harness): void {
     r1.calls.filter((call) => /complete|recording|upload|invite|exchange-legacy|livekit/.test(new URL(call.url).pathname)),
     'no completion, recording, upload or legacy call',
   ).toEqual([]);
+}
+
+/** Open the Meet bridge as the Recall bot's headless Chrome does: the ticket in the fragment. */
+export async function openBridge(r1: R1Harness, hash: string = MEET_TICKET_HASH): Promise<void> {
+  await r1.page.goto(`${MEET_BRIDGE_PATH}${hash}`);
+}
+
+/** The Meet bridge tile, whose `data-state` and `data-reason` name where the bridge is. */
+export function meetTile(page: Page) {
+  return page.locator('section.r1-meet-tile');
+}
+
+/**
+ * What the Meet bridge must never do, asserted on every bridge flow: send a credential header,
+ * put the ticket (or the resume token) in a URL or the page, call anything but its one exchange,
+ * or leave the address anything but the bare bridge path.
+ */
+export async function expectBridgeHygiene(r1: R1Harness): Promise<void> {
+  expect(
+    r1.calls.filter((call) => call.hasAuthorization).map((call) => `${call.method} ${call.url}`),
+    'bridge requests must carry no Authorization header',
+  ).toEqual([]);
+  expect(
+    r1.calls.filter((call) => call.url.includes(R1_MEET_TICKET) || call.url.includes(R1_MEET_RESUME_TOKEN)),
+    'the ticket and the resume token must never appear in a URL',
+  ).toEqual([]);
+  expect(
+    r1.calls.filter((call) => `${call.method} ${new URL(call.url).pathname}` !== 'POST /api/r1/meet/exchange'),
+    'the bridge calls nothing but its ticket exchange',
+  ).toEqual([]);
+  const markup = await r1.page.evaluate(() => document.body.innerHTML);
+  for (const secret of [R1_MEET_TICKET, R1_MEET_RESUME_TOKEN, 'e2e-meet-room-token']) {
+    expect(markup.includes(secret), `${secret} must not be in the page`).toBe(false);
+  }
+  const address = new URL(r1.page.url());
+  expect(
+    { path: address.pathname, query: address.search, fragment: address.hash },
+    'the address is the bare bridge path, the ticket stripped',
+  ).toEqual({ path: MEET_BRIDGE_PATH, query: '', fragment: '' });
 }
 
 export function bodiesOf(r1: R1Harness, path: string): Array<Record<string, unknown> | null> {

@@ -31,6 +31,8 @@ export interface MockSnapshot {
   connects: ConnectRecord[];
   disconnects: DisconnectRecord[];
   tracks: Array<{ kind: 'audio' | 'video'; readyState: MediaStreamTrackState }>;
+  /** How many times the page called `room.startAudio()` (the Meet bridge: once per room). */
+  audioStarts: number;
 }
 
 export interface MockRemote {
@@ -62,6 +64,7 @@ function remote(page: Page): MockRemote {
           connects: mock?.connects ?? [],
           disconnects: mock?.disconnects ?? [],
           tracks: (mock?.tracks ?? []).map((t) => ({ kind: t.kind, readyState: t.mediaStreamTrack.readyState })),
+          audioStarts: mock?.audioStarts ?? 0,
         };
       }),
     joinAgent: (attributes) => page.evaluate((a) => window.__r1Mock!.joinAgent(a), attributes),

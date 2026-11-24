@@ -52,6 +52,32 @@ describe('R1ClosedCard', () => {
     expect(screen.getByText(/Your link stays valid/)).toBeVisible();
   });
 
+  describe('a Google Meet round', () => {
+    const MEET_TITLE = 'This interview takes place in Google Meet at the scheduled time';
+
+    it('says where and when the interview takes place, with nothing to press', () => {
+      render(<R1ClosedCard kind="meet" />);
+      expect(screen.getByRole('heading', { level: 1, name: MEET_TITLE })).toBeVisible();
+      expect(screen.getByText('Google Meet interview')).toBeVisible();
+      expect(screen.getByText(/Join from your Google Meet invitation/)).toBeVisible();
+      expect(screen.queryByRole('button')).toBeNull();
+      expect(screen.queryByRole('link')).toBeNull();
+      // Nothing for the candidate to fix: a neutral card, not an alert.
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+
+    it('names no team, so a staff dry run reads the same words', () => {
+      const copy = R1_CLOSED_COPY.meet;
+      expect(`${copy.eyebrow} ${copy.title} ${copy.body}`).not.toMatch(/hiring team|project team/i);
+      expect(closedCopyFor('meet', 'staff')).toEqual(closedCopyFor('meet', 'candidate'));
+    });
+
+    it('has no accessibility violations', async () => {
+      const { container } = render(<R1ClosedCard kind="meet" />);
+      await expect(container).toHaveNoViolations();
+    });
+  });
+
   it('tells a link with no start left to contact the hiring team', () => {
     render(<R1ClosedCard kind="starts_exhausted" />);
     expect(

@@ -27,6 +27,11 @@
  * `r1_busy` unless it presents the attempt's nonce. A page that forgets the
  * nonce therefore cannot rejoin, exactly as against the real server.
  *
+ * The Meet bridge's `POST /api/r1/meet/exchange` (M034 S07; contract sections 4 and 9) is here
+ * too: the ticket travels in the body, a claimed ticket is refused unless the call presents the
+ * `resume_token` a 202 handed out, and the server's Meet switch answers 503 before anything else.
+ * The real route is built later (M034 S05) from the same contract.
+ *
  * Nothing here is verified against PR-3 (it is built in parallel). It mirrors
  * the web client and so proves the page is self-consistent, not that the server
  * agrees; src/lib/r1/r1-contract.test.ts is the guard against that drift.
@@ -54,6 +59,13 @@ export const R1_ATTEMPT_TOKEN = 'e2e-attempt-token-not-a-secret';
  */
 export const R1_FRESH_ATTEMPT_TOKEN = 'e2e-fresh-attempt-token-not-a-secret';
 export const R1_NONCE = 'e2e-nonce-0123456789abcdef';
+/**
+ * The Meet bridge ticket the Recall bot's page carries in `#t=` (M034; contract section 9 item 2:
+ * `[A-Za-z0-9_-]{32,128}`). Plainly not a secret, so no scanner mistakes it for one.
+ */
+export const R1_MEET_TICKET = 'e2e-meet-ticket-not-a-secret-0123456789';
+/** What a 202 `preparing` hands the bridge to present on its next call (contract section 9 item 4). */
+export const R1_MEET_RESUME_TOKEN = 'e2e-meet-resume-not-a-secret';
 
 export interface R1RecordedRequest {
   method: string;
@@ -89,9 +101,29 @@ export interface R1MockState {
   attemptTokenTtlSec: number;
   /** When each token this fake minted stops being accepted by `/api/r1/ready`, in epoch ms. */
   tokenExpiresAt: Record<string, number>;
+  /**
+   * A Google Meet round (M034; contract section 3, refined in section 9). `null` is today's
+   * server: the status body has no `channel` key at all. `'context'`: the status answers 200
+   * with `channel: 'meet'` and `/attempts` refuses 409 `round_channel_meet`. `'refuse'`: both
+   * `/status` and `/attempts` refuse 409 `round_channel_meet`. The real server may give either.
+   */
+  meetRound: null | 'context' | 'refuse';
+  /** The server's Meet switch (`R1_MEET_ENABLED`) is off: the bridge exchange answers 503 `meet_disabled`. */
+  meetDisabled: boolean;
+  /** How many 202 `preparing` answers the bridge exchange gives before the room is ready. */
+  meetPreparing: number;
+  /**
+   * The bridge ticket has been claimed (set by the first exchange that got past the checks, a 202
+   * or a 200). From then on the ticket alone is refused as `ticket_already_claimed`: only the
+   * continuation `{ ticket, resume_token }` a 202 handed out is let through.
+   */
+  meetClaimed: boolean;
   /** Install an error to make one route fail (consumed on use unless `sticky`). */
   failures: Partial<
-    Record<'status' | 'preflight' | 'attempts' | 'exchange' | 'consent' | 'ready', R1ForcedError>
+    Record<
+      'status' | 'preflight' | 'attempts' | 'exchange' | 'consent' | 'ready' | 'meetExchange',
+      R1ForcedError
+    >
   >;
 }
 
@@ -109,6 +141,10 @@ export function createR1State(): R1MockState {
     exchangePreparing: 0,
     attemptTokenTtlSec: 300,
     tokenExpiresAt: {},
+    meetRound: null,
+    meetDisabled: false,
+    meetPreparing: 0,
+    meetClaimed: false,
     failures: {},
   };
 }
@@ -179,6 +215,8 @@ function consentState(state: R1MockState): 'granted' | 'required' | 'declined' |
 }
 /** One stable answer for an unknown, expired or cancelled link, as the real routes give. */
 const LINK_INVALID = 'r1_link_invalid_or_expired';
+/** The refusal for a round that takes place in Google Meet (contract section 3; the string is fixed). */
+const ROUND_CHANNEL_MEET = 'round_channel_meet';
 const fail = (error: R1ForcedError): MockResponse => json(error.status, { error: error.error });
 
 function tokenOk(body: Record<string, unknown> | null): boolean {
@@ -207,6 +245,7 @@ export function r1Router(state: R1MockState): ApiRouter {
       case 'POST /api/r1/status': {
         if (!onlyKeys(body, ['token'])) return validationError();
         if (!tokenOk(body)) return json(404, { error: LINK_INVALID });
+        if (state.meetRound === 'refuse') return json(409, { error: ROUND_CHANNEL_MEET });
         return (
           forced('status') ??
           json(200, {
@@ -228,6 +267,8 @@ export function r1Router(state: R1MockState): ApiRouter {
               includes_role_play: true,
             },
             audience: state.audience,
+            // Today's server sends no channel: the key appears only for a Meet round.
+            ...(state.meetRound === 'context' ? { channel: 'meet' } : {}),
           })
         );
       }
@@ -300,6 +341,7 @@ export function r1Router(state: R1MockState): ApiRouter {
       case 'POST /api/r1/attempts': {
         if (!onlyKeys(body, ['token', 'nonce'])) return validationError();
         if (!tokenOk(body)) return json(404, { error: LINK_INVALID });
+        if (state.meetRound !== null) return json(409, { error: ROUND_CHANNEL_MEET });
         const failure = forced('attempts');
         if (failure) return failure;
         // Every token is minted with a lifetime, like the real route's (`attempt_token_expires_at`).
@@ -364,6 +406,36 @@ export function r1Router(state: R1MockState): ApiRouter {
         if (failure) return failure;
         if (!state.liveSession) return json(409, { error: 'not_live' });
         return json(200, { ok: true });
+      }
+      case 'POST /api/r1/meet/exchange': {
+        // The Meet bridge's ticket exchange (M034; `.gsd/milestones/M034/contracts/meet-contracts.md`
+        // section 4, as refined in section 9 items 2 to 5). The switch is checked before anything
+        // else, as the server's flag check is; then the strict body, the ticket, the claim.
+        if (state.meetDisabled) return json(503, { error: 'meet_disabled' });
+        if (!onlyKeys(body, ['ticket', 'resume_token']) || typeof body?.ticket !== 'string') {
+          return validationError();
+        }
+        if (body.ticket !== R1_MEET_TICKET) return json(404, { error: 'ticket_unknown' });
+        const failure = forced('meetExchange');
+        if (failure) return failure;
+        if (body.resume_token === undefined) {
+          // The claim is single-use and runs before admission: the ticket alone works once.
+          if (state.meetClaimed) return json(409, { error: 'ticket_already_claimed' });
+        } else if (!state.meetClaimed || body.resume_token !== R1_MEET_RESUME_TOKEN) {
+          // A continuation is only for the booking whose claim handed it out.
+          return json(404, { error: 'ticket_unknown' });
+        }
+        state.meetClaimed = true;
+        if (state.meetPreparing > 0) {
+          state.meetPreparing -= 1;
+          return json(202, { status: 'preparing', retry_after_sec: 3, resume_token: R1_MEET_RESUME_TOKEN });
+        }
+        // Nothing about the candidate: room and identity are inside the token (section 9 item 3).
+        return json(200, {
+          url: MOCK_LIVEKIT_ORIGIN,
+          livekit_token: 'e2e-meet-room-token',
+          expires_at: '2026-10-07T00:10:00.000Z',
+        });
       }
       default:
         // An /api/r1/ route the page called that this fake does not know:

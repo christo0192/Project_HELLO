@@ -20,17 +20,20 @@
  */
 
 import { auditA11y } from './fixtures/axe';
-import { expect, test } from './fixtures/candidate-harness';
+import { expect, test, type R1Harness } from './fixtures/candidate-harness';
 import {
   agree,
   backToBriefing,
   bodiesOf,
+  expectBridgeHygiene,
   expectCandidateHygiene,
   expectMobileFits,
   heading,
   LEARNER_NAME,
   LIVE_DESKTOP_SIZES,
+  meetTile,
   NARROW_WINDOWS,
+  openBridge,
   openLink,
   passDeviceCheck,
   FIT_WINDOWS,
@@ -40,11 +43,14 @@ import {
   storedNonce,
   storedNonceRaw,
 } from './fixtures/candidate-flows';
+import { MOCK_LIVEKIT_ORIGIN } from './fixtures/env';
 import { horizontalOverflow, insideStage, liveLayout, mediaRow } from './fixtures/layout';
 import {
   R1_ATTEMPT_TOKEN,
   R1_FRESH_ATTEMPT_TOKEN,
   R1_LINK_TOKEN,
+  R1_MEET_RESUME_TOKEN,
+  R1_MEET_TICKET,
   R1_NONCE,
 } from './fixtures/r1-candidate-api';
 
@@ -1484,6 +1490,238 @@ test.describe('scenario card, role-play clock and "I\'m ready"', () => {
     expect(bodiesOf(r1, '/api/r1/ready')).toEqual([
       { attempt_token: R1_FRESH_ATTEMPT_TOKEN, nonce: R1_NONCE },
     ]);
+    r1.expectHealthy();
+  });
+});
+
+/**
+ * A round that takes place in Google Meet (M034; contract section 3, refined in section 9). The
+ * server may say so either way: a 200 status with `channel: 'meet'`, or a 409
+ * `round_channel_meet`. Both show the same neutral card: no notice, no device check, no start.
+ */
+test.describe('a Google Meet round', () => {
+  const MEET_TITLE = 'This interview takes place in Google Meet at the scheduled time';
+
+  for (const meetRound of ['context', 'refuse'] as const) {
+    test(`says the interview takes place in Google Meet and starts nothing (${meetRound})`, async ({ r1 }, testInfo) => {
+      r1.state.meetRound = meetRound;
+      await openLink(r1);
+      const { page } = r1;
+      await expect(heading(page, MEET_TITLE)).toBeVisible();
+      await expect(page.getByText(/Join from your Google Meet invitation/)).toBeVisible();
+      await expect(page.getByRole('button', { name: /start|continue|check my camera/i })).toHaveCount(0);
+      await expect(page.getByRole('checkbox')).toHaveCount(0);
+      expect(
+        r1.state.requests.filter((request) =>
+          /^\/api\/r1\/(consent-template|preflight|attempts)$/.test(request.path)),
+      ).toEqual([]);
+      expect(bodiesOf(r1, '/api/r1/status')).toEqual([{ token: R1_LINK_TOKEN }]);
+      expect(r1.page.url()).not.toContain(R1_LINK_TOKEN);
+      expect(new URL(r1.page.url()).pathname).toBe('/candidate/r1');
+      expect((await r1.mock.snapshot()).mediaRequests).toEqual([]);
+      expectCandidateHygiene(r1);
+      await expectMobileFits(page, testInfo);
+      const audit = meetRound === 'context' ? 'r1-meet-round' : 'r1-meet-round-refused';
+      await auditA11y(page, testInfo, audit, { strict: true });
+      // The 409 of the refusing server is logged by the browser's network layer.
+      const others = r1.consoleErrors.filter((message) => !/status of 409/.test(message));
+      r1.consoleErrors.splice(0, r1.consoleErrors.length, ...others);
+      r1.expectHealthy();
+    });
+  }
+});
+
+/**
+ * The Meet bridge page (M034 S07; contract sections 4, 6 and 9). The Recall bot's Output Media
+ * loads it in a headless Chrome with the ticket in the fragment: the page's microphone is the
+ * mixed meeting audio, and the page is the bot's camera tile, which EVERYONE in the Meet sees.
+ * Here the fake exchange stands in for the server route (M034 S05 builds it from the same
+ * contract), and Chromium's fake microphone for the meeting audio.
+ */
+test.describe('the Meet bridge page (/candidate/r1/meet)', () => {
+  const EXCHANGE = '/api/r1/meet/exchange';
+  const IDLE_TITLE = 'The AI interviewer is not available for this call';
+  const UNAVAILABLE_TITLE = 'The AI interviewer cannot join this call';
+  /** The meeting-audio capture options (D-S07-8) and the publish options (D-S07-9). */
+  const CAPTURE = { echoCancellation: true, noiseSuppression: false, autoGainControl: false };
+  const PUBLISH = { source: 'microphone', dtx: false };
+
+  /** The browser's network layer logs a non-2xx answer as a console error: drop exactly those. */
+  function dropNetworkLogLines(r1: R1Harness, status: number): void {
+    const others = r1.consoleErrors.filter((message) => !message.includes(`status of ${status}`));
+    r1.consoleErrors.splice(0, r1.consoleErrors.length, ...others);
+  }
+
+  test('without a ticket it idles: no request, no audio, no room', async ({ r1 }, testInfo) => {
+    const { page } = r1;
+    await openBridge(r1, '');
+    const tile = meetTile(page);
+    await expect(heading(page, IDLE_TITLE)).toBeVisible();
+    await expect(tile).toHaveAttribute('data-state', 'idle');
+    await expect(tile).toHaveAttribute('data-reason', 'no_ticket');
+    await expect(page.getByText('The hiring team will be in touch.')).toBeVisible();
+    expect(r1.state.requests).toEqual([]);
+    const snapshot = await r1.mock.snapshot();
+    expect(snapshot.mediaRequests).toEqual([]);
+    expect(snapshot.roomCount).toBe(0);
+    await expect(page.getByRole('button')).toHaveCount(0);
+    await expectBridgeHygiene(r1);
+    await expectMobileFits(page, testInfo);
+    await auditA11y(page, testInfo, 'r1-meet-idle', { strict: true });
+    r1.expectHealthy();
+  });
+
+  test('a ticket is stripped at once, traded once, and only the meeting audio is published, DTX off', async ({ r1 }, testInfo) => {
+    const { page } = r1;
+    await openBridge(r1);
+    const tile = meetTile(page);
+    await expect(heading(page, 'Live interview')).toBeVisible();
+    await expect(tile).toHaveAttribute('data-state', 'live');
+    // One exchange, the ticket in its body only; nothing else is called.
+    expect(r1.state.requests.map((request) => `${request.method} ${request.path}${request.query}`)).toEqual([
+      `POST ${EXCHANGE}`,
+    ]);
+    expect(bodiesOf(r1, EXCHANGE)).toEqual([{ ticket: R1_MEET_TICKET }]);
+
+    const joined = await r1.mock.snapshot();
+    // The meeting audio, captured once: echo cancellation on (insurance against the interviewer
+    // hearing himself), noise suppression and gain control off (Meet has processed the mix).
+    expect(joined.mediaRequests.map(({ kind, options }) => ({ kind, options }))).toEqual([
+      { kind: 'audio', options: CAPTURE },
+    ]);
+    expect(joined.mediaRequests[0].constraints).toEqual(CAPTURE);
+    expect(joined.mediaRequests.filter((request) => request.kind === 'video')).toEqual([]);
+    // Published as the microphone with DTX off, and nothing else: no camera, ever.
+    expect(joined.publishes.map(({ kind, options }) => ({ kind, options }))).toEqual([
+      { kind: 'audio', options: PUBLISH },
+    ]);
+    expect(joined.roomCount).toBe(1);
+    expect(joined.roomOptions[0]).toMatchObject({ adaptiveStream: false });
+    expect(joined.connects).toEqual([{ roomIndex: 0, url: MOCK_LIVEKIT_ORIGIN, token: 'e2e-meet-room-token' }]);
+    expect(joined.audioStarts).toBe(1);
+    expect(joined.tracks).toEqual([{ kind: 'audio', readyState: 'live' }]);
+
+    // Before the interviewer joins, then once it is in the room: labels only, never a detail line.
+    const phase = tile.getByRole('status');
+    await expect(phase).toHaveText('Connecting');
+    await r1.mock.joinAgent();
+    await expect(phase).toHaveText('Interview in progress');
+    await r1.mock.setAgentAttributes({ phase: 'transition', leadname: LEARNER_NAME, rpleft: '480' });
+    await expect(phase).toHaveText('Role-play briefing');
+    const card = page.getByRole('region', { name: 'Your role-play' });
+    await expect(card.getByText(LEARNER_NAME)).toBeVisible();
+    await expect(card.getByText('$9,000')).toBeVisible();
+    const timer = page.getByRole('timer');
+    await expect(timer).toHaveText('Role-play · 8 min left');
+
+    // Someone who is not the interviewer can neither end the tile nor change what it shows. The
+    // interviewer's next write lands, so the intruder's writes have been processed by then.
+    await r1.mock.intrude({ phase: 'ended', leadname: 'Mallory', rpleft: '5' });
+    await r1.mock.setAgentAttributes({ rpleft: '420' });
+    await expect(timer).toHaveText('Role-play · 7 min left');
+    await expect(tile).toHaveAttribute('data-state', 'live');
+    await expect(phase).toHaveText('Role-play briefing');
+    await expect(card.getByText('Mallory')).toHaveCount(0);
+    await expect(card.getByText(LEARNER_NAME)).toBeVisible();
+    expect((await r1.mock.snapshot()).disconnects).toEqual([]);
+
+    // A camera tile has nothing to press.
+    await expect(page.getByRole('button')).toHaveCount(0);
+    await expect(page.getByRole('link')).toHaveCount(0);
+    await expectBridgeHygiene(r1);
+    await expectMobileFits(page, testInfo);
+    await auditA11y(page, testInfo, 'r1-meet-live', { strict: true });
+    r1.expectHealthy();
+  });
+
+  test('the server\'s Meet switch off idles the tile after one call and releases the audio', async ({ r1 }) => {
+    r1.state.meetDisabled = true;
+    const { page } = r1;
+    await openBridge(r1);
+    const tile = meetTile(page);
+    await expect(heading(page, IDLE_TITLE)).toBeVisible();
+    await expect(tile).toHaveAttribute('data-state', 'idle');
+    await expect(tile).toHaveAttribute('data-reason', 'disabled');
+    expect(bodiesOf(r1, EXCHANGE)).toEqual([{ ticket: R1_MEET_TICKET }]);
+    const snapshot = await r1.mock.snapshot();
+    expect(snapshot.roomCount).toBe(0);
+    expect(snapshot.connects).toEqual([]);
+    expect(snapshot.tracks).toEqual([{ kind: 'audio', readyState: 'ended' }]);
+    await expectBridgeHygiene(r1);
+    dropNetworkLogLines(r1, 503);
+    r1.expectHealthy();
+  });
+
+  test('an interviewer still being prepared shows "Preparing", and the retry presents the resume token', async ({ r1 }) => {
+    r1.state.meetPreparing = 1;
+    const { page } = r1;
+    await openBridge(r1);
+    const tile = meetTile(page);
+    await expect(tile).toHaveAttribute('data-reason', 'preparing');
+    await expect(heading(page, 'Preparing the interview…')).toBeVisible();
+    await expect(page.getByText('The AI interviewer will join in a moment.')).toBeVisible();
+    // The first wait is 3 s (the schedule's floor and the server's retry_after_sec).
+    await expect(heading(page, 'Live interview')).toBeVisible({ timeout: 15_000 });
+    // The ticket alone is single-use: the second call is the continuation the 202 handed out.
+    expect(bodiesOf(r1, EXCHANGE)).toEqual([
+      { ticket: R1_MEET_TICKET },
+      { ticket: R1_MEET_TICKET, resume_token: R1_MEET_RESUME_TOKEN },
+    ]);
+    const snapshot = await r1.mock.snapshot();
+    expect(snapshot.connects).toEqual([{ roomIndex: 0, url: MOCK_LIVEKIT_ORIGIN, token: 'e2e-meet-room-token' }]);
+    expect(snapshot.mediaRequests).toHaveLength(1);
+    await expectBridgeHygiene(r1);
+    r1.expectHealthy();
+  });
+
+  test('a ticket already claimed is a quiet terminal tile: no retry, no room', async ({ r1 }, testInfo) => {
+    r1.state.failures.meetExchange = { status: 409, error: 'ticket_already_claimed' };
+    const { page } = r1;
+    await openBridge(r1);
+    const tile = meetTile(page);
+    await expect(heading(page, UNAVAILABLE_TITLE)).toBeVisible();
+    await expect(tile).toHaveAttribute('data-state', 'unavailable');
+    await expect(tile).toHaveAttribute('data-reason', 'claimed');
+    expect(bodiesOf(r1, EXCHANGE)).toHaveLength(1);
+    // Longer than the first retry wait (3 s): a terminal refusal is never asked again.
+    await page.waitForTimeout(5_000);
+    expect(bodiesOf(r1, EXCHANGE)).toEqual([{ ticket: R1_MEET_TICKET }]);
+    const snapshot = await r1.mock.snapshot();
+    expect(snapshot.roomCount).toBe(0);
+    expect(snapshot.connects).toEqual([]);
+    expect(snapshot.tracks).toEqual([{ kind: 'audio', readyState: 'ended' }]);
+    // The machine reason stays out of the copy; nothing to press.
+    await expect(tile).not.toContainText(/claimed|ticket/i);
+    await expect(page.getByRole('button')).toHaveCount(0);
+    await expectBridgeHygiene(r1);
+    await expectMobileFits(page, testInfo);
+    await auditA11y(page, testInfo, 'r1-meet-unavailable', { strict: true });
+    dropNetworkLogLines(r1, 409);
+    r1.expectHealthy();
+  });
+
+  test('the interviewer ending the interview shows "Interview complete" and leaves the room once', async ({ r1 }, testInfo) => {
+    const { page } = r1;
+    await openBridge(r1);
+    const tile = meetTile(page);
+    await expect(heading(page, 'Live interview')).toBeVisible();
+    await r1.mock.joinAgent();
+    await r1.mock.setPhase('wrapup');
+    await expect(tile.getByRole('status')).toHaveText('Your questions');
+    await r1.mock.setPhase('ended');
+    await expect(heading(page, 'Interview complete')).toBeVisible();
+    await expect(tile).toHaveAttribute('data-state', 'ended');
+    await expect(tile).toHaveAttribute('data-reason', 'agent_ended');
+    await expect(page.getByText('Thank you for your time.')).toBeVisible();
+    const snapshot = await r1.mock.snapshot();
+    // The page leaves the room itself, once, and the meeting audio is released.
+    expect(snapshot.disconnects).toEqual([{ roomIndex: 0, stopTracks: true }]);
+    expect(snapshot.tracks).toEqual([{ kind: 'audio', readyState: 'ended' }]);
+    // A finished room is never traded for another: the ticket was presented once.
+    expect(bodiesOf(r1, EXCHANGE)).toEqual([{ ticket: R1_MEET_TICKET }]);
+    await expectBridgeHygiene(r1);
+    await expectMobileFits(page, testInfo);
+    await auditA11y(page, testInfo, 'r1-meet-ended', { strict: true });
     r1.expectHealthy();
   });
 });
