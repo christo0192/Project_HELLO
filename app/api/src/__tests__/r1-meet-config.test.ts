@@ -20,12 +20,16 @@ import {
   R1_MEET_DAILY_BOT_CAP_MAX,
   R1_MEET_DAILY_BOT_CAP_MIN,
   R1_MEET_ENV_VARIABLES,
+  R1_MEET_MULTI_HUMAN_POLICIES,
+  R1_MEET_MULTI_HUMAN_POLICY_DEFAULT,
   R1_MEET_RECALL_REALTIME_PATH,
   R1_MEET_REQUIRED_VARIABLES,
   R1_MEET_SECRET_VARIABLES,
   describeR1MeetConfig,
   getR1MeetConfig,
+  getR1MeetDrainConfig,
   r1MeetActive,
+  r1MeetDrainAllowed,
   resetR1MeetConfigReport,
   type R1MeetConfig,
   type R1MeetEnvSource,
@@ -68,6 +72,8 @@ const NAME_REASON = 'R1_MEET_BOT_NAME must be 1 to 100 characters with no contro
 const GROUP_REASON = 'R1_MEET_GOOGLE_LOGIN_GROUP_ID must be a UUID';
 const SERVICE_REASON = 'R1_MEET_SERVICE_USER_ID must be the UUID of a real staff user (not the nil or system-actor id)';
 const BASE_URL_REASON = 'RECALL_BASE_URL must be an https origin on a <region>.recall.ai host, with no path, port or query';
+const ARM_REASON = 'R1_MEET_ARM_AT_CREATE must be either "true" or "false"';
+const POLICY_REASON = 'R1_MEET_MULTI_HUMAN_POLICY must be "end" or "observe"';
 const ORIGIN_REASON = 'WEB_ORIGIN must start with an https origin (no path, query or credentials) when R1_MEET_ENABLED is "true"';
 const missingReason = (name: string): string => `${name} is required when R1_MEET_ENABLED is "true"`;
 const MALFORMED_REASON: Record<(typeof R1_MEET_REQUIRED_VARIABLES)[number], string> = {
@@ -116,6 +122,8 @@ describe('R1 Meet configuration: the flag', () => {
       R1_MEET_GOOGLE_LOGIN_GROUP_ID: 'nope',
       R1_MEET_SERVICE_USER_ID: NIL_UUID,
       RECALL_BASE_URL: 'http://evil.example',
+      R1_MEET_ARM_AT_CREATE: 'maybe',
+      R1_MEET_MULTI_HUMAN_POLICY: 'nope',
       R1_MEET_ASHBY_DEX_USER_ID: 'nope',
       RECALL_API_KEY: 'short',
       RECALL_WEBHOOK_SECRET: 'nope',
@@ -148,6 +156,8 @@ describe('R1 Meet configuration: enabled', () => {
     expect(config.serviceUserId).toBeNull();
     expect(config.botNameOverride).toBeNull();
     expect(config.dailyBotCap).toBe(20);
+    expect(config.armAtCreate).toBe(false);
+    expect(config.multiHumanPolicy).toBe('observe');
     expect(config.bridgePageUrl).toBe('https://hello.example.test/candidate/r1/meet');
     expect(config.recallRealtimeWebhookUrl).toBe('https://hello.example.test/api/integrations/recall/realtime');
     // The credentials are readable by name.
@@ -159,11 +169,13 @@ describe('R1 Meet configuration: enabled', () => {
   it('has exactly the documented enabled shape (Ashby/Dex booking, no booking-vendor settings)', () => {
     const config = enabled(getR1MeetConfig(valid({ R1_MEET_SERVICE_USER_ID: SERVICE_ID })));
     expect(Object.keys(config).sort()).toEqual([
+      'armAtCreate',
       'ashby',
       'botNameOverride',
       'bridgePageUrl',
       'dailyBotCap',
       'enabled',
+      'multiHumanPolicy',
       'recall',
       'recallRealtimeWebhookUrl',
       'serviceUserId',
@@ -185,6 +197,10 @@ describe('R1 Meet configuration: enabled', () => {
     expect(R1_MEET_RECALL_REALTIME_PATH).toBe('/api/integrations/recall/realtime');
     expect([R1_MEET_DAILY_BOT_CAP_DEFAULT, R1_MEET_DAILY_BOT_CAP_MIN, R1_MEET_DAILY_BOT_CAP_MAX]).toEqual([20, 1, 200]);
     expect(R1_MEET_BOT_NAME_MAX_LENGTH).toBe(100);
+    expect([...R1_MEET_MULTI_HUMAN_POLICIES]).toEqual(['end', 'observe']);
+    expect(Object.isFrozen(R1_MEET_MULTI_HUMAN_POLICIES)).toBe(true);
+    // S06-R3: `observe` until the live spike settles the bot's own join and HR's admission.
+    expect(R1_MEET_MULTI_HUMAN_POLICY_DEFAULT).toBe('observe');
     expect(R1_MEET_REQUIRED_VARIABLES).toEqual(['RECALL_API_KEY', 'RECALL_WEBHOOK_SECRET', 'R1_MEET_ASHBY_DEX_USER_ID']);
     expect(R1_MEET_SECRET_VARIABLES).toEqual(['RECALL_API_KEY', 'RECALL_WEBHOOK_SECRET']);
   });
@@ -314,21 +330,49 @@ describe('R1 Meet configuration: knobs', () => {
     }
   });
 
+  it('arms when a human joins unless R1_MEET_ARM_AT_CREATE is exactly "true"', () => {
+    for (const [raw, expected] of [[undefined, false], ['', false], ['false', false], ['true', true]] as const) {
+      expect(enabled(getR1MeetConfig(valid({ R1_MEET_ARM_AT_CREATE: raw }))).armAtCreate, String(raw)).toBe(expected);
+    }
+    for (const raw of ['TRUE', 'True', '1', 'yes', 'on', ' true', 'true ', 'False', '0', 'off', 'replace_me']) {
+      expectInvalid(getR1MeetConfig(valid({ R1_MEET_ARM_AT_CREATE: raw })), ARM_REASON, raw);
+    }
+    for (const raw of [true, false, 1, null, {}] as unknown[]) {
+      expectInvalid(getR1MeetConfig(valid({ R1_MEET_ARM_AT_CREATE: raw as string })), ARM_REASON, String(raw));
+    }
+  });
+
+  it('only logs a second human unless R1_MEET_MULTI_HUMAN_POLICY is exactly "end"', () => {
+    for (const [raw, expected] of [[undefined, 'observe'], ['', 'observe'], ['end', 'end'], ['observe', 'observe']] as const) {
+      expect(enabled(getR1MeetConfig(valid({ R1_MEET_MULTI_HUMAN_POLICY: raw }))).multiHumanPolicy, String(raw)).toBe(expected);
+    }
+    for (const raw of ['END', 'Observe', ' end', 'observe ', 'pause', 'true', 'off', 'replace_me']) {
+      expectInvalid(getR1MeetConfig(valid({ R1_MEET_MULTI_HUMAN_POLICY: raw })), POLICY_REASON, raw);
+    }
+    for (const raw of [true, 1, null, {}, ['end']] as unknown[]) {
+      expectInvalid(getR1MeetConfig(valid({ R1_MEET_MULTI_HUMAN_POLICY: raw as string })), POLICY_REASON, String(raw));
+    }
+  });
+
   it('checks the knobs first, then WEB_ORIGIN, then the required values', () => {
     expectInvalid(getR1MeetConfig({ R1_MEET_ENABLED: 'true', R1_MEET_DAILY_BOT_CAP: '0' }), CAP_REASON);
     expectInvalid(getR1MeetConfig({ R1_MEET_ENABLED: 'true', R1_MEET_BOT_NAME: ' x' }), NAME_REASON);
     expectInvalid(getR1MeetConfig({ R1_MEET_ENABLED: 'true', R1_MEET_GOOGLE_LOGIN_GROUP_ID: 'x' }), GROUP_REASON);
     expectInvalid(getR1MeetConfig({ R1_MEET_ENABLED: 'true', R1_MEET_SERVICE_USER_ID: 'x' }), SERVICE_REASON);
     expectInvalid(getR1MeetConfig({ R1_MEET_ENABLED: 'true', RECALL_BASE_URL: 'http://x.recall.ai' }), BASE_URL_REASON);
+    expectInvalid(getR1MeetConfig({ R1_MEET_ENABLED: 'true', R1_MEET_ARM_AT_CREATE: 'x' }), ARM_REASON);
+    expectInvalid(getR1MeetConfig({ R1_MEET_ENABLED: 'true', R1_MEET_MULTI_HUMAN_POLICY: 'x' }), POLICY_REASON);
     expectInvalid(getR1MeetConfig({ R1_MEET_ENABLED: 'true' }), ORIGIN_REASON);
     expectInvalid(getR1MeetConfig({ R1_MEET_ENABLED: 'true', WEB_ORIGIN: WEB }), missingReason('RECALL_API_KEY'));
-    // Within the knobs: cap, then bot name, then group id, then service user, then base URL.
+    // Within the knobs: cap, bot name, group id, service user, base URL, arm mode, multi-human policy.
     const allKnobsBad: R1MeetEnvSource = {
       R1_MEET_DAILY_BOT_CAP: '0',
       R1_MEET_BOT_NAME: ' x',
       R1_MEET_GOOGLE_LOGIN_GROUP_ID: 'x',
       R1_MEET_SERVICE_USER_ID: 'x',
       RECALL_BASE_URL: 'x',
+      R1_MEET_ARM_AT_CREATE: 'x',
+      R1_MEET_MULTI_HUMAN_POLICY: 'x',
       WEB_ORIGIN: 'http://x',
       R1_MEET_ASHBY_DEX_USER_ID: 'x',
     };
@@ -350,6 +394,20 @@ describe('R1 Meet configuration: knobs', () => {
         }),
       ),
       BASE_URL_REASON,
+    );
+    const onlySwitchesBad: R1MeetEnvSource = {
+      ...allKnobsBad,
+      R1_MEET_DAILY_BOT_CAP: '',
+      R1_MEET_BOT_NAME: '',
+      R1_MEET_GOOGLE_LOGIN_GROUP_ID: '',
+      R1_MEET_SERVICE_USER_ID: '',
+      RECALL_BASE_URL: '',
+    };
+    expectInvalid(getR1MeetConfig(valid(onlySwitchesBad)), ARM_REASON);
+    expectInvalid(getR1MeetConfig(valid({ ...onlySwitchesBad, R1_MEET_ARM_AT_CREATE: '' })), POLICY_REASON);
+    expectInvalid(
+      getR1MeetConfig(valid({ ...onlySwitchesBad, R1_MEET_ARM_AT_CREATE: '', R1_MEET_MULTI_HUMAN_POLICY: '' })),
+      ORIGIN_REASON,
     );
     // Then WEB_ORIGIN before any required value, then presence before shape.
     expectInvalid(getR1MeetConfig(valid({ WEB_ORIGIN: 'http://x', R1_MEET_ASHBY_DEX_USER_ID: '' })), ORIGIN_REASON);
@@ -471,6 +529,8 @@ describe('R1 Meet configuration: secrecy', () => {
       valid({ R1_MEET_GOOGLE_LOGIN_GROUP_ID: 'canary-group-id' }),
       valid({ R1_MEET_SERVICE_USER_ID: 'canary-service-user' }),
       valid({ RECALL_BASE_URL: `https://${CANARY_HOST}` }),
+      valid({ R1_MEET_ARM_AT_CREATE: 'canary-arm-mode' }),
+      valid({ R1_MEET_MULTI_HUMAN_POLICY: 'canary-policy' }),
       valid({ WEB_ORIGIN: `http://${CANARY_HOST}` }),
       valid({ RECALL_API_KEY: `${RECALL_KEY_VALUE} ` }),
       valid({ RECALL_WEBHOOK_SECRET: RECALL_WEBHOOK_VALUE.slice(PREFIX.length) }),
@@ -487,6 +547,8 @@ describe('R1 Meet configuration: secrecy', () => {
       'canary-group-id',
       'canary-service-user',
       'canary-dex-user',
+      'canary-arm-mode',
+      'canary-policy',
       CANARY_HOST,
       'recall-canary',
     ];
@@ -551,6 +613,8 @@ describe('R1 Meet configuration: process.env (the production path)', () => {
     R1_MEET_GOOGLE_LOGIN_GROUP_ID: GROUP_ID,
     R1_MEET_SERVICE_USER_ID: SERVICE_ID,
     RECALL_BASE_URL: 'https://us-east-1.recall.ai',
+    R1_MEET_ARM_AT_CREATE: 'true',
+    R1_MEET_MULTI_HUMAN_POLICY: 'observe',
     R1_MEET_ASHBY_DEX_USER_ID: DEX_ID,
     RECALL_API_KEY: RECALL_KEY_VALUE,
     RECALL_WEBHOOK_SECRET: RECALL_WEBHOOK_VALUE,
@@ -571,6 +635,8 @@ describe('R1 Meet configuration: process.env (the production path)', () => {
     expect(config.recall.webhookSecret).toBe(RECALL_WEBHOOK_VALUE);
     expect(config.ashby.dexUserId).toBe(DEX_ID);
     expect(config.serviceUserId).toBe(SERVICE_ID);
+    expect(config.armAtCreate).toBe(true);
+    expect(config.multiHumanPolicy).toBe('observe');
     expect(config.bridgePageUrl).toBe(`${WEB}${R1_MEET_BRIDGE_PAGE_PATH}`);
   });
 
@@ -586,6 +652,8 @@ describe('R1 Meet configuration: process.env (the production path)', () => {
     ['R1_MEET_GOOGLE_LOGIN_GROUP_ID', 'nope', GROUP_REASON],
     ['R1_MEET_SERVICE_USER_ID', ASHBY_SYSTEM_ACTOR, SERVICE_REASON],
     ['RECALL_BASE_URL', 'https://evil.example', BASE_URL_REASON],
+    ['R1_MEET_ARM_AT_CREATE', 'yes', ARM_REASON],
+    ['R1_MEET_MULTI_HUMAN_POLICY', 'pause', POLICY_REASON],
     ['WEB_ORIGIN', 'http://hello.example.test', ORIGIN_REASON],
     ['R1_MEET_ASHBY_DEX_USER_ID', 'nope', MALFORMED_REASON.R1_MEET_ASHBY_DEX_USER_ID],
     ['RECALL_API_KEY', 'short', MALFORMED_REASON.RECALL_API_KEY],
@@ -626,13 +694,119 @@ describe('R1 Meet configuration: helpers', () => {
   });
 });
 
+describe('R1 Meet configuration: the drain', () => {
+  const available = (source: Parameters<typeof getR1MeetDrainConfig>[0]) => {
+    const config = getR1MeetDrainConfig(source);
+    if (!config.available) throw new Error('expected an available drain config');
+    return config;
+  };
+
+  it('is available with a well-formed key alone, whatever the flag and every other variable say', () => {
+    for (const flag of [undefined, '', 'false', 'true', 'nope']) {
+      const broken: R1MeetEnvSource = {
+        R1_MEET_ENABLED: flag,
+        R1_MEET_DAILY_BOT_CAP: '0',
+        R1_MEET_ARM_AT_CREATE: 'x',
+        R1_MEET_MULTI_HUMAN_POLICY: 'x',
+        WEB_ORIGIN: 'http://x',
+        RECALL_WEBHOOK_SECRET: 'nope',
+        RECALL_API_KEY: RECALL_KEY_VALUE,
+      };
+      const config = available(broken);
+      expect(config.recall.baseUrl, String(flag)).toBe(RECALL_DEFAULT_BASE_URL);
+      expect(config.recall.apiKey, String(flag)).toBe(RECALL_KEY_VALUE);
+    }
+    expect(available({ RECALL_API_KEY: RECALL_KEY_VALUE, RECALL_BASE_URL: 'https://us-east-1.recall.ai/' }).recall.baseUrl).toBe(
+      'https://us-east-1.recall.ai',
+    );
+    expect(available({ RECALL_API_KEY: RECALL_KEY_VALUE, RECALL_BASE_URL: '' }).recall.baseUrl).toBe(RECALL_DEFAULT_BASE_URL);
+    expect(logged).toEqual([]);
+  });
+
+  it('is not available with no key, the placeholder, or a malformed key or base URL, and says nothing', () => {
+    for (const key of [undefined, '', 'replace_me', 'short', `${RECALL_KEY_VALUE} `, `\t${RECALL_KEY_VALUE}`, 'k'.repeat(257), 42, null, {}]) {
+      expect(getR1MeetDrainConfig({ RECALL_API_KEY: key as string }), String(key)).toStrictEqual({ available: false });
+    }
+    for (const base of ['http://ap-northeast-1.recall.ai', 'https://evil.example', 'https://recall.ai', 'x', 7]) {
+      expect(
+        getR1MeetDrainConfig({ RECALL_API_KEY: RECALL_KEY_VALUE, RECALL_BASE_URL: base as string }),
+        String(base),
+      ).toStrictEqual({ available: false });
+    }
+    expect(getR1MeetDrainConfig({})).toStrictEqual({ available: false });
+    expect(logged).toEqual([]);
+  });
+
+  it('reads only the Recall key and base URL', () => {
+    const reads: string[] = [];
+    const source = new Proxy({ RECALL_API_KEY: RECALL_KEY_VALUE } as R1MeetEnvSource, {
+      get(target, name) {
+        reads.push(String(name));
+        return target[name as keyof R1MeetEnvSource];
+      },
+    });
+    expect(getR1MeetDrainConfig(source).available).toBe(true);
+    expect([...new Set(reads)].sort()).toEqual(['RECALL_API_KEY', 'RECALL_BASE_URL']);
+  });
+
+  it('reads process.env when no source is passed, with the flag off', () => {
+    vi.stubEnv('R1_MEET_ENABLED', 'false');
+    vi.stubEnv('RECALL_API_KEY', RECALL_KEY_VALUE);
+    vi.stubEnv('RECALL_BASE_URL', 'https://us-east-1.recall.ai');
+    const config = getR1MeetDrainConfig();
+    expect(config.available && [config.recall.baseUrl, config.recall.apiKey]).toEqual(['https://us-east-1.recall.ai', RECALL_KEY_VALUE]);
+    vi.stubEnv('RECALL_API_KEY', '');
+    expect(getR1MeetDrainConfig()).toStrictEqual({ available: false });
+  });
+
+  it('never throws, and keeps the key out of every enumeration', () => {
+    const throwing = new Proxy({} as R1MeetEnvSource, {
+      get() {
+        throw new Error('boom');
+      },
+    });
+    expect(getR1MeetDrainConfig(throwing)).toStrictEqual({ available: false });
+    const config = available({ RECALL_API_KEY: RECALL_KEY_VALUE });
+    const text = [
+      JSON.stringify(config),
+      JSON.stringify(config.recall),
+      JSON.stringify({ ...config.recall }),
+      JSON.stringify(Object.entries(config.recall)),
+      Object.keys(config.recall).join(','),
+    ].join('\n');
+    expect(text).not.toContain(RECALL_KEY_VALUE);
+    expect(Object.keys(config.recall)).toEqual(['baseUrl']);
+    expect(Object.isFrozen(config)).toBe(true);
+    expect(Object.isFrozen(config.recall)).toBe(true);
+    expect(logged).toEqual([]);
+  });
+
+  it('is allowed only for a deliberate "off": never while enabled, and never for an invalid configuration', () => {
+    expect(r1MeetDrainAllowed(getR1MeetConfig({}))).toBe(true);
+    for (const flag of [undefined, '', 'false']) {
+      expect(r1MeetDrainAllowed(getR1MeetConfig(valid({ R1_MEET_ENABLED: flag }))), String(flag)).toBe(true);
+    }
+    expect(r1MeetDrainAllowed(getR1MeetConfig(valid()))).toBe(false);
+    for (const bad of [
+      valid({ R1_MEET_ENABLED: 'False' }),
+      valid({ R1_MEET_DAILY_BOT_CAP: '0' }),
+      valid({ R1_MEET_ARM_AT_CREATE: 'x' }),
+      valid({ RECALL_API_KEY: '' }),
+    ]) {
+      const config = getR1MeetConfig(bad);
+      expect(config.status).toBe('invalid');
+      expect(r1MeetDrainAllowed(config)).toBe(false);
+    }
+  });
+});
+
 describe('R1 Meet configuration: env contract', () => {
   const schema = JSON.parse(
     readFileSync(fileURLToPath(new URL('../../../../config/environment.schema.json', import.meta.url)), 'utf8'),
   ) as { components: { api: { variables: Record<string, { requiredInProduction: boolean; secret: boolean; external?: boolean }> } } };
   const example = readFileSync(fileURLToPath(new URL('../../.env.example', import.meta.url)), 'utf8');
 
-  it('lists exactly the nine Meet variables: non-secrets first, then the two credentials', () => {
+  it('lists exactly the eleven Meet variables: non-secrets first, then the two credentials', () => {
     expect([...R1_MEET_ENV_VARIABLES]).toEqual([
       'R1_MEET_ENABLED',
       'R1_MEET_BOT_NAME',
@@ -640,6 +814,8 @@ describe('R1 Meet configuration: env contract', () => {
       'R1_MEET_GOOGLE_LOGIN_GROUP_ID',
       'R1_MEET_SERVICE_USER_ID',
       'RECALL_BASE_URL',
+      'R1_MEET_ARM_AT_CREATE',
+      'R1_MEET_MULTI_HUMAN_POLICY',
       'R1_MEET_ASHBY_DEX_USER_ID',
       'RECALL_API_KEY',
       'RECALL_WEBHOOK_SECRET',

@@ -1,0 +1,1659 @@
+/**
+ * M034 S06 T4: the call side of the `r1-meet` runtime (lib/r1/meet/event-handler.ts), through the REAL
+ * Recall client over the S01 fake and the in-memory 0142 port.
+ *
+ * Pinned (D-S06-22..29, plan 2.5):
+ *  - every Recall event from every booking status (the D-S06-24 mapping), out of order and twice;
+ *  - the booking match (named booking first, then the holder) and the stray rule: pending waits then
+ *    rotates and releases, any other status (or no booking) alerts and releases at once, a terminal
+ *    event of a stray is ignored, a bot that is not ours is never touched;
+ *  - human present: one compare-and-set winner, so both signals at once give exactly one arm and one
+ *    output_media; a crashed winner is recovered by its re-run, a fresh duplicate never arms, a
+ *    recent arm is never replaced; the at-create switch (armed: watched, not re-armed; unarmed: the
+ *    normal arm; in a call: nothing);
+ *  - the sub-code table (unknown codes are a no-show, never an error) and the one 60 s wait on our
+ *    own leave; release after every terminal move;
+ *  - multiple humans: distinct ids with more joins than leaves (a rejoin is one human, null ids and
+ *    bots ignored, other bots' rows ignored), a check 120 s later, `end` leaves BEFORE it marks,
+ *    `observe` only logs;
+ *  - attempt_ended: a COUNTED attempt leaves -> completed -> release; one that did not count re-arms
+ *    while the round has a start, the window is open, an arm is left and a human is in the call, and
+ *    otherwise fails the call (no_show / bot_fatal), never `completed`; an unsettled one waits for the
+ *    outcome; another session or a terminal booking is ignored; a Recall outage defers within the bound;
+ *  - decideBridgeCheck, every row and boundary, and the handler's recheck / rearm / give-up;
+ *  - the kill points of the arm and the outcome, and the hot-window hints;
+ *  - no name, email, Meet URL, ticket or digest in any log line or job payload.
+ */
+
+import { describe, expect, it } from 'vitest';
+import { armBridge } from '../lib/r1/meet/arm.js';
+import { ensureBot } from '../lib/r1/meet/bot-flow.js';
+import {
+  R1_MEET_EVENT_DEFINITIONS,
+  R1_MEET_FATAL_SUB_CODES,
+  countHumans,
+  decideBridgeCheck,
+  r1MeetAttemptEndedDefinition,
+  r1MeetBridgeCheckDefinition,
+  r1MeetMultiHumanCheckDefinition,
+  r1MeetRecallEventDefinition,
+  type R1MeetBridgeCheckFacts,
+} from '../lib/r1/meet/event-handler.js';
+import { r1MeetJobMeta, type R1MeetJobMeta, type R1MeetJobResult } from '../lib/r1/meet/jobs.js';
+import type { R1MeetFlowDeps, R1MeetJobDefinition } from '../lib/r1/meet/recall-actions.js';
+import { r1MeetBotReleaseDefinition } from '../lib/r1/meet/schedule-handler.js';
+import { R1_MEET_TICKET_PATTERN, r1MeetTicketDigest } from '../lib/r1/meet/ticket.js';
+import {
+  BRIDGE_PAGE_URL,
+  BRIDGE_SOURCE,
+  MEET_URL,
+  createR1MeetHarness,
+  fixtureId,
+  type HarnessOptions,
+  type R1MeetHarness,
+} from './support/r1-meet-harness.js';
+import type { Row } from './support/r1-meet-fake-db.js';
+
+const SEC = 1000;
+const MIN = 60 * SEC;
+const iso = (ms: number): string => new Date(ms).toISOString();
+
+/** Distinct, predictable random bytes per mint: byte value n for the n-th mint. */
+function countingRandom(): (bytes: number) => Buffer {
+  let n = 0;
+  return (bytes) => Buffer.alloc(bytes, ++n);
+}
+
+function world(options: HarnessOptions = {}): R1MeetHarness {
+  return createR1MeetHarness({ random: countingRandom(), ...options });
+}
+
+function reset(h: R1MeetHarness): void {
+  h.timeline.length = 0;
+  h.requests.length = 0;
+  h.logs.length = 0;
+  h.hot.length = 0;
+}
+
+const done = (receipt: 'processed' | 'ignored', code: string) => ({ outcome: 'done', receipt, code });
+const deferred = (code: string, delaySeconds: number) => ({ outcome: 'defer', code, delaySeconds });
+const outputMedia = (h: R1MeetHarness) => h.requests.filter((request) => request.op === 'output_media');
+const recallOps = (h: R1MeetHarness) => h.requests.map((request) => request.op);
+/** The timeline without the test's own enqueue of the event row (what S03 does). */
+const steps = (h: R1MeetHarness) => h.timeline.filter((step) => step !== 'queue:recall_event');
+const pageUrlOf = (request: { body: unknown }) => (request.body as { camera: { config: { url: string } } }).camera.config.url;
+const ticketOf = (url: string): string => url.slice(`${BRIDGE_PAGE_URL}#t=`.length);
+const lastTicket = (h: R1MeetHarness): string => ticketOf(pageUrlOf(outputMedia(h).at(-1)!));
+const digestOf = (ticket: string): string => r1MeetTicketDigest(ticket, BRIDGE_SOURCE)!;
+
+async function runJob<T>(
+  h: R1MeetHarness,
+  definition: R1MeetJobDefinition<T>,
+  payload: Record<string, unknown>,
+  meta: R1MeetJobMeta = h.meta(),
+  deps: R1MeetFlowDeps = h.deps,
+): Promise<R1MeetJobResult> {
+  const job = definition.parse(payload);
+  expect(job, JSON.stringify(payload)).not.toBeNull();
+  return definition.run(deps, job!, meta);
+}
+
+/** A job meta with its own creation time (the bridge check reads it as the arm time). */
+function metaAt(
+  createdAtMs: number,
+  over: { attempts?: number; deferCount?: number; deferredAt?: string } = {},
+): R1MeetJobMeta {
+  return r1MeetJobMeta({
+    attempts: over.attempts ?? 1,
+    maxAttempts: 10,
+    deferCount: over.deferCount ?? 0,
+    deferredAt: over.deferredAt,
+    createdAt: iso(createdAtMs),
+  });
+}
+
+// ── Bookings in a given state ───────────────────────────────────────────────
+
+type Start =
+  | 'bot_scheduled'
+  | 'bot_joining'
+  | 'human_present'
+  | 'in_call'
+  | 'in_call_session'
+  | 'failed_owed'
+  | 'failed_released';
+
+interface Booked {
+  readonly id: string;
+  readonly botId: string;
+  readonly roundId: string;
+  readonly startAt: string;
+  readonly sessionId: string | null;
+}
+
+/**
+ * A booking with a bot in the asked state, reached through the real RPCs (create, ensureBot, the
+ * transitions, a real arm and a real claim, a bound session), the Recall fake's bot mirrored. The slot
+ * starts a minute from now, so the ticket window is open. Traces are cleared at the end.
+ */
+async function booked(
+  h: R1MeetHarness,
+  start: Start = 'bot_scheduled',
+  options: { readonly sessionStatus?: string } = {},
+): Promise<Booked> {
+  const created = await h.createBooking({ startAt: iso(h.now() + MIN) });
+  expect(await ensureBot(h.deps, created.bookingId, h.meta())).toMatchObject({ code: 'bot_scheduled' });
+  const row = h.db.booking(created.bookingId)!;
+  const id = row.id as string;
+  const botId = row.recall_bot_id as string;
+  let sessionId: string | null = null;
+  const move = async (from: string, to: string, reason = 'eligible'): Promise<void> => {
+    const answer = await h.db.store.transition({
+      bookingId: id,
+      from: from as never,
+      to: to as never,
+      reason: reason as never,
+      nowIso: iso(h.now()),
+    });
+    expect(answer.status).toBe('ok');
+  };
+  if (start === 'bot_joining') {
+    h.recall.markDispatched(botId);
+    await move('bot_scheduled', 'bot_joining');
+  }
+  if (start === 'human_present' || start === 'in_call' || start === 'in_call_session') {
+    h.recall.markDispatched(botId);
+    h.recall.setStatus(botId, 'in_call_recording');
+    await move('bot_scheduled', 'human_present');
+  }
+  if (start === 'in_call' || start === 'in_call_session') {
+    const booking = (await h.db.store.getBooking(id))!;
+    expect(await armBridge(h.deps, booking, h.meta())).toMatchObject({ code: 'armed' });
+    const claimed = await h.db.claimTicket(lastTicket(h), iso(h.now()), BRIDGE_SOURCE);
+    expect(claimed.data).toMatchObject({ status: 'ok' });
+    if (start === 'in_call_session') {
+      const session = h.db.addSession({ interview_round_id: row.round_id, status: options.sessionStatus ?? 'in_progress' });
+      expect((await h.db.bind(id, session.id as string, iso(h.now()))).data).toMatchObject({ status: 'ok' });
+      sessionId = session.id as string;
+    }
+  }
+  if (start === 'failed_owed' || start === 'failed_released') await move('bot_scheduled', 'failed', 'no_show');
+  if (start === 'failed_released') {
+    const answer = await h.db.store.setBot({
+      bookingId: id,
+      action: 'release',
+      expectedVersion: row.version,
+      expectedKeyAttempt: row.key_attempt,
+      nowIso: iso(h.now()),
+    });
+    expect(answer.status).toBe('ok');
+  }
+  reset(h);
+  return { id, botId, roundId: row.round_id as string, startAt: row.start_at as string, sessionId };
+}
+
+interface Delivery {
+  readonly subCode?: string | null;
+  readonly participantId?: number | null;
+  readonly isBot?: boolean | null;
+  /** `null` = the bot's metadata named no booking; omitted = the booking's id. */
+  readonly bookingId?: string | null;
+  readonly botId?: string;
+  /** Mirror a `bot.*` status at the Recall fake (default true): Recall's state matches its events. */
+  readonly mirror?: boolean;
+}
+
+/**
+ * What S03 does with one Recall webhook: the durable `recall_event` job row (payload exactly as the
+ * receiver writes it). Answers the payload, for `run`.
+ */
+function event(h: R1MeetHarness, b: Pick<Booked, 'id' | 'botId'> | null, type: string, d: Delivery = {}): Record<string, unknown> {
+  const receiptId = fixtureId();
+  const payload = {
+    kind: 'recall_event',
+    event_type: type,
+    recall_bot_id: d.botId ?? b!.botId,
+    booking_id: d.bookingId === undefined ? b!.id : d.bookingId,
+    occurred_at: iso(h.now()),
+    sub_code: d.subCode ?? null,
+    participant: type.startsWith('participant_events.')
+      ? { id: d.participantId === undefined ? 101 : d.participantId, is_host: null, is_bot: d.isBot ?? null }
+      : null,
+    receipt_id: receiptId,
+    source: 'recall',
+  };
+  h.db.enqueue({ payload, dedupKey: `r1-meet:receipt:${receiptId}`, maxAttempts: 5 });
+  const bot = h.recall.bots.get(payload.recall_bot_id);
+  if (d.mirror !== false && bot !== undefined && type.startsWith('bot.')) {
+    bot.dispatched = true;
+    h.recall.setStatus(bot.id, type.slice('bot.'.length), d.subCode ?? null);
+  }
+  return payload;
+}
+
+const run = (h: R1MeetHarness, payload: Record<string, unknown>, meta?: R1MeetJobMeta): Promise<R1MeetJobResult> =>
+  runJob(h, r1MeetRecallEventDefinition, payload, meta ?? h.meta());
+
+const deliver = (h: R1MeetHarness, b: Pick<Booked, 'id' | 'botId'> | null, type: string, d: Delivery = {}, meta?: R1MeetJobMeta) =>
+  run(h, event(h, b, type, d), meta);
+
+function expectNoPii(h: R1MeetHarness, ...secrets: string[]): void {
+  const text = JSON.stringify({ logs: h.logs, jobs: h.db.tables.job_queue.map((job) => job.payload) });
+  for (const value of [...secrets, MEET_URL, 'meet.google.com', '@', 'hello.example.test', BRIDGE_PAGE_URL]) {
+    expect(text).not.toContain(value);
+  }
+}
+
+// ── Definitions ─────────────────────────────────────────────────────────────
+
+describe('the definitions', () => {
+  it('exports the four kinds of this file with strict parsers', () => {
+    expect(R1_MEET_EVENT_DEFINITIONS.map((definition) => definition.kind)).toEqual([
+      'recall_event',
+      'attempt_ended',
+      'bridge_check',
+      'multi_human_check',
+    ]);
+    expect(Object.isFrozen(R1_MEET_EVENT_DEFINITIONS)).toBe(true);
+    for (const definition of R1_MEET_EVENT_DEFINITIONS) {
+      expect(Object.isFrozen(definition)).toBe(true);
+      expect(definition.parse(null)).toBeNull();
+      expect(definition.parse({ kind: definition.kind })).toBeNull();
+    }
+    const booking = fixtureId();
+    expect(r1MeetBridgeCheckDefinition.parse({ kind: 'bridge_check', booking_id: booking, version: 0, arm: 0 })).toBeNull();
+    expect(r1MeetMultiHumanCheckDefinition.parse({ kind: 'multi_human_check', booking_id: booking, version: 0 })).not.toBeNull();
+  });
+});
+
+// ── countHumans ─────────────────────────────────────────────────────────────
+
+describe('countHumans (D-S06-28)', () => {
+  const join = (id: number | null, isBot: boolean | null = null) => ({ type: 'join' as const, participantId: id, isBot });
+  const leave = (id: number | null, isBot: boolean | null = null) => ({ type: 'leave' as const, participantId: id, isBot });
+
+  it('counts distinct ids with more joins than leaves', () => {
+    expect(countHumans([])).toBe(0);
+    expect(countHumans([join(1)])).toBe(1);
+    expect(countHumans([join(1), join(2)])).toBe(2);
+    expect(countHumans([join(1), join(1)])).toBe(1);
+    expect(countHumans([leave(1), join(1)])).toBe(0);
+    expect(countHumans([leave(2), join(1)])).toBe(1);
+  });
+
+  it('a rejoin (leave, then a NEW id) is one human', () => {
+    expect(countHumans([join(2), leave(1), join(1)])).toBe(1);
+  });
+
+  it('ignores null ids and every id any row marks as a bot', () => {
+    expect(countHumans([join(null), join(null), join(1)])).toBe(1);
+    expect(countHumans([join(7, true), join(1)])).toBe(1);
+    // The leave is unmarked but the id was a bot's: still not a human.
+    expect(countHumans([join(7, true), leave(7), join(7), join(1)])).toBe(1);
+    expect(countHumans([join(1, false), join(2, false)])).toBe(2);
+  });
+});
+
+// ── Every event from every status (D-S06-24) ────────────────────────────────
+
+type Cell = readonly [code: string, status: string, reason: string];
+
+const OWED_LIVE: Cell = ['release_queued', 'failed', 'no_show'];
+const STRAY_LIVE: Cell = ['stray_bot', 'failed', 'no_show'];
+const OWED_ENDED: Cell = ['released_ended', 'failed', 'no_show'];
+const STRAY_ENDED: Cell = ['stray_ended', 'failed', 'no_show'];
+
+const unchanged = (code: string): Record<'bot_joining' | 'human_present' | 'in_call' | 'in_call_session', Cell> => ({
+  bot_joining: [code, 'bot_joining', 'eligible'],
+  human_present: [code, 'human_present', 'eligible'],
+  in_call: [code, 'in_call', 'eligible'],
+  in_call_session: [code, 'in_call', 'eligible'],
+});
+
+const JOINING_ROW: Record<Start, Cell> = {
+  bot_scheduled: ['bot_joining', 'bot_joining', 'eligible'],
+  ...unchanged('no_change'),
+  failed_owed: OWED_LIVE,
+  failed_released: STRAY_LIVE,
+};
+const HUMAN_ROW: Record<Start, Cell> = {
+  bot_scheduled: ['armed', 'human_present', 'eligible'],
+  bot_joining: ['armed', 'human_present', 'eligible'],
+  human_present: ['already_present', 'human_present', 'eligible'],
+  in_call: ['in_call', 'in_call', 'eligible'],
+  in_call_session: ['in_call', 'in_call', 'eligible'],
+  failed_owed: OWED_LIVE,
+  failed_released: STRAY_LIVE,
+};
+const quiet = (code: string): Record<Start, Cell> => ({
+  bot_scheduled: [code, 'bot_scheduled', 'eligible'],
+  ...unchanged(code),
+  failed_owed: OWED_LIVE,
+  failed_released: STRAY_LIVE,
+});
+const ENDED_ROW: Record<Start, Cell> = {
+  bot_scheduled: ['failed_no_show', 'failed', 'no_show'],
+  bot_joining: ['failed_no_show', 'failed', 'no_show'],
+  human_present: ['failed_bot_fatal', 'failed', 'bot_fatal'],
+  in_call: ['failed_admission_refused', 'failed', 'admission_refused'],
+  in_call_session: ['attempt_decides', 'in_call', 'eligible'],
+  failed_owed: OWED_ENDED,
+  failed_released: STRAY_ENDED,
+};
+const FATAL_ROW: Record<Start, Cell> = {
+  ...ENDED_ROW,
+  bot_scheduled: ['failed_bot_fatal', 'failed', 'bot_fatal'],
+  bot_joining: ['failed_bot_fatal', 'failed', 'bot_fatal'],
+};
+
+const MATRIX: ReadonlyArray<readonly [label: string, type: string, row: Record<Start, Cell>, delivery: Delivery]> = [
+  ['bot.joining_call', 'bot.joining_call', JOINING_ROW, {}],
+  ['bot.in_waiting_room', 'bot.in_waiting_room', JOINING_ROW, {}],
+  ['bot.in_call_not_recording', 'bot.in_call_not_recording', JOINING_ROW, {}],
+  ['bot.recording_permission_allowed', 'bot.recording_permission_allowed', JOINING_ROW, {}],
+  ['bot.recording_permission_denied', 'bot.recording_permission_denied', JOINING_ROW, {}],
+  ['bot.in_call_recording', 'bot.in_call_recording', HUMAN_ROW, {}],
+  ['participant_events.join (human)', 'participant_events.join', HUMAN_ROW, {}],
+  ['participant_events.join (is_bot)', 'participant_events.join', quiet('bot_participant'), { isBot: true }],
+  ['participant_events.leave', 'participant_events.leave', quiet('participant_left'), {}],
+  ['bot.call_ended', 'bot.call_ended', ENDED_ROW, {}],
+  ['bot.done', 'bot.done', ENDED_ROW, {}],
+  ['bot.fatal', 'bot.fatal', FATAL_ROW, {}],
+];
+
+const STARTS: readonly Start[] = [
+  'bot_scheduled',
+  'bot_joining',
+  'human_present',
+  'in_call',
+  'in_call_session',
+  'failed_owed',
+  'failed_released',
+];
+
+describe('recall_event: every event from every booking status (D-S06-24)', () => {
+  const cases = MATRIX.flatMap(([label, type, row, delivery]) =>
+    STARTS.map((start) => [label, start, type, row[start], delivery] as const),
+  );
+
+  it.each(cases)('%s on %s', async (_label, start, type, [code, status, reason], delivery) => {
+    const h = world();
+    const b = await booked(h, start);
+    const result = await deliver(h, b, type, delivery);
+    expect(result).toMatchObject({ outcome: 'done', code });
+
+    const row = h.db.booking(b.id)!;
+    expect({ status: row.status, reason: row.reason }).toEqual({ status, reason });
+    // Exactly one arm and one page, and only for the human signal that moved the booking.
+    expect(outputMedia(h)).toHaveLength(code === 'armed' ? 1 : 0);
+    // A terminal move, or an owed release finished: the bot is recorded released.
+    if (code.startsWith('failed_') || code.startsWith('released_')) expect(row.recall_bot_id).toBeNull();
+    // A live event of a terminal booking's own bot, or of a stray: one release job, never a call.
+    const releases = h.db.jobs('bot_release');
+    expect(releases).toHaveLength(code === 'release_queued' || code === 'stray_bot' ? 1 : 0);
+    if (releases.length === 1) {
+      expect(releases[0]!.payload).toEqual({ kind: 'bot_release', recall_bot_id: b.botId, booking_id: b.id });
+      expect(recallOps(h)).toEqual([]);
+    }
+    expect(h.alerts()).toEqual(code === 'stray_bot' ? ['r1_meet_stray_bot'] : []);
+    // Never a create, never a PATCH; a release is at most one GET then one command.
+    expect(recallOps(h)).not.toContain('create');
+    expect(h.requests.map((request) => request.method)).not.toContain('PATCH');
+    expectNoPii(h);
+  });
+});
+
+// ── Out of order, duplicates and the booking match ──────────────────────────
+
+describe('recall_event: order, duplicates and the booking match (D-S06-22)', () => {
+  it('a human before joining: bot_scheduled -> human_present, then joining_call changes nothing', async () => {
+    const h = world();
+    const b = await booked(h);
+    expect(await deliver(h, b, 'participant_events.join', { participantId: 5 })).toEqual(done('processed', 'armed'));
+    expect(await deliver(h, b, 'bot.joining_call')).toEqual(done('ignored', 'no_change'));
+    expect(await deliver(h, b, 'bot.in_waiting_room')).toEqual(done('ignored', 'no_change'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present' });
+    expect(outputMedia(h)).toHaveLength(1);
+  });
+
+  it('the same event twice: the second run is a no-op', async () => {
+    const h = world();
+    const b = await booked(h);
+    const joiningCall = event(h, b, 'bot.joining_call');
+    expect(await run(h, joiningCall)).toEqual(done('processed', 'bot_joining'));
+    expect(await run(h, joiningCall)).toEqual(done('ignored', 'no_change'));
+
+    const recording = event(h, b, 'bot.in_call_recording');
+    expect(await run(h, recording)).toEqual(done('processed', 'armed'));
+    expect(await run(h, recording)).toEqual(done('ignored', 'already_present'));
+    expect(outputMedia(h)).toHaveLength(1);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', ticket_arms: 1 });
+
+    const ended = event(h, b, 'bot.call_ended');
+    expect(await run(h, ended)).toEqual(done('processed', 'failed_bot_fatal'));
+    // Now released: the same terminal event is a stray's, and needs nothing.
+    expect(await run(h, ended)).toEqual(done('ignored', 'stray_ended'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'bot_fatal', recall_bot_id: null });
+  });
+
+  it('a bot whose metadata names no booking is matched by the booking that holds it', async () => {
+    const h = world();
+    const b = await booked(h);
+    expect(await deliver(h, b, 'bot.joining_call', { bookingId: null })).toEqual(done('processed', 'bot_joining'));
+  });
+
+  it('a named booking that is gone falls back to the holder of the bot', async () => {
+    const h = world();
+    const b = await booked(h);
+    expect(await deliver(h, b, 'bot.joining_call', { bookingId: fixtureId() })).toEqual(done('processed', 'bot_joining'));
+    expect(h.alerts()).toEqual([]);
+  });
+
+  it('events after a terminal move: a live one of the owed bot queues its release, then the bot is not current', async () => {
+    const h = world();
+    const b = await booked(h, 'failed_owed');
+    expect(await deliver(h, b, 'participant_events.leave')).toEqual(done('processed', 'release_queued'));
+    expect(await deliver(h, b, 'bot.done')).toEqual(done('processed', 'released_ended'));
+    expect(h.db.booking(b.id)).toMatchObject({ recall_bot_id: null });
+    expect(await deliver(h, b, 'bot.done')).toEqual(done('ignored', 'stray_ended'));
+  });
+});
+
+// ── Strays (D-S06-23) ───────────────────────────────────────────────────────
+
+describe('recall_event: stray bots (D-S06-23)', () => {
+  /** A bot created at Recall whose attach never happened: the booking stays `pending`. */
+  async function unattached(h: R1MeetHarness): Promise<{ id: string; botId: string }> {
+    const created = await h.createBooking({ startAt: iso(h.now() + 30 * MIN) });
+    h.db.failNext('r1_meet_set_bot');
+    await expect(ensureBot(h.deps, created.bookingId, h.meta())).rejects.toThrow('r1_meet_db_error');
+    const botId = [...h.recall.bots.keys()].at(-1)!;
+    expect(h.db.booking(created.bookingId)).toMatchObject({ status: 'pending', recall_bot_id: null });
+    reset(h);
+    return { id: created.bookingId, botId };
+  }
+
+  it('pending, then attached: the event waits, and once attached it is the current bot', async () => {
+    const h = world();
+    const s = await unattached(h);
+    const payload = event(h, s, 'bot.joining_call');
+    expect(await run(h, payload)).toEqual(deferred('stray_pending', 30));
+    expect(recallOps(h)).toEqual([]);
+    expect(h.alerts()).toEqual([]);
+
+    // The create is retried under the same key: Recall answers the same bot, which is attached.
+    expect(await ensureBot(h.deps, s.id, h.meta())).toMatchObject({ code: 'bot_scheduled' });
+    expect(h.recall.bots.size).toBe(1);
+    h.advance(30 * SEC);
+    expect(await run(h, payload, h.meta({ deferCount: 1, deferredAt: iso(h.now() - 30 * SEC) }))).toEqual(
+      done('processed', 'bot_joining'),
+    );
+    expect(h.db.jobs('bot_release')).toEqual([]);
+  });
+
+  it('pending for 20 waits: the key is rotated FIRST, then alert and release; the next create makes a new bot', async () => {
+    const h = world();
+    const s = await unattached(h);
+    const payload = event(h, s, 'bot.joining_call');
+    const meta = h.meta({ deferCount: 20, deferredAt: iso(h.now() - 10 * MIN) });
+    expect(await run(h, payload, meta)).toEqual(done('processed', 'stray_bot'));
+    expect(steps(h)).toEqual(['db:set_bot:rotate_key', 'queue:bot_release']);
+    expect(h.db.booking(s.id)).toMatchObject({ status: 'pending', key_attempt: 1 });
+    expect(h.logs).toContainEqual({ level: 'error', meta: { error_category: 'r1_meet_stray_bot', error_type: 'pending' } });
+    expect(h.db.jobs('bot_release')[0]!.dedup_key).toBe(`r1-meet:bot-release:${s.botId}`);
+
+    // The release job removes the stray (no live booking holds it) ...
+    const release = h.db.jobs('bot_release')[0]!.payload as Record<string, unknown>;
+    expect(await runJob(h, r1MeetBotReleaseDefinition, release)).toMatchObject({ code: 'released_left' });
+    // ... and the next create is not answered with it from Recall's cache.
+    expect(await ensureBot(h.deps, s.id, h.meta())).toMatchObject({ code: 'bot_scheduled' });
+    const attached = h.db.booking(s.id)!.recall_bot_id as string;
+    expect(attached).not.toBe(s.botId);
+    expect(h.recall.bots.size).toBe(2);
+  });
+
+  it('the deferral bound also ends the wait', async () => {
+    const h = world();
+    const s = await unattached(h);
+    const meta = h.meta({ deferCount: 3, deferredAt: iso(h.now() - 61 * MIN) });
+    expect(await deliver(h, s, 'bot.joining_call', {}, meta)).toEqual(done('processed', 'stray_bot'));
+  });
+
+  it('a blocked booking: alert and release at once, no wait and no rotation', async () => {
+    const h = world();
+    const s = await unattached(h);
+    expect((await h.db.store.transition({ bookingId: s.id, from: 'pending', to: 'blocked', reason: 'not_scheduled', nowIso: iso(h.now()) })).status).toBe('ok');
+    reset(h);
+    expect(await deliver(h, s, 'bot.in_waiting_room')).toEqual(done('processed', 'stray_bot'));
+    expect(steps(h)).toEqual(['queue:bot_release']);
+    expect(h.logs).toContainEqual({ level: 'error', meta: { error_category: 'r1_meet_stray_bot', error_type: 'blocked' } });
+  });
+
+  it('another bot on a booking that holds a bot: alert and release; the current bot is untouched', async () => {
+    const h = world();
+    const b = await booked(h);
+    const other = fixtureId();
+    expect(await deliver(h, b, 'participant_events.join', { botId: other })).toEqual(done('processed', 'stray_bot'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_scheduled', recall_bot_id: b.botId });
+    expect(h.db.jobs('bot_release').map((job) => job.payload.recall_bot_id)).toEqual([other]);
+  });
+
+  it('a deleted booking: alert and release; a terminal event needs nothing', async () => {
+    const h = world();
+    const gone = { id: fixtureId(), botId: fixtureId() };
+    expect(await deliver(h, gone, 'bot.call_ended')).toEqual(done('ignored', 'stray_ended'));
+    expect(h.db.jobs('bot_release')).toEqual([]);
+    expect(await deliver(h, gone, 'bot.joining_call')).toEqual(done('processed', 'stray_bot'));
+    expect(h.logs).toContainEqual({ level: 'error', meta: { error_category: 'r1_meet_stray_bot', error_type: 'booking_gone' } });
+    expect(h.db.jobs('bot_release')[0]!.payload).toEqual({ kind: 'bot_release', recall_bot_id: gone.botId, booking_id: gone.id });
+  });
+
+  it('a bot that is not ours (no booking named, none holds it) is never touched', async () => {
+    const h = world();
+    await booked(h);
+    const foreign = { id: fixtureId(), botId: fixtureId() };
+    for (const type of ['bot.joining_call', 'bot.in_call_recording', 'participant_events.join', 'bot.fatal']) {
+      expect(await deliver(h, foreign, type, { bookingId: null })).toEqual(done('ignored', 'unknown_bot'));
+    }
+    expect(h.requests).toEqual([]);
+    expect(steps(h)).toEqual([]);
+    expect(h.alerts()).toEqual([]);
+    expect(h.hot).toEqual([]);
+  });
+});
+
+// ── Human present (D-S06-25, D-S06-26) ──────────────────────────────────────
+
+describe('recall_event: the human-present arm (D-S06-25)', () => {
+  it('the winner arms in order: transition, GET, arm, bridge check, output_media', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    expect(await deliver(h, b, 'bot.in_call_recording')).toEqual(done('processed', 'armed'));
+    expect(steps(h)).toEqual([
+      'db:transition:human_present',
+      'recall:get',
+      'db:arm_ticket',
+      'queue:bridge_check',
+      'recall:output_media',
+    ]);
+    const ticket = lastTicket(h);
+    expect(ticket).toMatch(R1_MEET_TICKET_PATTERN);
+    expect(h.db.booking(b.id)).toMatchObject({ ticket_digest: digestOf(ticket), ticket_arms: 1, ticket_claimed_at: null });
+    expectNoPii(h, ticket, digestOf(ticket));
+  });
+
+  it('both signals at once: exactly one arm and one output_media', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    const join = event(h, b, 'participant_events.join', { participantId: 7 });
+    const recording = event(h, b, 'bot.in_call_recording');
+    const results = await Promise.all([run(h, join), run(h, recording)]);
+    expect(results.map((result) => result.code).sort()).toEqual([
+      'already_present',
+      'armed',
+    ]);
+    expect(outputMedia(h)).toHaveLength(1);
+    expect(steps(h).filter((step) => step === 'db:arm_ticket')).toHaveLength(1);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', ticket_arms: 1 });
+    expect(h.db.jobs('bridge_check')).toHaveLength(1);
+  });
+
+  it('both signals one after the other, and a third duplicate: still one arm', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_scheduled');
+    expect(await deliver(h, b, 'bot.in_call_recording')).toEqual(done('processed', 'armed'));
+    expect(await deliver(h, b, 'participant_events.join', { participantId: 3 })).toEqual(done('ignored', 'already_present'));
+    expect(await deliver(h, b, 'participant_events.join', { participantId: 3 })).toEqual(done('ignored', 'already_present'));
+    expect(outputMedia(h)).toHaveLength(1);
+  });
+
+  it('the winner crashed after the transition: a fresh second signal does not arm, the re-run does', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    const payload = event(h, b, 'bot.in_call_recording');
+    h.db.failNext('r1_meet_transition_booking', 'lost');
+    await expect(run(h, payload)).rejects.toThrow('r1_meet_db_error');
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', ticket_arms: 0 });
+
+    expect(await deliver(h, b, 'participant_events.join', { participantId: 9 })).toEqual(done('ignored', 'already_present'));
+    expect(outputMedia(h)).toHaveLength(0);
+
+    h.advance(60 * SEC);
+    expect(await run(h, payload, h.meta({ attempts: 2 }))).toEqual(done('processed', 'armed'));
+    expect(outputMedia(h)).toHaveLength(1);
+    expect(h.db.booking(b.id)).toMatchObject({ ticket_arms: 1, ticket_digest: digestOf(lastTicket(h)) });
+  });
+
+  it('the winner crashed after the arm: the re-run (60 s later) arms a fresh ticket and posts it', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    const payload = event(h, b, 'bot.in_call_recording');
+    h.db.failNext('r1_meet_arm_ticket', 'lost');
+    await expect(run(h, payload)).rejects.toThrow('r1_meet_db_error');
+    expect(h.db.booking(b.id)).toMatchObject({ ticket_arms: 1 });
+    expect(outputMedia(h)).toHaveLength(0);
+
+    h.advance(60 * SEC);
+    expect(await run(h, payload, h.meta({ attempts: 2 }))).toEqual(done('processed', 'armed'));
+    expect(outputMedia(h)).toHaveLength(1);
+    const row = h.db.booking(b.id)!;
+    expect(row).toMatchObject({ ticket_arms: 2, ticket_digest: digestOf(lastTicket(h)) });
+  });
+
+  it('a re-run within 20 s of an arm does not replace it (a page is loading)', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    const payload = event(h, b, 'bot.in_call_recording');
+    h.db.failNext('r1_meet_arm_ticket', 'lost');
+    await expect(run(h, payload)).rejects.toThrow('r1_meet_db_error');
+    h.advance(19 * SEC);
+    expect(await run(h, payload, h.meta({ attempts: 2 }))).toEqual(done('ignored', 'already_present'));
+    expect(h.requests.filter((request) => request.op !== 'get')).toEqual([]);
+    expect(h.db.booking(b.id)).toMatchObject({ ticket_arms: 1 });
+    h.advance(SEC);
+    expect(await run(h, payload, h.meta({ attempts: 3 }))).toEqual(done('processed', 'armed'));
+  });
+
+  it('a claimed ticket is never re-armed by an event (the page is in): in_call gives nothing', async () => {
+    const h = world();
+    const b = await booked(h, 'in_call');
+    expect(await deliver(h, b, 'bot.in_call_recording', {}, h.meta({ attempts: 3 }))).toEqual(done('ignored', 'in_call'));
+    expect(h.requests).toEqual([]);
+  });
+});
+
+describe('recall_event: arm at create (D-S06-26)', () => {
+  const atCreate = (): R1MeetHarness => world({ config: { armAtCreate: true } });
+
+  it('armed at create: the human signal moves the booking, never re-arms, and queues the check of that arm', async () => {
+    const h = atCreate();
+    const b = await booked(h, 'bot_scheduled');
+    expect(h.db.booking(b.id)).toMatchObject({ ticket_arms: 1 });
+    expect(await deliver(h, b, 'bot.in_call_recording')).toEqual(done('processed', 'human_present'));
+    expect(steps(h)).toEqual(['db:transition:human_present', 'queue:bridge_check']);
+    expect(h.requests).toEqual([]);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', ticket_arms: 1 });
+    expect(h.db.jobs('bridge_check')[0]).toMatchObject({
+      payload: { kind: 'bridge_check', booking_id: b.id, version: 0, arm: 1 },
+      scheduled_at: iso(h.now() + 45 * SEC),
+    });
+    // A re-run neither re-arms (still armed at create) nor queues a second check.
+    expect(await deliver(h, b, 'participant_events.join', {}, h.meta({ attempts: 2 }))).toEqual(done('ignored', 'already_present'));
+    expect(h.db.jobs('bridge_check')).toHaveLength(1);
+    expect(outputMedia(h)).toHaveLength(0);
+  });
+
+  it('not armed at create (the arm failed): the human signal falls back to the normal arm', async () => {
+    const h = atCreate();
+    const created = await h.createBooking({ startAt: iso(h.now() + MIN) });
+    h.db.failNext('r1_meet_arm_ticket');
+    expect(await ensureBot(h.deps, created.bookingId, h.meta())).toMatchObject({ code: 'bot_scheduled' });
+    const row = h.db.booking(created.bookingId)!;
+    expect(row).toMatchObject({ ticket_arms: 0, ticket_not_before: null });
+    reset(h);
+    const b = { id: row.id as string, botId: row.recall_bot_id as string };
+    expect(await deliver(h, b, 'bot.in_call_recording')).toEqual(done('processed', 'armed'));
+    expect(outputMedia(h)).toHaveLength(1);
+    expect(h.db.booking(b.id)).toMatchObject({ ticket_arms: 1, ticket_digest: digestOf(lastTicket(h)) });
+  });
+
+  it('already in the call (the create-time ticket was claimed): nothing', async () => {
+    const h = atCreate();
+    const created = await h.createBooking({ startAt: iso(h.now() + MIN) });
+    await ensureBot(h.deps, created.bookingId, h.meta());
+    const create = h.requests.find((request) => request.op === 'create')!;
+    const ticket = ticketOf(((create.body as { output_media: { camera: { config: { url: string } } } }).output_media.camera.config.url));
+    expect((await h.db.claimTicket(ticket, iso(h.now()), BRIDGE_SOURCE)).data).toMatchObject({ status: 'ok' });
+    reset(h);
+    const row = h.db.booking(created.bookingId)!;
+    const b = { id: row.id as string, botId: row.recall_bot_id as string };
+    expect(await deliver(h, b, 'bot.in_call_recording', {}, h.meta({ attempts: 2 }))).toEqual(done('ignored', 'in_call'));
+    expect(h.requests).toEqual([]);
+    expect(h.db.jobs('bridge_check')).toEqual([]);
+  });
+});
+
+// ── Terminal events: sub-codes, our own leave, the release ──────────────────
+
+describe('recall_event: terminal events (D-S06-24)', () => {
+  const subCodeCases: ReadonlyArray<readonly [type: string, subCode: string | null, reason: string]> = [
+    ...R1_MEET_FATAL_SUB_CODES.map((code) => ['bot.call_ended', code, 'bot_fatal'] as const),
+    ...R1_MEET_FATAL_SUB_CODES.map((code) => ['bot.done', code, 'bot_fatal'] as const),
+    ['bot.call_ended', null, 'no_show'],
+    ['bot.call_ended', 'timeout_exceeded_noone_joined', 'no_show'],
+    ['bot.call_ended', 'timeout_exceeded_everyone_left', 'no_show'],
+    ['bot.call_ended', 'call_ended_by_host', 'no_show'],
+    ['bot.call_ended', 'a_sub_code_recall_added_later.v2', 'no_show'],
+    ['bot.done', null, 'no_show'],
+    ['bot.fatal', null, 'bot_fatal'],
+    ['bot.fatal', 'google_meet_sign_in_failed', 'bot_fatal'],
+    ['bot.fatal', 'a_sub_code_recall_added_later.v2', 'bot_fatal'],
+  ];
+
+  it.each(subCodeCases.flatMap((entry) => (['bot_scheduled', 'bot_joining'] as const).map((start) => [...entry, start] as const)))(
+    '%s with sub-code %s -> failed/%s (from %s)',
+    async (type, subCode, reason, start) => {
+      const h = world();
+      const b = await booked(h, start);
+      expect(await deliver(h, b, type, { subCode })).toEqual(done('processed', `failed_${reason}`));
+      expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason, recall_bot_id: null });
+      expect(h.alerts()).toEqual([]);
+    },
+  );
+
+  it('after a terminal move the bot is released: the GET says ended, nothing else is sent, then set_bot release', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    expect(await deliver(h, b, 'bot.call_ended', { subCode: 'timeout_exceeded_noone_joined' })).toEqual(
+      done('processed', 'failed_no_show'),
+    );
+    expect(steps(h)).toEqual(['db:transition:failed', 'recall:get', 'db:set_bot:release']);
+  });
+
+  it('a bot whose call ended but Recall still reports it live (out of order) is left first', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    expect(await deliver(h, b, 'bot.fatal', { mirror: false })).toEqual(done('processed', 'failed_bot_fatal'));
+    expect(recallOps(h)).toEqual(['get', 'leave']);
+    expect(h.db.booking(b.id)).toMatchObject({ recall_bot_id: null });
+  });
+
+  it('our own leave (bot_received_leave_call) waits once, 60 s, then maps on a fresh read', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    const payload = event(h, b, 'bot.call_ended', { subCode: 'bot_received_leave_call' });
+    expect(await run(h, payload)).toEqual(deferred('own_leave', 60));
+    expect(h.requests).toEqual([]);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining' });
+    h.advance(60 * SEC);
+    expect(await run(h, payload, h.meta({ deferCount: 1, deferredAt: iso(h.now() - 60 * SEC) }))).toEqual(
+      done('processed', 'failed_no_show'),
+    );
+  });
+
+  it('our own leave whose job marked the booking meanwhile: the wait ends in the owed release', async () => {
+    const h = world();
+    const b = await booked(h, 'human_present');
+    const payload = event(h, b, 'bot.call_ended', { subCode: 'bot_received_leave_call' });
+    expect(await run(h, payload)).toEqual(deferred('own_leave', 60));
+    // The leaving job (here: the multi-human policy) marked it, and died before its release mark.
+    expect((await h.db.store.transition({ bookingId: b.id, from: 'human_present', to: 'failed', reason: 'multiple_humans', nowIso: iso(h.now()) })).status).toBe('ok');
+    expect(await run(h, payload, h.meta({ deferCount: 1, deferredAt: iso(h.now()) }))).toEqual(done('processed', 'released_ended'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'multiple_humans', recall_bot_id: null });
+  });
+
+  it('a lost release mark after the move: the re-run finishes the owed release', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    const payload = event(h, b, 'bot.call_ended');
+    h.db.failNext('r1_meet_set_bot');
+    await expect(run(h, payload)).rejects.toThrow('r1_meet_db_error');
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', recall_bot_id: b.botId });
+    expect(await run(h, payload, h.meta({ attempts: 2 }))).toEqual(done('processed', 'released_ended'));
+    expect(h.db.booking(b.id)).toMatchObject({ recall_bot_id: null });
+  });
+
+  it('Recall down at the release after the move: deferred within the bound, the move stays', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    const payload = event(h, b, 'bot.call_ended');
+    h.intercept('get', { status: 503 });
+    expect(await run(h, payload)).toMatchObject({ outcome: 'defer', code: 'r1_meet_recall_unavailable' });
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'no_show', recall_bot_id: b.botId });
+    expect(await run(h, payload, h.meta({ deferCount: 1, deferredAt: iso(h.now()) }))).toEqual(done('processed', 'released_ended'));
+  });
+});
+
+// ── Multiple humans (D-S06-28) ──────────────────────────────────────────────
+
+describe('multiple humans (D-S06-28)', () => {
+  const checkPayload = (b: Booked, version = 0) => ({ kind: 'multi_human_check', booking_id: b.id, version });
+  const check = (h: R1MeetHarness, b: Booked, meta?: R1MeetJobMeta) =>
+    runJob(h, r1MeetMultiHumanCheckDefinition, checkPayload(b), meta ?? h.meta());
+
+  async function present(h: R1MeetHarness): Promise<Booked> {
+    const b = await booked(h, 'bot_joining');
+    expect(await deliver(h, b, 'participant_events.join', { participantId: 1 })).toEqual(done('processed', 'armed'));
+    reset(h);
+    return b;
+  }
+
+  it('a second human queues ONE check 120 s later (per bot generation)', async () => {
+    const h = world();
+    const b = await present(h);
+    expect(h.db.jobs('multi_human_check')).toEqual([]);
+    expect(await deliver(h, b, 'participant_events.join', { participantId: 2 })).toEqual(done('ignored', 'already_present'));
+    expect(h.db.jobs('multi_human_check')).toEqual([
+      expect.objectContaining({
+        payload: { kind: 'multi_human_check', booking_id: b.id, version: 0 },
+        dedup_key: `r1-meet:multi-human:${b.id}:v0`,
+        max_attempts: 10,
+        scheduled_at: iso(h.now() + 120 * SEC),
+      }),
+    ]);
+    await deliver(h, b, 'participant_events.join', { participantId: 3 });
+    expect(h.db.jobs('multi_human_check')).toHaveLength(1);
+    expectNoPii(h);
+  });
+
+  it('a rejoin (a leave, then a new id) is one human: no check', async () => {
+    const h = world();
+    const b = await present(h);
+    await deliver(h, b, 'participant_events.leave', { participantId: 1 });
+    await deliver(h, b, 'participant_events.join', { participantId: 2 });
+    expect(h.db.jobs('multi_human_check')).toEqual([]);
+  });
+
+  it('null ids, bots and other bots\' rows are not humans', async () => {
+    const h = world();
+    const b = await present(h);
+    await deliver(h, b, 'participant_events.join', { participantId: null });
+    await deliver(h, b, 'participant_events.join', { participantId: 8, isBot: true });
+    // Another bot's call (its own booking): its participants are not this call's.
+    event(h, { id: fixtureId(), botId: fixtureId() }, 'participant_events.join', { participantId: 2 });
+    await deliver(h, b, 'participant_events.join', { participantId: null });
+    expect(h.db.jobs('multi_human_check')).toEqual([]);
+  });
+
+  it('a join in the call (in_call) is counted too', async () => {
+    const h = world();
+    const b = await booked(h, 'in_call_session');
+    event(h, b, 'participant_events.join', { participantId: 1 });
+    expect(await deliver(h, b, 'participant_events.join', { participantId: 2 })).toEqual(done('ignored', 'in_call'));
+    expect(h.db.jobs('multi_human_check')).toHaveLength(1);
+  });
+
+  it('still two at the check, policy end: alert, leave BEFORE the mark, failed/multiple_humans, release', async () => {
+    const h = world();
+    const b = await present(h);
+    await deliver(h, b, 'participant_events.join', { participantId: 2 });
+    reset(h);
+    h.advance(120 * SEC);
+    expect(await check(h, b)).toEqual(done('processed', 'multiple_humans'));
+    expect(steps(h)).toEqual(['recall:get', 'recall:leave', 'db:transition:failed', 'db:set_bot:release']);
+    expect(h.alerts()).toEqual(['r1_meet_multiple_humans']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'multiple_humans', recall_bot_id: null });
+    expectNoPii(h);
+  });
+
+  it('down to one by the check: nothing', async () => {
+    const h = world();
+    const b = await present(h);
+    await deliver(h, b, 'participant_events.join', { participantId: 2 });
+    await deliver(h, b, 'participant_events.leave', { participantId: 2 });
+    reset(h);
+    expect(await check(h, b)).toEqual(done('ignored', 'one_human'));
+    expect(h.requests).toEqual([]);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present' });
+  });
+
+  it('policy observe: one warning, the call goes on', async () => {
+    const h = world({ config: { multiHumanPolicy: 'observe' } });
+    const b = await present(h);
+    await deliver(h, b, 'participant_events.join', { participantId: 2 });
+    reset(h);
+    expect(await check(h, b)).toEqual(done('ignored', 'observed'));
+    expect(h.logs).toEqual([{ level: 'warn', meta: { error_category: 'r1_meet_multi_human_observed' } }]);
+    expect(h.requests).toEqual([]);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', recall_bot_id: b.botId });
+  });
+
+  it('another generation, a gone or ended booking: ignored', async () => {
+    const h = world();
+    const b = await present(h);
+    await deliver(h, b, 'participant_events.join', { participantId: 2 });
+    reset(h);
+    expect(await runJob(h, r1MeetMultiHumanCheckDefinition, checkPayload(b, 1))).toEqual(done('ignored', 'generation_changed'));
+    expect(await runJob(h, r1MeetMultiHumanCheckDefinition, { ...checkPayload(b), booking_id: fixtureId() })).toEqual(
+      done('ignored', 'booking_gone'),
+    );
+    const released = await booked(h, 'failed_released');
+    expect(await check(h, released)).toEqual(done('ignored', 'booking_terminal'));
+    expect(h.requests).toEqual([]);
+  });
+
+  it('kill point: the leave answer is lost; the re-run finds the bot ended and marks', async () => {
+    const h = world();
+    const b = await present(h);
+    await deliver(h, b, 'participant_events.join', { participantId: 2 });
+    reset(h);
+    h.intercept('leave', 'lost');
+    expect(await check(h, b)).toMatchObject({ outcome: 'defer', code: 'r1_meet_recall_unavailable' });
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present' });
+    expect(await check(h, b, h.meta({ deferCount: 1, deferredAt: iso(h.now()) }))).toEqual(done('processed', 'multiple_humans'));
+    expect(recallOps(h)).toEqual(['get', 'leave', 'get']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'multiple_humans', recall_bot_id: null });
+  });
+
+  it('kill point: the release mark is lost after the move; the re-run settles the owed release', async () => {
+    const h = world();
+    const b = await present(h);
+    await deliver(h, b, 'participant_events.join', { participantId: 2 });
+    reset(h);
+    h.db.failNext('r1_meet_set_bot');
+    await expect(check(h, b)).rejects.toThrow('r1_meet_db_error');
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', recall_bot_id: b.botId });
+    expect(await check(h, b, h.meta({ attempts: 2 }))).toEqual(done('processed', 'released_ended'));
+    expect(h.db.booking(b.id)).toMatchObject({ recall_bot_id: null });
+  });
+});
+
+// ── attempt_ended (D-S06-29) ────────────────────────────────────────────────
+
+describe('attempt_ended (D-S06-29)', () => {
+  const payloadOf = (b: Booked, sessionId = b.sessionId!) => ({ kind: 'attempt_ended', booking_id: b.id, session_id: sessionId });
+  const ended = (h: R1MeetHarness, b: Booked, meta?: R1MeetJobMeta, sessionId?: string) =>
+    runJob(h, r1MeetAttemptEndedDefinition, payloadOf(b, sessionId), meta ?? h.meta());
+  /** What `r1_settle_attempt` leaves for the bound session (the route queues this job after it). */
+  const settle = (h: R1MeetHarness, b: Booked, outcome: string | null = 'complete', counted = outcome === 'complete') =>
+    h.db.addAttempt({ session_id: b.sessionId!, round_id: b.roundId, outcome, counted });
+
+  it.each(['in_progress', 'completed', 'failed', 'created'])(
+    'counted: leave -> completed/attempt_settled -> release, whatever the session says (%s)',
+    async (sessionStatus) => {
+      const h = world();
+      const b = await booked(h, 'in_call_session', { sessionStatus });
+      settle(h, b);
+      expect(await ended(h, b)).toEqual(done('processed', 'completed'));
+      expect(steps(h)).toEqual(['recall:get', 'recall:leave', 'db:transition:completed', 'db:set_bot:release']);
+      expect(h.db.booking(b.id)).toMatchObject({ status: 'completed', reason: 'attempt_settled', recall_bot_id: null });
+      expect(h.alerts()).toEqual([]);
+      expectNoPii(h);
+    },
+  );
+
+  it('another session (the round restarted and re-bound): ignored, no Recall call', async () => {
+    const h = world();
+    const b = await booked(h, 'in_call_session');
+    expect(await ended(h, b, undefined, fixtureId())).toEqual(done('ignored', 'other_session'));
+    expect(h.requests).toEqual([]);
+  });
+
+  it('a terminal booking whose bot is released: ignored; a gone booking: ignored', async () => {
+    const h = world();
+    const b = await booked(h, 'in_call_session');
+    settle(h, b);
+    expect(await ended(h, b)).toEqual(done('processed', 'completed'));
+    reset(h);
+    expect(await ended(h, b)).toEqual(done('ignored', 'booking_terminal'));
+    expect(await runJob(h, r1MeetAttemptEndedDefinition, { ...payloadOf(b), booking_id: fixtureId() })).toEqual(
+      done('ignored', 'booking_gone'),
+    );
+    expect(h.requests).toEqual([]);
+  });
+
+  it('a booking already failed (another job ended the call) but still holding the bot: the release is finished', async () => {
+    const h = world();
+    const b = await booked(h, 'in_call_session');
+    expect((await h.db.store.transition({ bookingId: b.id, from: 'in_call', to: 'failed', reason: 'multiple_humans', nowIso: iso(h.now()) })).status).toBe('ok');
+    expect(await ended(h, b)).toEqual(done('processed', 'released_left'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'multiple_humans', recall_bot_id: null });
+  });
+
+  it('Recall down: deferred within the bound; past it the job throws (DLQ, maintenance re-drives)', async () => {
+    const h = world();
+    const b = await booked(h, 'in_call_session');
+    settle(h, b);
+    h.intercept('get', 'network');
+    expect(await ended(h, b)).toMatchObject({ outcome: 'defer', code: 'r1_meet_recall_unavailable' });
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'in_call' });
+    h.intercept('get', 'network');
+    await expect(ended(h, b, h.meta({ deferCount: 30, deferredAt: iso(h.now()) }))).rejects.toThrow('r1_meet_recall_network');
+    h.intercept('get', { status: 401 });
+    expect(await ended(h, b)).toMatchObject({ outcome: 'defer', code: 'r1_meet_recall_rejected' });
+    expect(h.alerts()).toContain('r1_meet_recall_rejected');
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'in_call', recall_bot_id: b.botId });
+  });
+
+  describe('an attempt that did not count (PR #444 review S06-R1)', () => {
+    const round = (h: R1MeetHarness, b: Booked) => h.db.tables.interview_rounds.find((row) => row.id === b.roundId)!;
+    /** The candidate (participant 1) is in the call: a durable participant join of this bot. */
+    const candidateIn = (h: R1MeetHarness, b: Booked) => event(h, b, 'participant_events.join', { participantId: 1 });
+
+    it.each(['provider_error', 'shutdown_forced', 'configuration_failed', 'context_failed', 'no_show', 'candidate_left'])(
+      '%s with a start left and the candidate in the call: re-armed, never completed, the bot stays',
+      async (outcome) => {
+        const h = world();
+        const b = await booked(h, 'in_call_session', { sessionStatus: 'failed' });
+        settle(h, b, outcome, false);
+        candidateIn(h, b);
+        expect(await ended(h, b)).toEqual(done('processed', 'rearmed'));
+        expect(steps(h)).toEqual(['recall:get', 'db:arm_ticket', 'queue:bridge_check', 'recall:output_media']);
+        expect(recallOps(h)).not.toContain('leave');
+        const ticket = lastTicket(h);
+        expect(h.db.booking(b.id)).toMatchObject({
+          status: 'in_call',
+          reason: 'eligible',
+          recall_bot_id: b.botId,
+          session_id: b.sessionId,
+          ticket_arms: 2,
+          ticket_claimed_at: null,
+          ticket_digest: digestOf(ticket),
+        });
+        expect(h.db.jobs('bridge_check').map((job) => job.payload.arm)).toContain(2);
+        expect(h.hot.length).toBeGreaterThan(0);
+        expect(h.alerts()).toEqual([]);
+        expectNoPii(h, ticket, digestOf(ticket));
+        // The page claims the new ticket; S05 admits a new attempt and re-binds: this outcome is over.
+        expect((await h.db.claimTicket(ticket, iso(h.now()), BRIDGE_SOURCE)).data).toMatchObject({ status: 'ok' });
+        const next = h.db.addSession({ interview_round_id: b.roundId, status: 'in_progress' });
+        expect((await h.db.bind(b.id, next.id as string, iso(h.now()))).data).toMatchObject({ status: 'ok' });
+        reset(h);
+        expect(await ended(h, b)).toEqual(done('ignored', 'other_session'));
+        expect(h.requests).toEqual([]);
+      },
+    );
+
+    it('nobody left in the call: leave, failed/no_show (not completed), release', async () => {
+      const h = world();
+      const b = await booked(h, 'in_call_session', { sessionStatus: 'failed' });
+      settle(h, b, 'provider_error', false);
+      candidateIn(h, b);
+      event(h, b, 'participant_events.leave', { participantId: 1 });
+      expect(await ended(h, b)).toEqual(done('processed', 'failed_no_show'));
+      expect(steps(h)).toEqual(['recall:get', 'recall:leave', 'db:transition:failed', 'db:set_bot:release']);
+      expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'no_show', recall_bot_id: null, ticket_arms: 1 });
+    });
+
+    it('the round has no start left or lapsed, the window closed or the arms are spent: leave, failed/bot_fatal', async () => {
+      const cases: Array<[string, (h: R1MeetHarness, b: Booked) => void]> = [
+        ['starts', (h, b) => {
+          round(h, b).starts_used = 3;
+        }],
+        ['round_lapsed', (h, b) => {
+          round(h, b).status = 'expired';
+        }],
+        ['window', (h, b) => {
+          h.setNow(Date.parse(b.startAt) + 45 * MIN + 15 * MIN);
+        }],
+        ['arms', (h, b) => {
+          h.db.booking(b.id)!.ticket_arms = 5;
+        }],
+      ];
+      for (const [name, setUp] of cases) {
+        const h = world();
+        const b = await booked(h, 'in_call_session', { sessionStatus: 'failed' });
+        settle(h, b, 'provider_error', false);
+        candidateIn(h, b);
+        setUp(h, b);
+        expect(await ended(h, b), name).toEqual(done('processed', 'failed_bot_fatal'));
+        expect(steps(h), name).toEqual(['recall:get', 'recall:leave', 'db:transition:failed', 'db:set_bot:release']);
+        expect(h.db.booking(b.id), name).toMatchObject({ status: 'failed', reason: 'bot_fatal', recall_bot_id: null });
+      }
+    });
+
+    it('the round has all its counted attempts (an earlier attempt counted): completed', async () => {
+      const h = world();
+      const b = await booked(h, 'in_call_session', { sessionStatus: 'completed' });
+      settle(h, b, 'complete', false);
+      candidateIn(h, b);
+      round(h, b).attempts_counted = round(h, b).attempts_allowed;
+      expect(await ended(h, b)).toEqual(done('processed', 'completed'));
+      expect(h.db.booking(b.id)).toMatchObject({ status: 'completed', reason: 'attempt_settled', recall_bot_id: null });
+    });
+
+    it('the bot already left the call: the arm finds it ended, so the booking fails no_show', async () => {
+      const h = world();
+      const b = await booked(h, 'in_call_session', { sessionStatus: 'failed' });
+      settle(h, b, 'provider_error', false);
+      candidateIn(h, b);
+      h.recall.setStatus(b.botId, 'call_ended');
+      expect(await ended(h, b)).toEqual(done('processed', 'failed_no_show'));
+      expect(recallOps(h)).toEqual(['get', 'get']);
+      expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'no_show', recall_bot_id: null });
+    });
+
+    it('a second job for the same ended session while the re-arm is out: left to its bridge check, then re-armed', async () => {
+      const h = world();
+      const b = await booked(h, 'in_call_session', { sessionStatus: 'failed' });
+      settle(h, b, 'provider_error', false);
+      candidateIn(h, b);
+      expect(await ended(h, b)).toEqual(done('processed', 'rearmed'));
+      reset(h);
+      // Maintenance (a fresh job) within the re-arm's bridge-check horizon: nothing.
+      h.advance(200 * SEC);
+      expect(await ended(h, b)).toEqual(done('ignored', 'rearm_pending'));
+      expect(h.requests).toEqual([]);
+      // Past the horizon nothing claimed it: one more arm (still bounded by the five).
+      h.advance(46 * SEC);
+      expect(await ended(h, b)).toEqual(done('processed', 'rearmed'));
+      expect(h.db.booking(b.id)).toMatchObject({ status: 'in_call', ticket_arms: 3 });
+    });
+
+    it('a re-run of the same job (its output_media deferred) re-arms once the arm is 20 s old', async () => {
+      const h = world();
+      const b = await booked(h, 'in_call_session', { sessionStatus: 'failed' });
+      settle(h, b, 'provider_error', false);
+      candidateIn(h, b);
+      for (let i = 0; i < 4; i += 1) h.intercept('output_media', { status: 503 });
+      expect(await ended(h, b)).toMatchObject({ outcome: 'defer', code: 'r1_meet_recall_unavailable', delaySeconds: 20 });
+      expect(h.sleeps).toEqual([2 * SEC, 4 * SEC, 8 * SEC]);
+      expect(h.db.booking(b.id)).toMatchObject({ status: 'in_call', ticket_arms: 2 });
+      const rerun = (): R1MeetJobMeta => h.meta({ deferCount: 1, deferredAt: iso(h.now()) });
+      // The in-run retries took 14 s; 5 s more is still inside the 20 s.
+      h.advance(5 * SEC);
+      expect(await ended(h, b, rerun())).toEqual(done('ignored', 'rearm_pending'));
+      h.advance(SEC);
+      expect(await ended(h, b, rerun())).toEqual(done('processed', 'rearmed'));
+      expect(h.db.booking(b.id)).toMatchObject({ ticket_arms: 3 });
+    });
+
+    describe('not settled yet', () => {
+      it('waits for the worker outcome (30 s, at most 4 times); an outcome that lands meanwhile decides', async () => {
+        const h = world();
+        const b = await booked(h, 'in_call_session', { sessionStatus: 'failed' });
+        candidateIn(h, b);
+        expect(await ended(h, b)).toEqual(deferred('outcome_pending', 30));
+        expect(await ended(h, b, h.meta({ deferCount: 3, deferredAt: iso(h.now()) }))).toEqual(deferred('outcome_pending', 30));
+        // A row with no outcome is not settled either.
+        const attempt = settle(h, b, null, false);
+        expect(await ended(h, b, h.meta({ deferCount: 1, deferredAt: iso(h.now()) }))).toEqual(deferred('outcome_pending', 30));
+        expect(h.requests).toEqual([]);
+        Object.assign(attempt, { outcome: 'complete', counted: true });
+        expect(await ended(h, b, h.meta({ deferCount: 2, deferredAt: iso(h.now()) }))).toEqual(done('processed', 'completed'));
+      });
+
+      it.each([
+        ['completed', 'processed', 'completed', 'completed'],
+        ['failed', 'processed', 'rearmed', 'in_call'],
+        ['expired', 'processed', 'rearmed', 'in_call'],
+        ['in_progress', 'ignored', 'session_live', 'in_call'],
+      ] as const)('after the waits, a session that is %s decides', async (sessionStatus, receipt, code, status) => {
+        const h = world();
+        const b = await booked(h, 'in_call_session', { sessionStatus });
+        candidateIn(h, b);
+        expect(await ended(h, b, h.meta({ deferCount: 4, deferredAt: iso(h.now()) }))).toEqual(done(receipt, code));
+        expect(h.db.booking(b.id)).toMatchObject({ status });
+      });
+    });
+  });
+
+  describe('kill points (plan 2.5, outcome: GET -> leave | completed | release)', () => {
+    it('after the leave (its answer lost): the re-run finds the bot ended and completes', async () => {
+      const h = world();
+      const b = await booked(h, 'in_call_session');
+      settle(h, b);
+      h.intercept('leave', 'lost');
+      expect(await ended(h, b)).toMatchObject({ outcome: 'defer' });
+      expect(await ended(h, b, h.meta({ deferCount: 1, deferredAt: iso(h.now()) }))).toEqual(done('processed', 'completed'));
+      expect(recallOps(h)).toEqual(['get', 'leave', 'get']);
+      expect(h.db.booking(b.id)).toMatchObject({ status: 'completed', recall_bot_id: null });
+    });
+
+    it('after the move (its answer lost): the re-run finishes the release', async () => {
+      const h = world();
+      const b = await booked(h, 'in_call_session');
+      settle(h, b);
+      h.db.failNext('r1_meet_transition_booking', 'lost');
+      await expect(ended(h, b)).rejects.toThrow('r1_meet_db_error');
+      expect(h.db.booking(b.id)).toMatchObject({ status: 'completed', recall_bot_id: b.botId });
+      expect(await ended(h, b, h.meta({ attempts: 2 }))).toEqual(done('processed', 'released_ended'));
+      expect(h.db.booking(b.id)).toMatchObject({ status: 'completed', recall_bot_id: null });
+    });
+
+    it('after the release mark (its answer lost): the re-run is a no-op', async () => {
+      const h = world();
+      const b = await booked(h, 'in_call_session');
+      settle(h, b);
+      h.db.failNext('r1_meet_set_bot', 'lost');
+      await expect(ended(h, b)).rejects.toThrow('r1_meet_db_error');
+      reset(h);
+      expect(await ended(h, b, h.meta({ attempts: 2 }))).toEqual(done('ignored', 'booking_terminal'));
+      expect(h.requests).toEqual([]);
+      expect(h.db.booking(b.id)).toMatchObject({ status: 'completed', recall_bot_id: null });
+    });
+  });
+});
+
+// ── decideBridgeCheck (D-S06-27) ────────────────────────────────────────────
+
+describe('decideBridgeCheck (D-S06-27)', () => {
+  const NOW = Date.parse('2030-01-01T10:00:00.000Z');
+  const BOT = '7f000000-0000-4000-8000-0000000000aa';
+  type BookingFacts = NonNullable<R1MeetBridgeCheckFacts['booking']>;
+  const facts = (booking: Partial<BookingFacts> = {}, rest: Partial<R1MeetBridgeCheckFacts> = {}): R1MeetBridgeCheckFacts => ({
+    booking: {
+      status: 'human_present',
+      version: 2,
+      recallBotId: BOT,
+      ticketArms: 1,
+      ticketNotBefore: iso(NOW - 10 * MIN),
+      ticketClaimedAt: null,
+      sessionId: null,
+      endAt: iso(NOW + 30 * MIN),
+      ...booking,
+    },
+    check: { version: 2, arm: 1 },
+    sessionStatus: null,
+    armedAtMs: NOW - 45 * SEC,
+    nowMs: NOW,
+    ...rest,
+  });
+  const SESSION = '7f000000-0000-4000-8000-0000000000bb';
+
+  it('done: no booking, another generation, another arm, no live bot', () => {
+    expect(decideBridgeCheck(facts({}, { booking: null }))).toEqual({ action: 'done', code: 'booking_gone' });
+    expect(decideBridgeCheck(facts({ version: 3 }))).toEqual({ action: 'done', code: 'generation_changed' });
+    expect(decideBridgeCheck(facts({ ticketArms: 2 }))).toEqual({ action: 'done', code: 'superseded' });
+    for (const status of ['completed', 'cancelled', 'failed', 'drained', 'pending', 'blocked', 'unmatched_application', 'unmapped_scheduler'] as const) {
+      expect(decideBridgeCheck(facts({ status })), status).toEqual({ action: 'done', code: 'booking_not_live' });
+    }
+    expect(decideBridgeCheck(facts({ recallBotId: null }))).toEqual({ action: 'done', code: 'booking_not_live' });
+  });
+
+  it('done: the window closed (end + 15 min), not a millisecond before', () => {
+    const end = NOW + 30 * MIN;
+    const at = (nowMs: number) => decideBridgeCheck(facts({}, { nowMs, armedAtMs: nowMs - 300 * SEC }));
+    expect(at(end + 15 * MIN)).toEqual({ action: 'done', code: 'window_closed' });
+    expect(at(end + 15 * MIN - 1)).toEqual({ action: 'rearm', code: 'unclaimed' });
+  });
+
+  it('done: the bound session is in progress, or ended', () => {
+    const claimed = { ticketClaimedAt: iso(NOW - 600 * SEC), sessionId: SESSION, status: 'in_call' as const };
+    expect(decideBridgeCheck(facts(claimed, { sessionStatus: 'in_progress' }))).toEqual({ action: 'done', code: 'session_in_progress' });
+    for (const status of ['completed', 'failed', 'cancelled', 'expired'] as const) {
+      expect(decideBridgeCheck(facts(claimed, { sessionStatus: status })), status).toEqual({ action: 'done', code: 'session_ended' });
+    }
+    // An in-progress session after a re-arm (ticket unclaimed again) is still done.
+    expect(decideBridgeCheck(facts({ ...claimed, ticketClaimedAt: null }, { sessionStatus: 'in_progress' }))).toEqual({
+      action: 'done',
+      code: 'session_in_progress',
+    });
+  });
+
+  it('an ended session with an UNCLAIMED ticket (a re-arm after it ended) follows the unclaimed rule (S06-R1)', () => {
+    const rearmed = { ticketClaimedAt: null, sessionId: SESSION, status: 'in_call' as const, ticketArms: 2 };
+    for (const status of ['completed', 'failed', 'cancelled', 'expired'] as const) {
+      expect(decideBridgeCheck(facts(rearmed, { sessionStatus: status, check: { version: 2, arm: 2 } })), status).toEqual({
+        action: 'recheck',
+        code: 'unclaimed',
+        delaySeconds: 155,
+      });
+      expect(
+        decideBridgeCheck(facts(rearmed, { sessionStatus: status, check: { version: 2, arm: 2 }, armedAtMs: NOW - 200 * SEC })),
+        status,
+      ).toEqual({ action: 'rearm', code: 'unclaimed' });
+    }
+    expect(
+      decideBridgeCheck(facts({ ...rearmed, ticketArms: 5 }, { sessionStatus: 'failed', check: { version: 2, arm: 5 }, armedAtMs: NOW - 200 * SEC })),
+    ).toEqual({ action: 'give_up', code: 'arms_exhausted' });
+  });
+
+  it('unclaimed: rearm at 200 s after the arm, recheck before (landing on the threshold)', () => {
+    expect(decideBridgeCheck(facts())).toEqual({ action: 'recheck', code: 'unclaimed', delaySeconds: 155 });
+    expect(decideBridgeCheck(facts({}, { armedAtMs: NOW - 199_001 }))).toEqual({ action: 'recheck', code: 'unclaimed', delaySeconds: 1 });
+    expect(decideBridgeCheck(facts({}, { armedAtMs: NOW - 200 * SEC }))).toEqual({ action: 'rearm', code: 'unclaimed' });
+    // The page cannot claim before the window opens: counted from the opening when that is later.
+    expect(decideBridgeCheck(facts({ ticketNotBefore: iso(NOW - 100 * SEC) }, { armedAtMs: NOW - 300 * SEC }))).toEqual({
+      action: 'recheck',
+      code: 'unclaimed',
+      delaySeconds: 100,
+    });
+  });
+
+  it('claimed with no session: rearm at 45 s after the claim', () => {
+    const claimedAt = (ms: number) => facts({ status: 'in_call', ticketClaimedAt: iso(NOW - ms) });
+    expect(decideBridgeCheck(claimedAt(44 * SEC))).toEqual({ action: 'recheck', code: 'claimed_no_session', delaySeconds: 1 });
+    expect(decideBridgeCheck(claimedAt(10 * SEC))).toEqual({ action: 'recheck', code: 'claimed_no_session', delaySeconds: 35 });
+    expect(decideBridgeCheck(claimedAt(45 * SEC))).toEqual({ action: 'rearm', code: 'claimed_no_session' });
+    // A bound session whose row is gone counts as no session.
+    expect(decideBridgeCheck(facts({ status: 'in_call', ticketClaimedAt: iso(NOW - 45 * SEC), sessionId: SESSION }))).toEqual({
+      action: 'rearm',
+      code: 'claimed_no_session',
+    });
+  });
+
+  it('claimed with a session still created / waiting: rearm at 200 s after the claim', () => {
+    for (const status of ['created', 'waiting'] as const) {
+      const at = (ms: number) => facts({ status: 'in_call', ticketClaimedAt: iso(NOW - ms), sessionId: SESSION }, { sessionStatus: status });
+      expect(decideBridgeCheck(at(199 * SEC)), status).toEqual({ action: 'recheck', code: 'session_not_started', delaySeconds: 1 });
+      expect(decideBridgeCheck(at(200 * SEC)), status).toEqual({ action: 'rearm', code: 'session_not_started' });
+    }
+  });
+
+  it('five arms spent: a rearm becomes a give-up; a recheck stays a recheck', () => {
+    expect(decideBridgeCheck(facts({ ticketArms: 5 }, { check: { version: 2, arm: 5 }, armedAtMs: NOW - 200 * SEC }))).toEqual({
+      action: 'give_up',
+      code: 'arms_exhausted',
+    });
+    expect(decideBridgeCheck(facts({ ticketArms: 4 }, { check: { version: 2, arm: 4 }, armedAtMs: NOW - 200 * SEC }))).toEqual({
+      action: 'rearm',
+      code: 'unclaimed',
+    });
+    expect(decideBridgeCheck(facts({ ticketArms: 5 }, { check: { version: 2, arm: 5 } }))).toEqual({
+      action: 'recheck',
+      code: 'unclaimed',
+      delaySeconds: 155,
+    });
+  });
+
+  it('a clock value that is not a number counts as now, never as long ago', () => {
+    expect(decideBridgeCheck(facts({ ticketNotBefore: null }, { armedAtMs: Number.NaN }))).toEqual({
+      action: 'recheck',
+      code: 'unclaimed',
+      delaySeconds: 200,
+    });
+  });
+});
+
+// ── bridge_check: the handler (D-S06-27) ────────────────────────────────────
+
+describe('bridge_check: recheck, rearm and give-up', () => {
+  const payloadOf = (b: Booked, arm: number, version = 0) => ({ kind: 'bridge_check', booking_id: b.id, version, arm });
+  const check = (h: R1MeetHarness, b: Booked, arm: number, meta: R1MeetJobMeta) =>
+    runJob(h, r1MeetBridgeCheckDefinition, payloadOf(b, arm), meta);
+
+  /** Human present and armed (arm 1) at `armedAt`. */
+  async function armed(h: R1MeetHarness): Promise<{ b: Booked; armedAt: number }> {
+    const b = await booked(h, 'bot_joining');
+    const armedAt = h.now();
+    expect(await deliver(h, b, 'bot.in_call_recording')).toEqual(done('processed', 'armed'));
+    reset(h);
+    return { b, armedAt };
+  }
+
+  it('at 45 s an unclaimed ticket is rechecked at the 200 s mark', async () => {
+    const h = world();
+    const { b, armedAt } = await armed(h);
+    h.advance(45 * SEC);
+    expect(await check(h, b, 1, metaAt(armedAt))).toEqual(deferred('bridge_recheck', 155));
+    expect(h.requests).toEqual([]);
+    expect(h.hot).toContain(h.now() + 5 * MIN);
+  });
+
+  it('the recheck bound: at most 10 rechecks', async () => {
+    const h = world();
+    const { b, armedAt } = await armed(h);
+    h.advance(45 * SEC);
+    expect(await check(h, b, 1, metaAt(armedAt, { deferCount: 10, deferredAt: iso(armedAt) }))).toEqual(
+      done('ignored', 'recheck_limit'),
+    );
+  });
+
+  it('unclaimed for 200 s: a fresh ticket is armed and posted, with its own check', async () => {
+    const h = world();
+    const { b, armedAt } = await armed(h);
+    h.advance(200 * SEC);
+    expect(await check(h, b, 1, metaAt(armedAt, { deferCount: 1, deferredAt: iso(armedAt + 45 * SEC) }))).toEqual(
+      done('processed', 'armed'),
+    );
+    expect(steps(h)).toEqual(['recall:get', 'db:arm_ticket', 'queue:bridge_check', 'recall:output_media']);
+    expect(h.db.booking(b.id)).toMatchObject({ ticket_arms: 2, ticket_digest: digestOf(lastTicket(h)) });
+    expect(h.db.jobs('bridge_check').map((job) => job.payload.arm)).toEqual([1, 2]);
+    expectNoPii(h, lastTicket(h));
+  });
+
+  it('claimed with no session for 45 s: re-armed, the claim reset, still in the call', async () => {
+    const h = world();
+    const b = await booked(h, 'in_call');
+    const claimedAt = h.now();
+    h.advance(45 * SEC);
+    expect(await check(h, b, 1, metaAt(claimedAt - SEC))).toEqual(done('processed', 'armed'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'in_call', ticket_arms: 2, ticket_claimed_at: null });
+  });
+
+  it('a newer arm or the session in progress: done, nothing sent', async () => {
+    const h = world();
+    const { b, armedAt } = await armed(h);
+    h.advance(200 * SEC);
+    expect(await check(h, b, 1, metaAt(armedAt))).toEqual(done('processed', 'armed'));
+    reset(h);
+    expect(await check(h, b, 1, metaAt(armedAt))).toEqual(done('ignored', 'superseded'));
+    expect(await runJob(h, r1MeetBridgeCheckDefinition, payloadOf(b, 2, 1), metaAt(armedAt))).toEqual(
+      done('ignored', 'generation_changed'),
+    );
+    const s = await booked(h, 'in_call_session');
+    h.advance(10 * MIN);
+    expect(await check(h, s, 1, metaAt(h.now() - 10 * MIN))).toEqual(done('ignored', 'session_in_progress'));
+    expect(h.requests).toEqual([]);
+  });
+
+  it('claimed, and its session ended (before it ran): done, and that session goes to attempt_ended at once', async () => {
+    const h = world();
+    const b = await booked(h, 'in_call_session', { sessionStatus: 'expired' });
+    h.advance(45 * SEC);
+    expect(await check(h, b, 1, metaAt(h.now() - 45 * SEC))).toEqual(done('ignored', 'session_ended'));
+    expect(h.requests).toEqual([]);
+    expect(h.db.jobs('attempt_ended')).toEqual([
+      expect.objectContaining({
+        payload: { kind: 'attempt_ended', booking_id: b.id, session_id: b.sessionId },
+        dedup_key: `r1-meet:attempt-ended:${b.sessionId}`,
+      }),
+    ]);
+    // The outcome route queues the same key: still one job.
+    expect(await check(h, b, 1, metaAt(h.now() - 45 * SEC))).toEqual(done('ignored', 'session_ended'));
+    expect(h.db.jobs('attempt_ended')).toHaveLength(1);
+  });
+
+  /** Spend all five arms (human present), the last one unclaimed or claimed. */
+  async function exhausted(h: R1MeetHarness, claim: boolean): Promise<{ b: Booked; armedAt: number }> {
+    const { b } = await armed(h);
+    for (let arm = 2; arm <= 5; arm += 1) {
+      h.advance(30 * SEC);
+      expect(await armBridge(h.deps, (await h.db.store.getBooking(b.id))!, h.meta())).toMatchObject({ code: 'armed' });
+    }
+    const armedAt = h.now();
+    if (claim) expect((await h.db.claimTicket(lastTicket(h), iso(h.now()), BRIDGE_SOURCE)).data).toMatchObject({ status: 'ok' });
+    expect(h.db.booking(b.id)).toMatchObject({ ticket_arms: 5 });
+    reset(h);
+    return { b, armedAt };
+  }
+
+  it('five arms spent, still unclaimed: give up, leave, failed/bot_fatal, release', async () => {
+    const h = world();
+    const { b, armedAt } = await exhausted(h, false);
+    h.advance(200 * SEC);
+    expect(await check(h, b, 5, metaAt(armedAt))).toEqual(done('processed', 'bridge_gave_up'));
+    expect(h.logs).toContainEqual({ level: 'error', meta: { error_category: 'r1_meet_bridge_gave_up', error_type: 'arms_exhausted' } });
+    expect(steps(h)).toEqual(['recall:get', 'recall:leave', 'db:transition:failed', 'db:set_bot:release']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'bot_fatal', recall_bot_id: null });
+  });
+
+  it('five arms spent, claimed with no session: give up from in_call as failed/admission_refused', async () => {
+    const h = world();
+    const { b, armedAt } = await exhausted(h, true);
+    h.advance(45 * SEC);
+    expect(await check(h, b, 5, metaAt(armedAt))).toEqual(done('processed', 'bridge_gave_up'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'admission_refused', recall_bot_id: null });
+  });
+
+  it('kill point: a give-up whose release mark failed is finished by its re-run', async () => {
+    const h = world();
+    const { b, armedAt } = await exhausted(h, false);
+    h.advance(200 * SEC);
+    h.db.failNext('r1_meet_set_bot');
+    await expect(check(h, b, 5, metaAt(armedAt))).rejects.toThrow('r1_meet_db_error');
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', recall_bot_id: b.botId });
+    reset(h);
+    expect(await check(h, b, 5, metaAt(armedAt, { attempts: 2 }))).toEqual(done('processed', 'released_ended'));
+    expect(recallOps(h)).toEqual(['get']);
+    expect(h.db.booking(b.id)).toMatchObject({ recall_bot_id: null });
+  });
+});
+
+// ── Kill points of the arm (plan 2.5) ───────────────────────────────────────
+
+describe('kill points of the arm (transition | GET | arm | enqueue check | output_media)', () => {
+  /** After every kill point the page Recall shows carries the ticket the booking holds, unclaimed. */
+  function expectRecoverable(h: R1MeetHarness, b: Booked): void {
+    const row = h.db.booking(b.id)!;
+    expect(row).toMatchObject({ status: 'human_present', ticket_claimed_at: null });
+    expect(row.ticket_digest).toBe(digestOf(lastTicket(h)));
+    expect(h.recall.bots.get(b.botId)!.outputMedia).toBe('webpage');
+    // The check of the current arm exists (a crash never leaves an arm unwatched).
+    expect(h.db.jobs('bridge_check').map((job) => job.payload.arm)).toContain(row.ticket_arms);
+  }
+
+  async function killed(fail: (h: R1MeetHarness) => R1MeetFlowDeps | void, expectThrow: boolean) {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    const payload = event(h, b, 'bot.in_call_recording');
+    const deps = fail(h) ?? h.deps;
+    const first = runJob(h, r1MeetRecallEventDefinition, payload, h.meta(), deps);
+    if (expectThrow) await expect(first).rejects.toThrow();
+    else expect(await first).toMatchObject({ outcome: 'defer' });
+    h.advance(60 * SEC);
+    expect(await run(h, payload, h.meta({ attempts: 2, deferCount: expectThrow ? 0 : 1, deferredAt: iso(h.now()) }))).toEqual(
+      done('processed', 'armed'),
+    );
+    expectRecoverable(h, b);
+    return { h, b };
+  }
+
+  it('after the transition', async () => {
+    const { h } = await killed((w) => w.db.failNext('r1_meet_transition_booking', 'lost'), true);
+    expect(outputMedia(h)).toHaveLength(1);
+  });
+
+  it('after the GET (the arm never wrote)', async () => {
+    const { h } = await killed((w) => w.db.failNext('r1_meet_arm_ticket'), true);
+    expect(outputMedia(h)).toHaveLength(1);
+    expect(h.db.tables.r1_meet_bookings[0]).toMatchObject({ ticket_arms: 1 });
+  });
+
+  it('after the arm', async () => {
+    const { h } = await killed((w) => w.db.failNext('r1_meet_arm_ticket', 'lost'), true);
+    expect(outputMedia(h)).toHaveLength(1);
+  });
+
+  it('after the bridge check was queued', async () => {
+    const { h } = await killed((w) => {
+      let killedOnce = false;
+      return {
+        ...w.deps,
+        enqueue: async (spec, options) => {
+          await w.deps.enqueue(spec, options);
+          if (spec.payload.kind === 'bridge_check' && !killedOnce) {
+            killedOnce = true;
+            throw new Error('killed');
+          }
+        },
+      };
+    }, true);
+    expect(outputMedia(h)).toHaveLength(1);
+    expect(h.db.jobs('bridge_check').map((job) => job.payload.arm)).toEqual([1, 2]);
+  });
+
+  it('after output_media (two answers lost): the in-run retry posts the same page a third time, no new arm', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    h.intercept('output_media', 'lost');
+    h.intercept('output_media', 'lost');
+    expect(await deliver(h, b, 'bot.in_call_recording')).toEqual(done('processed', 'armed'));
+    expect(outputMedia(h)).toHaveLength(3);
+    expect(new Set(outputMedia(h).map(pageUrlOf)).size).toBe(1);
+    expect(h.sleeps).toEqual([2 * SEC, 4 * SEC]);
+    expect(h.db.booking(b.id)).toMatchObject({ ticket_arms: 1 });
+    expectRecoverable(h, b);
+  });
+
+  it('after output_media (every in-run answer lost): the re-run posts a fresh page', async () => {
+    const { h } = await killed((w) => {
+      for (let i = 0; i < 4; i += 1) w.intercept('output_media', 'lost');
+    }, false);
+    // Four lost posts of arm 1 (the in-run retries), then the re-run's post of arm 2.
+    expect(outputMedia(h)).toHaveLength(5);
+    expect(new Set(outputMedia(h).slice(0, 4).map(pageUrlOf)).size).toBe(1);
+    expect(pageUrlOf(outputMedia(h)[4]!)).not.toBe(pageUrlOf(outputMedia(h)[0]!));
+  });
+
+  it('a Recall outage of about five minutes at the human-present arm: five arms are enough (S06-R4)', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    const outageEndsAt = h.now() + 5 * MIN;
+    // Recall answers output_media 503 until the outage ends; everything else works.
+    const down = (): boolean => h.now() < outageEndsAt;
+    for (let i = 0; i < 200; i += 1) {
+      h.intercept((_req, op) => op === 'output_media' && down(), { status: 503 });
+    }
+    const payload = event(h, b, 'bot.in_call_recording');
+    let meta = h.meta();
+    let result = await run(h, payload, meta);
+    let deferrals = 0;
+    while (result.outcome === 'defer') {
+      deferrals += 1;
+      h.advance(result.delaySeconds * SEC);
+      meta = h.meta({ attempts: 1, deferCount: deferrals, deferredAt: iso(h.now()) });
+      result = await run(h, payload, meta);
+    }
+    expect(result).toEqual(done('processed', 'armed'));
+    const row = h.db.booking(b.id)!;
+    expect(row.ticket_arms).toBeLessThanOrEqual(5);
+    expect(row.ticket_digest).toBe(digestOf(lastTicket(h)));
+    expect(h.alerts()).toEqual([]);
+  });
+});
+
+// ── Hot-window hints (D-S06-3) ──────────────────────────────────────────────
+
+describe('hot-window hints (D-S06-3)', () => {
+  it('every event of a live booking: 5 minutes; a booking joining: until 15 minutes after its start', async () => {
+    const h = world();
+    const b = await booked(h);
+    await deliver(h, b, 'bot.joining_call');
+    expect(h.hot).toContain(h.now() + 5 * MIN);
+    expect(h.hot).toContain(Date.parse(b.startAt) + 15 * MIN);
+    reset(h);
+    h.advance(30 * SEC);
+    await deliver(h, b, 'bot.in_waiting_room');
+    expect(h.hot).toEqual([h.now() + 5 * MIN, Date.parse(b.startAt) + 15 * MIN]);
+    reset(h);
+    await deliver(h, b, 'participant_events.join');
+    expect(h.hot).toEqual([h.now() + 5 * MIN, Date.parse(b.startAt) + 15 * MIN]);
+    reset(h);
+    await deliver(h, b, 'participant_events.leave');
+    expect(h.hot).toEqual([h.now() + 5 * MIN]);
+  });
+
+  it('no hint for a terminal booking, a stray or a bot that is not ours', async () => {
+    const h = world();
+    const b = await booked(h, 'failed_owed');
+    await deliver(h, b, 'bot.joining_call');
+    await deliver(h, { id: fixtureId(), botId: fixtureId() }, 'bot.joining_call');
+    await deliver(h, { id: fixtureId(), botId: fixtureId() }, 'bot.joining_call', { bookingId: null });
+    expect(h.hot).toEqual([]);
+  });
+
+  it('flows without a lane (no hint port) work the same', async () => {
+    const h = world();
+    const b = await booked(h);
+    const deps: R1MeetFlowDeps = { ...h.deps };
+    delete (deps as { hotUntil?: unknown }).hotUntil;
+    expect('hotUntil' in deps).toBe(false);
+    expect(await runJob(h, r1MeetRecallEventDefinition, event(h, b, 'bot.joining_call'), h.meta(), deps)).toEqual(
+      done('processed', 'bot_joining'),
+    );
+  });
+});
+
+// ── No PII anywhere (D-S06-33) ──────────────────────────────────────────────
+
+describe('no PII in logs, payloads or errors', () => {
+  it('a whole call: join, arm, a second human, the policy, our own leave, the release', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_scheduled');
+    await deliver(h, b, 'bot.joining_call');
+    await deliver(h, b, 'participant_events.join', { participantId: 1 });
+    const ticket = lastTicket(h);
+    await deliver(h, b, 'participant_events.join', { participantId: 2 });
+    h.advance(120 * SEC);
+    await runJob(h, r1MeetMultiHumanCheckDefinition, { kind: 'multi_human_check', booking_id: b.id, version: 0 });
+    await deliver(h, b, 'bot.call_ended', { subCode: 'bot_received_leave_call' }, h.meta({ deferCount: 1, deferredAt: iso(h.now()) }));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'multiple_humans', recall_bot_id: null });
+    expectNoPii(h, ticket, digestOf(ticket));
+    // Every job S06 wrote here carries ids, kinds, counters and times only.
+    for (const job of h.db.tables.job_queue) {
+      if (job.payload.kind === 'recall_event') continue;
+      for (const value of Object.values(job.payload as Row)) expect(['string', 'number']).toContain(typeof value);
+    }
+  });
+
+  it('thrown errors carry a closed code and nothing else', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    h.db.failNext('r1_meet_transition_booking');
+    const error = await deliver(h, b, 'bot.in_call_recording').catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe('r1_meet_db_error');
+  });
+});

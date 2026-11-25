@@ -7,11 +7,19 @@
  * here the route's contract is pinned: worker authentication, strict payload
  * validation, the stable response codes the worker logs against, and that it
  * is never gated on R1 switches.
+ *
+ * M034 S06: on `ok` or `duplicate` the route also queues the Meet bot's leave
+ * (`notifyR1MeetAttemptEnded`, fire-and-forget). With Meet off it reads nothing
+ * (every test above runs with the Meet flag unset); with Meet on it makes one
+ * booking lookup and queues one `attempt_ended` job 5 s later, and nothing it
+ * does can change the route's answer.
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import express from 'express';
 import request from 'supertest';
+import { FAKE_RECALL_API_KEY } from './support/recall-fake.js';
+import { createR1MeetFakeDb, type R1MeetFakeDb } from './support/r1-meet-fake-db.js';
 
 const mocks = vi.hoisted(() => ({ rpc: vi.fn(), from: vi.fn() }));
 vi.mock('../lib/supabase.js', () => ({
@@ -159,5 +167,152 @@ describe('POST /api/internal/r1/attempt-outcome', () => {
     expect(response.status).toBe(201);
     expect(mocks.from).not.toHaveBeenCalled();
     expect(mocks.rpc.mock.calls[0]![1]).toEqual({ p_session_id: ATTEMPT, p_outcome: 'complete' });
+  });
+});
+
+describe('M034 S06: the Meet bot leaves after a settled attempt (dark)', () => {
+  interface Inserted {
+    name: string;
+    payload: Record<string, unknown>;
+    dedup_key: string;
+    max_attempts: number;
+    scheduled_at: string;
+    created_at: string;
+  }
+  let fake: R1MeetFakeDb;
+  let inserted: Inserted[];
+  let insertFails: boolean;
+  let warnings: string[];
+
+  function meetOn(): void {
+    vi.stubEnv('R1_MEET_ENABLED', 'true');
+    vi.stubEnv('RECALL_API_KEY', FAKE_RECALL_API_KEY);
+    // Built at run time: never a secret-shaped literal.
+    vi.stubEnv('RECALL_WEBHOOK_SECRET', 'whsec' + '_' + Buffer.alloc(32, 7).toString('base64'));
+    vi.stubEnv('R1_MEET_ASHBY_DEX_USER_ID', '7f000000-0000-4000-8000-0000000000d1');
+    vi.stubEnv('WEB_ORIGIN', 'https://hello.example.test');
+  }
+
+  /** A Meet booking in a call, bound to the attempt's session. */
+  function meetBooking(): string {
+    const round = fake.addRound();
+    const row = fake.seedBooking({
+      status: 'in_call',
+      reason: 'eligible',
+      round_id: round.id,
+      recall_bot_id: '7f000000-0000-4000-8000-0000000000a1',
+      session_id: ATTEMPT,
+    });
+    return row.id as string;
+  }
+
+  beforeEach(() => {
+    fake = createR1MeetFakeDb();
+    inserted = [];
+    insertFails = false;
+    warnings = [];
+    vi.spyOn(console, 'warn').mockImplementation((line: unknown) => {
+      warnings.push(String(line));
+    });
+    mocks.from.mockImplementation((table: string) => {
+      if (table !== 'job_queue') return fake.client.from(table);
+      return {
+        insert: (row: Inserted) => ({
+          select: () => ({
+            single: async () => {
+              if (insertFails) return { data: null, error: { code: 'XX000', message: 'down' } };
+              inserted.push(row);
+              return { data: { id: 'job-1', status: 'pending', priority: 0, attempts: 0, ...row }, error: null };
+            },
+          }),
+        }),
+      };
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  it('Meet off: ok and duplicate read no table at all', async () => {
+    meetBooking();
+    expect((await send({ attempt_id: ATTEMPT, outcome: 'complete' })).status).toBe(201);
+    mocks.rpc.mockResolvedValue({ data: { status: 'duplicate', counted: true }, error: null });
+    expect((await send({ attempt_id: ATTEMPT, outcome: 'complete' })).status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(mocks.from).not.toHaveBeenCalled();
+    expect(fake.calls).toEqual([]);
+  });
+
+  it.each([
+    ['ok', 201],
+    ['duplicate', 200],
+  ])('Meet on, settled %s: one lookup, one attempt_ended job 5 s later, ids only', async (status, http) => {
+    meetOn();
+    const bookingId = meetBooking();
+    mocks.rpc.mockResolvedValue({ data: { status, counted: true }, error: null });
+    const response = await send({ attempt_id: ATTEMPT, outcome: 'complete' });
+    expect(response.status).toBe(http);
+    await vi.waitFor(() => expect(inserted).toHaveLength(1));
+    const [job] = inserted;
+    expect(job!.name).toBe('r1-meet');
+    expect(job!.payload).toEqual({ kind: 'attempt_ended', booking_id: bookingId, session_id: ATTEMPT });
+    expect(job!.dedup_key).toBe(`r1-meet:attempt-ended:${ATTEMPT}`);
+    expect(job!.max_attempts).toBe(10);
+    const delay = Date.parse(job!.scheduled_at) - Date.parse(job!.created_at);
+    expect(delay).toBeGreaterThan(4000);
+    expect(delay).toBeLessThanOrEqual(5000);
+    expect(fake.calls.filter((call) => call.kind === 'from').map((call) => call.name)).toEqual(['r1_meet_bookings']);
+    expect(warnings).toEqual([]);
+  });
+
+  it('Meet on, a browser session: the lookup only, nothing queued', async () => {
+    meetOn();
+    const response = await send({ attempt_id: ATTEMPT, outcome: 'complete' });
+    expect(response.status).toBe(201);
+    await vi.waitFor(() => expect(fake.calls).toHaveLength(1));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(inserted).toEqual([]);
+    expect(mocks.from.mock.calls.map((call) => call[0])).toEqual(['r1_meet_bookings']);
+  });
+
+  it('a failed lookup or enqueue never changes the answer: one closed warning, no id', async () => {
+    meetOn();
+    meetBooking();
+    fake.failNext('r1_meet_bookings');
+    const first = await send({ attempt_id: ATTEMPT, outcome: 'complete' });
+    expect(first.status).toBe(201);
+    expect(first.body).toEqual({ ok: true, counted: true, duplicate: false });
+    await vi.waitFor(() => expect(warnings).toHaveLength(1));
+
+    insertFails = true;
+    const second = await send({ attempt_id: ATTEMPT, outcome: 'complete' });
+    expect(second.status).toBe(201);
+    await vi.waitFor(() => expect(warnings).toHaveLength(2));
+    for (const line of warnings) {
+      expect(JSON.parse(line)).toMatchObject({ level: 'warn', component: 'r1-meet', error_category: 'r1_meet_attempt_ended_enqueue_failed' });
+      expect(line).not.toContain(ATTEMPT);
+    }
+    expect(inserted).toEqual([]);
+  });
+
+  it('a refused, unknown or failed settlement queues nothing and reads nothing', async () => {
+    meetOn();
+    meetBooking();
+    for (const [data, http] of [
+      [{ status: 'outcome_conflict' }, 409],
+      [{ status: 'session_not_settled' }, 409],
+      [{ status: 'attempt_not_found' }, 404],
+      [{ status: 'invalid_outcome' }, 400],
+      [null, 503],
+    ] as const) {
+      mocks.rpc.mockResolvedValueOnce({ data, error: null });
+      expect((await send({ attempt_id: ATTEMPT, outcome: 'complete' })).status).toBe(http);
+    }
+    expect((await send({ attempt_id: 'not-a-uuid', outcome: 'complete' })).status).toBe(400);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(mocks.from).not.toHaveBeenCalled();
+    expect(inserted).toEqual([]);
   });
 });

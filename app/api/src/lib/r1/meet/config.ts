@@ -21,8 +21,24 @@
  *
  * Check order when the flag is "true" (the first failure is the reason): the knobs
  * (R1_MEET_DAILY_BOT_CAP, R1_MEET_BOT_NAME, R1_MEET_GOOGLE_LOGIN_GROUP_ID, R1_MEET_SERVICE_USER_ID,
- * RECALL_BASE_URL), then the first WEB_ORIGIN entry, then the three required values present (in
- * `R1_MEET_REQUIRED_VARIABLES` order), then each of them well formed in the same order.
+ * RECALL_BASE_URL, R1_MEET_ARM_AT_CREATE, R1_MEET_MULTI_HUMAN_POLICY), then the first WEB_ORIGIN
+ * entry, then the three required values present (in `R1_MEET_REQUIRED_VARIABLES` order), then each
+ * of them well formed in the same order.
+ *
+ * The two runtime switches (M034 S06) exist because only a live call can settle them, and each must
+ * be reversible without a deploy:
+ *   R1_MEET_ARM_AT_CREATE       blank or "false" = the bridge page is opened when a human joins;
+ *                               "true" = it is armed when the bot is created (critic B2).
+ *   R1_MEET_MULTI_HUMAN_POLICY  blank or "observe" = a second human in the call is only logged;
+ *                               "end" = it ends the call (critic C4). The default stays `observe`
+ *                               until the live spike shows whether Recall reports the bot's own join
+ *                               and whether HR must stay to admit the candidate (PR #444 review
+ *                               S06-R3): with either, `end` would cut every interview at 2 minutes.
+ *
+ * The drain (M034 S06) must be able to remove bots AFTER the flag was turned off, so it cannot use
+ * the enabled configuration: `getR1MeetDrainConfig` reads the Recall key and base URL and nothing
+ * else, and `r1MeetDrainAllowed` says yes only for `disabled`. A typo (`invalid`) never drains: it
+ * would cancel every booked interview.
  *
  * `R1_MEET_SERVICE_USER_ID` is optional. Blank = no fallback: a booking whose Ashby scheduler is not
  * one of our staff users gets no round and no bot. Set = that staff user owns such rounds
@@ -64,6 +80,11 @@ export const R1_MEET_DAILY_BOT_CAP_MIN = 1;
 export const R1_MEET_DAILY_BOT_CAP_MAX = 200;
 export const R1_MEET_BOT_NAME_MAX_LENGTH = 100;
 
+/** What a second human in the Meet does: end the call, or only be logged. Frozen. */
+export const R1_MEET_MULTI_HUMAN_POLICIES = Object.freeze(['end', 'observe'] as const);
+export type R1MeetMultiHumanPolicy = (typeof R1_MEET_MULTI_HUMAN_POLICIES)[number];
+export const R1_MEET_MULTI_HUMAN_POLICY_DEFAULT: R1MeetMultiHumanPolicy = 'observe';
+
 /** The Ashby user id of "Dex (AI Interviewer)": required, but not a credential. */
 const R1_MEET_DEX_USER_VARIABLE = 'R1_MEET_ASHBY_DEX_USER_ID';
 
@@ -78,6 +99,8 @@ export const R1_MEET_ENV_VARIABLES = [
   'R1_MEET_GOOGLE_LOGIN_GROUP_ID',
   'R1_MEET_SERVICE_USER_ID',
   'RECALL_BASE_URL',
+  'R1_MEET_ARM_AT_CREATE',
+  'R1_MEET_MULTI_HUMAN_POLICY',
   R1_MEET_DEX_USER_VARIABLE,
   'RECALL_API_KEY',
   'RECALL_WEBHOOK_SECRET',
@@ -143,9 +166,22 @@ export type R1MeetConfig =
       /** Overrides the objective profile's bot display name; null = use the profile's. */
       readonly botNameOverride: string | null;
       readonly dailyBotCap: number;
+      /** Arm the bridge page when the bot is created, instead of when a human joins. */
+      readonly armAtCreate: boolean;
+      readonly multiHumanPolicy: R1MeetMultiHumanPolicy;
       readonly bridgePageUrl: string;
       readonly recallRealtimeWebhookUrl: string;
     };
+
+/** What the drain needs to remove bots while Meet is off. `apiKey` is NON-ENUMERABLE, as above. */
+export interface R1MeetDrainRecallSettings {
+  readonly baseUrl: string;
+  readonly apiKey: string;
+}
+
+export type R1MeetDrainConfig =
+  | { readonly available: false }
+  | { readonly available: true; readonly recall: R1MeetDrainRecallSettings };
 
 // Every reason is one of a small set of fixed strings, so remembering them all is bounded and means
 // each problem is logged once per process however often the config is re-read.
@@ -217,6 +253,23 @@ function parseServiceUserId(raw: unknown): string | null | undefined {
   return R1_MEET_REFUSED_SERVICE_USER_IDS.has(id) ? undefined : id;
 }
 
+/** `undefined` = invalid. Blank is false: the same strict spelling as the flag itself. */
+function parseArmAtCreate(raw: unknown): boolean | undefined {
+  if (!present(raw) || raw === 'false') return false;
+  return raw === 'true' ? true : undefined;
+}
+
+/** `undefined` = invalid. */
+function parseMultiHumanPolicy(raw: unknown): R1MeetMultiHumanPolicy | undefined {
+  if (!present(raw)) return R1_MEET_MULTI_HUMAN_POLICY_DEFAULT;
+  return R1_MEET_MULTI_HUMAN_POLICIES.find((policy) => policy === raw);
+}
+
+/** The Recall origin: blank = the default region; null = malformed. */
+function parseBaseUrl(raw: unknown): string | null {
+  return present(raw) ? normalizeRecallBaseUrl(raw) : RECALL_DEFAULT_BASE_URL;
+}
+
 /**
  * The first WEB_ORIGIN entry as a canonical https origin, or null. Same selection as the R1 join
  * link (`routes/r1.ts`): split on ',', take the first entry, drop trailing '/'. The entry must then
@@ -272,6 +325,8 @@ function readProcessEnv(): R1MeetEnvSource {
     R1_MEET_GOOGLE_LOGIN_GROUP_ID: process.env.R1_MEET_GOOGLE_LOGIN_GROUP_ID,
     R1_MEET_SERVICE_USER_ID: process.env.R1_MEET_SERVICE_USER_ID,
     RECALL_BASE_URL: process.env.RECALL_BASE_URL,
+    R1_MEET_ARM_AT_CREATE: process.env.R1_MEET_ARM_AT_CREATE,
+    R1_MEET_MULTI_HUMAN_POLICY: process.env.R1_MEET_MULTI_HUMAN_POLICY,
     R1_MEET_ASHBY_DEX_USER_ID: process.env.R1_MEET_ASHBY_DEX_USER_ID,
     RECALL_API_KEY: process.env.RECALL_API_KEY,
     RECALL_WEBHOOK_SECRET: process.env.RECALL_WEBHOOK_SECRET,
@@ -310,11 +365,14 @@ export function getR1MeetConfig(source?: R1MeetEnvSource): R1MeetConfig {
     if (serviceUserId === undefined) {
       return invalid('R1_MEET_SERVICE_USER_ID must be the UUID of a real staff user (not the nil or system-actor id)');
     }
-    const rawBaseUrl: unknown = env.RECALL_BASE_URL;
-    const baseUrl = present(rawBaseUrl) ? normalizeRecallBaseUrl(rawBaseUrl) : RECALL_DEFAULT_BASE_URL;
+    const baseUrl = parseBaseUrl(env.RECALL_BASE_URL);
     if (baseUrl === null) {
       return invalid('RECALL_BASE_URL must be an https origin on a <region>.recall.ai host, with no path, port or query');
     }
+    const armAtCreate = parseArmAtCreate(env.R1_MEET_ARM_AT_CREATE);
+    if (armAtCreate === undefined) return invalid('R1_MEET_ARM_AT_CREATE must be either "true" or "false"');
+    const multiHumanPolicy = parseMultiHumanPolicy(env.R1_MEET_MULTI_HUMAN_POLICY);
+    if (multiHumanPolicy === undefined) return invalid('R1_MEET_MULTI_HUMAN_POLICY must be "end" or "observe"');
 
     const origin = firstHttpsWebOrigin(env.WEB_ORIGIN);
     if (origin === null) {
@@ -344,6 +402,8 @@ export function getR1MeetConfig(source?: R1MeetEnvSource): R1MeetConfig {
       serviceUserId,
       botNameOverride,
       dailyBotCap,
+      armAtCreate,
+      multiHumanPolicy,
       bridgePageUrl: `${origin}${R1_MEET_BRIDGE_PAGE_PATH}`,
       recallRealtimeWebhookUrl: `${origin}${R1_MEET_RECALL_REALTIME_PATH}`,
     });
@@ -356,6 +416,43 @@ export function getR1MeetConfig(source?: R1MeetEnvSource): R1MeetConfig {
 /** Meet work may run only when R1 itself is on AND the Meet configuration is enabled. */
 export function r1MeetActive(r1: { readonly enabled: boolean }, meet: R1MeetConfig): boolean {
   return r1.enabled === true && meet.enabled === true;
+}
+
+const DRAIN_UNAVAILABLE: R1MeetDrainConfig = Object.freeze({ available: false as const });
+
+/**
+ * What the drain needs to remove bots from Recall, whatever the flag says (M034 S06). Reads only
+ * RECALL_API_KEY and RECALL_BASE_URL. Silent and NEVER throws: an absent, placeholder or malformed
+ * key (or base URL) simply means there is nothing this process could drain with. It grants nothing
+ * by itself: see `r1MeetDrainAllowed`.
+ */
+export function getR1MeetDrainConfig(
+  source?: Pick<R1MeetEnvSource, 'RECALL_API_KEY' | 'RECALL_BASE_URL'>,
+): R1MeetDrainConfig {
+  try {
+    const env = source ?? {
+      RECALL_API_KEY: process.env.RECALL_API_KEY,
+      RECALL_BASE_URL: process.env.RECALL_BASE_URL,
+    };
+    const apiKey: unknown = env.RECALL_API_KEY;
+    if (!isSet('RECALL_API_KEY', apiKey) || !isRecallApiKeyShaped(apiKey)) return DRAIN_UNAVAILABLE;
+    const baseUrl = parseBaseUrl(env.RECALL_BASE_URL);
+    if (baseUrl === null) return DRAIN_UNAVAILABLE;
+    return Object.freeze({
+      available: true as const,
+      recall: withHiddenCredentials({ baseUrl }, { apiKey }) as R1MeetDrainRecallSettings,
+    });
+  } catch {
+    return DRAIN_UNAVAILABLE;
+  }
+}
+
+/**
+ * The flag-off backstop may drain only when Meet was deliberately turned OFF. `invalid` is a typo or
+ * a lost secret, and a drained booking is terminal, so it must never cancel every booked interview.
+ */
+export function r1MeetDrainAllowed(meet: R1MeetConfig): boolean {
+  return meet.status === 'disabled';
 }
 
 /** Health/metadata view: status and reason only, never a credential, URL or knob value. */

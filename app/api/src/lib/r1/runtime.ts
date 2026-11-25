@@ -57,6 +57,14 @@
  *                  row whose room still has a live worker job is spared (the pass asks the R1
  *                  SFU's dispatch list; see `orphan-lapse.ts`). A failure of one half never
  *                  skips the other.
+ *
+ * ── R1 OVER GOOGLE MEET (M034 S06, DARK) ──────────────────────────────
+ * No fifth loop and no new queue by default (critic C8). The `r1-meet` lane (`./meet/runtime.ts`) is
+ * built ONLY when R1 and `R1_MEET_ENABLED` are both on; then `queues` gains `r1-meet`, the lane's own
+ * runner is ticked by the `r1-storage` loop (kept at its base cadence while a Meet call is live), and
+ * the `r1-sweep` loop queues one Meet maintenance job per bucket. With the Meet flag deliberately off
+ * and a Recall key still set, the same `r1-sweep` tick (here, or in the standalone storage runtime)
+ * runs the bounded drain backstop that removes any bot left behind. Never configured: nothing at all.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -87,6 +95,14 @@ import {
 import { R1_RECORDING_ERASE_QUEUE, R1_RECORDING_FINALIZE_QUEUE, R1_SWEEP_QUEUE } from './recording/queues.js';
 import { getR1RecordingStore } from './recording/store-factory.js';
 import type { R1ObjectStore } from './recording/store.js';
+import { getR1MeetConfig, getR1MeetDrainConfig, type R1MeetConfig, type R1MeetDrainConfig } from './meet/config.js';
+import {
+  createR1MeetLane,
+  createR1MeetSweepTick,
+  withR1MeetStorageTick,
+  type R1MeetLane,
+  type R1MeetRecall,
+} from './meet/runtime.js';
 import { agentDispatchClientFor, browserLiveKitEndpoint } from '../livekit-endpoints.js';
 import type { DispatchListerLike } from './worker-gate.js';
 import { recordR1ScoringFailure, type R1AssessmentOptions } from '../../services/r1-assessment.js';
@@ -131,6 +147,8 @@ export interface R1RuntimeSnapshot {
   readonly jobEvents: Readonly<Record<string, number>>;
   /** The recording lane's queue events, kept apart from `jobEvents` (scoring). */
   readonly storageJobEvents: Readonly<Record<string, number>>;
+  /** The `r1-meet` lane's queue events (empty while the lane is off). */
+  readonly meetJobEvents: Readonly<Record<string, number>>;
 }
 
 /**
@@ -168,6 +186,10 @@ export interface R1RuntimeOptions {
     readonly clearTimer?: (handle: unknown) => void;
     readonly now?: () => number;
   };
+  /** M034 S06 test seams; production reads the Meet variables at call time and builds its own client. */
+  readonly meetConfig?: () => R1MeetConfig;
+  readonly meetDrainConfig?: () => R1MeetDrainConfig;
+  readonly meetRecall?: R1MeetRecall;
 }
 
 export interface R1RuntimeHandle {
@@ -175,6 +197,8 @@ export interface R1RuntimeHandle {
   readonly runner: QueueRunnerHandle;
   /** The recording lane's runner (`r1-storage`). */
   readonly storageRunner: QueueRunnerHandle;
+  /** The `r1-meet` lane (M034 S06), or null unless R1 and Meet are both on. */
+  readonly meetLane: R1MeetLane | null;
   readonly queue: Queue;
   /** The queue names this runtime claims from. */
   readonly queues: readonly string[];
@@ -285,6 +309,26 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
   const storageRunner = lane.runner;
   const sweepEnqueueTick = lane.sweepEnqueueTick;
 
+  // M034 S06 (dark): null unless R1 AND Meet are on, so with the shipped defaults this adds nothing.
+  const meetConfig = options.meetConfig ?? ((): R1MeetConfig => getR1MeetConfig());
+  const meetLane = createR1MeetLane({
+    r1Config: () => options.config ?? getR1Config(),
+    meetConfig,
+    client,
+    queue,
+    owner,
+    now: () => clock().getTime(),
+    ...(options.meetRecall === undefined ? {} : { recall: options.meetRecall }),
+  });
+  const meetSweepTick = createR1MeetSweepTick({
+    lane: meetLane,
+    meetConfig,
+    drainConfig: options.meetDrainConfig ?? ((): R1MeetDrainConfig => getR1MeetDrainConfig()),
+    client,
+    now: () => clock().getTime(),
+    ...(options.meetRecall === undefined ? {} : { recall: options.meetRecall }),
+  });
+
   const sweepPendingRejects = async (): Promise<boolean> => {
     try {
       const { data, error } = await client.rpc('r1_apply_due_pending_rejects', {
@@ -348,9 +392,18 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
       {
         name: 'r1-storage',
         intervalMs: loopIntervalsMs['r1-storage'],
-        tick: queueRunnerTick(storageRunner),
+        tick: withR1MeetStorageTick(meetLane, queueRunnerTick(storageRunner), () => clock().getTime()),
       },
-      { name: 'r1-sweep', intervalMs: loopIntervalsMs['r1-sweep'], tick: sweepEnqueueTick },
+      {
+        name: 'r1-sweep',
+        intervalMs: loopIntervalsMs['r1-sweep'],
+        // Both halves every tick: neither may starve the other.
+        tick: async () => {
+          const swept = await sweepEnqueueTick();
+          const meet = await meetSweepTick();
+          return swept || meet;
+        },
+      },
     ],
   });
 
@@ -358,8 +411,9 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
     scheduler,
     runner,
     storageRunner,
+    meetLane,
     queue,
-    queues: R1_RUNTIME_QUEUES,
+    queues: meetLane === null ? R1_RUNTIME_QUEUES : Object.freeze([...R1_RUNTIME_QUEUES, ...meetLane.queues]),
     assessmentConcurrency,
     loopIntervalsMs,
     snapshot: () => ({
@@ -369,17 +423,21 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
       orphanLapseErrors,
       jobEvents: { ...jobEvents },
       storageJobEvents: { ...storageJobEvents },
+      meetJobEvents: meetLane === null ? {} : meetLane.events(),
     }),
     async tickAll(): Promise<void> {
       await runner.tick();
       await sweepEnqueueTick();
+      await meetSweepTick();
       await storageRunner.tick();
+      if (meetLane !== null) await meetLane.tick();
       await statusTick();
     },
     async stop(): Promise<void> {
       await scheduler.stop();
       await runner.stop();
       await storageRunner.stop();
+      if (meetLane !== null) await meetLane.stop();
     },
   };
 }
@@ -519,6 +577,10 @@ export interface R1StorageRuntimeOptions {
   readonly recordingStore?: (config: EnabledRecordingConfig) => R1ObjectStore;
   readonly now?: () => Date;
   readonly scheduler?: R1RuntimeOptions['scheduler'];
+  /** M034 S06 test seams of the Meet drain backstop; production reads the Meet variables at call time. */
+  readonly meetConfig?: () => R1MeetConfig;
+  readonly meetDrainConfig?: () => R1MeetDrainConfig;
+  readonly meetRecall?: R1MeetRecall;
 }
 
 export interface R1StorageRuntimeSnapshot {
@@ -573,6 +635,16 @@ export function createR1StorageRuntime(options: R1StorageRuntimeOptions = {}): R
     recordingStore: options.recordingStore ?? getR1RecordingStore,
     events: storageJobEvents,
   });
+  // M034 S06: with R1 off there is never a Meet lane, only the drain backstop of a deliberately
+  // disabled Meet flag (a bot left behind must still be removed). No Recall key: it does nothing.
+  const meetSweepTick = createR1MeetSweepTick({
+    lane: null,
+    meetConfig: options.meetConfig ?? ((): R1MeetConfig => getR1MeetConfig()),
+    drainConfig: options.meetDrainConfig ?? ((): R1MeetDrainConfig => getR1MeetDrainConfig()),
+    client,
+    now: () => clock().getTime(),
+    ...(options.meetRecall === undefined ? {} : { recall: options.meetRecall }),
+  });
   const loopIntervalsMs = {
     'r1-storage': R1_RUNTIME_BOUNDS.storagePollMs,
     'r1-sweep': R1_RUNTIME_BOUNDS.sweepPollMs,
@@ -582,7 +654,15 @@ export function createR1StorageRuntime(options: R1StorageRuntimeOptions = {}): R
     metricPrefix: 'r1',
     loops: [
       { name: 'r1-storage', intervalMs: loopIntervalsMs['r1-storage'], tick: queueRunnerTick(lane.runner) },
-      { name: 'r1-sweep', intervalMs: loopIntervalsMs['r1-sweep'], tick: lane.sweepEnqueueTick },
+      {
+        name: 'r1-sweep',
+        intervalMs: loopIntervalsMs['r1-sweep'],
+        tick: async () => {
+          const swept = await lane.sweepEnqueueTick();
+          const meet = await meetSweepTick();
+          return swept || meet;
+        },
+      },
     ],
   });
   logger.info('unknown_event', { error_category: 'r1_storage_runtime_standalone' });
@@ -596,6 +676,7 @@ export function createR1StorageRuntime(options: R1StorageRuntimeOptions = {}): R
     snapshot: () => ({ storageJobEvents: { ...storageJobEvents } }),
     async tickAll(): Promise<void> {
       await lane.sweepEnqueueTick();
+      await meetSweepTick();
       await lane.runner.tick();
     },
     async stop(): Promise<void> {

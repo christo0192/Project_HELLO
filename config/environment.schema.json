@@ -48,6 +48,8 @@
         "R1_MEET_GOOGLE_LOGIN_GROUP_ID": { "requiredInProduction": false, "secret": false },
         "R1_MEET_SERVICE_USER_ID": { "requiredInProduction": false, "secret": false },
         "RECALL_BASE_URL": { "requiredInProduction": false, "secret": false },
+        "R1_MEET_ARM_AT_CREATE": { "requiredInProduction": false, "secret": false },
+        "R1_MEET_MULTI_HUMAN_POLICY": { "requiredInProduction": false, "secret": false },
         "R1_MEET_ASHBY_DEX_USER_ID": { "requiredInProduction": false, "secret": false },
         "RECALL_API_KEY": { "requiredInProduction": false, "secret": true },
         "RECALL_WEBHOOK_SECRET": { "requiredInProduction": false, "secret": true },
