@@ -45,10 +45,10 @@
  *      (30 s), both bounded, then throw `r1_meet_feedback_ashby_rate_limited` / `_unavailable`. A
  *      permanent 4xx or `success:false` alerts `r1_meet_feedback_rejected` and is terminal
  *      (`ashby_rejected`, or `ashby_rejected_after_retry` when an earlier run of the job may have
- *      reached this submit, `r1MeetFeedbackSubmitMayHaveRun`: the card may already be in Ashby and the
- *      tenant refused the update); the client's own request validation is terminal
- *      `ashby_request_invalid`. Anything that is not an Ashby error is rethrown (the dispatcher makes it
- *      `r1_meet_unexpected_error`).
+ *      reached this submit or the queue cannot tell, `r1MeetFeedbackSubmitMayHaveRun`: the card may
+ *      already be in Ashby and the tenant refused the update); the client's own request validation
+ *      is terminal `ashby_request_invalid`. Anything that is not an Ashby error is rethrown (the
+ *      dispatcher makes it `r1_meet_unexpected_error`).
  * A terminal fault leaves the receipt `failed`, so the runbook's re-post can send it again after the fix.
  *
  * LOGS (D-S09-13). Closed words, counts and an HTTP status only: never an id, a form, section or field
@@ -76,6 +76,9 @@ import {
 } from './feedback-store.js';
 import {
   R1MeetJobError,
+  R1_MEET_DB_ERROR,
+  R1_MEET_MALFORMED_PAYLOAD,
+  R1_MEET_UNKNOWN_KIND,
   canDeferR1MeetJob,
   parseScorecardFeedbackJob,
   r1MeetDefer,
@@ -128,37 +131,64 @@ export interface R1MeetFeedbackDeps {
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const LIVE: ReadonlySet<string> = new Set(R1_MEET_LIVE_STATUSES);
+const UNWIRED = 'r1_meet_feedback_unwired';
 
-/** The deferrals a run answers once it reached the submit (step 12). */
-const SUBMIT_DEFERRALS: ReadonlySet<string> = new Set(['ashby_rate_limited', 'ashby_unavailable']);
-/** The closed codes a run throws when its wait BEFORE the submit passed the deferral bound (steps 4, 10). */
-const PRE_SUBMIT_THROWS: ReadonlySet<string> = new Set([
+/**
+ * The outcomes a run can only reach BEFORE any submit, as the queue keeps them: the job's own waits
+ * (steps 4 and 10) and the codes thrown when those waits pass the bound; the dispatcher's
+ * `r1_meet_inactive` deferral (no handler ran; a literal here, because `dispatcher.ts` imports this
+ * module); and the throws that cannot follow a submit that may have landed: `r1_meet_db_error` (the
+ * settle after a success only warns, and the terminal settle follows a refusal, which posts nothing),
+ * `r1_meet_feedback_unwired`, `r1_meet_unknown_kind`, `r1_meet_malformed_payload`. NOT here, because
+ * they may follow a submit that landed: the submit's own waits and throws (`ashby_rate_limited`,
+ * `ashby_unavailable`, `r1_meet_feedback_ashby_*`) and `r1_meet_unexpected_error`.
+ */
+const PRE_SUBMIT_OUTCOMES: ReadonlySet<string> = new Set([
+  'booking_not_settled',
+  'form_unavailable',
+  'r1_meet_inactive',
   'r1_meet_feedback_booking_not_settled',
   'r1_meet_feedback_form_unavailable',
+  R1_MEET_DB_ERROR,
+  UNWIRED,
+  R1_MEET_UNKNOWN_KIND,
+  R1_MEET_MALFORMED_PAYLOAD,
 ]);
 
 /**
- * May an earlier run of this job have reached Ashby's submit (so the card may already be there)? From
- * the previous run's outcome as the queue keeps it (`R1MeetJobMeta.lastDeferReason`, `.lastError`):
- *  - it deferred on the submit (`ashby_rate_limited`, `ashby_unavailable`): yes;
- *  - otherwise only a run that threw or ended without an outcome (a lost lease) is left, because a
- *    deferral refunds its attempt: `attempts > 1`. Yes, unless the code it threw is one of the waits
- *    before the submit (`r1_meet_feedback_booking_not_settled`, `_form_unavailable`).
- * A job that only waited for its booking or the form (`booking_not_settled`, `form_unavailable`,
- * Meet inactive) answers no, so its first rejection reads `ashby_rejected`. Pure.
- * The one blind spot: reclaiming a lost lease keeps the queue's previous `error_message`, so a run
- * that reached the submit and then lost its lease right AFTER a pre-submit throw reads as that throw
- * (no). It only picks the label of a terminal outcome; the receipt is `failed` either way.
+ * May an earlier run of this job have reached Ashby's submit, so the card may already be there? Pure;
+ * it only picks the label of a terminal refusal (`ashby_rejected_after_retry` or `ashby_rejected`),
+ * and the receipt ends `failed` either way.
+ *
+ * The queue keeps only the PREVIOUS run's outcome (`defer_job` and `fail_job` overwrite each other's
+ * fields; a lost lease leaves both as they were), but it counts every earlier run exactly: a deferral
+ * refunds its attempt and adds to `defer_count`, a throw or a lost lease keeps its attempt, so the
+ * job's earlier runs are `(attempts - 1) + deferCount`. Hence:
+ *  1. no earlier run: no;
+ *  2. every earlier run was a deferral (`attempts === 1`, so nothing threw and no lease was lost) and
+ *     the last one found the booking still live (`booking_not_settled`): no. A completed booking is
+ *     never revived (0142 §3, §10, §14), so every earlier run also found it not completed, and the
+ *     submit needs a completed booking;
+ *  3. more than one earlier run otherwise: yes, because what came before the previous run is
+ *     unknown (a submit that Ashby could not answer, then a form read that failed, keeps only the
+ *     form's code);
+ *  4. exactly one earlier run: its outcome is the one the queue kept. Yes, unless it is one of
+ *     `PRE_SUBMIT_OUTCOMES`; a run that left no outcome (a lost lease) is yes.
+ * A re-post (a new job) or a replayed dead letter (a new row) starts a new history and reads as a first
+ * run: the runbook tells the operator to look for the card first after one of those.
  */
 export function r1MeetFeedbackSubmitMayHaveRun(
-  meta: Pick<R1MeetJobMeta, 'attempts' | 'lastDeferReason' | 'lastError'>,
+  meta: Pick<R1MeetJobMeta, 'attempts' | 'deferCount' | 'lastDeferReason' | 'lastError'>,
 ): boolean {
-  if (meta.lastDeferReason !== null && SUBMIT_DEFERRALS.has(meta.lastDeferReason)) return true;
-  if (meta.attempts <= 1) return false;
-  return meta.lastError === null || !PRE_SUBMIT_THROWS.has(meta.lastError);
+  const kept = Math.max(0, meta.attempts - 1);
+  const earlierRuns = kept + Math.max(0, meta.deferCount);
+  if (earlierRuns === 0) return false;
+  if (kept === 0 && meta.lastDeferReason === 'booking_not_settled') return false;
+  if (earlierRuns > 1) return true;
+  const previous = meta.lastDeferReason ?? meta.lastError;
+  return previous === null || !PRE_SUBMIT_OUTCOMES.has(previous);
 }
 
-const UNWIRED = 'r1_meet_feedback_unwired';
 const SUBMITTED_LOG = 'r1_meet_feedback_submitted';
 const SETTLE_FAILED_LOG = 'r1_meet_feedback_receipt_settle_failed';
 

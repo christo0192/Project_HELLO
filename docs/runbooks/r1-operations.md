@@ -4266,7 +4266,7 @@ receipt is `failed`.
 |---|---|---|
 | `r1_meet_feedback_config_invalid` | `error_type` `feedback_config_invalid`: `R1_MEET_ASHBY_FEEDBACK_FORM_ID` is not a UUID; or `ashby_key_missing`: no usable `ASHBY_API_KEY`. That interview's receipt is `failed` | Fix the value or set the key, then re-post (below) |
 | `r1_meet_feedback_form_invalid` | The Dex form cannot take the card (`error_type`): `form_unreadable` (Ashby 4xx on the form read, with `http_status`: a wrong id, or the key lacks `hiringProcessMetadataRead`), `form_mismatch`, `form_archived`, `form_overall_missing`, `form_overall_options_mismatch`, `form_summary_missing`, `form_summary_ambiguous`, `form_required_field_unbound`. Receipt `failed` | Fix the form in Ashby (setup above), then re-post |
-| `r1_meet_feedback_rejected` | Ashby refused the submit: a 4xx other than 429, or `success:false` (`error_type` `<category>[:<Ashby code>]`, `http_status`); the job ends `ashby_rejected`, or `ashby_rejected_after_retry` when an earlier run of the job may have reached the submit (it waited on a 429 or 5xx submit, threw past that wait, or ended with no outcome; a wait for the booking to settle or for the form does NOT count): the card may already be in Ashby and the tenant refused the update. The client's own request check ends `ashby_request_invalid`. Receipt `failed` | 401 or 403: the key's permissions (above). `ashby_rejected_after_retry`: look for Dex's card in Ashby first. `ashby_rejected`: no card was posted by this job; read the code, fix, re-post |
+| `r1_meet_feedback_rejected` | Ashby refused the submit: a 4xx other than 429, or `success:false` (`error_type` `<category>[:<Ashby code>]`, `http_status`); the job ends `ashby_rejected_after_retry` when an earlier run of the job may have reached the submit OR the queue cannot tell (the queue keeps only the previous run's outcome: a 429 or 5xx submit, a throw past that wait, a run with no outcome, or more than one earlier run unless they were all waits for the booking to settle), and `ashby_rejected` otherwise (the job's first run; its only earlier run stopped before the submit: a wait for the booking or the form, Meet inactive, a database or build fault; or every earlier run waited for the booking). The client's own request check ends `ashby_request_invalid`. Receipt `failed` | 401 or 403: the key's permissions (above). `ashby_rejected_after_retry`: look for Dex's card in Ashby first; if there is none, treat it as `ashby_rejected`. `ashby_rejected`: no earlier run of THIS job can have posted the card; read the code, fix, re-post. After a re-post or a dead-letter replay (a new job that starts a new history), or when Ashby was failing around that time, look for the card first either way |
 
 Warnings: `r1_meet_feedback_enqueue_failed` (the trigger could not record; the re-drive tries again
 at every bucket for 26 hours), `r1_meet_feedback_redrive_failed` (the next bucket tries again),
@@ -4330,7 +4330,9 @@ Each job runs the full check list again and posts only what may be posted. A suc
 receipt `failed -> processed`; a `processed` receipt is never posted again. A receipt that ended
 `ignored` (for example `feedback_off`, while the form id was blank) is not re-posted by this SQL:
 HR enters such a card by hand from the R1 review page. A dead-lettered feedback job can also be
-replayed with `select screening_v2.replay_dlq_job('<dlq id>');`.
+replayed with `select screening_v2.replay_dlq_job('<dlq id>');`. A re-posted or replayed job starts a
+new queue history, so a refusal on its first run reads `ashby_rejected` even when the earlier job's
+submit may have landed: look for Dex's card in Ashby before you act on such a refusal.
 
 ### Lost trigger: a completed Meet interview with no feedback receipt at all
 

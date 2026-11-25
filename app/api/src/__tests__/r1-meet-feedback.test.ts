@@ -12,7 +12,8 @@
  *     and the receipt `processed`;
  *  4  a permanent 4xx (400, 404, 422) or `success:false` is terminal with an alert, the receipt
  *     `failed`, and `ashby_rejected_after_retry` only when an earlier run may have reached the submit
- *     (S09-R2: a wait for the booking or the form before it does not count);
+ *     or the queue cannot tell (S09-R2: one earlier run that stopped before the submit, or waits for
+ *     the booking alone, do not count; more than one earlier run otherwise does);
  *  5  429 and 5xx defer (60 s, 30 s) within the bound, then throw their closed codes;
  *  6  a missing mapping or setting (off, invalid, no key, every form fault) submits nothing;
  *  7  every off-path guard makes ZERO Ashby calls, a browser round included;
@@ -45,7 +46,12 @@ import {
   type R1MeetJobResult,
   type R1MeetScorecardFeedbackJob,
 } from '../lib/r1/meet/jobs.js';
-import { createR1MeetDispatcher } from '../lib/r1/meet/dispatcher.js';
+import {
+  R1_MEET_INACTIVE,
+  R1_MEET_INACTIVE_DEFER_SEC,
+  createR1MeetDispatcher,
+  type R1MeetDispatcher,
+} from '../lib/r1/meet/dispatcher.js';
 import type { R1MeetFlowDeps } from '../lib/r1/meet/recall-actions.js';
 import { R1_MEET_LIVE_STATUSES, R1_MEET_TERMINAL_STATUSES } from '../lib/r1/meet/runtime-store.js';
 import { FAKE_STATUS_REASONS } from './support/r1-meet-fake-db.js';
@@ -283,13 +289,22 @@ describe('4. a permanent Ashby rejection is terminal', () => {
   });
 
   // S09-R2: `_after_retry` says "the card may already be in Ashby", so it needs an earlier run that may
-  // have reached the submit, not just any earlier run.
+  // have reached the submit, not just any earlier run. The queue keeps only the PREVIOUS run's outcome,
+  // so with more than one earlier run (other than booking waits alone) the history is unknown: yes.
   it.each([
     ['after a rate-limited submit', { deferCount: 1, deferredAt: HARNESS_NOW, lastDeferReason: 'ashby_rate_limited' }],
     ['after a submit Ashby could not answer', { deferCount: 2, deferredAt: HARNESS_NOW, lastDeferReason: 'ashby_unavailable' }],
     ['after a run that threw past the submit bound', { attempts: 2, lastError: 'r1_meet_feedback_ashby_unavailable' }],
     ['after a run that threw something unexpected', { attempts: 2, lastError: 'r1_meet_unexpected_error' }],
     ['after a run that ended with no outcome (a lost lease)', { attempts: 2 }],
+    // S09-R2 round 2: the previous run stopped before the submit, but an earlier one is unknown.
+    ['after two earlier runs, the last a form wait', { deferCount: 2, deferredAt: HARNESS_NOW, lastDeferReason: 'form_unavailable' }],
+    ['after three form waits', { deferCount: 3, deferredAt: HARNESS_NOW, lastDeferReason: 'form_unavailable' }],
+    ['after two earlier runs, the last Meet inactive', { deferCount: 2, deferredAt: HARNESS_NOW, lastDeferReason: 'r1_meet_inactive' }],
+    ['after two earlier runs, the last a database throw', { attempts: 2, deferCount: 1, lastError: 'r1_meet_db_error' }],
+    ['after two throws, the last a database throw', { attempts: 3, lastError: 'r1_meet_db_error' }],
+    // A booking wait proves the history only when nothing threw or lost its lease (`attempts` 1).
+    ['after a booking wait and a throw or lost lease', { attempts: 2, deferCount: 1, deferredAt: HARNESS_NOW, lastDeferReason: 'booking_not_settled' }],
   ] as Array<[string, MetaOver]>)('%s it is ashby_rejected_after_retry (the card may already be in Ashby)', async (_label, over) => {
     const { w, b } = await world();
     w.ashby.next('submit', { status: 403, body: { success: false, errors: ['feedback_edit_disabled'] } });
@@ -302,9 +317,18 @@ describe('4. a permanent Ashby rejection is terminal', () => {
 
   it.each([
     ['after waiting for the booking to settle', { deferCount: 1, deferredAt: HARNESS_NOW, lastDeferReason: 'booking_not_settled' }],
-    ['after waiting for the form', { deferCount: 3, deferredAt: HARNESS_NOW, lastDeferReason: 'form_unavailable' }],
+    // A completed booking is never revived (0142): runs that only deferred, the last on a live
+    // booking, all found it not completed, so none of them reached the submit.
+    ['after four waits, the last for the booking', { deferCount: 4, deferredAt: HARNESS_NOW, lastDeferReason: 'booking_not_settled' }],
+    ['after waiting for the form', { deferCount: 1, deferredAt: HARNESS_NOW, lastDeferReason: 'form_unavailable' }],
+    ['after a run claimed while Meet was inactive', { deferCount: 1, deferredAt: HARNESS_NOW, lastDeferReason: 'r1_meet_inactive' }],
     ['after a throw while the booking was still live', { attempts: 2, lastError: 'r1_meet_feedback_booking_not_settled' }],
     ['after a throw while the form could not be read', { attempts: 2, lastError: 'r1_meet_feedback_form_unavailable' }],
+    // S09-R2 round 2: throws that cannot follow a submit that may have landed.
+    ['after a database throw', { attempts: 2, lastError: 'r1_meet_db_error' }],
+    ['after an unwired build', { attempts: 2, lastError: 'r1_meet_feedback_unwired' }],
+    ['after a build that did not know the kind', { attempts: 2, lastError: 'r1_meet_unknown_kind' }],
+    ['after a payload refusal', { attempts: 2, lastError: 'r1_meet_malformed_payload' }],
   ] as Array<[string, MetaOver]>)('%s, a first submit Ashby refuses is ashby_rejected (no card can be there yet)', async (_label, over) => {
     const { w, b } = await world();
     w.ashby.next('submit', { status: 403, body: { success: false, errors: ['missing_endpoint_permission'] } });
@@ -313,8 +337,11 @@ describe('4. a permanent Ashby rejection is terminal', () => {
     expect(outcome(w, b)).toBe('failed');
   });
 
-  /** The REAL in-memory queue on the world's clock; `pass()` is one runner pass, awaited to its end. */
-  function realQueue(w: R1MeetFeedbackWorld) {
+  /**
+   * The REAL in-memory queue on the world's clock; `pass()` is one runner pass, awaited to its end. The
+   * handler is the world's always-active dispatcher unless a test passes its own.
+   */
+  function realQueue(w: R1MeetFeedbackWorld, dispatcher: R1MeetDispatcher = w.dispatcher) {
     const clock = (): string => new Date(w.h.now()).toISOString();
     const adapter = new MemoryAdapter({ clock });
     const queue = new Queue(adapter, { clock });
@@ -324,7 +351,7 @@ describe('4. a permanent Ashby rejection is terminal', () => {
       async pass(): Promise<void> {
         const runner = createQueueRunner({
           queue,
-          handlers: { [R1_MEET_QUEUE]: (job) => w.dispatcher.handle(job) },
+          handlers: { [R1_MEET_QUEUE]: (job) => dispatcher.handle(job) },
           owner: 'test-meet',
           leaseSeconds: 60,
           pollMs: 5000,
@@ -337,15 +364,17 @@ describe('4. a permanent Ashby rejection is terminal', () => {
     };
   }
 
-  it('through the real queue: a wait for the booking, then a refused first submit, is ashby_rejected', async () => {
+  it('through the real queue: waits for the booking, then a refused first submit, is ashby_rejected', async () => {
     const { w, b } = await world();
     const q = realQueue(w);
-    // Scoring finished while the call was still `in_call`: the job waits (attempt refunded).
+    // Scoring finished while the call was still `in_call`: the job waits (attempt refunded), twice.
     setStatus(w, b.bookingId, 'in_call');
     const queued = await q.queue.enqueue(R1_MEET_QUEUE, b.job!.payload, { maxAttempts: 5 });
     await q.pass();
+    w.h.setNow(w.h.now() + (R1_MEET_FEEDBACK_DEFER.notSettled + 1) * 1000);
+    await q.pass();
     expect(w.ashby.requests).toEqual([]);
-    expect(await q.adapter.getById(queued.id)).toMatchObject({ status: 'delayed', attempts: 0, deferCount: 1, deferReason: 'booking_not_settled' });
+    expect(await q.adapter.getById(queued.id)).toMatchObject({ status: 'delayed', attempts: 0, deferCount: 2, deferReason: 'booking_not_settled' });
 
     // The booking settles; the next run makes the FIRST submit, and Ashby refuses the key's permission.
     setStatus(w, b.bookingId, 'completed');
@@ -353,7 +382,11 @@ describe('4. a permanent Ashby rejection is terminal', () => {
     w.h.setNow(w.h.now() + (R1_MEET_FEEDBACK_DEFER.notSettled + 1) * 1000);
     await q.pass();
     expect(w.ashby.submits()).toHaveLength(1);
-    expect(jobLines(w)).toEqual(['scorecard_feedback:booking_not_settled', 'scorecard_feedback:ashby_rejected']);
+    expect(jobLines(w)).toEqual([
+      'scorecard_feedback:booking_not_settled',
+      'scorecard_feedback:booking_not_settled',
+      'scorecard_feedback:ashby_rejected',
+    ]);
     expect(outcome(w, b)).toBe('failed');
   });
 
@@ -370,6 +403,66 @@ describe('4. a permanent Ashby rejection is terminal', () => {
     await q.pass();
     expect(w.ashby.submits()).toHaveLength(2);
     expect(jobLines(w)).toEqual(['scorecard_feedback:ashby_unavailable', 'scorecard_feedback:ashby_rejected_after_retry']);
+    expect(outcome(w, b)).toBe('failed');
+  });
+
+  // S09-R2 round 2: the queue keeps only the previous run's outcome, so a form wait AFTER a submit Ashby
+  // could not answer must not hide that submit (before this fix it read `ashby_rejected`).
+  it('through the real queue: a submit Ashby could not answer, a failed form read, then a refusal, is ashby_rejected_after_retry', async () => {
+    const { w, b } = await world();
+    const q = realQueue(w);
+    const queued = await q.queue.enqueue(R1_MEET_QUEUE, b.job!.payload, { maxAttempts: 5 });
+    w.ashby.next('submit', { status: 503, body: '' });
+    await q.pass();
+    w.ashby.next('form', { status: 503, body: '' });
+    w.h.setNow(w.h.now() + (R1_MEET_FEEDBACK_DEFER.unavailable + 1) * 1000);
+    await q.pass();
+    expect(await q.adapter.getById(queued.id)).toMatchObject({ status: 'delayed', attempts: 0, deferCount: 2, deferReason: 'form_unavailable' });
+
+    w.ashby.next('submit', { status: 403, body: { success: false, errors: ['feedback_edit_disabled'] } });
+    w.h.setNow(w.h.now() + (R1_MEET_FEEDBACK_DEFER.form + 1) * 1000);
+    await q.pass();
+    expect(w.ashby.submits()).toHaveLength(2);
+    expect(jobLines(w)).toEqual([
+      'scorecard_feedback:ashby_unavailable',
+      'scorecard_feedback:form_unavailable',
+      'scorecard_feedback:ashby_rejected_after_retry',
+    ]);
+    expect(outcome(w, b)).toBe('failed');
+  });
+
+  it('through the real queue: a database throw before any Ashby call, then a refused first submit, is ashby_rejected', async () => {
+    const { w, b } = await world();
+    const q = realQueue(w);
+    const queued = await q.queue.enqueue(R1_MEET_QUEUE, b.job!.payload, { maxAttempts: 5 });
+    w.failNext('assessments');
+    await q.pass();
+    expect(w.ashby.requests).toEqual([]);
+    expect(await q.adapter.getById(queued.id)).toMatchObject({ status: 'delayed', attempts: 1, deferCount: 0, errorMessage: 'r1_meet_db_error' });
+
+    w.ashby.next('submit', { status: 403, body: { success: false, errors: ['missing_endpoint_permission'] } });
+    w.h.setNow(w.h.now() + 61_000);
+    await q.pass();
+    expect(w.ashby.submits()).toHaveLength(1);
+    expect(jobLines(w)).toEqual(['scorecard_feedback:r1_meet_db_error', 'scorecard_feedback:ashby_rejected']);
+    expect(outcome(w, b)).toBe('failed');
+  });
+
+  it('through the real queue: a run claimed while Meet was inactive, then a refused first submit, is ashby_rejected', async () => {
+    const { w, b } = await world();
+    let active = false;
+    const q = realQueue(w, createR1MeetDispatcher({ flowDeps: () => w.deps, active: () => active }));
+    const queued = await q.queue.enqueue(R1_MEET_QUEUE, b.job!.payload, { maxAttempts: 5 });
+    await q.pass();
+    expect(w.ashby.requests).toEqual([]);
+    expect(await q.adapter.getById(queued.id)).toMatchObject({ status: 'delayed', attempts: 0, deferCount: 1, deferReason: R1_MEET_INACTIVE });
+
+    active = true;
+    w.ashby.next('submit', { status: 403, body: { success: false, errors: ['missing_endpoint_permission'] } });
+    w.h.setNow(w.h.now() + (R1_MEET_INACTIVE_DEFER_SEC + 1) * 1000);
+    await q.pass();
+    expect(w.ashby.submits()).toHaveLength(1);
+    expect(jobLines(w)).toEqual([`scorecard_feedback:${R1_MEET_INACTIVE}`, 'scorecard_feedback:ashby_rejected']);
     expect(outcome(w, b)).toBe('failed');
   });
 
