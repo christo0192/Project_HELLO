@@ -1,9 +1,11 @@
 /**
  * The dedicated R1 queue runtime (plan 6.7): off by default, its own handler set, a fail-closed
  * `r1_settings.enabled` claim gate, the final-attempt/DLQ behaviour, and the status loop. The
- * structural half pins that the phone runtime's handler set is untouched (fence 3).
+ * structural half pins that the phone runtime's handler set is untouched (fence 3). M034 S09: the
+ * assessment handler's `onResult` is the Meet scorecard-ready hook; with Meet off scoring makes exactly
+ * the database calls it made before.
  */
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -39,6 +41,10 @@ import {
 } from './support/r1-fake-db.js';
 import { cleanLogRows, interviewRows, modelAnswer } from './support/r1-scorer.js';
 import type { QueueJob } from '../lib/queue/types.js';
+import { getR1MeetConfig, getR1MeetFeedbackConfig } from '../lib/r1/meet/config.js';
+import type { FakeDb } from './support/r1-fake-db.js';
+import { STAFF_USER_ID, WEB_ORIGIN_FIXTURE } from './support/r1-meet-harness.js';
+import { FAKE_RECALL_API_KEY } from './support/recall-fake.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const src = path.resolve(here, '..');
@@ -901,5 +907,113 @@ describe('structural fences (plan 9, fence 3)', () => {
     const migration = readFileSync(path.resolve(here, '../../../supabase/migrations/0116_r1_shared_session_fields.sql'), 'utf8');
     expect(migration).toContain(`'${R1_ASSESSMENT_QUEUE}'`);
     expect(migration).toContain("max_attempts");
+  });
+});
+
+describe('M034 S09: the Meet scorecard-ready hook (the assessment handler onResult)', () => {
+  const FORM_ID = '7f000000-0000-4000-8000-00000000f0a1';
+  /** An enabled Meet config: the webhook secret is built at run time, never a secret-shaped literal. */
+  const MEET_ON = getR1MeetConfig({
+    R1_MEET_ENABLED: 'true',
+    RECALL_API_KEY: FAKE_RECALL_API_KEY,
+    RECALL_WEBHOOK_SECRET: 'whsec' + '_' + Buffer.alloc(32, 7).toString('base64'),
+    R1_MEET_ASHBY_DEX_USER_ID: '7f000000-0000-4000-8000-0000000000d1',
+    R1_MEET_SERVICE_USER_ID: STAFF_USER_ID,
+    WEB_ORIGIN: WEB_ORIGIN_FIXTURE,
+  });
+  const FIXED_NOW = Date.parse('2026-10-06T10:00:00Z');
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  /**
+   * The R1 fake names an inserted row `assessments-<n>`; a real assessment id is a UUID. This client
+   * gives each inserted assessment a UUID, so the hook's id gate is not what stops it.
+   */
+  function withUuidAssessments(db: FakeDb): FakeDb['client'] {
+    let next = 0;
+    const withId = (row: Record<string, unknown>) => ({
+      id: `7f000000-0000-4000-8000-${(0xa000 + (next += 1)).toString(16).padStart(12, '0')}`,
+      ...row,
+    });
+    return {
+      ...db.client,
+      from: (table: string) => {
+        const query = db.client.from(table);
+        if (table === 'assessments') {
+          const insert = query.insert;
+          query.insert = (value: Record<string, unknown> | Array<Record<string, unknown>>) =>
+            insert(Array.isArray(value) ? value.map(withId) : withId(value));
+        }
+        return query;
+      },
+    };
+  }
+
+  async function scoreOne(options: {
+    readonly hook?: (result: unknown) => void;
+    readonly meetOn?: boolean;
+    readonly tickAll?: boolean;
+  }): Promise<FakeDb> {
+    const db = createFakeDb(tablesWithInterview(), happyRpc());
+    const queue = makeQueue();
+    await queue.enqueue(R1_ASSESSMENT_QUEUE, { session_id: SESSION_ID });
+    const infer = vi.fn(async () => modelAnswer(rows, allScores(3)));
+    const runtime = createR1Runtime({
+      config: ENABLED,
+      client: withUuidAssessments(db) as never,
+      queue,
+      infer,
+      now: () => new Date(FIXED_NOW),
+      ...(options.meetOn === true ? { meetConfig: () => MEET_ON } : {}),
+      ...(options.hook === undefined ? {} : { meetScorecardHook: options.hook }),
+    })!;
+    if (options.tickAll === false) await runtime.runner.tick();
+    else await runtime.tickAll();
+    await runtime.runner.stop();
+    if (runtime.meetLane !== null) await runtime.meetLane.stop();
+    // The hook is fire-and-forget: let anything it started settle before the calls are compared.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(db.tables.assessments).toHaveLength(1);
+    return db;
+  }
+
+  it('hands the assessment handler an onResult that calls the seam with the result', async () => {
+    const hook = vi.fn();
+    const db = await scoreOne({ hook });
+    expect(hook).toHaveBeenCalledTimes(1);
+    const result = hook.mock.calls[0]![0] as Record<string, unknown>;
+    expect(result).toMatchObject({ sessionId: SESSION_ID, roundId: ROUND_ID, attach: 'ok', reused: false });
+    expect(result.assessmentId).toBe(db.tables.assessments![0]!.id);
+  });
+
+  it('with the shipped defaults (Meet off) scoring makes exactly the calls a no-op hook makes', async () => {
+    vi.stubEnv('R1_MEET_ENABLED', '');
+    // The feedback setting is ON, so Meet being off is the only thing that keeps the hook silent.
+    vi.stubEnv('R1_MEET_ASHBY_FEEDBACK_FORM_ID', FORM_ID);
+    expect(getR1MeetConfig().status).toBe('disabled');
+    expect(getR1MeetFeedbackConfig().status).toBe('on');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const shipped = await scoreOne({});
+    const noop = await scoreOne({ hook: () => {} });
+    expect(shipped.fromCalls).toEqual(noop.fromCalls);
+    expect(shipped.rpcCalls.map((call) => call.fn)).toEqual(noop.rpcCalls.map((call) => call.fn));
+    for (const table of ['r1_meet_bookings', 'r1_meet_receipts']) expect(shipped.fromCalls).not.toContain(table);
+    expect(shipped.rpcCalls.map((call) => call.fn)).not.toContain('r1_meet_record_receipt');
+    expect(fetchSpy).not.toHaveBeenCalled();
+    fetchSpy.mockRestore();
+  });
+
+  it('control: with Meet on, the shipped hook makes exactly ONE extra read (the booking of the session), and no RPC', async () => {
+    vi.stubEnv('R1_MEET_ASHBY_FEEDBACK_FORM_ID', FORM_ID);
+    expect(MEET_ON.status).toBe('enabled');
+    // The assessment runner alone: the lane's own maintenance would read bookings too.
+    const shipped = await scoreOne({ meetOn: true, tickAll: false });
+    const noop = await scoreOne({ meetOn: true, tickAll: false, hook: () => {} });
+    expect(shipped.fromCalls).toEqual([...noop.fromCalls, 'r1_meet_bookings']);
+    // No booking is bound to this browser session: nothing is recorded.
+    expect(shipped.rpcCalls.map((call) => call.fn)).toEqual(noop.rpcCalls.map((call) => call.fn));
   });
 });

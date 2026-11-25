@@ -29,20 +29,39 @@
  * with the flag off = at most two narrow booking reads per bucket, and no outbound call unless a booking
  * still holds a bot (then only GET, DELETE and leave_call). Nothing is created, armed or queued while off.
  *
+ * DEX'S SCORECARD TO ASHBY (M034 S09, D-S09-12): the lane's flow ports carry `feedback`, the ports of
+ * the `scorecard_feedback` job and of the maintenance re-drive: the form setting
+ * (`getR1MeetFeedbackConfig`, read per job), the feedback store over the same client, the Dex user and
+ * the bridge page of the enabled Meet config, and the Ashby port. The Ashby port is built on the first
+ * job that needs it, from the existing Ashby runtime config (`loadAshbyRuntimeConfig`, the same
+ * `ASHBY_API_KEY` as every other Ashby write; no new secret): no usable key = null (the job alerts
+ * `ashby_key_missing`), and a null is NOT remembered, so a key set later is picked up by the next job.
+ * A built port is kept. The Ashby client it holds makes one attempt per call (the queue retries).
+ *
  * MULTI-MACHINE (D-S06-35): correctness comes from the leases, the RPCs' compare-and-sets and the dedup
  * keys; the hot window and the bucket memory are per process and only shape cadence.
  *
  * Loading this module performs no I/O: the database client, the queue, the clock and the Recall seam
- * are arguments, and the Recall client is built on first use.
+ * are arguments, and the Recall and Ashby clients are built on first use.
  */
 
+import { loadAshbyRuntimeConfig } from '../../../integrations/ashby/config.js';
 import { createRecallClient } from '../../../integrations/recall/client.js';
 import type { Queue } from '../../queue/index.js';
 import { createQueueRunner, type QueueRunnerEvent, type QueueRunnerHandle } from '../../queue/runner.js';
 import type { supabase } from '../../supabase.js';
-import { r1MeetActive, r1MeetDrainAllowed, type R1MeetConfig, type R1MeetDrainConfig } from './config.js';
+import {
+  getR1MeetFeedbackConfig,
+  r1MeetActive,
+  r1MeetDrainAllowed,
+  type R1MeetConfig,
+  type R1MeetDrainConfig,
+} from './config.js';
 import { createR1MeetDispatcher } from './dispatcher.js';
 import { R1_MEET_DRAIN, drainR1Meet, type R1MeetDrainPorts } from './drain.js';
+import type { R1MeetFeedbackDeps } from './feedback.js';
+import { createR1MeetAshbyFeedbackPort, type R1MeetAshbyFeedbackPort } from './feedback-ashby.js';
+import { createR1MeetFeedbackStore } from './feedback-store.js';
 import { R1_MEET_QUEUE, r1MeetJobs, type R1MeetJobSpec } from './jobs.js';
 import {
   R1_MEET_ALERTS,
@@ -95,6 +114,11 @@ export interface R1MeetLaneDeps {
   readonly log?: R1MeetLog;
   /** Test seam (and S09's): production registers `R1_MEET_DEFINITIONS`. */
   readonly definitions?: readonly R1MeetJobDefinition[];
+  /**
+   * Test seam (M034 S09): the ports of Dex's scorecard feedback. Production builds them from the
+   * enabled Meet config, the feedback form setting and the Ashby runtime config (see the header).
+   */
+  readonly feedback?: R1MeetFeedbackDeps;
 }
 
 export interface R1MeetLaneTick {
@@ -119,6 +143,37 @@ export interface R1MeetLane {
   tick(): Promise<R1MeetLaneTick>;
   /** Stop claiming and resolve once the jobs in flight settle. */
   stop(): Promise<void>;
+}
+
+/**
+ * The production ports of Dex's scorecard feedback (M034 S09, see the header). The Ashby port is
+ * built lazily from `loadAshbyRuntimeConfig()`: null while no usable key is configured (not
+ * remembered, so a key set later counts at the next job), kept once built.
+ */
+export function createR1MeetFeedbackPorts(
+  client: Db,
+  meet: Extract<R1MeetConfig, { readonly enabled: true }>,
+  log: R1MeetLog,
+): R1MeetFeedbackDeps {
+  let port: R1MeetAshbyFeedbackPort | null = null;
+  return Object.freeze({
+    config: () => getR1MeetFeedbackConfig(),
+    store: createR1MeetFeedbackStore(client),
+    ashby: (): R1MeetAshbyFeedbackPort | null => {
+      if (port !== null) return port;
+      const ashby = loadAshbyRuntimeConfig();
+      if (!ashby.apiKeyConfigured) return null;
+      try {
+        port = createR1MeetAshbyFeedbackPort({ apiKey: ashby.apiKey, log });
+      } catch {
+        // The client refused the key: as unusable as none (the job alerts `ashby_key_missing`).
+        return null;
+      }
+      return port;
+    },
+    dexUserId: meet.ashby.dexUserId,
+    bridgePageUrl: meet.bridgePageUrl,
+  });
 }
 
 function laneActive(deps: Pick<R1MeetLaneDeps, 'r1Config' | 'meetConfig'>): boolean {
@@ -171,6 +226,8 @@ export function createR1MeetLane(deps: R1MeetLaneDeps): R1MeetLane | null {
         const capped = Math.min(untilMs, deps.now() + R1_MEET_LANE.hotMaxMs);
         if (Number.isFinite(capped) && capped > hotUntil) hotUntil = capped;
       },
+      // M034 S09: Dex's scorecard to Ashby (the `scorecard_feedback` job and the maintenance re-drive).
+      feedback: deps.feedback ?? createR1MeetFeedbackPorts(deps.client, meet, log),
     }));
 
   const dispatcher = createR1MeetDispatcher({

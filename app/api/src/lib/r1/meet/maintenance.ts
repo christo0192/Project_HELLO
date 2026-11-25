@@ -30,6 +30,12 @@
  *                      it is still reached;
  *   prune              every 24th bucket (6 hours): receipts and round-less bookings older than 30
  *                      days, 500 each (0142's own RPCs; they refuse anything under 7 days).
+ *   feedback re-drive  (M034 S09) AFTER the steps above and OUTSIDE `R1_MEET_MAINTENANCE_STEPS`:
+ *                      Dex's scorecard feedback that a lost scorecard-ready trigger never queued
+ *                      (`redriveR1MeetFeedback`, `feedback-notify.ts`: completed bookings whose slot
+ *                      started 26 h to 20 min ago, at most 10). It writes its own log lines, never
+ *                      throws, and leaves the job's result and the warning below unchanged. Inert
+ *                      (no read) while the Ashby feedback form setting is blank.
  * Every job it queues carries ids only and is deduplicated by its key, so a slow step that overlaps
  * the next bucket queues nothing twice.
  *
@@ -39,6 +45,7 @@
 
 import type { R1MeetBookingReason, R1MeetBookingStatus } from './bookings-read.js';
 import { R1_MEET_LATE_CREATE_LIMIT_MS } from './bot-flow.js';
+import { redriveR1MeetFeedback } from './feedback-notify.js';
 import {
   R1MeetJobError,
   R1_MEET_RPC_UNEXPECTED,
@@ -236,6 +243,8 @@ export const r1MeetMaintenanceDefinition: R1MeetJobDefinition<R1MeetMaintenanceJ
   parse: parseMaintenanceJob,
   async run(deps: R1MeetFlowDeps, job: R1MeetMaintenanceJob, _meta: R1MeetJobMeta): Promise<R1MeetJobResult> {
     const report = await runR1MeetMaintenance(deps, job.bucket);
+    // M034 S09: outside the pinned steps (its own lines; never throws; no read while feedback is off).
+    await redriveR1MeetFeedback(deps);
     if (report.failed.length === 0) return r1MeetProcessed('maintenance');
     // Closed step names only. The next bucket's run retries whatever is still owed.
     deps.log.warn({ error_category: 'r1_meet_maintenance_had_errors', error_type: report.failed.join(':') });
