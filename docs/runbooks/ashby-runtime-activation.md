@@ -387,6 +387,14 @@ Rollback is a flag flip at any stage, in this order:
 3. `ASHBY_INTEGRATION_ENABLED=false` → the webhook returns 503 and makes no DB or
    network call.
 
+Step 1 or step 3 also stops the third write of §7, Dex's R1-over-Meet feedback
+card (M034 S09): its job reads both switches before every post and, with either
+off, holds the card (`ashby_inactive`, warning `r1_meet_feedback_ashby_inactive`,
+receipt `failed`, re-postable). Step 2 does NOT stop it: Meet bookings are not
+mapping-based. Its own kill switch, which leaves the rest of Ashby running, is a
+blank `R1_MEET_ASHBY_FEEDBACK_FORM_ID` (`r1-operations.md`, "R1 over Google Meet:
+Dex's scorecard as Ashby feedback", Rollback).
+
 **No migration rollback is required.** `0032` is additive only (one CHECK
 extension on `lifecycle`, one on `chk_audit_action`, three nullable columns with
 defaults, four new functions, two replaced functions, one new trigger). It
@@ -399,13 +407,22 @@ unused.
 
 ## 7. What is written back to Ashby (read this before "fixing" it)
 
-Two things are written. A completed screening parks at the `writeback_pending`
+Three things are written. A completed screening parks at the `writeback_pending`
 lifecycle state (0032), and then:
 
 - `scorecard_write` submits the scorecard through `applicationFeedback.submit`,
   bound to the verified form (`HELLO_CHRISTY_SCORECARD_BINDING`, see
   `ashby-scorecard-fields.md`). An Ashby scorecard cannot be retracted.
 - `recommendation_tag` keeps one Christy verdict tag on the candidate (§11).
+
+And, outside this lifecycle, the R1-over-Meet lane (M034 S09, dark until
+`R1_MEET_ENABLED` and `R1_MEET_ASHBY_FEEDBACK_FORM_ID` are set) writes:
+
+- Dex's R1 scorecard of a Meet interview, through `applicationFeedback.submit`
+  with the interview event and the Dex Ashby user, on the Dex form of
+  `R1_MEET_ASHBY_FEEDBACK_FORM_ID` (`r1-operations.md`, "R1 over Google Meet:
+  Dex's scorecard as Ashby feedback"). Like the Christy card it cannot be
+  retracted. It honours §6 steps 1 and 3; its own kill switch is a blank form id.
 
 Nothing else is published: no `applicationFeedbackRequest.create`, no
 `application.changeStage`, and **no TA stage move**. There is no auto-reject

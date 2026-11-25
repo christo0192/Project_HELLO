@@ -644,6 +644,7 @@ describe('M034 S09: the feedback ports of the lane', () => {
     const given = Object.freeze({
       config: () => ({ status: 'off' as const }),
       store: {} as R1MeetFeedbackDeps['store'],
+      ashbyActive: () => false,
       ashby: () => null,
       dexUserId: DEX_ID,
       bridgePageUrl: BRIDGE_PAGE_URL,
@@ -671,6 +672,37 @@ describe('M034 S09: the feedback ports of the lane', () => {
     expect(feedback.ashby()).toBeNull();
     vi.stubEnv('ASHBY_API_KEY', 'replace_me');
     expect(feedback.ashby()).toBeNull();
+    expect(factory).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(w.db.calls).toEqual([]);
+  });
+
+  it("production ports: Ashby's own switches, read per call (master switch with its secret AND the runtime flag)", async () => {
+    // A webhook secret long enough to count, built at run time (never a secret-shaped literal).
+    const secret = 's'.repeat(24);
+    vi.stubEnv('ASHBY_INTEGRATION_ENABLED', 'true');
+    vi.stubEnv('ASHBY_WEBHOOK_SECRET', secret);
+    vi.stubEnv('ASHBY_RUNTIME_ENABLED', 'true');
+    vi.stubEnv('ASHBY_API_KEY', '');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const w = world();
+    const feedback = (await flowDepsOf(w)).feedback!;
+    // On: both switches, whatever the key (the key is the job's next question).
+    expect(feedback.ashbyActive()).toBe(true);
+    // The documented "stop all Ashby writes" rollback, each step on its own (ashby-runtime-activation.md §6).
+    vi.stubEnv('ASHBY_RUNTIME_ENABLED', 'false');
+    expect(feedback.ashbyActive()).toBe(false);
+    vi.stubEnv('ASHBY_RUNTIME_ENABLED', 'true');
+    vi.stubEnv('ASHBY_INTEGRATION_ENABLED', 'false');
+    expect(feedback.ashbyActive()).toBe(false);
+    vi.stubEnv('ASHBY_INTEGRATION_ENABLED', 'true');
+    vi.stubEnv('ASHBY_WEBHOOK_SECRET', 'replace_me');
+    expect(feedback.ashbyActive()).toBe(false);
+    vi.stubEnv('ASHBY_WEBHOOK_SECRET', secret);
+    vi.stubEnv('ASHBY_RUNTIME_ENABLED', '');
+    expect(feedback.ashbyActive()).toBe(false);
+    vi.stubEnv('ASHBY_RUNTIME_ENABLED', 'true');
+    expect(feedback.ashbyActive()).toBe(true);
     expect(factory).not.toHaveBeenCalled();
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(w.db.calls).toEqual([]);

@@ -93,7 +93,9 @@ export interface R1MeetHarness {
   /** A `pending` booking through the real create RPC: an application link, a staff user, a slot. */
   createBooking(options?: CreateBookingOptions): Promise<Extract<R1MeetCreateAnswer, { status: 'created' | 'relinked' }>>;
   /** A first run of a job (attempts 1, no deferral), or the meta you ask for. */
-  meta(overrides?: Partial<Pick<R1MeetJobMeta, 'attempts' | 'maxAttempts' | 'deferCount' | 'deferredAt'>>): R1MeetJobMeta;
+  meta(
+    overrides?: Partial<Pick<R1MeetJobMeta, 'attempts' | 'maxAttempts' | 'deferCount' | 'deferredAt' | 'lastDeferReason' | 'lastError'>>,
+  ): R1MeetJobMeta;
 }
 
 export interface CreateBookingOptions {
@@ -263,13 +265,17 @@ export function createR1MeetHarness(options: HarnessOptions = {}): R1MeetHarness
       }
       return answer;
     },
-    meta(overrides: Partial<Pick<R1MeetJobMeta, 'attempts' | 'maxAttempts' | 'deferCount' | 'deferredAt'>> = {}) {
+    meta(
+      overrides: Partial<Pick<R1MeetJobMeta, 'attempts' | 'maxAttempts' | 'deferCount' | 'deferredAt' | 'lastDeferReason' | 'lastError'>> = {},
+    ) {
       return r1MeetJobMeta({
         attempts: overrides.attempts ?? 1,
         maxAttempts: overrides.maxAttempts ?? 10,
         deferCount: overrides.deferCount ?? 0,
         deferredAt: overrides.deferredAt ?? undefined,
         createdAt: new Date(nowMs).toISOString(),
+        deferReason: overrides.lastDeferReason ?? undefined,
+        errorMessage: overrides.lastError ?? undefined,
       });
     },
   }) as R1MeetHarness;

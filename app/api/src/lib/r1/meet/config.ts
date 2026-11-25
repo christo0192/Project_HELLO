@@ -445,8 +445,9 @@ const NIL_UUID = '00000000-0000-0000-0000-000000000000';
 /**
  * The Ashby feedback form Dex's scorecard is posted to (M034 S09). Reads R1_MEET_ASHBY_FEEDBACK_FORM_ID
  * and nothing else. Silent (no log line: the S09 handler alerts per affected interview) and NEVER
- * throws. Unset or blank = `off`; a UUID other than the nil one = `on`, verbatim; anything else,
- * including surrounding spaces, = `invalid`. `source` is a test seam, as for `getR1MeetConfig`.
+ * throws. Unset or blank = `off`; a UUID other than the nil one = `on`, lower-cased (Ashby's ids are
+ * lower case, and an id pasted in upper case names the same form); anything else, including
+ * surrounding spaces, = `invalid`. `source` is a test seam, as for `getR1MeetConfig`.
  */
 export function getR1MeetFeedbackConfig(
   source?: Pick<R1MeetEnvSource, 'R1_MEET_ASHBY_FEEDBACK_FORM_ID'>,
@@ -458,7 +459,7 @@ export function getR1MeetFeedbackConfig(
     if (typeof formDefinitionId !== 'string' || !UUID.test(formDefinitionId) || formDefinitionId === NIL_UUID) {
       return Object.freeze({ status: 'invalid' as const, reason: FEEDBACK_FORM_REASON });
     }
-    return Object.freeze({ status: 'on' as const, formDefinitionId });
+    return Object.freeze({ status: 'on' as const, formDefinitionId: formDefinitionId.toLowerCase() });
   } catch {
     // Defensive (e.g. a throwing getter on the source): this reader never throws either.
     return Object.freeze({

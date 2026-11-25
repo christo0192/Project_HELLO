@@ -24,12 +24,17 @@
  *   4  booking_missing | defer booking_not_settled (a live status, 60 s, bounded, then throw
  *      `r1_meet_feedback_booking_not_settled`) | booking_not_completed (failed, cancelled, drained:
  *      a call that went wrong is never posted) | booking_unbound (no round or session) | stale (more
- *      than 7 days after the slot ended).
+ *      than 7 days after the slot ended) | profile_unknown (an `objective_profile` this build has no
+ *      profile for: the card's header names the profile's bot and interview kind, never a guess).
  *   5  round_not_meet (missing or a browser round) | assessment_superseded (not the round's current).
  *   6  assessment_missing | assessment_not_booking_session (not the booking's attempt).
  *   7  decision_use_blocked (an open appeal) | consent_withdrawn (withdrawn or declined).
  *   8  not_postable                a placeholder, `human_review`, v1 or a value that cannot be mapped.
- *   9  ashby_key_missing           no usable Ashby key: alert, receipt `failed`.
+ *   9  ashby_inactive              Ashby's own switches are off (`ASHBY_INTEGRATION_ENABLED` with a
+ *                                 usable webhook secret, and `ASHBY_RUNTIME_ENABLED`: the documented
+ *                                 "stop all Ashby writes" rollback stops this write too): one warning,
+ *                                 receipt `failed` (re-postable once Ashby is back on), no Ashby call;
+ *      ashby_key_missing           no usable Ashby key: alert, receipt `failed`.
  *  10  the form read: a transient failure, no definition or no schema defers `form_unavailable` (60 s,
  *      bounded, then throw `r1_meet_feedback_form_unavailable`); a permanent 4xx alerts
  *      `form_unreadable`, receipt `failed`.
@@ -39,8 +44,9 @@
  *      `ashby_rate_limited` (60 s) and a 5xx, timeout or network failure defers `ashby_unavailable`
  *      (30 s), both bounded, then throw `r1_meet_feedback_ashby_rate_limited` / `_unavailable`. A
  *      permanent 4xx or `success:false` alerts `r1_meet_feedback_rejected` and is terminal
- *      (`ashby_rejected`, or `ashby_rejected_after_retry` on a re-run: the card is probably already in
- *      Ashby and the tenant refused the update); the client's own request validation is terminal
+ *      (`ashby_rejected`, or `ashby_rejected_after_retry` when an earlier run of the job may have
+ *      reached this submit, `r1MeetFeedbackSubmitMayHaveRun`: the card may already be in Ashby and the
+ *      tenant refused the update); the client's own request validation is terminal
  *      `ashby_request_invalid`. Anything that is not an Ashby error is rethrown (the dispatcher makes it
  *      `r1_meet_unexpected_error`).
  * A terminal fault leaves the receipt `failed`, so the runbook's re-post can send it again after the fix.
@@ -80,6 +86,7 @@ import {
   type R1MeetScorecardFeedbackJob,
 } from './jobs.js';
 import type { R1MeetFlowDeps, R1MeetJobDefinition, R1MeetLog } from './recall-actions.js';
+import { getR1MeetProfile } from './profiles.js';
 import { R1_MEET_LIVE_STATUSES } from './runtime-store.js';
 
 /** The alerts of this job (error lines). Not part of `R1_MEET_ALERTS`, which S06 owns. Frozen. */
@@ -88,6 +95,9 @@ export const R1_MEET_FEEDBACK_ALERTS = Object.freeze({
   formInvalid: 'r1_meet_feedback_form_invalid',
   rejected: 'r1_meet_feedback_rejected',
 } as const);
+
+/** The warning of a card held back because Ashby's own switches are off (a rollback, not a fault). */
+export const R1_MEET_FEEDBACK_ASHBY_INACTIVE_LOG = 'r1_meet_feedback_ashby_inactive';
 
 /** The deferrals of this job, in seconds. Frozen. */
 export const R1_MEET_FEEDBACK_DEFER = Object.freeze({
@@ -102,6 +112,12 @@ export interface R1MeetFeedbackDeps {
   /** `getR1MeetFeedbackConfig()`, asked once per job. */
   config(): R1MeetFeedbackConfig;
   readonly store: R1MeetFeedbackStore;
+  /**
+   * Ashby's own switches, asked per job: the integration master switch with a usable webhook secret
+   * (`isAshbyWebhookActive`) AND `ASHBY_RUNTIME_ENABLED` (ashby-runtime-activation.md §6). The key is
+   * the next question (`ashby`).
+   */
+  ashbyActive(): boolean;
   /** The Ashby port, or null when no usable Ashby key is configured. */
   ashby(): R1MeetAshbyFeedbackPort | null;
   /** The Dex Ashby user (`R1_MEET_ASHBY_DEX_USER_ID`): the interviewer the card is submitted for. */
@@ -112,6 +128,35 @@ export interface R1MeetFeedbackDeps {
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const LIVE: ReadonlySet<string> = new Set(R1_MEET_LIVE_STATUSES);
+
+/** The deferrals a run answers once it reached the submit (step 12). */
+const SUBMIT_DEFERRALS: ReadonlySet<string> = new Set(['ashby_rate_limited', 'ashby_unavailable']);
+/** The closed codes a run throws when its wait BEFORE the submit passed the deferral bound (steps 4, 10). */
+const PRE_SUBMIT_THROWS: ReadonlySet<string> = new Set([
+  'r1_meet_feedback_booking_not_settled',
+  'r1_meet_feedback_form_unavailable',
+]);
+
+/**
+ * May an earlier run of this job have reached Ashby's submit (so the card may already be there)? From
+ * the previous run's outcome as the queue keeps it (`R1MeetJobMeta.lastDeferReason`, `.lastError`):
+ *  - it deferred on the submit (`ashby_rate_limited`, `ashby_unavailable`): yes;
+ *  - otherwise only a run that threw or ended without an outcome (a lost lease) is left, because a
+ *    deferral refunds its attempt: `attempts > 1`. Yes, unless the code it threw is one of the waits
+ *    before the submit (`r1_meet_feedback_booking_not_settled`, `_form_unavailable`).
+ * A job that only waited for its booking or the form (`booking_not_settled`, `form_unavailable`,
+ * Meet inactive) answers no, so its first rejection reads `ashby_rejected`. Pure.
+ * The one blind spot: reclaiming a lost lease keeps the queue's previous `error_message`, so a run
+ * that reached the submit and then lost its lease right AFTER a pre-submit throw reads as that throw
+ * (no). It only picks the label of a terminal outcome; the receipt is `failed` either way.
+ */
+export function r1MeetFeedbackSubmitMayHaveRun(
+  meta: Pick<R1MeetJobMeta, 'attempts' | 'lastDeferReason' | 'lastError'>,
+): boolean {
+  if (meta.lastDeferReason !== null && SUBMIT_DEFERRALS.has(meta.lastDeferReason)) return true;
+  if (meta.attempts <= 1) return false;
+  return meta.lastError === null || !PRE_SUBMIT_THROWS.has(meta.lastError);
+}
 
 const UNWIRED = 'r1_meet_feedback_unwired';
 const SUBMITTED_LOG = 'r1_meet_feedback_submitted';
@@ -180,6 +225,9 @@ export async function runR1MeetScorecardFeedback(
   }
   const endMs = Date.parse(booking.endAt);
   if (!Number.isFinite(endMs) || deps.now() > endMs + R1_MEET_FEEDBACK_LIMITS.staleMs) return r1MeetIgnored('stale');
+  // The card says which interview this was: the booking's profile, never a default.
+  const profile = getR1MeetProfile(booking.objectiveProfile);
+  if (profile === null) return r1MeetIgnored('profile_unknown');
 
   // 5. The round: a Meet round whose CURRENT assessment is this one.
   const round = await store.round(booking.roundId);
@@ -199,7 +247,12 @@ export async function runR1MeetScorecardFeedback(
   const source = r1MeetFeedbackSource(assessment.row);
   if (isR1MeetFeedbackRefused(source)) return r1MeetIgnored('not_postable');
 
-  // 9. The Ashby key.
+  // 9. Ashby's own switches (a rollback that stops every Ashby write stops this one), then the key.
+  if (!feedback.ashbyActive()) {
+    deps.log.warn({ error_category: R1_MEET_FEEDBACK_ASHBY_INACTIVE_LOG });
+    if (receipt !== null) await store.settleReceipt(receipt.id, 'failed', nowIso());
+    return r1MeetIgnored('ashby_inactive');
+  }
   const ashby = feedback.ashby();
   if (ashby === null) {
     return terminal(receipt, R1_MEET_FEEDBACK_ALERTS.configInvalid, 'ashby_key_missing', 'ashby_key_missing');
@@ -225,7 +278,7 @@ export async function runR1MeetScorecardFeedback(
   const binding = bindR1MeetFeedbackForm(source, form, {
     formDefinitionId: config.formDefinitionId,
     reportUrl: r1MeetFeedbackReportUrl(feedback.bridgePageUrl, booking.roundId),
-    summary: r1MeetFeedbackSummary(source),
+    summary: r1MeetFeedbackSummary(source, profile),
   });
   if (!binding.ok) return terminal(receipt, R1_MEET_FEEDBACK_ALERTS.formInvalid, binding.reason, binding.reason);
 
@@ -252,7 +305,7 @@ export async function runR1MeetScorecardFeedback(
           receipt,
           R1_MEET_FEEDBACK_ALERTS.rejected,
           failure.detail,
-          meta.isRerun ? 'ashby_rejected_after_retry' : 'ashby_rejected',
+          r1MeetFeedbackSubmitMayHaveRun(meta) ? 'ashby_rejected_after_retry' : 'ashby_rejected',
           failure.httpStatus,
         );
       case 'request_invalid':

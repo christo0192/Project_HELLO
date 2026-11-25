@@ -26,14 +26,17 @@
  *
  * THE RE-DRIVE (`redriveR1MeetFeedback`). The `maintenance` job (once per 15-minute bucket while
  * Meet is active) calls it after its own steps. It looks at the completed bookings whose slot started
- * between 26 hours and 20 minutes ago (at most 10, newest first), their rounds' current assessment,
- * and the feedback receipts that already exist, and records the missing ones (the same RPC as the
- * trigger). Idle, that is one narrow read per bucket. Inert (no read at all) without the feedback
- * ports or with the form setting `off`. The bound is deliberate (critic C8): the ten NEWEST completed
- * bookings are looked at, so a booking gets its chances in the buckets right after it settles; with
- * more than ten newer completed bookings in the window an older miss is left to the runbook's
- * re-post. It never throws: a failure logs one closed warning (`r1_meet_feedback_redrive_failed`);
- * a pass that queued something logs `r1_meet_feedback_redriven` with the count. The handler re-checks everything (settled, current, the booking's own session), so
+ * between 26 hours and 20 minutes ago (at most 100, newest first: ONE narrow read), their rounds'
+ * current assessment, and the feedback receipts that already exist, LEAVES OUT every booking that
+ * already has its receipt, and records the missing ones (the same RPC as the trigger), at most 10 a
+ * pass, newest first; the rest are still missing at the next bucket. So a lost trigger is found again
+ * at every bucket while it is in the window, however many newer bookings already have their receipt
+ * (S09-R1). Idle, that is one narrow read per bucket (critic C8); with bookings, at most four reads
+ * (bookings, rounds, two key batches) plus the records. Inert (no read at all) without the feedback
+ * ports or with the form setting `off`. A miss older than the window, or beyond the 100 newest, is
+ * the runbook's "lost trigger" re-post. It never throws: a failure logs one closed warning
+ * (`r1_meet_feedback_redrive_failed`); a pass that queued something logs `r1_meet_feedback_redriven`
+ * with the count. The handler re-checks everything (settled, current, the booking's own session), so
  * a re-driven job for a booking that must not be posted simply ends `ignored`.
  *
  * LOGS: closed words and counts only, never an id.
@@ -65,14 +68,16 @@ const ENQUEUE_FAILED_LOG = 'r1_meet_feedback_enqueue_failed';
 const REDRIVE_FAILED_LOG = 'r1_meet_feedback_redrive_failed';
 const REDRIVEN_LOG = 'r1_meet_feedback_redriven';
 
-/** The re-drive's window and bound (D-S09-9). Frozen. */
+/** The re-drive's window and bounds (D-S09-9, S09-R1). Frozen. */
 export const R1_MEET_FEEDBACK_REDRIVE = Object.freeze({
   /** The oldest slot start looked at: a day of interviews, plus margin for a late scoring job. */
   lookbackMs: 26 * HOUR_MS,
   /** The newest slot start looked at: the trigger gets this long to do its own work first. */
   settleMs: 20 * MINUTE_MS,
-  /** Completed bookings per pass. */
-  limit: 10,
+  /** Completed bookings looked at per pass (one read; one `.in` batch of rounds, `ID_BATCH_SIZE`). */
+  scanLimit: 100,
+  /** Missing receipts recorded per pass, newest first (the RPCs and jobs one pass may add). */
+  recordLimit: 10,
 });
 
 /**
@@ -176,7 +181,7 @@ export async function redriveR1MeetFeedback(
     const bookings = await store.listRecentCompleted({
       startAfter: new Date(nowMs - window.lookbackMs).toISOString(),
       startBefore: new Date(nowMs - window.settleMs).toISOString(),
-      limit: window.limit,
+      limit: window.scanLimit,
     });
     // A booking without its round or session can never be posted (the handler's `booking_unbound`).
     const bound = bookings.filter((booking) => booking.roundId !== null && booking.sessionId !== null);
@@ -193,9 +198,10 @@ export async function redriveR1MeetFeedback(
     if (candidates.length === 0) return Object.freeze({ queued });
 
     const existing = await store.existingFeedbackKeys(candidates.map((candidate) => candidate.key));
+    // Only the missing ones count against the bound: a booking that has its receipt takes no slot.
+    const missing = candidates.filter((candidate) => !existing.has(candidate.key)).slice(0, window.recordLimit);
     let failures = 0;
-    for (const candidate of candidates) {
-      if (existing.has(candidate.key)) continue;
+    for (const candidate of missing) {
       // One failing record never stops the others; the next bucket retries what is still missing.
       try {
         const answer = await store.recordFeedback(candidate.bookingId, candidate.assessmentId, nowMs);

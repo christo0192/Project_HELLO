@@ -11,7 +11,8 @@
  *  3  a lost answer (or a timeout), then success: two identical submits (Ashby updates Dex's one card)
  *     and the receipt `processed`;
  *  4  a permanent 4xx (400, 404, 422) or `success:false` is terminal with an alert, the receipt
- *     `failed`, and `ashby_rejected_after_retry` on a re-run;
+ *     `failed`, and `ashby_rejected_after_retry` only when an earlier run may have reached the submit
+ *     (S09-R2: a wait for the booking or the form before it does not count);
  *  5  429 and 5xx defer (60 s, 30 s) within the bound, then throw their closed codes;
  *  6  a missing mapping or setting (off, invalid, no key, every form fault) submits nothing;
  *  7  every off-path guard makes ZERO Ashby calls, a browser round included;
@@ -20,8 +21,13 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { Queue } from '../lib/queue/index.js';
+import { MemoryAdapter } from '../lib/queue/memory-adapter.js';
+import { createQueueRunner } from '../lib/queue/runner.js';
+import { getR1MeetFeedbackConfig } from '../lib/r1/meet/config.js';
 import {
   R1_MEET_FEEDBACK_ALERTS,
+  R1_MEET_FEEDBACK_ASHBY_INACTIVE_LOG,
   R1_MEET_FEEDBACK_DEFER,
   r1MeetScorecardFeedbackDefinition,
 } from '../lib/r1/meet/feedback.js';
@@ -29,6 +35,7 @@ import {
   R1MeetJobError,
   R1_MEET_DEFER_MAX_COUNT,
   R1_MEET_DEFER_MAX_MS,
+  R1_MEET_QUEUE,
   parseScorecardFeedbackJob,
   r1MeetDefer,
   r1MeetIgnored,
@@ -101,7 +108,9 @@ function jobOf(b: Pick<CompletedBooking, 'bookingId' | 'assessmentId'>): R1MeetS
   return job;
 }
 
-type MetaOver = Partial<Pick<R1MeetJobMeta, 'attempts' | 'maxAttempts' | 'deferCount' | 'deferredAt'>>;
+type MetaOver = Partial<
+  Pick<R1MeetJobMeta, 'attempts' | 'maxAttempts' | 'deferCount' | 'deferredAt' | 'lastDeferReason' | 'lastError'>
+>;
 
 /** One run of the handler, as the dispatcher would make it (a first run unless `over` says otherwise). */
 function run(w: R1MeetFeedbackWorld, b: Pick<CompletedBooking, 'bookingId' | 'assessmentId'>, over: MetaOver = {}, deps: R1MeetFlowDeps = w.deps): Promise<R1MeetJobResult> {
@@ -273,16 +282,94 @@ describe('4. a permanent Ashby rejection is terminal', () => {
     expect(JSON.stringify(w.h.logs)).not.toContain('SENTINEL');
   });
 
+  // S09-R2: `_after_retry` says "the card may already be in Ashby", so it needs an earlier run that may
+  // have reached the submit, not just any earlier run.
   it.each([
-    ['after a deferral', RERUN],
-    ['on a second attempt', { attempts: 2 }],
-  ])('%s it is ashby_rejected_after_retry (the card is probably in Ashby already)', async (_label, over) => {
+    ['after a rate-limited submit', { deferCount: 1, deferredAt: HARNESS_NOW, lastDeferReason: 'ashby_rate_limited' }],
+    ['after a submit Ashby could not answer', { deferCount: 2, deferredAt: HARNESS_NOW, lastDeferReason: 'ashby_unavailable' }],
+    ['after a run that threw past the submit bound', { attempts: 2, lastError: 'r1_meet_feedback_ashby_unavailable' }],
+    ['after a run that threw something unexpected', { attempts: 2, lastError: 'r1_meet_unexpected_error' }],
+    ['after a run that ended with no outcome (a lost lease)', { attempts: 2 }],
+  ] as Array<[string, MetaOver]>)('%s it is ashby_rejected_after_retry (the card may already be in Ashby)', async (_label, over) => {
     const { w, b } = await world();
     w.ashby.next('submit', { status: 403, body: { success: false, errors: ['feedback_edit_disabled'] } });
     expect(await run(w, b, over)).toEqual(r1MeetIgnored('ashby_rejected_after_retry'));
     expect(errorLines(w)).toEqual([
       { error_category: 'r1_meet_feedback_rejected', error_type: 'http_client_error:feedback_edit_disabled', http_status: 403 },
     ]);
+    expect(outcome(w, b)).toBe('failed');
+  });
+
+  it.each([
+    ['after waiting for the booking to settle', { deferCount: 1, deferredAt: HARNESS_NOW, lastDeferReason: 'booking_not_settled' }],
+    ['after waiting for the form', { deferCount: 3, deferredAt: HARNESS_NOW, lastDeferReason: 'form_unavailable' }],
+    ['after a throw while the booking was still live', { attempts: 2, lastError: 'r1_meet_feedback_booking_not_settled' }],
+    ['after a throw while the form could not be read', { attempts: 2, lastError: 'r1_meet_feedback_form_unavailable' }],
+  ] as Array<[string, MetaOver]>)('%s, a first submit Ashby refuses is ashby_rejected (no card can be there yet)', async (_label, over) => {
+    const { w, b } = await world();
+    w.ashby.next('submit', { status: 403, body: { success: false, errors: ['missing_endpoint_permission'] } });
+    expect(await run(w, b, over)).toEqual(r1MeetIgnored('ashby_rejected'));
+    expect(w.ashby.submits()).toHaveLength(1);
+    expect(outcome(w, b)).toBe('failed');
+  });
+
+  /** The REAL in-memory queue on the world's clock; `pass()` is one runner pass, awaited to its end. */
+  function realQueue(w: R1MeetFeedbackWorld) {
+    const clock = (): string => new Date(w.h.now()).toISOString();
+    const adapter = new MemoryAdapter({ clock });
+    const queue = new Queue(adapter, { clock });
+    return {
+      adapter,
+      queue,
+      async pass(): Promise<void> {
+        const runner = createQueueRunner({
+          queue,
+          handlers: { [R1_MEET_QUEUE]: (job) => w.dispatcher.handle(job) },
+          owner: 'test-meet',
+          leaseSeconds: 60,
+          pollMs: 5000,
+          now: () => w.h.now(),
+          random: () => 0,
+        });
+        await runner.tick();
+        await runner.stop();
+      },
+    };
+  }
+
+  it('through the real queue: a wait for the booking, then a refused first submit, is ashby_rejected', async () => {
+    const { w, b } = await world();
+    const q = realQueue(w);
+    // Scoring finished while the call was still `in_call`: the job waits (attempt refunded).
+    setStatus(w, b.bookingId, 'in_call');
+    const queued = await q.queue.enqueue(R1_MEET_QUEUE, b.job!.payload, { maxAttempts: 5 });
+    await q.pass();
+    expect(w.ashby.requests).toEqual([]);
+    expect(await q.adapter.getById(queued.id)).toMatchObject({ status: 'delayed', attempts: 0, deferCount: 1, deferReason: 'booking_not_settled' });
+
+    // The booking settles; the next run makes the FIRST submit, and Ashby refuses the key's permission.
+    setStatus(w, b.bookingId, 'completed');
+    w.ashby.next('submit', { status: 403, body: { success: false, errors: ['missing_endpoint_permission'] } });
+    w.h.setNow(w.h.now() + (R1_MEET_FEEDBACK_DEFER.notSettled + 1) * 1000);
+    await q.pass();
+    expect(w.ashby.submits()).toHaveLength(1);
+    expect(jobLines(w)).toEqual(['scorecard_feedback:booking_not_settled', 'scorecard_feedback:ashby_rejected']);
+    expect(outcome(w, b)).toBe('failed');
+  });
+
+  it('through the real queue: a submit Ashby could not answer, then a refusal, is ashby_rejected_after_retry', async () => {
+    const { w, b } = await world();
+    const q = realQueue(w);
+    const queued = await q.queue.enqueue(R1_MEET_QUEUE, b.job!.payload, { maxAttempts: 5 });
+    w.ashby.next('submit', { status: 503, body: '' });
+    await q.pass();
+    expect(await q.adapter.getById(queued.id)).toMatchObject({ status: 'delayed', deferCount: 1, deferReason: 'ashby_unavailable' });
+
+    w.ashby.next('submit', { status: 403, body: { success: false, errors: ['feedback_edit_disabled'] } });
+    w.h.setNow(w.h.now() + (R1_MEET_FEEDBACK_DEFER.unavailable + 1) * 1000);
+    await q.pass();
+    expect(w.ashby.submits()).toHaveLength(2);
+    expect(jobLines(w)).toEqual(['scorecard_feedback:ashby_unavailable', 'scorecard_feedback:ashby_rejected_after_retry']);
     expect(outcome(w, b)).toBe('failed');
   });
 
@@ -375,6 +462,35 @@ describe('6. a missing mapping or setting submits nothing', () => {
     expect(errorLines(w)).toEqual([{ error_category: 'r1_meet_feedback_config_invalid', error_type: 'ashby_key_missing' }]);
     expect(outcome(w, b)).toBe('failed');
     expect(w.ashby.requests).toEqual([]);
+  });
+
+  it("Ashby's own switches off (the 'stop all Ashby writes' rollback): one warning, receipt failed, no Ashby call (S09-R3)", async () => {
+    const { w, b } = await world();
+    w.setAshbyActive(false);
+    await expect(w.dispatcher.handle(w.queueJob(b.job!.payload))).resolves.toBeUndefined();
+    expect(jobLines(w)).toEqual(['scorecard_feedback:ashby_inactive']);
+    expect(w.ashby.requests).toEqual([]);
+    expect(errorLines(w)).toEqual([]);
+    expect(w.h.logs.filter((line) => line.level === 'warn').map((line) => line.meta)).toEqual([
+      { error_category: R1_MEET_FEEDBACK_ASHBY_INACTIVE_LOG },
+    ]);
+    // `failed`, not `ignored`: once Ashby is back on, the runbook re-post sends it.
+    expect(outcome(w, b)).toBe('failed');
+    w.setAshbyActive(true);
+    await w.dispatcher.handle(w.queueJob(r1MeetJobs.scorecardFeedback(b.bookingId, b.assessmentId).payload));
+    expect(outcome(w, b)).toBe('processed');
+    expect(w.ashby.submits()).toHaveLength(1);
+    expect(w.ashby.submits()[0]!.raw).toBe(expectedBody(b));
+  });
+
+  it('a form id pasted in upper case names the same form: the card is posted with the lower-case id (S09-R4)', async () => {
+    const { w, b } = await world();
+    w.setConfig(getR1MeetFeedbackConfig({ R1_MEET_ASHBY_FEEDBACK_FORM_ID: FEEDBACK_FORM_ID.toUpperCase() }));
+    expect(await run(w, b)).toEqual(r1MeetProcessed('submitted'));
+    expect(errorLines(w)).toEqual([]);
+    expect(w.ashby.submits()).toHaveLength(1);
+    expect(w.ashby.submits()[0]!.raw).toBe(expectedBody(b));
+    expect(outcome(w, b)).toBe('processed');
   });
 
   const overall = (fields: ReturnType<typeof dexFormFields>, values: string[]) =>
@@ -485,6 +601,11 @@ describe('7. off-path guards: no Ashby call', () => {
     }],
     ['no round', 'booking_unbound', (w, b) => {
       w.h.db.booking(b.bookingId)!.round_id = null;
+    }],
+    // S09-R5: the card's header names the booking's profile, so a profile this build does not know
+    // posts nothing rather than a card labelled as Dex's sales round.
+    ['an objective profile this build does not know', 'profile_unknown', (w, b) => {
+      w.h.db.booking(b.bookingId)!.objective_profile = 'r1_later_persona';
     }],
     ['a round that is gone', 'round_not_meet', (w, b) => {
       w.h.db.tables.interview_rounds.splice(w.h.db.tables.interview_rounds.findIndex((round) => round.id === b.roundId), 1);

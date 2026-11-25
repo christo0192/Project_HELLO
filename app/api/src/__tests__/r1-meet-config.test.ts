@@ -820,12 +820,13 @@ describe('R1 Meet configuration: the Ashby feedback form (M034 S09)', () => {
     expect(logged).toEqual([]);
   });
 
-  it('is on for a UUID, kept verbatim in either case', () => {
+  it('is on for a UUID in either case, lower-cased (an id pasted in upper case names the same form, S09-R4)', () => {
     for (const formId of [FORM_ID, FORM_ID.toUpperCase(), GROUP_ID, GROUP_ID.toUpperCase()]) {
       const config = feedback(formId);
-      expect(config, formId).toStrictEqual({ status: 'on', formDefinitionId: formId });
+      expect(config, formId).toStrictEqual({ status: 'on', formDefinitionId: formId.toLowerCase() });
       expect(Object.isFrozen(config), formId).toBe(true);
     }
+    expect(feedback(FORM_ID.toUpperCase())).toStrictEqual(feedback(FORM_ID));
     expect(logged).toEqual([]);
   });
 

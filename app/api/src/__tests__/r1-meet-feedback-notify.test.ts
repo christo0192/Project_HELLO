@@ -12,12 +12,14 @@
  *  - an `invalid` setting still records (the job alerts and fails it per interview);
  *  - it never rejects: a throwing store, a refused RPC, a throwing config or a throwing logger give at
  *    most one closed warning and no id;
- *  - the re-drive: inert without ports or with the setting off; records only the missing receipts of
- *    completed bookings in [now - 26 h, now - 20 min], at most 10; skips a round without an assessment;
- *    a failure is one warning and the maintenance job's result is unchanged.
+ *  - the re-drive: inert without ports or with the setting off; looks at up to 100 completed bookings
+ *    in [now - 26 h, now - 20 min] and records only the missing receipts, at most 10 a pass, so a
+ *    booking that already has its receipt never hides a lost trigger behind it (S09-R1); skips a round
+ *    without an assessment; a failure is one warning and the maintenance job's result is unchanged.
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ID_BATCH_SIZE } from '../lib/id-batches.js';
 import { getR1MeetConfig, type R1MeetConfig, type R1MeetFeedbackConfig } from '../lib/r1/meet/config.js';
 import {
   R1_MEET_FEEDBACK_REDRIVE,
@@ -380,9 +382,11 @@ describe('redriveR1MeetFeedback', () => {
   const recordCalls = (w: R1MeetFeedbackWorld) =>
     w.h.db.calls.filter((call) => call.kind === 'rpc' && call.name === 'r1_meet_record_receipt');
 
-  it('the window is frozen: 26 hours back, 20 minutes settle, 10 bookings', () => {
-    expect(R1_MEET_FEEDBACK_REDRIVE).toEqual({ lookbackMs: 26 * HOUR, settleMs: 20 * MINUTE, limit: 10 });
+  it('the window is frozen: 26 hours back, 20 minutes settle, 100 bookings looked at, 10 records a pass', () => {
+    expect(R1_MEET_FEEDBACK_REDRIVE).toEqual({ lookbackMs: 26 * HOUR, settleMs: 20 * MINUTE, scanLimit: 100, recordLimit: 10 });
     expect(Object.isFrozen(R1_MEET_FEEDBACK_REDRIVE)).toBe(true);
+    // One read of bookings, and their rounds in ONE `.in` batch.
+    expect(R1_MEET_FEEDBACK_REDRIVE.scanLimit).toBe(ID_BATCH_SIZE);
   });
 
   it('without the feedback ports, or with the setting off: null and no read at all', async () => {
@@ -449,7 +453,7 @@ describe('redriveR1MeetFeedback', () => {
     const deps: R1MeetFlowDeps = { ...w.deps, feedback: { ...w.feedback, store: { ...w.store, listRecentCompleted, roundAssessmentIds } } };
     await expect(redriveR1MeetFeedback(deps)).resolves.toEqual({ queued: 0 });
     const now = w.h.now();
-    expect(listRecentCompleted.mock.calls).toEqual([[{ startAfter: iso(now - 26 * HOUR), startBefore: iso(now - 20 * MINUTE), limit: 10 }]]);
+    expect(listRecentCompleted.mock.calls).toEqual([[{ startAfter: iso(now - 26 * HOUR), startBefore: iso(now - 20 * MINUTE), limit: 100 }]]);
     expect(roundAssessmentIds).not.toHaveBeenCalled();
   });
 
@@ -469,7 +473,7 @@ describe('redriveR1MeetFeedback', () => {
     expect(queuedFor).not.toContain(tooNew.bookingId);
   });
 
-  it('the real query: at most 10 a pass, newest slot first (the documented bound)', async () => {
+  it('the real query: at most 10 records a pass, newest slot first; the rest at the next bucket', async () => {
     const w = createR1MeetFeedbackWorld();
     const now = w.h.now();
     const bookings: CompletedBooking[] = [];
@@ -477,11 +481,34 @@ describe('redriveR1MeetFeedback', () => {
     await expect(redriveR1MeetFeedback(w.deps)).resolves.toEqual({ queued: 10 });
     const first = w.h.db.jobs('scorecard_feedback').map((job) => job.payload.booking_id).sort();
     expect(first).toEqual(bookings.slice(0, 10).map((b) => b.bookingId).sort());
-    // The bound (D-S09-9): the query answers the ten NEWEST completed bookings every pass, so while ten
-    // newer ones stay in the window the two oldest are not reached by the re-drive. A booking gets its
-    // chances in the buckets right after it settles; a miss beyond that is the runbook's re-post.
+    // The ten that now have their receipt take no slot: the next bucket records the two oldest.
+    await expect(redriveR1MeetFeedback(w.deps)).resolves.toEqual({ queued: 2 });
+    expect(w.h.db.jobs('scorecard_feedback').map((job) => job.payload.booking_id).sort()).toEqual(
+      bookings.map((b) => b.bookingId).sort(),
+    );
     await expect(redriveR1MeetFeedback(w.deps)).resolves.toEqual({ queued: 0 });
-    expect(w.h.db.jobs('scorecard_feedback')).toHaveLength(10);
+    expect(w.h.db.jobs('scorecard_feedback')).toHaveLength(12);
+  });
+
+  it('a lost trigger behind more than ten newer bookings that have their receipt is still found (S09-R1)', async () => {
+    const w = createR1MeetFeedbackWorld();
+    const now = w.h.now();
+    // The lost one settled first; fourteen newer interviews (R1 runs up to 15 at once) got their receipt.
+    const lost = await w.completedBooking({ record: false, startAt: iso(now - 3 * HOUR) });
+    for (let i = 0; i < 14; i += 1) await w.completedBooking({ startAt: iso(now - HOUR - i * MINUTE) });
+    const before = recordCalls(w).length;
+    await expect(redriveR1MeetFeedback(w.deps)).resolves.toEqual({ queued: 1 });
+    const calls = recordCalls(w).slice(before);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.args!.p_payload).toStrictEqual({
+      kind: 'scorecard_feedback',
+      booking_id: lost.bookingId,
+      assessment_id: lost.assessmentId,
+    });
+    expect(w.receiptRow(lost.key)).toMatchObject({ outcome: 'enqueued' });
+    // Nothing more is missing: the next bucket records nothing.
+    await expect(redriveR1MeetFeedback(w.deps)).resolves.toEqual({ queued: 0 });
+    expect(recordCalls(w).slice(before)).toHaveLength(1);
   });
 
   it('a failing read: one warning, nothing recorded, never a throw', async () => {

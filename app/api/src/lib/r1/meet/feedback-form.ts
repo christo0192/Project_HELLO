@@ -17,15 +17,18 @@
  *     A metric counts as scored only when `evidenceStatus === 'scored'` and its score is an integer on
  *     the row's scale. `evidence`, `evidenceRefs` and `raw` are never read, so a transcript quote can
  *     never reach the card.
- *  2. `r1MeetFeedbackSummary(source)` writes the Summary text (D-S09-7): a header with the verdict word
- *     and the coverage, then the NOT SCORED lines first (so the bound can never drop them), then the
- *     scored lines in rubric order. Every name and rationale is control-stripped and bounded; lines are
- *     kept whole up to 2000 characters. It names no candidate, no contact detail and no Meet URL.
+ *  2. `r1MeetFeedbackSummary(source, profile)` writes the Summary text (D-S09-7): a header naming the
+ *     booking's objective profile (its bot and its interview kind, so a later persona is never labelled
+ *     as Dex's sales round), the verdict word and the coverage, then the NOT SCORED lines first (so the
+ *     bound can never drop them), then the scored lines in rubric order. Every name and rationale is
+ *     control-stripped and bounded; lines are kept whole up to 2000 characters. It names no candidate,
+ *     no contact detail and no Meet URL.
  *  3. `bindR1MeetFeedbackForm(source, form, options)` binds the card onto the LIVE form definition
  *     (`feedbackFormDefinition.info`, structure only). It refuses, in this order:
  *       form_no_schema                 the read carried no field schema;
- *       form_mismatch                  the read is another form than the configured one, or two
- *                                      bound values would share one path;
+ *       form_mismatch                  the read is another form than the configured one (UUIDs
+ *                                      compare without case), or two bound values would share one
+ *                                      path;
  *       form_archived                  the form is archived;
  *       form_overall_missing           not exactly one field has the path `overall_recommendation`;
  *       form_overall_options_mismatch  that field is not a ValueSelect offering exactly "1".."4";
@@ -69,6 +72,7 @@ import {
   isScoreScaleMax,
   type ScoreScaleMax,
 } from '../../scorecards/contracts.js';
+import type { R1MeetObjectiveProfile } from './profiles.js';
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -85,6 +89,17 @@ export const R1_MEET_FEEDBACK_OVERALL_PATH = 'overall_recommendation';
 export const R1_MEET_FEEDBACK_SUMMARY_TITLE = 'Summary';
 /** The optional deep-link field, by title. */
 export const R1_MEET_FEEDBACK_REPORT_TITLE = 'Detailed report';
+
+/**
+ * The Summary header's words for each interview kind a Meet objective profile can run. Typed over
+ * every `interviewKind` of `profiles.ts`, so a new kind does not compile until it has its words.
+ */
+export const R1_MEET_FEEDBACK_KIND_LABELS: Readonly<Record<R1MeetObjectiveProfile['interviewKind'], string>> = Object.freeze({
+  sales_r1: 'R1 sales role-play',
+});
+
+/** What the Summary header reads of the booking's objective profile (`getR1MeetProfile`). */
+export type R1MeetFeedbackProfile = Pick<R1MeetObjectiveProfile, 'botDisplayName' | 'interviewKind'>;
 
 /** The verdict words HR already reads on the dashboard and in the Ashby tags (M027). */
 export const R1_MEET_VERDICT_WORDS = Object.freeze({
@@ -110,6 +125,7 @@ const RICH_TEXT_FIELD_TYPE = 'RichText';
 const PLAIN_TEXT_FIELD_TYPES: ReadonlySet<string> = new Set(['LongText', 'String']);
 const URL_FIELD_TYPE = 'Url';
 const MAX_METRIC_NAME_LEN = 100;
+const MAX_BOT_NAME_LEN = 40;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** A numeric column as PostgREST may send it: a JSON number, or a plain decimal string. */
 const DECIMAL = /^-?\d{1,12}(?:\.\d{1,12})?$/;
@@ -171,11 +187,11 @@ export type R1MeetFeedbackBinding =
   | { readonly ok: false; readonly reason: R1MeetFeedbackFormRefusal };
 
 export interface R1MeetFeedbackBindOptions {
-  /** The configured form (`R1_MEET_ASHBY_FEEDBACK_FORM_ID`), compared exactly. */
+  /** The configured form (`R1_MEET_ASHBY_FEEDBACK_FORM_ID`), compared as a UUID: case ignored. */
   readonly formDefinitionId: string;
   /** `r1MeetFeedbackReportUrl(...)`; null leaves the report field empty. */
   readonly reportUrl: string | null;
-  /** `r1MeetFeedbackSummary(source)`. */
+  /** `r1MeetFeedbackSummary(source, profile)`. */
   readonly summary: string;
 }
 
@@ -248,14 +264,16 @@ export function r1MeetFeedbackSource(row: R1MeetAssessmentRow | null | undefined
 // ── 2. The Summary text ─────────────────────────────────────────────────────
 
 /** The Summary field's text (D-S09-7). Pure; always at most `summaryMax` characters. */
-export function r1MeetFeedbackSummary(source: R1MeetFeedbackSource): string {
+export function r1MeetFeedbackSummary(source: R1MeetFeedbackSource, profile: R1MeetFeedbackProfile): string {
   const scaleMax = source.scaleMax;
   const total = source.metrics.length;
   const scoredCount = source.metrics.filter((metric) => metric.score !== null).length;
   const notScored = total - scoredCount;
   const coverage = `across ${scoredCount} of ${total} metric${total === 1 ? '' : 's'}`
     + (notScored > 0 ? `; ${notScored} not scored (listed below)` : '');
-  const header = `Dex (AI interviewer): R1 sales role-play over Google Meet. `
+  const bot = boundedText(profile.botDisplayName, MAX_BOT_NAME_LEN);
+  const kind = R1_MEET_FEEDBACK_KIND_LABELS[profile.interviewKind];
+  const header = `${bot} (AI interviewer): ${kind} over Google Meet. `
     + `Verdict: ${R1_MEET_VERDICT_WORDS[source.recommendation]}. `
     + `Weighted ${formatWeighted(source.weighted)}/${scaleMax} ${coverage}.`;
 
@@ -308,7 +326,7 @@ export function bindR1MeetFeedbackForm(
   options: R1MeetFeedbackBindOptions,
 ): R1MeetFeedbackBinding {
   if (form.schemaAvailable !== true) return refuse('form_no_schema');
-  if (form.formDefinitionId !== options.formDefinitionId) return refuse('form_mismatch');
+  if (!sameUuid(form.formDefinitionId, options.formDefinitionId)) return refuse('form_mismatch');
   if (form.archived === true) return refuse('form_archived');
 
   const fields = formFields(form);
@@ -410,6 +428,11 @@ export function r1MeetFeedbackRequest(input: R1MeetFeedbackRequestInput): Feedba
 
 function refused(reason: R1MeetFeedbackSourceRefusal): { readonly refused: R1MeetFeedbackSourceRefusal } {
   return Object.freeze({ refused: reason });
+}
+
+/** Two UUIDs name the same form whatever their case (Ashby answers lower case; a pasted id may not be). */
+function sameUuid(a: unknown, b: unknown): boolean {
+  return typeof a === 'string' && typeof b === 'string' && UUID.test(a) && a.toLowerCase() === b.toLowerCase();
 }
 
 function refuse(reason: R1MeetFeedbackFormRefusal): { readonly ok: false; readonly reason: R1MeetFeedbackFormRefusal } {

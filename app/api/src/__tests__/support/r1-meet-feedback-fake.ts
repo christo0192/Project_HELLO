@@ -314,6 +314,8 @@ export interface R1MeetFeedbackWorld {
   setConfig(config: R1MeetFeedbackConfig): void;
   /** False: `ashby()` answers null (no usable Ashby key). */
   setKeyConfigured(configured: boolean): void;
+  /** False: `ashbyActive()` answers false (Ashby's master or runtime switch is off). */
+  setAshbyActive(active: boolean): void;
   /** The next read of `assessments` or `candidates` answers a DB error. */
   failNext(table: keyof ExtraTables): void;
   completedBooking(options?: CompletedBookingOptions): Promise<CompletedBooking>;
@@ -352,9 +354,11 @@ export function createR1MeetFeedbackWorld(): R1MeetFeedbackWorld {
 
   let config: R1MeetFeedbackConfig = Object.freeze({ status: 'on', formDefinitionId: FEEDBACK_FORM_ID });
   let keyConfigured = true;
+  let ashbyActive = true;
   const feedback: R1MeetFeedbackDeps = Object.freeze({
     config: () => config,
     store,
+    ashbyActive: () => ashbyActive,
     ashby: () => (keyConfigured ? port : null),
     dexUserId: DEX_USER_ID,
     bridgePageUrl: BRIDGE_PAGE_URL,
@@ -376,6 +380,9 @@ export function createR1MeetFeedbackWorld(): R1MeetFeedbackWorld {
     },
     setKeyConfigured(configured) {
       keyConfigured = configured;
+    },
+    setAshbyActive(active) {
+      ashbyActive = active;
     },
     failNext(table) {
       failures.add(table);

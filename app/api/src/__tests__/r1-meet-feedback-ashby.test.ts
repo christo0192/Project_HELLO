@@ -29,6 +29,7 @@ import {
   r1MeetFeedbackSource,
   r1MeetFeedbackSummary,
 } from '../lib/r1/meet/feedback-form.js';
+import { R1_MEET_DEFAULT_PROFILE_ID, getR1MeetProfile } from '../lib/r1/meet/profiles.js';
 import type { R1MeetLog, R1MeetLogMeta } from '../lib/r1/meet/recall-actions.js';
 import { R1_METRICS } from '../lib/r1/rubric.js';
 
@@ -153,7 +154,7 @@ function cardRequest(form: ProbeFeedbackForm) {
   const bound = bindR1MeetFeedbackForm(source, form, {
     formDefinitionId: FORM_ID,
     reportUrl: r1MeetFeedbackReportUrl(BRIDGE_PAGE_URL, ROUND_ID),
-    summary: r1MeetFeedbackSummary(source),
+    summary: r1MeetFeedbackSummary(source, getR1MeetProfile(R1_MEET_DEFAULT_PROFILE_ID)!),
   });
   if (!bound.ok) throw new Error(`fixture binding refused: ${bound.reason}`);
   return r1MeetFeedbackRequest({

@@ -32,7 +32,11 @@
  * DEX'S SCORECARD TO ASHBY (M034 S09, D-S09-12): the lane's flow ports carry `feedback`, the ports of
  * the `scorecard_feedback` job and of the maintenance re-drive: the form setting
  * (`getR1MeetFeedbackConfig`, read per job), the feedback store over the same client, the Dex user and
- * the bridge page of the enabled Meet config, and the Ashby port. The Ashby port is built on the first
+ * the bridge page of the enabled Meet config, Ashby's own switches and the Ashby port. The switches
+ * (`ashbyActive`) are read per job: the integration master switch with a usable webhook secret
+ * (`isAshbyWebhookActive(loadAshbyConfig())`) AND `ASHBY_RUNTIME_ENABLED`, the switches every other
+ * Ashby write honours, so the documented "stop all Ashby writes" rollback (ashby-runtime-activation.md
+ * §6) stops Dex's card too (the job holds it: `ashby_inactive`). The Ashby port is built on the first
  * job that needs it, from the existing Ashby runtime config (`loadAshbyRuntimeConfig`, the same
  * `ASHBY_API_KEY` as every other Ashby write; no new secret): no usable key = null (the job alerts
  * `ashby_key_missing`), and a null is NOT remembered, so a key set later is picked up by the next job.
@@ -45,7 +49,7 @@
  * are arguments, and the Recall and Ashby clients are built on first use.
  */
 
-import { loadAshbyRuntimeConfig } from '../../../integrations/ashby/config.js';
+import { isAshbyWebhookActive, loadAshbyConfig, loadAshbyRuntimeConfig } from '../../../integrations/ashby/config.js';
 import { createRecallClient } from '../../../integrations/recall/client.js';
 import type { Queue } from '../../queue/index.js';
 import { createQueueRunner, type QueueRunnerEvent, type QueueRunnerHandle } from '../../queue/runner.js';
@@ -146,9 +150,10 @@ export interface R1MeetLane {
 }
 
 /**
- * The production ports of Dex's scorecard feedback (M034 S09, see the header). The Ashby port is
- * built lazily from `loadAshbyRuntimeConfig()`: null while no usable key is configured (not
- * remembered, so a key set later counts at the next job), kept once built.
+ * The production ports of Dex's scorecard feedback (M034 S09, see the header). Ashby's switches are
+ * read per job (a switch that cannot be read is off). The Ashby port is built lazily from
+ * `loadAshbyRuntimeConfig()`: null while no usable key is configured (not remembered, so a key set
+ * later counts at the next job), kept once built.
  */
 export function createR1MeetFeedbackPorts(
   client: Db,
@@ -159,6 +164,13 @@ export function createR1MeetFeedbackPorts(
   return Object.freeze({
     config: () => getR1MeetFeedbackConfig(),
     store: createR1MeetFeedbackStore(client),
+    ashbyActive: (): boolean => {
+      try {
+        return isAshbyWebhookActive(loadAshbyConfig()) && loadAshbyRuntimeConfig().runtimeEnabled;
+      } catch {
+        return false;
+      }
+    },
     ashby: (): R1MeetAshbyFeedbackPort | null => {
       if (port !== null) return port;
       const ashby = loadAshbyRuntimeConfig();

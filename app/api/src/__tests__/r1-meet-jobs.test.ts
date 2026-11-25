@@ -877,6 +877,8 @@ describe('job facts, results and errors', () => {
       createdAt: '2030-01-01T00:00:00.000Z',
       isRerun: false,
       finalAttempt: false,
+      lastDeferReason: null,
+      lastError: null,
     });
     expect(r1MeetJobMeta({ ...base, attempts: 2 })).toMatchObject({ isRerun: true, finalAttempt: false });
     // A deferral refunds the attempt, so a re-run after one is seen through the count.
@@ -889,6 +891,24 @@ describe('job facts, results and errors', () => {
     expect(r1MeetJobMeta({ ...base, attempts: 5 }).finalAttempt).toBe(true);
     expect(r1MeetJobMeta({ ...base, attempts: 6 }).finalAttempt).toBe(true);
     expect(Object.isFrozen(r1MeetJobMeta(base))).toBe(true);
+  });
+
+  it("carries the previous run's deferral reason and thrown code as the queue keeps them (S09-R2)", () => {
+    expect(r1MeetJobMeta({ ...base, deferCount: 1, deferReason: 'booking_not_settled' })).toMatchObject({
+      lastDeferReason: 'booking_not_settled',
+      lastError: null,
+    });
+    expect(r1MeetJobMeta({ ...base, attempts: 2, errorMessage: 'r1_meet_feedback_ashby_unavailable' })).toMatchObject({
+      lastDeferReason: null,
+      lastError: 'r1_meet_feedback_ashby_unavailable',
+    });
+    // Only the closed code shape of 0037 is kept; anything else (driver text, a value) reads as null.
+    for (const odd of ['', 'Has Spaces', 'x'.repeat(65), 'ÜBER', 'a\nb']) {
+      expect(r1MeetJobMeta({ ...base, deferReason: odd, errorMessage: odd }), JSON.stringify(odd)).toMatchObject({
+        lastDeferReason: null,
+        lastError: null,
+      });
+    }
   });
 
   it('allows a deferral under 30 of them and under an hour of one streak', () => {

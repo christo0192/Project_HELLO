@@ -19,6 +19,7 @@ import type { ProbeFeedbackForm, ProbeFormField } from '../integrations/ashby/pr
 import { R1_METRICS } from '../lib/r1/rubric.js';
 import {
   R1_MEET_FEEDBACK_FORM_REFUSALS,
+  R1_MEET_FEEDBACK_KIND_LABELS,
   R1_MEET_FEEDBACK_LIMITS,
   R1_MEET_FEEDBACK_OVERALL_PATH,
   R1_MEET_FEEDBACK_REPORT_TITLE,
@@ -32,6 +33,10 @@ import {
   r1MeetFeedbackSummary,
   type R1MeetFeedbackSource,
 } from '../lib/r1/meet/feedback-form.js';
+import { R1_MEET_PROFILES, R1_MEET_DEFAULT_PROFILE_ID } from '../lib/r1/meet/profiles.js';
+
+/** The one profile this build knows (the booking's `objective_profile` default). */
+const DEX = R1_MEET_PROFILES[R1_MEET_DEFAULT_PROFILE_ID]!;
 
 const SRC = path.resolve(fileURLToPath(new URL('../', import.meta.url)));
 
@@ -141,7 +146,7 @@ function without(id: string, base: readonly ProbeFormField[] = ALL_FIELDS): Prob
 }
 
 function bind(f: ProbeFeedbackForm = form(), src: R1MeetFeedbackSource = source(), reportUrl: string | null = REPORT_URL) {
-  return bindR1MeetFeedbackForm(src, f, { formDefinitionId: FORM_ID, reportUrl, summary: r1MeetFeedbackSummary(src) });
+  return bindR1MeetFeedbackForm(src, f, { formDefinitionId: FORM_ID, reportUrl, summary: r1MeetFeedbackSummary(src, DEX) });
 }
 
 const HAPPY_SUMMARY = [
@@ -320,14 +325,14 @@ describe('r1MeetFeedbackSource: metrics', () => {
 
 describe('r1MeetFeedbackSummary', () => {
   it('writes the header and one line per metric in rubric order', () => {
-    expect(r1MeetFeedbackSummary(source())).toBe(HAPPY_SUMMARY);
+    expect(r1MeetFeedbackSummary(source(), DEX)).toBe(HAPPY_SUMMARY);
   });
 
   it.each([
     ['hold', 55, 'Borderline'],
     ['reject', 20, 'Reject'],
   ] as const)('says the verdict word for %s', (recommendation, overall, word) => {
-    expect(r1MeetFeedbackSummary(source({ recommendation, overall_score: overall }))).toContain(`. Verdict: ${word}. `);
+    expect(r1MeetFeedbackSummary(source({ recommendation, overall_score: overall }), DEX)).toContain(`. Verdict: ${word}. `);
   });
 
   it('puts the NOT SCORED lines first and states the coverage', () => {
@@ -341,7 +346,7 @@ describe('r1MeetFeedbackSummary', () => {
         metricResult(4, 3, RATIONALES[4]),
       ],
     });
-    expect(r1MeetFeedbackSummary(src)).toBe([
+    expect(r1MeetFeedbackSummary(src, DEX)).toBe([
       'Dex (AI interviewer): R1 sales role-play over Google Meet. Verdict: Select. Weighted 3.4/4 across 3 of 5 metrics; 2 not scored (listed below).',
       'Objection handling — NOT SCORED (insufficient evidence): The learner raised no objection.',
       'Negotiation & discount discipline — NOT SCORED (insufficient evidence)',
@@ -352,7 +357,7 @@ describe('r1MeetFeedbackSummary', () => {
   });
 
   it('rounds the weighted score to two decimals and omits an empty rationale', () => {
-    const summary = r1MeetFeedbackSummary(source({ weighted_score_5: 3.3333, metric_results: [metricResult(0, 3, '  ')] }));
+    const summary = r1MeetFeedbackSummary(source({ weighted_score_5: 3.3333, metric_results: [metricResult(0, 3, '  ')] }), DEX);
     expect(summary).toBe(
       'Dex (AI interviewer): R1 sales role-play over Google Meet. Verdict: Select. Weighted 3.33/4 across 1 of 1 metric.\n'
       + 'Probing & discovery — 3/4',
@@ -363,7 +368,7 @@ describe('r1MeetFeedbackSummary', () => {
     const src = source({ metric_results: [metricResult(0, 4, 'word '.repeat(100))] });
     expect(src.metrics[0]!.rationale).toHaveLength(280);
     expect(src.metrics[0]!.rationale.endsWith('…')).toBe(true);
-    const line = r1MeetFeedbackSummary(src).split('\n')[1]!;
+    const line = r1MeetFeedbackSummary(src, DEX).split('\n')[1]!;
     expect(line).toBe(`Probing & discovery — 4/4: ${src.metrics[0]!.rationale}`);
   });
 
@@ -379,7 +384,7 @@ describe('r1MeetFeedbackSummary', () => {
       });
     }
     const src = source({ metric_results: entries });
-    const summary = r1MeetFeedbackSummary(src);
+    const summary = r1MeetFeedbackSummary(src, DEX);
     expect(summary.length).toBeLessThanOrEqual(2000);
     const lines = summary.split('\n');
     expect(lines[0]).toContain('across 17 of 20 metrics; 3 not scored (listed below).');
@@ -403,15 +408,29 @@ describe('r1MeetFeedbackSummary', () => {
     expect(src.metrics[0]!.name).toBe('Pro bing');
     expect(src.metrics[0]!.rationale).toBe('Good open questions here then more');
     expect(src.metrics[1]!.rationale).toBe(`${'a'.repeat(278)}…`);
-    const summary = r1MeetFeedbackSummary(src);
+    const summary = r1MeetFeedbackSummary(src, DEX);
     expect(summary).not.toMatch(LONE_SURROGATE);
     expect(summary.replace(/\n/g, '')).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
   });
 
   it('holds no evidence quote, no candidate detail and no old persona name', () => {
-    const summary = r1MeetFeedbackSummary(source());
+    const summary = r1MeetFeedbackSummary(source(), DEX);
     for (const sentinel of Object.values(PII)) expect(summary).not.toContain(sentinel);
     expect(summary).not.toMatch(/christy/i);
+  });
+
+  it("names the booking's objective profile in the header, never a hard-coded persona (S09-R5)", () => {
+    expect(R1_MEET_FEEDBACK_KIND_LABELS).toStrictEqual({ sales_r1: 'R1 sales role-play' });
+    expect(Object.isFrozen(R1_MEET_FEEDBACK_KIND_LABELS)).toBe(true);
+    const later = r1MeetFeedbackSummary(source(), { botDisplayName: 'Ava', interviewKind: 'sales_r1' });
+    expect(later).toBe(HAPPY_SUMMARY.replace(/^Dex \(AI interviewer\)/, 'Ava (AI interviewer)'));
+    expect(later.split('\n')[0]).toMatch(/^Ava \(AI interviewer\): R1 sales role-play over Google Meet\. Verdict: Select\. /);
+    expect(later).not.toContain('Dex');
+    // The profile's name is bounded and control-stripped like any other text on the card.
+    const odd = r1MeetFeedbackSummary(source(), { botDisplayName: `Ava\u0000\n${'x'.repeat(60)}`, interviewKind: 'sales_r1' });
+    const header = odd.split('\n')[0]!;
+    expect(header.slice(0, header.indexOf(' (AI interviewer)')).length).toBeLessThanOrEqual(40);
+    expect(header).not.toMatch(/[\u0000-\u001f]/);
   });
 });
 
@@ -540,9 +559,19 @@ describe('bindR1MeetFeedbackForm: the form itself, in check order', () => {
     expect(bind(form(ALL_FIELDS, { schemaAvailable: false }))).toStrictEqual({ ok: false, reason: 'form_no_schema' });
     expect(bind(form(ALL_FIELDS, { formDefinitionId: '7f000000-0000-4000-8000-00000000f002' })))
       .toStrictEqual({ ok: false, reason: 'form_mismatch' });
-    expect(bind(form(ALL_FIELDS, { formDefinitionId: FORM_ID.toUpperCase() })))
-      .toStrictEqual({ ok: false, reason: 'form_mismatch' });
+    expect(bind(form(ALL_FIELDS, { formDefinitionId: 'not-a-uuid' }))).toStrictEqual({ ok: false, reason: 'form_mismatch' });
     expect(bind(form(ALL_FIELDS, { archived: true }))).toStrictEqual({ ok: false, reason: 'form_archived' });
+  });
+
+  it('compares the form ids as UUIDs: case never makes another form (S09-R4)', () => {
+    const src = source();
+    const options = (formDefinitionId: string) => ({ formDefinitionId, reportUrl: REPORT_URL, summary: r1MeetFeedbackSummary(src, DEX) });
+    // Ashby's read in upper case, the setting in lower case; and the other way round.
+    expect(bindR1MeetFeedbackForm(src, form(ALL_FIELDS, { formDefinitionId: FORM_ID.toUpperCase() }), options(FORM_ID)).ok).toBe(true);
+    expect(bindR1MeetFeedbackForm(src, form(), options(FORM_ID.toUpperCase())).ok).toBe(true);
+    // Another UUID is still another form, in any case.
+    const other = '7f000000-0000-4000-8000-00000000f002';
+    expect(bindR1MeetFeedbackForm(src, form(), options(other.toUpperCase()))).toStrictEqual({ ok: false, reason: 'form_mismatch' });
   });
 
   it('answers the first refusal when several apply', () => {

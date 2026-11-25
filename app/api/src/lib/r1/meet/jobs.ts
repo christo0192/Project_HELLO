@@ -653,10 +653,31 @@ export interface R1MeetJobMeta {
   readonly isRerun: boolean;
   /** A throw now dead-letters the job (`fail_job`: attempts >= max_attempts). */
   readonly finalAttempt: boolean;
+  /**
+   * The reason code of the deferral that ended the PREVIOUS run, or null. The queue keeps
+   * `defer_reason` from `defer_job` until the next non-deferral outcome (`complete_job` and
+   * `fail_job` clear it, a claim does not: 0037). S09.
+   */
+  readonly lastDeferReason: string | null;
+  /**
+   * The closed code the PREVIOUS run threw, or null. The queue keeps `error_message` from `fail_job`
+   * until the next deferral (`defer_job` clears it, a claim does not: 0028, 0037). S09.
+   */
+  readonly lastError: string | null;
+}
+
+/** The shape a queue reason or error code has (0037 `chk_job_queue_defer_reason`); anything else is null. */
+const QUEUE_CODE = /^[a-z0-9_.:-]{1,64}$/;
+
+function queueCode(value: unknown): string | null {
+  return typeof value === 'string' && QUEUE_CODE.test(value) ? value : null;
 }
 
 export function r1MeetJobMeta(
-  job: Pick<QueueJob<unknown>, 'attempts' | 'maxAttempts' | 'deferCount' | 'deferredAt' | 'createdAt'>,
+  job: Pick<
+    QueueJob<unknown>,
+    'attempts' | 'maxAttempts' | 'deferCount' | 'deferredAt' | 'createdAt' | 'deferReason' | 'errorMessage'
+  >,
 ): R1MeetJobMeta {
   const deferCount = typeof job.deferCount === 'number' ? job.deferCount : 0;
   return Object.freeze({
@@ -667,6 +688,8 @@ export function r1MeetJobMeta(
     createdAt: job.createdAt,
     isRerun: job.attempts > 1 || deferCount > 0,
     finalAttempt: job.attempts >= job.maxAttempts,
+    lastDeferReason: queueCode(job.deferReason),
+    lastError: queueCode(job.errorMessage),
   });
 }
 
