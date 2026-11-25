@@ -41,7 +41,7 @@ function addRound(i: number, over: Row = {}, candidateOver: Row = {}): void {
   (engine.tables.interview_rounds ??= []).push({
     id: roundId(i), candidate_id: candidateId(i), status: 'completed', expires_at: LINK_ALIVE, attempts_allowed: 2, attempts_counted: 1,
     recommendation: 'hold', overall: 58, status_write: 'hold_flag', pending_reject_until: null, consent_locale: 'en-IN',
-    created_at: sentAt(i), created_by: OWNER, link_token_digest: 'd'.repeat(64), status_write_audit: { secret: 'SECRET-AUDIT' }, ...over,
+    created_at: sentAt(i), created_by: OWNER, link_token_digest: 'd'.repeat(64), status_write_audit: { secret: 'SECRET-AUDIT' }, channel: 'browser', ...over,
   });
 }
 
@@ -486,13 +486,57 @@ describe('a row', () => {
     expect(row).toMatchObject({
       id: roundId(0), candidate_id: candidateId(0), candidate_name: 'Candidate 0', status: 'completed', attempts_allowed: 2, attempts_counted: 1,
       recommendation: 'reject', overall: 31, status_write: 'pending_reject', pending_reject_until: '2026-11-02T00:00:00Z',
-      scores_withheld: false, is_staff_dry_run: false, created_at: sentAt(0),
+      scores_withheld: false, is_staff_dry_run: false, created_at: sentAt(0), channel: 'browser',
     });
     expect(row.attempts.map((attempt: Row) => attempt.session_id)).toEqual([sessionId(0, 0), sessionId(0, 1)]);
     expect(row.attempts[0]).toMatchObject({
       attempt_number: 1, counted: true, outcome: 'complete', session_status: 'completed', ended_at: sentAt(1), in_progress: false, consent_withdrawn: false, recording: { state: 'none' },
     });
     expect(row.attempts[1].recording).toMatchObject({ state: 'partial', has_video: true, duration_ms: 1_500_000 });
+  });
+
+  // M034 S09 (the S10-R1 go-live blocker): the queue marks a Meet round "Via Meet", so the row says how the
+  // candidate joins. Only the two closed words leave, and an appeal keeps it: it is no verdict.
+  it('says how the candidate joins: meet for a Meet round, browser otherwise, and keeps it under an appeal', async () => {
+    addRound(0, { channel: 'meet' });
+    addRound(1);
+    addRound(2, { channel: 'MEET' });
+    addRound(3);
+    delete engine.tables.interview_rounds[3].channel;
+    addRound(4, { channel: 'meet' }, { decision_use_blocked_at: '2026-10-05T00:00:00Z' });
+    const { body } = await list('?view=all&sort=oldest');
+    expect(body.rounds.map((round: Row) => [round.id, round.channel])).toEqual([
+      [roundId(0), 'meet'], [roundId(1), 'browser'], [roundId(2), 'browser'], [roundId(3), 'browser'], [roundId(4), 'meet'],
+    ]);
+    expect(body.rounds[4]).toMatchObject({ recommendation: null, overall: null, scores_withheld: true, channel: 'meet' });
+  });
+
+  it('asks PostgREST for channel, on a real supabase-js client', async () => {
+    const selects: string[] = [];
+    const client = createClient('https://project.invalid', 'test-key', {
+      auth: { persistSession: false, autoRefreshToken: false },
+      global: {
+        fetch: async (input: RequestInfo | URL) => {
+          const url = new URL(input instanceof Request ? input.url : String(input));
+          const rounds = url.pathname.endsWith('/rest/v1/interview_rounds');
+          if (rounds) selects.push(url.searchParams.get('select') ?? '');
+          const found = rounds
+            ? [{ id: roundId(0), candidate_id: candidateId(0), status: 'completed', created_at: sentAt(0), channel: 'meet', candidates: { name: 'Candidate 0', decision_use_blocked_at: null } }]
+            : [];
+          // The page read is counted, and PostgREST answers its count in Content-Range.
+          const headers: Record<string, string> = { 'content-type': 'application/json' };
+          if (rounds) headers['content-range'] = '0-0/1';
+          return new Response(JSON.stringify(found), { status: 200, headers });
+        },
+      },
+    });
+    const query = parseR1QueueQuery({ view: 'all' })!;
+    const result = await readR1Queue(client as never, { id: OWNER, appRole: 'admin', active: true }, query);
+    expect(result).toMatchObject({ kind: 'ok', body: { rounds: [{ id: roundId(0), channel: 'meet' }] } });
+    // The row reads, not a head-only count of ids.
+    const rowReads = selects.filter((select) => select.split(',').includes('status'));
+    expect(rowReads.length).toBeGreaterThan(0);
+    for (const select of rowReads) expect(select.split(',')).toContain('channel');
   });
 
   it('says an interview is still running, and a round with no attempt has none', async () => {

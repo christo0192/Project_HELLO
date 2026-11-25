@@ -59,7 +59,7 @@ const MAX_PAGES = 5;
 
 const ROUND_COLUMNS =
   'id,candidate_id,status,expires_at,attempts_allowed,attempts_counted,recommendation,overall,assessment_id,'
-  + 'status_write,pending_reject_until,consent_locale,created_at,created_by';
+  + 'status_write,pending_reject_until,consent_locale,created_at,created_by,channel';
 const CANDIDATE_COLUMNS = 'id,owner_id,name,role_id,skills,experience_years,parsed,decision_use_blocked_at';
 const ATTEMPT_COLUMNS = 'session_id,attempt_number,persona_id,counted,outcome,created_at';
 const SESSION_COLUMNS = 'id,status,started_at,ended_at';
@@ -518,6 +518,9 @@ export async function readR1Review(
           is_staff_dry_run: round.consent_locale === STAFF_LOCALE,
           created_at: round.created_at,
           created_by: round.created_by,
+          // How the candidate joins (0142, M034). Not a verdict, so an appeal keeps it; only the two
+          // closed words leave, and anything else, absent included, is our browser link.
+          channel: round.channel === 'meet' ? 'meet' : 'browser',
         },
         candidate: {
           id: candidate.id,

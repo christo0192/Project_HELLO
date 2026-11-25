@@ -98,7 +98,7 @@ function tablesFor(overrides: Partial<Tables> = {}): Tables {
       id: ROUND, candidate_id: CANDIDATE, role_id: 'r1-role', status: 'completed', expires_at: '2026-11-06T00:00:00Z',
       attempts_allowed: 2, attempts_counted: 1, recommendation: 'hold', overall: 58, assessment_id: ASSESSMENT,
       status_write: 'pending_reject', pending_reject_until: '2026-11-06T10:00:00Z', consent_locale: 'en-IN',
-      created_at: '2026-11-01T00:00:00Z', created_by: OWNER, link_token_digest: 'd'.repeat(64),
+      created_at: '2026-11-01T00:00:00Z', created_by: OWNER, link_token_digest: 'd'.repeat(64), channel: 'browser',
     }],
     candidates: [{
       id: CANDIDATE, owner_id: OWNER, status: 'screened', decision_use_blocked_at: null, name: 'Ava Example', role_id: ROLE,
@@ -235,7 +235,55 @@ describe('what the answer carries', () => {
       id: ROUND, candidate_id: CANDIDATE, status: 'completed', expires_at: '2026-11-06T00:00:00Z',
       attempts_allowed: 2, attempts_counted: 1, recommendation: 'hold', overall: 58, status_write: 'pending_reject',
       pending_reject_until: '2026-11-06T10:00:00Z', scores_withheld: false, is_staff_dry_run: false,
-      created_at: '2026-11-01T00:00:00Z', created_by: OWNER,
+      created_at: '2026-11-01T00:00:00Z', created_by: OWNER, channel: 'browser',
+    });
+  });
+
+  // M034 S09 (the S10-R1 go-live blocker): the review page marks a Meet round "Via Meet", so the round says
+  // how the candidate joins. Only the two closed words leave, and an appeal keeps it: it is no verdict.
+  describe('channel', () => {
+    it('asks the store for channel, so a Meet round can ever read as one', async () => {
+      const tables = tablesFor();
+      const app = appFor('admin', OWNER, tables);
+      const selected: string[] = [];
+      mocks.from.mockImplementation((table: string) => {
+        const q = query(table, tables);
+        if (table !== 'interview_rounds') return q;
+        const select = q.select;
+        q.select = (columns: string) => { selected.push(columns); return select(columns); };
+        return q;
+      });
+      expect((await review(app)).status).toBe(200);
+      expect(selected.length).toBeGreaterThan(0);
+      for (const columns of selected) expect(columns.split(',')).toContain('channel');
+    });
+
+    it('answers meet for a round stored as meet, and nothing else about the round changes', async () => {
+      const tables = tablesFor();
+      tables.interview_rounds[0].channel = 'meet';
+      const { body } = await review(appFor('admin', OWNER, tables));
+      expect(body.round).toEqual({
+        id: ROUND, candidate_id: CANDIDATE, status: 'completed', expires_at: '2026-11-06T00:00:00Z',
+        attempts_allowed: 2, attempts_counted: 1, recommendation: 'hold', overall: 58, status_write: 'pending_reject',
+        pending_reject_until: '2026-11-06T10:00:00Z', scores_withheld: false, is_staff_dry_run: false,
+        created_at: '2026-11-01T00:00:00Z', created_by: OWNER, channel: 'meet',
+      });
+    });
+
+    it.each([['absent', undefined], ['null', null], ['another word', 'MEET']])('reads a %s channel as our browser link, so no raw value leaves', async (_label, value) => {
+      const tables = tablesFor();
+      if (value === undefined) delete tables.interview_rounds[0].channel;
+      else tables.interview_rounds[0].channel = value;
+      const { body } = await review(appFor('admin', OWNER, tables));
+      expect(body.round.channel).toBe('browser');
+    });
+
+    it('keeps channel while an appeal withholds the result', async () => {
+      const tables = tablesFor();
+      tables.interview_rounds[0].channel = 'meet';
+      tables.candidates[0].decision_use_blocked_at = '2026-11-04T00:00:00Z';
+      const { body } = await review(appFor('admin', OWNER, tables));
+      expect(body.round).toMatchObject({ recommendation: null, overall: null, scores_withheld: true, channel: 'meet' });
     });
   });
 
