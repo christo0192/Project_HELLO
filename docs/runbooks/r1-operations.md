@@ -3835,3 +3835,309 @@ stagger the joins. Real candidates join from their own networks.
    until the others end or lapse.
 4. The pool and the SFU size can stay (the limit caps admission). Shrink the pool with `--retire`
    and revert the SFU size (with its validator pin) only in a zero-live window.
+
+## R1 over Google Meet: runtime and go-live (M034 S06, dark)
+
+S06 adds the `r1-meet` runtime of R1 over Google Meet: the one queue handler that turns Ashby
+schedule deliveries into rounds, bookings and Recall bots, opens the bridge page in the call when a
+person joins, ends the call on a second person (by default), sends the bot away when the attempt
+ends, removes bots on the way out (the drain) and caps bots per day. The code is
+`app/api/src/lib/r1/meet/` (`dispatcher.ts` and one file per concern), hosted by
+`lib/r1/runtime.ts`. "Deploying 0142" (Rollback) and "Meet webhook receivers" (Rollback) above point
+here for the drain. The vendor is Recall.ai, region ap-northeast-1 (Tokyo).
+
+### What runs, and what stays off
+
+- **Dark by default.** The `r1-meet` queue runner exists only when BOTH `R1_ENABLED=true` and
+  `R1_MEET_ENABLED=true` when the API starts (the R1 runtime is built at boot, and every
+  `fly secrets set` restarts the API). Otherwise the R1 runtime has exactly its four queues and no
+  Meet job is ever claimed. The runner also stops claiming the moment Meet reads inactive, and a job
+  claimed a moment before is deferred (`r1_meet_inactive`, 60 s) before it reads or calls anything.
+- **No poller, no new loop.** Webhooks drive everything. The lane is ticked by the existing
+  `r1-storage` loop (kept at its 5 s cadence while a call is live), and the existing `r1-sweep`
+  loop queues one `maintenance` job per 15-minute bucket: owed releases, overdue bookings, ended
+  attempts, stuck creates, cap-blocked bookings, and every 6 hours the 30-day prunes of receipts and
+  bookings.
+- **What "off" costs.** Never configured (no `RECALL_API_KEY`): zero queries and zero calls. A
+  Recall key with the flag off: at most two narrow booking reads per 15 minutes, and no outbound
+  call unless a booking still holds a bot (then only GET, DELETE and `leave_call`). Nothing is
+  created, armed or queued while off.
+- **The flow when on.** Ashby `ashby_schedule` job -> `r1_meet_create_round_from_ashby` (the
+  round, the booking, the HR-attested consent) -> Recall Create Bot (`join_at` = start - 2 minutes,
+  `web_4_core`, Idempotency-Key `r1-meet-<event>-v<version>-k<key_attempt>`) -> `bot_scheduled`
+  -> `bot_joining` -> a person joins (`human_present`): a fresh bridge ticket is armed and the
+  bridge page is posted as the bot's camera (`output_media`) -> the page claims the ticket
+  (`in_call`) and Dex runs the interview -> the worker reports the attempt outcome -> `leave_call`
+  -> `completed/attempt_settled`. An attempt that does NOT count (a provider error, a forced
+  shutdown, a bridge that never got in, a session that lapsed before the worker joined) does not end
+  the call: while the round has a start left, the claim window is open, an arm is left and a person
+  is still in the call, a fresh ticket is armed and posted (the next claim is a new attempt, as a
+  browser candidate would restart). Otherwise the bot leaves and the booking is `failed/no_show`
+  (nobody left in the call) or `failed/bot_fatal` (Dex could not go on): HR books again. A move in
+  Ashby releases the bot and creates a new one (never a PATCH); a cancel, or Dex removed, releases it
+  and cancels the booking.
+- **The bot leaves on its own** (Recall `automatic_leave`, profile `r1_dex_sales`): waiting room
+  600 s, nobody joined 900 s, everyone left 90 s (the worker's rejoin grace), in the call but not
+  recording 900 s, recording 2700 s (45 minutes). These bound the bill of a bot nobody released.
+- **Logs.** One info line per job, `error_category: r1_meet_job`, `error_type: <kind>:<code>`.
+  Alerts are error lines with the closed categories of the alerts table below. Recall calls log
+  `r1_meet_recall_ok` / `r1_meet_recall_failed` with the operation, category and HTTP status. No
+  line ever holds an id, a name, an email, a Meet URL, a ticket or a digest.
+
+### The Dex Ashby user (owner, once)
+
+1. Create the Ashby user **"Dex (AI Interviewer)"** with the email of the bot's Google account
+   (below), so that Ashby invites that account whenever Dex is an interviewer.
+2. Add Dex as an interviewer on the R1 interview of the stage HR schedules R1 in. HR schedules the
+   R1 interview in Ashby with Dex as the interviewer; Ashby creates the Google Meet and invites the
+   candidate and the bot account. Scheduling it is the HR-attested consent and India-location
+   attestation (D-M034-11): the attestation names the Ashby user who scheduled it.
+3. Copy Dex's Ashby user id (Ashby `user.search` with the bot account's email, or the admin user
+   page) into `R1_MEET_ASHBY_DEX_USER_ID` (see Secrets). Only events with this user among the
+   interviewers get a bot.
+4. Tell HR: book the slot at most 14 days ahead (a later slot waits as `blocked/slot_too_far` and
+   is picked up by itself); admit the candidate, then leave the call within 2 minutes (with the
+   policy `end`, two people in the call for 2 minutes end it as `failed/multiple_humans`; the
+   default `observe` only logs it); bring no notetaker bot. Dex starts when the first person joins,
+   so HR should not wait in the call ahead of the candidate.
+
+### The Ashby webhook (owner, LAST step of the go-live)
+
+Create two Ashby webhooks with the Ashby API `webhook.create`, one per type:
+`interviewScheduleCreate` and `interviewScheduleUpdate`. Request URL: the same receiver as the
+existing Ashby webhooks (`.../api/integrations/ashby/webhook`). Secret token: the existing
+`ASHBY_WEBHOOK_SECRET` value. Do this only after the flag is on and S06 is running: with the flag
+off the receiver answers these two actions 400 `unresolvable_id`, which Ashby does not retry, so a
+delivery sent while dark is lost. The Ashby API key stays with the owner.
+
+### Recall setup (owner, once)
+
+- **Account and region.** The Recall workspace is in ap-northeast-1; `RECALL_BASE_URL` defaults to
+  `https://ap-northeast-1.recall.ai`. A key from another region does not work there.
+- **The bot's Google account.** A dedicated paid Google Workspace (Starter is enough) on its own
+  primary domain, separate from the company domains, with one NON-admin user: the bot. In that
+  user's Google Calendar settings, set "Add invitations to my calendar" to "Only if the sender is
+  known". Nothing reads this calendar (no Calendar sync, no Recall Calendar V2): Ashby's webhooks are
+  the only source of bookings.
+- **Signed-in bot (recommended).** A bot signed in as the invited account can skip the Meet waiting
+  room (Google still decides). In Google Admin for the bot domain: Security, SSO, a Legacy SSO
+  profile whose sign-in URL is `https://ap-northeast-1.recall.ai/api/v1/bot/gmeet-sign-in` and
+  sign-out URL `https://ap-northeast-1.recall.ai/api/v1/bot/gmeet-sign-out`, with an uploaded
+  certificate. In the Recall dashboard: create a Google Login Group, then a Google Login (the bot's
+  email, the group, the private key and the certificate). Put the group id in
+  `R1_MEET_GOOGLE_LOGIN_GROUP_ID`. A signed-in bot shows the Google account's name and photo, not
+  `R1_MEET_BOT_NAME`. Recall allows 30 concurrent sign-ins per account.
+- **The status endpoint.** In the Recall dashboard, create the webhook endpoint
+  `<WEB_ORIGIN>/api/integrations/recall/webhook` for the nine `bot.*` events only (listed in "Meet
+  webhook receivers"). The real-time participant endpoint needs no setup: every bot carries it.
+- **Credit and billing alerts.** Pay as you go: $0.50 an hour plus $0.10 for `web_4_core`, billed
+  per second from `joining_call` to `done`, waiting room included (about $0.35 per 35-minute
+  interview, an estimate). Turn on Recall's usage or low-credit email alert. Out of credit, every
+  create answers 402 and the runtime alerts `r1_meet_recall_rejected` (`payment_required`).
+
+### Secrets (the owner sets them; never in chat, code, a PR or a log)
+
+The owner runs, on the API app only (never the workers, never `fly.toml`):
+
+```
+fly secrets set RECALL_API_KEY=... RECALL_WEBHOOK_SECRET=... R1_MEET_ASHBY_DEX_USER_ID=... -a project-hello-api
+```
+
+- `RECALL_API_KEY` is the workspace API key and `RECALL_WEBHOOK_SECRET` the workspace verification
+  secret (it starts with `whsec_`). Nobody pastes either value into a chat, a ticket, a PR, a test
+  or a log; the API never logs them, and `.env.example` keeps `replace_me`.
+- `fly secrets set` restarts the API machines: do it in a quiet window (live R1 count 0).
+- A malformed value turns Meet `invalid` (Meet off; see the kill switch: `invalid` never drains).
+  The API logs one `[r1-meet-config] Meet off: <reason>` line that names the variable, never its
+  value. Read it after every change.
+- Rotating `WORKER_CONTEXT_SECRET` invalidates every armed bridge ticket (and, with
+  `R1_MEET_ARM_AT_CREATE=true`, every create-time page). Live calls recover through the bridge
+  check, which re-arms a ticket that nobody claimed (at most 5 arms per bot). Rotate outside
+  interview hours.
+
+### Knobs
+
+All are API Fly secrets: `fly secrets set NAME=value -a project-hello-api` (it restarts the API), and
+`fly secrets unset NAME -a project-hello-api` returns to the default. Blank means the default. A
+value out of range makes Meet `invalid`; nothing is clamped.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `R1_MEET_DAILY_BOT_CAP` | 20 | Bots per IST day of the slot start, 1..200. At the cap a booking is `blocked/bot_cap_reached` (alert `r1_meet_bot_cap_reached`, no Recall call); maintenance creates its bot within 15 minutes of the count dropping or the cap being raised. Two creates at the same moment can overshoot by one. |
+| `R1_MEET_SERVICE_USER_ID` | blank | The staff user that owns Meet rounds (`interview_rounds.created_by`). **Needed in practice:** no Ashby-user-to-staff mapping exists yet, so with it blank every booking ends `unmapped_scheduler` with no round and no bot. Never the nil or Ashby system-actor id. The consent attestation always names the Ashby scheduler, never this user. |
+| `R1_MEET_ARM_AT_CREATE` | `false` | `true` puts the bridge page in the create body (armed right after the create) instead of posting it when a person joins (critic B2). If no ticket is armed at join time, the normal arm runs anyway. |
+| `R1_MEET_MULTI_HUMAN_POLICY` | `observe` | `observe`: more than one person in the call for 2 minutes is only a `r1_meet_multi_human_observed` warning. `end`: it ends the call (`failed/multiple_humans`). Keep `observe` until the live spike shows that Recall does not report the bot's own join and that HR need not stay to admit the candidate: either would make `end` cut every interview at 2 minutes. |
+| `R1_MEET_GOOGLE_LOGIN_GROUP_ID` | blank | The Recall Google Login Group of the signed-in bot; blank = a guest bot. |
+| `R1_MEET_BOT_NAME` | blank (`Dex`) | The name a guest bot shows; ignored for a signed-in bot. |
+| `RECALL_BASE_URL` | `https://ap-northeast-1.recall.ai` | The Recall region. |
+
+### Go-live order
+
+Preconditions, each with an owner:
+- the consent template release that names Google Meet and Recall.ai, with Legal sign-off (critic
+  B11; release it only when no Meet booking is live);
+- the staff reads that send `channel` (contracts section 9, S10 item 4), so HR sees "Via Meet" and
+  no Reissue on Meet rounds;
+- the owner's confirmation of the post-claim recovery pick (S06 re-arms through the bridge check);
+- a `max_concurrent_sessions` that leaves room for booked Meet interviews next to browser R1
+  (critic B8);
+- the live spike below.
+
+Then, in order:
+1. Every M034 PR merged and deployed dark; `R1_MEET_ENABLED` unset. The read-only queries below
+   return nothing.
+2. Owner: the Dex Ashby user, the bot Workspace, the Recall login group (sections above).
+3. Owner: the secrets and the knobs (at least `R1_MEET_SERVICE_USER_ID`), still with the flag off.
+4. The voice worker's Meet channel, `R1_MEET_VOICE_ENABLED=true` on `project-hello-voice` (S08), in
+   a zero-live window.
+5. `fly secrets set R1_MEET_ENABLED=true -a project-hello-api`. Never before S06 is deployed: jobs
+   would queue with no consumer. Check that no `[r1-meet-config] Meet off` line appears.
+6. Create the Recall status endpoint (the nine `bot.*` events).
+7. Create the two Ashby webhooks (`interviewScheduleCreate`, `interviewScheduleUpdate`), last.
+8. One staff rehearsal booking end to end; watch the `r1_meet_job` lines and the bookings query.
+
+### Kill switch and drain
+
+Turning `R1_MEET_ENABLED` off does NOT cancel bots already scheduled in Recall: they would still join
+and bill. Drain first, then turn the flag off.
+
+1. **Operator drain (the flag and R1 still on).** In the Supabase SQL editor:
+
+   ```sql
+   insert into screening_v2.job_queue (name, payload, dedup_key, max_attempts)
+   values ('r1-meet', '{"kind":"drain"}', 'r1-meet:drain', 10)
+   on conflict do nothing;
+   ```
+
+   The `r1-meet` lane runs it, up to 25 bookings in 40 s per pass. It takes every booking that holds
+   or is about to get a bot (`pending`, `bot_scheduled`, `bot_joining`, `human_present`, `in_call`)
+   and every owed release. For each: the bot is released at Recall (one GET, then DELETE before
+   dispatch or `leave_call` after), then the booking moves to `drained/flag_off` (an `in_call` whose
+   session ended moves to `completed/attempt_settled` only when its attempt counted, or the round's
+   counted attempts are all used; an attempt that did not count, or whose outcome never arrived,
+   stays `drained/flag_off`, so HR books it again), then the bot is marked released. A Recall
+   failure leaves that booking as it was for the next pass. The job passes again 5 s later while
+   rows remain, and every 60 s while only live interviews or Recall failures remain. After 120
+   passes (about 2 hours) it alerts `r1_meet_drain_failed` (`passes_exhausted`) and stops.
+   - **Live interviews finish.** A booking whose session is `created`, `waiting` or `in_progress` is
+     skipped until it ends (its outcome sends the bot away). To cut them, insert
+     `'{"kind":"drain","force":true}'` instead. If a plain drain is already waiting, upgrade it:
+     `update screening_v2.job_queue set payload = '{"kind":"drain","force":true}' where name = 'r1-meet' and dedup_key = 'r1-meet:drain' and status in ('pending', 'delayed');`
+   - The lane exists only while R1 and the Meet flag are both on. With R1 already off, the job
+     waits; rely on step 4 (the backstop) instead.
+2. **Confirm.** Both queries must return no rows:
+
+   ```sql
+   select status, count(*) as bookings, count(recall_bot_id) as holding_a_bot
+     from screening_v2.r1_meet_bookings
+    where status in ('pending', 'bot_scheduled', 'bot_joining', 'human_present', 'in_call')
+       or recall_bot_id is not null
+    group by 1;
+   select status, defer_reason, attempts, error_message from screening_v2.job_queue
+    where name = 'r1-meet' and dedup_key = 'r1-meet:drain' and status <> 'completed';
+   ```
+
+3. **Then turn the flag off:** `fly secrets set R1_MEET_ENABLED=false -a project-hello-api`
+   (exactly `false`, or unset it). The Ashby schedule actions go back to 400 `unresolvable_id`,
+   which Ashby does not retry (review the Dex interviews HR changed in that window before turning
+   the flag back on), and the Recall paths answer 200 `disabled`.
+4. **The flag-off backstop.** With the flag deliberately off (status exactly `disabled`) and
+   `RECALL_API_KEY` still set, the `r1-sweep` tick drains what is left, for example a bot created
+   between the drain and the restart. It runs within about a minute of the restart, then once per
+   15 minutes (sooner while rows remain), 10 bookings and 40 s a pass. It touches only bookings
+   untouched for 5 minutes (a rolling restart must not drain what a new machine just booked) and
+   never cuts a live interview. It logs `r1_meet_drain_pass` (`settled_<n>`). Keep `RECALL_API_KEY`
+   set until the confirm query returns no rows. It runs in the R1 runtime or, with R1 off, in the
+   standalone recording runtime, which exists only when the R2 recording configuration is enabled
+   (production has it). With neither there is no host loop, so drain first.
+5. **What never drains.**
+   - A Meet configuration that is `invalid` (a typo, a malformed secret): draining would cancel
+     every booked interview, so fix the value instead.
+   - `R1_ENABLED=false` on its own (the receivers' Rollback above lists "or turn R1 off"). With R1
+     off and the Meet flag on, there is no `r1-meet` lane and no drain: bots still join at
+     `join_at` and nobody arms them. A bot nobody joins leaves after about 15 minutes, but once the
+     candidate is in, the bot stays in the call, recording and silent, with no explanation to the
+     candidate, until everyone has left (+90 s) or for up to 45 minutes (`in_call_recording_timeout`).
+     So while Meet bookings exist, NEVER use `R1_ENABLED=false` as the kill switch on its own: run the
+     operator drain (step 1) first, or turn the Meet flag off first (step 3, which lets the backstop
+     drain), and only then turn R1 off.
+6. **After a drain.** `drained` bookings are terminal and never revived: HR books a new Dex
+   interview in Ashby. Jobs still queued stay pending while the flag is off, and run (or are
+   dropped as stale, past or superseded) when it is back on.
+
+### Alerts and what to do
+
+| Alert (`error_category`, error level) | Meaning | Action |
+|---|---|---|
+| `r1_meet_bot_cap_reached` | The day's bot cap is reached; the booking is `blocked/bot_cap_reached`, no Recall call | Check the day's bookings; raise `R1_MEET_DAILY_BOT_CAP` if they are real, else look for a loop |
+| `r1_meet_bot_create_failed` | The create was refused for good (`error_type`: a 4xx category, `key_attempts_exhausted`, `too_late`); `failed/bot_create_failed` | Read the `r1_meet_recall_failed` lines; HR re-books |
+| `r1_meet_generation_exhausted` | The event was moved too many times; `failed/bot_create_failed` | HR books a new Dex interview |
+| `r1_meet_recall_rejected` | Recall 401 (`unauthorized`: the key is wrong or revoked), 402 (`payment_required`: out of credit) or 403 (`forbidden`); the jobs retry every 5 minutes | Fix the key or the credit |
+| `r1_meet_stray_bot` | One of our bots is not its booking's current bot; its release is queued | None if rare; investigate if repeated |
+| `r1_meet_bot_in_use` | Recall returned a bot that another booking already holds; nothing is released | Investigate in the Recall dashboard |
+| `r1_meet_release_owed` | A cancel was recorded but Recall could not be reached; the bot is an owed release that maintenance retries | Watch the owed-release query; delete the bot in the Recall dashboard if it stays |
+| `r1_meet_arm_refused` | The bridge ticket could not be armed (`no_ticket`: `WORKER_CONTEXT_SECRET` missing or short, or the claim window closed; `page_url`; `remint_exhausted`; an RPC status) | Check `WORKER_CONTEXT_SECRET` and `WEB_ORIGIN` |
+| `r1_meet_output_media_refused` | Recall refused to show the bridge page | Live-spike item B2; check the bot in Recall |
+| `r1_meet_bridge_gave_up` | 5 arms and the bridge never worked; the bot left, `failed/*` | Read `r1_meet_exchange_refused`; check the worker gate and SFU reachability (B1) |
+| `r1_meet_multiple_humans` | Policy `end` only: more than one person for 2 minutes; the call ended, `failed/multiple_humans` | Remind HR to leave; if the bot's own join is counted, set the policy back to `observe` |
+| `r1_meet_profile_unknown` | A booking names a profile this build does not know (a rollback) | Deploy the build that knows it |
+| `r1_meet_drain_failed` | A drain could not release a bot (`<op>:<category>`), a pass threw, or `passes_exhausted` | Check Recall; insert the drain job again |
+| `r1_meet_malformed_payload` / `r1_meet_unknown_kind` | A job this build cannot read (version skew during a deploy) | Finish the deploy; replay from the DLQ |
+| `r1_meet_job_failed` | A job's final attempt failed; its receipt is `failed` | Read the DLQ `error_message`, fix the cause, replay |
+
+Warnings: `r1_meet_receipt_finish_failed`, `r1_meet_maintenance_had_errors` (`error_type` = the
+failed steps), `r1_meet_attempt_ended_enqueue_failed` (maintenance re-drives it),
+`r1_meet_multi_human_observed`, `r1_meet_recall_failed`, `r1_meet_queue_poll_error`,
+`r1_meet_queue_stale_lease`, `r1_meet_queue_no_handler`, `r1_meet_maintenance_enqueue_error`.
+
+**Cost.** Three bounds: the daily cap (`r1_meet_bot_cap_reached`), Recall's own usage alert (above),
+and the automatic-leave timers (a lost bot costs at most about 15 minutes before a call, 45 minutes
+in one). Each Meet interview also wakes the R1 SFU like a browser one ("On-demand SFU: idle stop and
+wake (M025)").
+
+### Read-only checks
+
+```sql
+-- bookings by status and reason (live ones, and the last 7 days)
+select status, reason, count(*) from screening_v2.r1_meet_bookings
+ where status not in ('completed', 'cancelled', 'failed', 'drained') or updated_at > now() - interval '7 days'
+ group by 1, 2 order by 1, 2;
+-- owed releases (a terminal booking still holding a bot)
+select status, count(*) from screening_v2.r1_meet_bookings
+ where recall_bot_id is not null and status in ('completed', 'cancelled', 'failed', 'drained') group by 1;
+-- r1-meet jobs by kind, and why they wait
+select payload->>'kind' as kind, status, defer_reason, count(*) from screening_v2.job_queue
+ where name = 'r1-meet' and status in ('pending', 'active', 'delayed') group by 1, 2, 3 order by 1, 2, 3;
+-- dead letters by kind and closed code
+select payload->>'kind' as kind, error_message, count(*), max(moved_at) from screening_v2.job_dlq
+ where name = 'r1-meet' group by 1, 2 order by 4 desc;
+-- receipts not finished after 15 minutes
+select source, outcome, count(*) from screening_v2.r1_meet_receipts
+ where outcome in ('recorded', 'enqueued') and received_at < now() - interval '15 minutes' group by 1, 2;
+```
+
+**DLQ replay.** Every job is idempotent (each state write is a compare-and-set, and each destructive
+Recall call is confirmed by one GET), so after fixing the cause, replay a dead letter with the
+existing primitive, which resets the dedup key: `select screening_v2.replay_dlq_job('<dlq id>');`.
+An old `ashby_schedule` job replayed after a newer delivery is dropped as `superseded`.
+
+### Live spike: what only a real call can settle
+
+Run it with the owner's Recall key and the bot account, staff only, before go-live (critic B12:
+enable only after it clears B1, B2, B3 and B10). Keep the default `R1_MEET_MULTI_HUMAN_POLICY`
+(`observe`) and read the `r1_meet_multi_human_observed` lines; switch to `end` only once they show
+that the bot's own join is not counted and HR leaves after admitting the candidate.
+
+- **B1.** Recall's Chrome reaches the R1 SFU (UDP 7882, TCP 7881): the bridge page connects.
+- **B2.** The `#t=` fragment survives Recall's page load, mid-call `output_media` works on Meet, and
+  autoplay works. This picks `R1_MEET_ARM_AT_CREATE` (`false` if mid-call works). Also check
+  whether `bot.in_call_recording` arrives before anyone has joined (Dex would then start in an
+  empty call).
+- **B3.** Who admits the candidate: HR as the organizer, open access, or the signed-in bot as a
+  guest.
+- **B10.** The latency Meet, Recall and the SFU add.
+- Whether Recall reports the bot's OWN join as a participant (it would count as a person: keep
+  `observe`), and whether notetaker bots on HR's calendars join (they count as people). The
+  recovery of an attempt that did not count also reads this count: with the bot's own join counted,
+  a candidate who left could be offered one more attempt in an empty call (the bot then leaves 90 s
+  after the last person, and the booking fails).

@@ -1,5 +1,6 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { createHash, timingSafeEqual } from 'node:crypto';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase.js';
 import { generateInviteToken, hashInviteToken } from '../lib/invite-token.js';
 import { getR1Config } from '../lib/r1/config.js';
@@ -11,6 +12,9 @@ import { toCanonicalUuid } from '../lib/r1/recording/keys.js';
 import { withRecordingAttempts } from '../lib/r1/recording/summary.js';
 import { parseR1QueueQuery, readR1Queue } from '../lib/r1/queue.js';
 import { STAFF_LOCALE, readR1Review } from '../lib/r1/review.js';
+import { Queue } from '../lib/queue/index.js';
+import { PgAdapter } from '../lib/queue/pg-adapter.js';
+import { notifyR1MeetAttemptEnded, type R1MeetAttemptEndedDeps } from '../lib/r1/meet/attempt-ended.js';
 
 export const r1Router = Router();
 export const r1InternalRouter = Router();
@@ -313,6 +317,22 @@ const R1_ATTEMPT_OUTCOMES: ReadonlySet<string> = new Set([
   'context_failed',
 ]);
 
+/**
+ * M034 S06 (dark): a settled attempt of a Meet round reaches its call through one `r1-meet` job (a
+ * counted one makes the Recall bot leave; one that did not count re-arms the bridge while the round
+ * has a start left). Fire-and-forget and never thrown (lib/r1/meet/attempt-ended.ts): with Meet off it reads nothing,
+ * and nothing it does can change this route's answer. The queue is built on first use, as in
+ * routes/r1-recording.ts.
+ */
+let meetQueue: Queue | null = null;
+const meetAttemptEnded: R1MeetAttemptEndedDeps = {
+  client: supabase,
+  enqueue: (name, payload, options) => {
+    meetQueue ??= new Queue(new PgAdapter(supabase as unknown as SupabaseClient), { defaultMaxAttempts: 5 });
+    return meetQueue.enqueue(name, payload, options);
+  },
+};
+
 r1InternalRouter.post('/attempt-outcome', workerAuth, async (req, res, next) => {
   try {
     const body = req.body ?? {};
@@ -330,9 +350,12 @@ r1InternalRouter.post('/attempt-outcome', workerAuth, async (req, res, next) => 
     });
     if (error || !data) return res.status(503).json({ error: 'service_unavailable' });
     if (data.status === 'ok') {
+      void notifyR1MeetAttemptEnded(body.attempt_id, meetAttemptEnded);
       return res.status(201).json({ ok: true, counted: data.counted === true, duplicate: false });
     }
     if (data.status === 'duplicate') {
+      // A replay may be the retry of an outcome whose leave was never queued; the dedup key collapses it.
+      void notifyR1MeetAttemptEnded(body.attempt_id, meetAttemptEnded);
       return res.status(200).json({ ok: true, counted: data.counted === true, duplicate: true });
     }
     if (data.status === 'attempt_not_found') {

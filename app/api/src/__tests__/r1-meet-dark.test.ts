@@ -5,6 +5,10 @@
  * Meet bridge exchange in the candidate router and the HR read of the Meet bookings
  * (routes/r1-meet-bookings.ts), and nothing else: exactly the importers and imports in
  * `WIRED_IMPORTS`. S06 (runtime) must narrow this pin again in the same PR that wires it.
+ * S06 wired the runtime: lib/r1/runtime.ts hosts the `r1-meet` lane, the maintenance tick and the
+ * drain backstop (built only when R1 and Meet are on, or, for the drain, when the Meet flag is
+ * deliberately off and a Recall key is set), and routes/r1.ts queues the bot's leave after a settled
+ * attempt (it reads nothing while Meet is off: r1-attempt-outcome.test.ts).
  *
  * What "dark" means here (S01 plan R21, R30, R31; S03 plan R16; S05 plan D-S05-18; D-M034-11):
  *  (a) no runtime file outside the three Meet folders (integrations/recall, integrations/google-meet,
@@ -57,7 +61,7 @@ const MEET_SUPPORT_FILES = ['recall-fake.ts', 'meet-webhook-signing.ts', 'ashby-
   (name) => path.join(TESTS_DIR, 'support', name),
 );
 
-/** The nine Meet variables (config/environment.schema.json, api), in `R1_MEET_ENV_VARIABLES` order. */
+/** The eleven Meet variables (config/environment.schema.json, api), in `R1_MEET_ENV_VARIABLES` order. */
 const MEET_ENV_NAMES = [
   'R1_MEET_ENABLED',
   'R1_MEET_BOT_NAME',
@@ -65,6 +69,8 @@ const MEET_ENV_NAMES = [
   'R1_MEET_GOOGLE_LOGIN_GROUP_ID',
   'R1_MEET_SERVICE_USER_ID',
   'RECALL_BASE_URL',
+  'R1_MEET_ARM_AT_CREATE',
+  'R1_MEET_MULTI_HUMAN_POLICY',
   'R1_MEET_ASHBY_DEX_USER_ID',
   'RECALL_API_KEY',
   'RECALL_WEBHOOK_SECRET',
@@ -149,6 +155,14 @@ const WIRED_IMPORTS: Readonly<Record<string, readonly string[]>> = {
     'app/api/src/lib/r1/meet/receipts.js',
     'app/api/src/lib/r1/meet/recall-event.js',
   ],
+  // M034 S06: the runtime host (the lane, the sweep tick) and the attempt-outcome hook.
+  'app/api/src/lib/r1/runtime.ts': [
+    'app/api/src/lib/r1/meet/config.js',
+    'app/api/src/lib/r1/meet/runtime.js',
+  ],
+  'app/api/src/routes/r1.ts': [
+    'app/api/src/lib/r1/meet/attempt-ended.js',
+  ],
 };
 const AUTH_FILE = path.join(SRC, 'lib', 'auth.ts');
 const APP_FILE = path.join(SRC, 'app.ts');
@@ -216,9 +230,11 @@ describe('M034 S01: the Meet modules are dark libraries', () => {
   it('(a) each wired importer imports EXACTLY its listed Meet modules (no stale or silent widening)', () => {
     const wired = Object.keys(WIRED_IMPORTS).sort();
     expect(wired).toEqual([
+      'app/api/src/lib/r1/runtime.ts',
       'app/api/src/routes/ashby-webhook.ts',
       'app/api/src/routes/r1-candidate.ts',
       'app/api/src/routes/r1-meet-bookings.ts',
+      'app/api/src/routes/r1.ts',
       'app/api/src/routes/recall-webhook.ts',
     ]);
     for (const key of wired) {
