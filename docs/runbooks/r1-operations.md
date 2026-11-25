@@ -4141,3 +4141,196 @@ that the bot's own join is not counted and HR leaves after admitting the candida
   recovery of an attempt that did not count also reads this count: with the bot's own join counted,
   a candidate who left could be offered one more attempt in an empty call (the bot then leaves 90 s
   after the last person, and the booking fails).
+
+## R1 over Google Meet: Dex's scorecard as Ashby feedback (M034 S09, dark)
+
+S09 posts Dex's R1 scorecard of a Meet round to Ashby as the feedback of that interview, on the Dex
+interview HR scheduled (`applicationFeedback.submit` with the booking's interview event and the Dex
+Ashby user), so HR reads the result where they booked it (D-M034-11). The dashboard keeps showing
+the same scorecard, and browser rounds are unchanged. The code is `app/api/src/lib/r1/meet/`:
+`feedback.ts` (the `scorecard_feedback` job), `feedback-form.ts` (the mapping onto the form),
+`feedback-ashby.ts` (the Ashby port), `feedback-store.ts` (the reads and the receipt) and
+`feedback-notify.ts` (the trigger and the re-drive). The same PR makes the three staff round reads
+send `channel` (contracts section 9, S10 item 4), the "staff reads that send `channel`"
+precondition of the S06 go-live order above: HR now sees "Via Meet", and no Reissue, on Meet rounds.
+
+### What it does, and when it posts
+
+- **Dark, three gates.** Nothing is read or sent unless all three hold: the `r1-meet` lane runs
+  (`R1_ENABLED` and `R1_MEET_ENABLED` on, S06), `R1_MEET_ASHBY_FEEDBACK_FORM_ID` holds a UUID, and
+  `ASHBY_API_KEY` is usable. A blank form id is off: the trigger reads nothing, and a job already
+  queued ends `ignored` (`feedback_off`) with no Ashby call. A malformed form id never turns Meet off
+  (bots keep joining); each interview then alerts and its receipt is `failed` (re-post it after the
+  fix, below). This write does NOT depend on the Christy write-back locks
+  (`ashby-runtime-activation.md` section 7) or the Christy binding: those govern the phone-screen
+  card only.
+- **The trigger.** When the R1 scorer settles an assessment and attaches it to its round, the API
+  looks up the Meet booking of that session (one read; a browser session has none, so nothing
+  happens). It then records ONE receipt, `source = 'ashby'`, `event_type = 'scorecard_feedback'`,
+  key `ashby-schedule:feedback:<booking id>:<assessment id>`, and queues its `r1-meet` job
+  `{"kind":"scorecard_feedback","booking_id":...,"assessment_id":...}` (5 attempts) in the same
+  transaction (`r1_meet_record_receipt`). With Meet off nothing is read, so the browser scoring path
+  is byte-identical. A second trigger for the same pair is a duplicate and queues nothing.
+- **The re-drive.** The S06 `maintenance` job (once per 15-minute bucket) then looks at the 10
+  NEWEST completed bookings whose slot started between 26 hours and 20 minutes ago and records the
+  receipts that are missing (a trigger lost to a restart). An older miss is the re-post below. So
+  setting the form id after a blank period also posts the completed Meet interviews of the last 26
+  hours that have no receipt yet.
+- **When a card is posted (D-S09-4).** All of these hold, checked again by the job each time:
+  - the booking is `completed/attempt_settled`. A live booking waits (60 s, checked again); a
+    `failed/*`, `cancelled/*` or `drained` booking is never posted (`booking_not_completed`): a call
+    that went wrong has no card;
+  - the booking has its round and session (`booking_unbound` otherwise), the round is a Meet round
+    (`round_not_meet`), this assessment is the round's CURRENT one (`assessment_superseded`) and it
+    is the assessment of the booking's attempt (`assessment_not_booking_session`);
+  - the assessment is v2 with a verdict (advance, hold or reject), a weighted score and at least one
+    scored metric. A placeholder (`scoring_failed`, `no_candidate_speech`) or a `human_review` row
+    is never posted (`not_postable`): a value is never made up (the M029 rule).
+- **Guards (D-S09-5): no card, closed reason.** An open appeal (`decision_use_blocked`), a withdrawn
+  or declined consent of the round (`consent_withdrawn`), or more than 7 days after the slot ended
+  (`stale`).
+- **Once (D-S09-1).** Every submit names the interview event and the Dex user, so Ashby UPDATES
+  Dex's one submission for that event instead of adding a card. And once the receipt is
+  `processed`, a re-delivered, replayed or re-posted job makes no Ashby call (`already_submitted`).
+- **What the card holds.** The Overall Recommendation 1..4 by verdict (the M029 rule: Reject 1,
+  Borderline under 50 is 2, Borderline at 50 or more is 3, Select 4). The Summary: a header line
+  (`Dex (AI interviewer): R1 sales role-play over Google Meet. Verdict: <Select|Borderline|Reject>.
+  Weighted <x>/4 across <n> of <m> metrics`), then each metric not scored, then each scored metric
+  as `<Name> — <score>/4: <rationale>` (a rationale at most 280 characters, the whole at most 2000,
+  lines kept whole). One Score per metric the form has a field for, and the link
+  `<web origin>/interviews/<round id>` (the R1 review page; a staff sign-in is needed). Never the
+  candidate's name or contact details, the transcript, evidence quotes, the Meet URL or the
+  recording (`docs/data-classification.md`, "Ashby feedback (M034 S09)").
+- **Retries.** The Ashby client makes one try per run; the queue does the retrying. A 429 waits 60 s
+  and a 5xx, timeout or network failure 30 s, within the shared deferral bound (30 deferrals or a
+  60-minute streak). Past it the job throws a closed code (`r1_meet_feedback_ashby_rate_limited`,
+  `_ashby_unavailable`, `_form_unavailable`, `_booking_not_settled`), retries, and on its final
+  attempt the receipt is `failed` (alert `r1_meet_job_failed`). A permanent 4xx is terminal at
+  once, with an alert (below).
+
+### The Dex feedback form in Ashby (owner and HR, once)
+
+1. In Ashby, build the feedback form Dex fills, with:
+   - the **Overall Recommendation** field (path `overall_recommendation`), a single select whose
+     option values are exactly `1`, `2`, `3` and `4`, as on the Christy form;
+   - a **RichText** field titled exactly `Summary` (LongText or String also work);
+   - optional: **Score** fields (Ashby's 1..4 scale, the scale R1 scores on) titled exactly like the
+     five R1 metrics of `app/api/src/lib/r1/rubric.ts`: `Probing & discovery`,
+     `Objection handling`, `Urgency & close`, `Negotiation & discount discipline` and
+     `Communication & rapport`. Titles compare without case or punctuation (the #275 rule,
+     `ashby-scorecard-fields.md`). A metric without its field is simply not filled: the info line
+     `r1_meet_feedback_submitted` counts it (`metrics_<bound>_unbound_<n>`);
+   - optional: a **Url** field titled `Detailed report`;
+   - **no other REQUIRED field.** A required field Dex cannot fill refuses the whole card
+     (`form_required_field_unbound`).
+2. Attach this form to the Dex interview of the R1 stage in each job's interview plan. Every job's
+   Dex interview must use this ONE form: Ashby refuses a submit whose form is not the one assigned
+   to the interview (`r1_meet_feedback_rejected`).
+3. Read the form id: Ashby Mission Control, Job mappings, **Discover feedback form** on the job
+   (`ashby-feedback-form-discovery.md`), the form of the Dex interview. Copy it exactly as shown
+   (lower case): the job compares it exactly with the form it reads.
+4. Set it on the API only:
+   `fly secrets set R1_MEET_ASHBY_FEEDBACK_FORM_ID=<form uuid> -a project-hello-api` (it restarts
+   the API: a quiet window, live R1 count 0). It is not a credential; it is set like the other Meet
+   knobs. Check that the next Meet interview's job ends `scorecard_feedback:submitted` and that the
+   card shows in Ashby.
+
+### The Ashby API key
+
+The card goes through the existing `ASHBY_API_KEY` (the API's Fly secret; no new secret). Its
+permissions must include `candidatesWrite` (`applicationFeedback.submit`) and
+`hiringProcessMetadataRead` (`feedbackFormDefinition.info`, the structure read before each post).
+Ashby applies "your feedback-editing settings and access permissions": the key's user must be
+allowed to submit feedback for another interviewer (the Dex user), and the tenant's feedback-editing
+setting must allow an interviewer's submitted feedback to be updated (a re-post updates Dex's card).
+Both are live-spike items. Without a usable key each interview alerts `ashby_key_missing` and its
+receipt is `failed`.
+
+### Alerts and what to do
+
+| Alert (`error_category`, error level) | Meaning | Action |
+|---|---|---|
+| `r1_meet_feedback_config_invalid` | `error_type` `feedback_config_invalid`: `R1_MEET_ASHBY_FEEDBACK_FORM_ID` is not a UUID; or `ashby_key_missing`: no usable `ASHBY_API_KEY`. That interview's receipt is `failed` | Fix the value or set the key, then re-post (below) |
+| `r1_meet_feedback_form_invalid` | The Dex form cannot take the card (`error_type`): `form_unreadable` (Ashby 4xx on the form read, with `http_status`: a wrong id, or the key lacks `hiringProcessMetadataRead`), `form_mismatch`, `form_archived`, `form_overall_missing`, `form_overall_options_mismatch`, `form_summary_missing`, `form_summary_ambiguous`, `form_required_field_unbound`. Receipt `failed` | Fix the form in Ashby (setup above), then re-post |
+| `r1_meet_feedback_rejected` | Ashby refused the submit: a 4xx other than 429, or `success:false` (`error_type` `<category>[:<Ashby code>]`, `http_status`); the job ends `ashby_rejected`, or `ashby_rejected_after_retry` when this is not the job's first run (an earlier run deferred or threw; the card is probably already in Ashby and the tenant refused the update). The client's own request check ends `ashby_request_invalid`. Receipt `failed` | 401 or 403: the key's permissions (above). `ashby_rejected_after_retry`: look for Dex's card in Ashby first. Otherwise read the code, fix, re-post |
+
+Warnings: `r1_meet_feedback_enqueue_failed` (the trigger could not record; the re-drive tries again
+within 26 hours), `r1_meet_feedback_redrive_failed` (the next bucket tries again),
+`r1_meet_feedback_receipt_settle_failed` (the card IS in Ashby; the dispatcher finishes the
+receipt) and `r1_meet_ashby_failed` (one Ashby call failed: `error_type` `<operation>:<category>`,
+`http_status`). Info: `r1_meet_feedback_submitted`, `r1_meet_feedback_redriven` (`queued_<n>`),
+`r1_meet_ashby_ok`, and the S06 `r1_meet_job` line `scorecard_feedback:<code>`. No line holds an
+id, a form, section or field id, a URL, a name or any rationale text.
+
+### Read-only checks
+
+```sql
+-- Dex feedback outcomes, last 7 days (counts only)
+select outcome, count(*) from screening_v2.r1_meet_receipts
+ where source = 'ashby' and event_type = 'scorecard_feedback'
+   and received_at > now() - interval '7 days'
+ group by 1 order by 1;
+-- feedback jobs waiting, and why
+select status, defer_reason, count(*) from screening_v2.job_queue
+ where name = 'r1-meet' and payload->>'kind' = 'scorecard_feedback'
+   and status in ('pending', 'active', 'delayed')
+ group by 1, 2 order by 1, 2;
+-- feedback dead letters by closed code
+select error_message, count(*), max(moved_at) from screening_v2.job_dlq
+ where name = 'r1-meet' and payload->>'kind' = 'scorecard_feedback'
+ group by 1 order by 3 desc;
+```
+
+`processed` = posted; `ignored` = not posted by a rule above (read the `r1_meet_job` line's code);
+`failed` = a permanent fault, re-postable; `recorded`/`enqueued` = waiting for its job.
+
+### Re-post after a fix
+
+After fixing the cause of `failed` receipts (the form id, the key, the form), queue one job per
+failed receipt whose slot ended less than 7 days ago (older ones would only end `stale`). In the
+Supabase SQL editor:
+
+```sql
+insert into screening_v2.job_queue (name, payload, dedup_key, max_attempts)
+select 'r1-meet',
+       jsonb_build_object('kind', 'scorecard_feedback',
+                          'booking_id', split_part(x.dedupe_key, ':', 3),
+                          'assessment_id', split_part(x.dedupe_key, ':', 4)),
+       'r1-meet:scorecard-feedback:' || split_part(x.dedupe_key, ':', 3) || ':'
+         || split_part(x.dedupe_key, ':', 4),
+       5
+  from screening_v2.r1_meet_receipts x
+  join screening_v2.r1_meet_bookings b on b.id = split_part(x.dedupe_key, ':', 3)::uuid
+ where x.source = 'ashby'
+   and x.event_type = 'scorecard_feedback'
+   and x.outcome = 'failed'
+   and x.dedupe_key like 'ashby-schedule:feedback:%'
+   and b.end_at > now() - interval '7 days'
+on conflict do nothing;
+```
+
+Each job runs the full check list again and posts only what may be posted. A success moves the
+receipt `failed -> processed`; a `processed` receipt is never posted again. A receipt that ended
+`ignored` (for example `feedback_off`, while the form id was blank) is not re-posted by this SQL:
+HR enters such a card by hand from the R1 review page. A dead-lettered feedback job can also be
+replayed with `select screening_v2.replay_dlq_job('<dlq id>');`.
+
+### Rollback
+
+Blank the form id: `fly secrets unset R1_MEET_ASHBY_FEEDBACK_FORM_ID -a project-hello-api`. The code
+reads it per trigger and per job (nothing caches it), so it takes effect with the restart
+`fly secrets` does anyway: nothing more is queued, and queued jobs end `ignored` (`feedback_off`)
+with no Ashby call. Bots keep joining and interviews keep being scored: Meet ignores this name.
+Cards already posted stay in Ashby; remove one there by hand if needed. A full rollback is a revert
+of the squash commit: no migration, no data, one blank env name.
+
+### Live spike: what only a real post can settle
+
+- Ashby accepts `userId` = the Dex user with `interviewEventId` from this API key (feedback
+  submitted for another interviewer), and the card shows as Dex's on the interview.
+- A second submit for the same event and user UPDATES the card (the re-post and retry semantics)
+  under the tenant's feedback-editing settings, and does not add a second card.
+- The Dex form's Overall field has the path `overall_recommendation` with values `1`..`4`, and its
+  RichText `Summary` takes the `PlainText` value the Christy card already sends in production.
+- The Summary's line breaks read well on the Ashby card, and the `Detailed report` link opens the
+  R1 review page after a staff sign-in.

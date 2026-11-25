@@ -589,6 +589,13 @@ Ashby interview-schedule webhook (keyed by the S01 `ashby-schedule:` key).
 There is no body column and no metadata column. A receipt says only that a delivery arrived and
 what became of it.
 
+Since M034 S09 the table also holds one OUTBOUND outcome per (booking, assessment): whether Dex's
+scorecard of that Meet interview was posted to Ashby (see "Ashby feedback (M034 S09)" below). Such
+a row has source `ashby`, event type `scorecard_feedback`, `booking_id` set, and the key
+`ashby-schedule:feedback:<booking id>:<assessment id>`: two internal UUIDs, no Ashby id. Its
+outcome is `processed` (posted), `ignored` (not posted, by a guard) or `failed` (a permanent fault,
+re-postable). Like every receipt it holds no body, no form value and no Ashby answer.
+
 #### Columns added to existing tables
 
 | Table / column | Classification | Notes |
@@ -642,7 +649,8 @@ booking exists. Every other `r1-meet` job (a Recall receipt, a bot release, a ro
 delayed re-run) carries no Meet URL, and its worker reads the URL from the booking. No payload
 ever carries the Ashby `scheduledByEmail`, a name, an email, a raw webhook body or a signature.
 The receipt RPC caps a payload at 4096 bytes and requires a `kind`. S03 and S06 own the rest of
-this rule. Job rows are not reached by the DSAR cascade: a completed job is deleted 7 days after
+this rule. A `scorecard_feedback` job (S09) carries `booking_id` and `assessment_id` only (plus
+the RPC's `receipt_id` and `source`; an operator's re-post carries neither). Job rows are not reached by the DSAR cascade: a completed job is deleted 7 days after
 it completes (`reap_completed_jobs`), and a dead-lettered one stays in `job_dlq` until an operator
 deletes it after triage. A DSAR erasure therefore also deletes the candidate's pending and
 dead-lettered `r1-meet` rows, found by their booking id or Ashby application id.
@@ -678,6 +686,29 @@ The receipt RPC adds `receipt_id` and `source` to each job.
 The receipt rows stay body-free: a receipt holds the source, the dedupe key (the Svix
 `webhook-id`, or an `ashby-schedule:` key built from the schedule id, a time stamp and a suffix),
 the event name and an outcome. The receivers log closed codes only.
+
+**Ashby feedback (M034 S09).** For a Meet round only, the API posts Dex's R1 scorecard to Ashby as
+the feedback of that interview (`applicationFeedback.submit`), so it shows where HR scheduled it.
+The recipient is Ashby, the existing ATS processor that already holds the candidate, the
+application and the phone-screen card; nothing goes to any other party.
+- **What is sent.** The ids Ashby needs to place the card: the application id and interview event
+  id (from the booking), the Dex Ashby user id (the interviewer) and the feedback form id. Then the
+  form values: the Overall Recommendation 1..4 by verdict (the M029 rule); the Summary (the verdict
+  word, the weighted score and coverage, and per metric its name, score and the model's rationale,
+  control-stripped, at most 280 characters each and 2000 in all); one Score per metric the form
+  has a field for; and the link `<web origin>/interviews/<round id>`, which needs a staff sign-in.
+- **What is never sent.** The candidate's name, email or phone, the transcript, evidence quotes or
+  references, the raw model output, the Meet URL, the recording, the consent proof, and any other
+  internal id (the round id inside the link is the only one).
+- **Guards.** Nothing is read or sent unless `R1_MEET_ENABLED`, `R1_MEET_ASHBY_FEEDBACK_FORM_ID`
+  and `ASHBY_API_KEY` are all set. A card is also never sent for an open appeal
+  (`candidates.decision_use_blocked_at`), a withdrawn or declined consent of the round, a booking
+  that did not complete, a placeholder or `human_review` scorecard, or later than 7 days after the
+  slot ended.
+- **What is kept.** Ashby's answer is discarded: it is not stored and not logged. The outcome is
+  the receipt row above. Log lines hold closed codes, counts and an HTTP status only. S09 deletes
+  nothing in Ashby: a card already posted is part of the candidate's Ashby record, and a DSAR
+  erasure in this system does not remove it there.
 
 ## Classification summary
 
