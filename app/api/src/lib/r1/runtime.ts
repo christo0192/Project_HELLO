@@ -65,6 +65,12 @@
  * the `r1-sweep` loop queues one Meet maintenance job per bucket. With the Meet flag deliberately off
  * and a Recall key still set, the same `r1-sweep` tick (here, or in the standalone storage runtime)
  * runs the bounded drain backstop that removes any bot left behind. Never configured: nothing at all.
+ *
+ * M034 S09 (dark): the assessment handler's `onResult` is the Meet scorecard-ready hook
+ * (`./meet/feedback-notify.ts`), fire-and-forget. For a Meet round whose assessment settled it queues
+ * ONE `scorecard_feedback` job (Dex's scorecard to Ashby as the interview's feedback). With Meet
+ * inactive, or the Ashby feedback form setting blank, it returns before any read, so scoring a browser
+ * round makes exactly the database calls it made before. It never throws into the scoring job.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -96,6 +102,7 @@ import { R1_RECORDING_ERASE_QUEUE, R1_RECORDING_FINALIZE_QUEUE, R1_SWEEP_QUEUE }
 import { getR1RecordingStore } from './recording/store-factory.js';
 import type { R1ObjectStore } from './recording/store.js';
 import { getR1MeetConfig, getR1MeetDrainConfig, type R1MeetConfig, type R1MeetDrainConfig } from './meet/config.js';
+import { notifyR1MeetScorecardReady } from './meet/feedback-notify.js';
 import {
   createR1MeetLane,
   createR1MeetSweepTick,
@@ -105,7 +112,11 @@ import {
 } from './meet/runtime.js';
 import { agentDispatchClientFor, browserLiveKitEndpoint } from '../livekit-endpoints.js';
 import type { DispatchListerLike } from './worker-gate.js';
-import { recordR1ScoringFailure, type R1AssessmentOptions } from '../../services/r1-assessment.js';
+import {
+  recordR1ScoringFailure,
+  type R1AssessmentOptions,
+  type R1AssessmentResult,
+} from '../../services/r1-assessment.js';
 import { env, r1AssessmentConcurrencyFrom } from '../env.js';
 
 /** The ONLY queues this runtime registers. A structural test pins it. */
@@ -190,6 +201,11 @@ export interface R1RuntimeOptions {
   readonly meetConfig?: () => R1MeetConfig;
   readonly meetDrainConfig?: () => R1MeetDrainConfig;
   readonly meetRecall?: R1MeetRecall;
+  /**
+   * M034 S09 test seam: what the assessment handler calls with each result. Production queues Dex's
+   * Ashby feedback for a Meet round (`notifyR1MeetScorecardReady`); it must never throw.
+   */
+  readonly meetScorecardHook?: (result: R1AssessmentResult) => void;
 }
 
 export interface R1RuntimeHandle {
@@ -266,6 +282,20 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
     }
   });
 
+  // M034 S06/S09 (dark): the Meet switch, asked by the lane, the sweep tick and the scorecard hook.
+  const meetConfig = options.meetConfig ?? ((): R1MeetConfig => getR1MeetConfig());
+
+  // M034 S09 (dark): a Meet round's settled assessment queues Dex's Ashby feedback. Fire-and-forget:
+  // the hook never throws or rejects, and with Meet inactive it returns before any read.
+  const meetScorecardHook = options.meetScorecardHook ?? ((result: R1AssessmentResult): void => {
+    void notifyR1MeetScorecardReady(result, {
+      client: client as never,
+      r1Config: () => options.config ?? getR1Config(),
+      meetConfig,
+      now: () => clock().getTime(),
+    });
+  });
+
   const runner = createQueueRunner({
     queue: finalDeferrals.guard(queue),
     handlers: {
@@ -275,6 +305,7 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
         // The deferral budget is measured against the same clock as the rest of the runtime.
         now: () => clock().getTime(),
         onFinalDeferral: finalDeferrals.note,
+        onResult: meetScorecardHook,
       }),
     },
     owner,
@@ -310,7 +341,6 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
   const sweepEnqueueTick = lane.sweepEnqueueTick;
 
   // M034 S06 (dark): null unless R1 AND Meet are on, so with the shipped defaults this adds nothing.
-  const meetConfig = options.meetConfig ?? ((): R1MeetConfig => getR1MeetConfig());
   const meetLane = createR1MeetLane({
     r1Config: () => options.config ?? getR1Config(),
     meetConfig,

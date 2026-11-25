@@ -113,7 +113,7 @@ const reviewedFilter = (nowIso: string): string =>
 
 const ROUND_COLUMNS =
   'id,candidate_id,status,expires_at,attempts_allowed,attempts_counted,recommendation,overall,status_write,'
-  + 'pending_reject_until,consent_locale,created_at';
+  + 'pending_reject_until,consent_locale,created_at,channel';
 const CANDIDATE_EMBED = 'candidates!inner(name,decision_use_blocked_at)';
 const ATTEMPT_COLUMNS = 'session_id,round_id,attempt_number,counted,outcome,created_at';
 
@@ -145,6 +145,8 @@ export interface R1QueueRound {
   is_staff_dry_run: boolean;
   created_at: string;
   attempts: R1ListedAttempt[];
+  /** How the candidate joins (0142, M034): our browser link or Google Meet. Not a verdict, so never withheld. */
+  channel: 'browser' | 'meet';
 }
 
 export interface R1QueueBody {
@@ -368,6 +370,8 @@ export async function readR1Queue(
         is_staff_dry_run: round.consent_locale === STAFF_LOCALE,
         created_at: String(round.created_at),
         attempts: attemptsByRound.get(String(round.id)) ?? [],
+        // Only the two closed words leave: anything else, absent included, is our browser link.
+        channel: round.channel === 'meet' ? 'meet' : 'browser',
       };
     });
 

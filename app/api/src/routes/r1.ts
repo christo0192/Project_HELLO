@@ -75,10 +75,13 @@ r1Router.post('/candidates/:id/interview-rounds', requireRole('interviewer'), as
 r1Router.get('/candidates/:id/interview-rounds', requireRole('viewer'), async (req, res, next) => { try {
   if (!UUID.test(req.params.id)) return res.status(400).json({ error: 'invalid_id' });
   const candidate = await candidateAccess(req, res, req.params.id, false); if (!candidate) return;
-  const { data, error } = await supabase.from('interview_rounds').select('id,status,expires_at,attempts_allowed,attempts_counted,recommendation,overall,status_write,pending_reject_until,consent_locale,created_at,created_by').eq('candidate_id', req.params.id).order('created_at', { ascending: false });
+  const { data, error } = await supabase.from('interview_rounds').select('id,status,expires_at,attempts_allowed,attempts_counted,recommendation,overall,status_write,pending_reject_until,consent_locale,created_at,created_by,channel').eq('candidate_id', req.params.id).order('created_at', { ascending: false });
   if (error) throw error;
   // A staff dry run promises no decision use, so the page must be able to tell it from the candidate's own.
-  const marked = (data ?? []).map(({ consent_locale, ...round }) => ({ ...round, is_staff_dry_run: consent_locale === STAFF_LOCALE }));
+  // `channel` (0142, M034): a Meet round is booked in Ashby and its link is never reissued, so the page
+  // marks it and offers no reissue. Only the two closed words leave; anything else reads as our browser link.
+  // It is not a verdict, so the appeal mapping below keeps it.
+  const marked = (data ?? []).map(({ consent_locale, channel, ...round }) => ({ ...round, is_staff_dry_run: consent_locale === STAFF_LOCALE, channel: channel === 'meet' ? 'meet' as const : 'browser' as const }));
   // While an appeal blocks decision use the result is withheld at read time, as the phone list does
   // (latest_recommendation / latest_score in routes/candidates.ts); the stored round is untouched.
   // status_write and pending_reject_until go with them: each gives the verdict away (0115 allows

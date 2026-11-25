@@ -1,8 +1,8 @@
 /**
- * The `r1-meet` job contract (M034 S06, dark): the one queue name, the eleven job kinds, a strict
- * parser per kind, the dedup keys and attempts, and the small shared vocabulary of the handlers
- * (job facts, results, errors, the deferral bound). Nothing here registers a queue, reads an
- * environment variable or performs I/O.
+ * The `r1-meet` job contract (M034 S06, dark; S09 adds the twelfth kind): the one queue name, the
+ * twelve job kinds, a strict parser per kind, the dedup keys and attempts, and the small shared
+ * vocabulary of the handlers (job facts, results, errors, the deferral bound). Nothing here registers
+ * a queue, reads an environment variable or performs I/O.
  *
  * WHY ONE QUEUE WITH A `kind` (critic C8): every queue name costs one claim RPC per tick per machine,
  * even when idle, so all Meet work shares `r1-meet` and is told apart by its payload.
@@ -15,6 +15,10 @@
  *  - `booking_rerun`, `ensure_bot`, `attempt_ended`, `bridge_check`, `multi_human_check` and
  *    `maintenance`: S06 itself, always through `r1MeetJobs`, so a payload and its key have one source.
  *  - `drain`: an operator's SQL insert (docs/runbooks/r1-operations.md).
+ *  - `scorecard_feedback` (S09): the scorecard-ready trigger and the maintenance re-drive, through
+ *    `r1_meet_record_receipt` (one receipt per booking and assessment, so `receipt_id` and `source`
+ *    are added as for S03), or an operator's manual re-post, built by `r1MeetJobs.scorecardFeedback`.
+ *    Its payload is ids only: `booking_id` and `assessment_id`.
  *
  * PARSING. A payload is untrusted: it crossed a webhook, a trigger or an operator's keyboard. Each
  * parser reads the KNOWN keys of its kind and refuses (null) the whole job when any of them is absent
@@ -24,7 +28,7 @@
  * retried within its bound and then dead-lettered (a closed failure).
  *
  * What comes out is normalised so that the handlers compare plain strings: event, booking, bot,
- * round and session ids lower-cased (they are `uuid` columns), instants as `toISOString()`. The Ashby
+ * round, session and assessment ids lower-cased (they are `uuid` columns), instants as `toISOString()`. The Ashby
  * schedule, application, stage, interview and scheduler ids stay VERBATIM: they are `text` columns
  * matched exactly (the application link table, 0142 §4 step 4).
  *
@@ -52,7 +56,10 @@ import { parseR1MeetInstant } from './ticket.js';
 /** The ONE queue of R1 over Meet (0142 hard-codes the same name). */
 export const R1_MEET_QUEUE = 'r1-meet' as const;
 
-/** Every job kind this build handles. S09 adds its own definition to the dispatcher. Frozen. */
+/**
+ * Every job kind this build handles. S09 appends `scorecard_feedback` LAST and adds its own definition
+ * to the dispatcher. Frozen.
+ */
 export const R1_MEET_JOB_KINDS = Object.freeze([
   'ashby_schedule',
   'recall_event',
@@ -65,12 +72,14 @@ export const R1_MEET_JOB_KINDS = Object.freeze([
   'multi_human_check',
   'maintenance',
   'drain',
+  'scorecard_feedback',
 ] as const);
 export type R1MeetJobKind = (typeof R1_MEET_JOB_KINDS)[number];
 
 /**
  * Attempts per kind. The first two are fixed by `r1_meet_record_receipt` (0142 §18), the next two by
- * the 0142 triggers (whose `bot_release` S06 also writes), `drain` by the runbook's SQL. Frozen.
+ * the 0142 triggers (whose `bot_release` S06 also writes), `drain` by the runbook's SQL, and
+ * `scorecard_feedback` again by `r1_meet_record_receipt` (0142:1818), which writes it. Frozen.
  */
 export const R1_MEET_JOB_MAX_ATTEMPTS: Readonly<Record<R1MeetJobKind, number>> = Object.freeze({
   ashby_schedule: 5,
@@ -84,6 +93,8 @@ export const R1_MEET_JOB_MAX_ATTEMPTS: Readonly<Record<R1MeetJobKind, number>> =
   multi_human_check: 10,
   maintenance: 3,
   drain: 10,
+  // Fixed by r1_meet_record_receipt (0142:1818): the job it inserts always has max_attempts 5.
+  scorecard_feedback: 5,
 });
 
 /** The Recall events a `recall_event` job may carry: nine bot statuses and two participant events. Frozen. */
@@ -245,6 +256,14 @@ export interface R1MeetDrainJob {
   /** Also drain a booking whose bound session is still live. */
   readonly force: boolean;
 }
+/** Post Dex's scorecard of this assessment to Ashby as the booking's interview feedback (S09). */
+export interface R1MeetScorecardFeedbackJob {
+  readonly kind: 'scorecard_feedback';
+  /** Lower-cased. */
+  readonly bookingId: string;
+  /** Lower-cased. */
+  readonly assessmentId: string;
+}
 
 export interface R1MeetJobByKind {
   readonly ashby_schedule: R1MeetAshbyScheduleJob;
@@ -258,6 +277,7 @@ export interface R1MeetJobByKind {
   readonly multi_human_check: R1MeetMultiHumanCheckJob;
   readonly maintenance: R1MeetMaintenanceJob;
   readonly drain: R1MeetDrainJob;
+  readonly scorecard_feedback: R1MeetScorecardFeedbackJob;
 }
 
 /** A parser of one kind: the frozen job, or null for anything else. Never throws. */
@@ -493,6 +513,13 @@ export const parseDrainJob = parserOf('drain', (fields) => ({
   force: fields.force === undefined ? false : boolean(fields.force),
 }));
 
+/** Ids only. The `receipt_id` and `source` that `r1_meet_record_receipt` adds are not read here. */
+export const parseScorecardFeedbackJob = parserOf('scorecard_feedback', (fields) => ({
+  kind: 'scorecard_feedback',
+  bookingId: uuid(fields.booking_id),
+  assessmentId: uuid(fields.assessment_id),
+}));
+
 /** Every parser, by kind. Frozen. */
 export const R1_MEET_JOB_PARSERS: { readonly [K in R1MeetJobKind]: R1MeetJobParser<R1MeetJobByKind[K]> } =
   Object.freeze({
@@ -507,6 +534,7 @@ export const R1_MEET_JOB_PARSERS: { readonly [K in R1MeetJobKind]: R1MeetJobPars
     multi_human_check: parseMultiHumanCheckJob,
     maintenance: parseMaintenanceJob,
     drain: parseDrainJob,
+    scorecard_feedback: parseScorecardFeedbackJob,
   });
 
 /** The `kind` a payload names (it need not be one this build knows), or null. Never throws. */
@@ -553,6 +581,9 @@ export const r1MeetDedupKeys = Object.freeze({
     `r1-meet:multi-human:${bookingId.toLowerCase()}:v${version}`,
   maintenance: (bucket: number): string => `r1-meet:maintenance:${bucket}`,
   drain: (): string => 'r1-meet:drain',
+  /** A manual re-post (S09). The trigger's own jobs carry the receipt's key, `r1-meet:receipt:<id>`. */
+  scorecardFeedback: (bookingId: string, assessmentId: string): string =>
+    `r1-meet:scorecard-feedback:${bookingId.toLowerCase()}:${assessmentId.toLowerCase()}`,
 });
 
 /** What to hand the queue for one job: ids, kinds, counters and times only. */
@@ -599,6 +630,12 @@ export const r1MeetJobs = Object.freeze({
     ),
   maintenance: (bucket: number): R1MeetJobSpec =>
     spec({ kind: 'maintenance', bucket }, r1MeetDedupKeys.maintenance(bucket)),
+  /** S09: the operator's manual re-post (runbook) and tests. Ids only. */
+  scorecardFeedback: (bookingId: string, assessmentId: string): R1MeetJobSpec =>
+    spec(
+      { kind: 'scorecard_feedback', booking_id: bookingId, assessment_id: assessmentId },
+      r1MeetDedupKeys.scorecardFeedback(bookingId, assessmentId),
+    ),
 });
 
 // ── Job facts, results, errors and the deferral bound ───────────────────────
@@ -616,10 +653,31 @@ export interface R1MeetJobMeta {
   readonly isRerun: boolean;
   /** A throw now dead-letters the job (`fail_job`: attempts >= max_attempts). */
   readonly finalAttempt: boolean;
+  /**
+   * The reason code of the deferral that ended the PREVIOUS run, or null. The queue keeps
+   * `defer_reason` from `defer_job` until the next non-deferral outcome (`complete_job` and
+   * `fail_job` clear it, a claim does not: 0037). S09.
+   */
+  readonly lastDeferReason: string | null;
+  /**
+   * The closed code the PREVIOUS run threw, or null. The queue keeps `error_message` from `fail_job`
+   * until the next deferral (`defer_job` clears it, a claim does not: 0028, 0037). S09.
+   */
+  readonly lastError: string | null;
+}
+
+/** The shape a queue reason or error code has (0037 `chk_job_queue_defer_reason`); anything else is null. */
+const QUEUE_CODE = /^[a-z0-9_.:-]{1,64}$/;
+
+function queueCode(value: unknown): string | null {
+  return typeof value === 'string' && QUEUE_CODE.test(value) ? value : null;
 }
 
 export function r1MeetJobMeta(
-  job: Pick<QueueJob<unknown>, 'attempts' | 'maxAttempts' | 'deferCount' | 'deferredAt' | 'createdAt'>,
+  job: Pick<
+    QueueJob<unknown>,
+    'attempts' | 'maxAttempts' | 'deferCount' | 'deferredAt' | 'createdAt' | 'deferReason' | 'errorMessage'
+  >,
 ): R1MeetJobMeta {
   const deferCount = typeof job.deferCount === 'number' ? job.deferCount : 0;
   return Object.freeze({
@@ -630,6 +688,8 @@ export function r1MeetJobMeta(
     createdAt: job.createdAt,
     isRerun: job.attempts > 1 || deferCount > 0,
     finalAttempt: job.attempts >= job.maxAttempts,
+    lastDeferReason: queueCode(job.deferReason),
+    lastError: queueCode(job.errorMessage),
   });
 }
 

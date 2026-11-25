@@ -228,6 +228,67 @@ describe('R1 recruiter routes', () => {
     });
   });
 
+  // M034 S09 (the S10-R1 go-live blocker): the staff page marks a Meet round "Via Meet" and offers no reissue
+  // (0142 refuses one), so this read must send how the candidate joins.
+  describe('GET /candidates/:id/interview-rounds carries channel', () => {
+    const scoredRound = { id: ROUND, candidate_id: CANDIDATE, created_by: OWNER, status: 'completed', attempts_allowed: 2, attempts_counted: 1, recommendation: 'reject', overall: 31, status_write: 'pending_reject', pending_reject_until: '2026-10-07T00:00:00.000Z', created_at: '2026-10-05T00:00:00.000Z', version: 1 };
+
+    /** The candidate rounds read with the columns it asked `interview_rounds` for. */
+    async function readRounds(rows: Row[], blockedAt: string | null = null) {
+      const tables = baseTables();
+      tables.candidates[0].decision_use_blocked_at = blockedAt;
+      tables.interview_rounds.push(...rows);
+      const { app } = appFor('viewer', OTHER, tables);
+      const selected: string[] = [];
+      from.mockImplementation((table: string) => {
+        const q = query(table, tables);
+        if (table !== 'interview_rounds') return q;
+        const select = q.select;
+        q.select = (columns: string) => { selected.push(columns); return select(columns); };
+        return q;
+      });
+      const response = await request(app).get(`/api/candidates/${CANDIDATE}/interview-rounds`);
+      expect(response.status).toBe(200);
+      return { rounds: response.body.rounds as Row[], selected };
+    }
+
+    it('asks the store for channel, so a Meet round can ever read as one', async () => {
+      const { selected } = await readRounds([{ ...scoredRound, channel: 'meet' }]);
+      expect(selected).toHaveLength(1);
+      expect(selected[0].split(',')).toContain('channel');
+    });
+
+    it('answers a browser round exactly as before, plus channel browser', async () => {
+      const { rounds } = await readRounds([{ ...scoredRound, consent_locale: 'en-IN', channel: 'browser' }]);
+      // This double hands back whole rows and does not model the attempts read, so the round comes back as
+      // stored, less consent_locale, plus the two marks and no attempts (the list's fail-open path).
+      expect(rounds).toEqual([{
+        id: ROUND, candidate_id: CANDIDATE, created_by: OWNER, status: 'completed', attempts_allowed: 2, attempts_counted: 1,
+        recommendation: 'reject', overall: 31, status_write: 'pending_reject', pending_reject_until: '2026-10-07T00:00:00.000Z',
+        created_at: '2026-10-05T00:00:00.000Z', version: 1, is_staff_dry_run: false, channel: 'browser',
+      }]);
+    });
+
+    it('answers meet for a round stored as meet', async () => {
+      const { rounds } = await readRounds([{ ...scoredRound, channel: 'meet' }]);
+      expect(rounds[0]).toMatchObject({ id: ROUND, channel: 'meet', recommendation: 'reject', overall: 31 });
+    });
+
+    it('reads a round without the column, or with any other value, as our browser link, so no raw value leaves', async () => {
+      const { rounds } = await readRounds([
+        { ...scoredRound },
+        { ...scoredRound, id: '20000000-0000-4000-8000-000000000002', channel: 'MEET' },
+        { ...scoredRound, id: '20000000-0000-4000-8000-000000000003', channel: null },
+      ]);
+      expect(rounds.map((round) => round.channel)).toEqual(['browser', 'browser', 'browser']);
+    });
+
+    it('keeps channel while an appeal withholds the result: how the candidate joins is no verdict', async () => {
+      const { rounds } = await readRounds([{ ...scoredRound, channel: 'meet' }], '2026-10-06T00:00:00.000Z');
+      expect(rounds[0]).toMatchObject({ recommendation: null, overall: null, status_write: null, pending_reject_until: null, scores_withheld: true, channel: 'meet' });
+    });
+  });
+
   it('reissues a different digest and grants only an unspent counted retake', async () => {
     const tables = baseTables();
     tables.interview_rounds.push({ id: ROUND, candidate_id: CANDIDATE, created_by: OWNER, status: 'completed', attempts_allowed: 2, attempts_counted: 1, version: 4, link_token_digest: 'a'.repeat(64) });

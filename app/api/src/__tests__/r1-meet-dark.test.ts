@@ -9,6 +9,10 @@
  * drain backstop (built only when R1 and Meet are on, or, for the drain, when the Meet flag is
  * deliberately off and a Recall key is set), and routes/r1.ts queues the bot's leave after a settled
  * attempt (it reads nothing while Meet is off: r1-attempt-outcome.test.ts).
+ * S09 adds one import to lib/r1/runtime.ts: the scorecard-ready hook (meet/feedback-notify.ts), the
+ * assessment handler's `onResult`, which queues Dex's Ashby feedback for a Meet round and reads
+ * nothing while Meet is off or the feedback form setting is blank (r1-meet-feedback-notify.test.ts,
+ * r1-runtime.test.ts).
  *
  * What "dark" means here (S01 plan R21, R30, R31; S03 plan R16; S05 plan D-S05-18; D-M034-11):
  *  (a) no runtime file outside the three Meet folders (integrations/recall, integrations/google-meet,
@@ -61,7 +65,7 @@ const MEET_SUPPORT_FILES = ['recall-fake.ts', 'meet-webhook-signing.ts', 'ashby-
   (name) => path.join(TESTS_DIR, 'support', name),
 );
 
-/** The eleven Meet variables (config/environment.schema.json, api), in `R1_MEET_ENV_VARIABLES` order. */
+/** The twelve Meet variables (config/environment.schema.json, api), in `R1_MEET_ENV_VARIABLES` order. */
 const MEET_ENV_NAMES = [
   'R1_MEET_ENABLED',
   'R1_MEET_BOT_NAME',
@@ -72,6 +76,7 @@ const MEET_ENV_NAMES = [
   'R1_MEET_ARM_AT_CREATE',
   'R1_MEET_MULTI_HUMAN_POLICY',
   'R1_MEET_ASHBY_DEX_USER_ID',
+  'R1_MEET_ASHBY_FEEDBACK_FORM_ID',
   'RECALL_API_KEY',
   'RECALL_WEBHOOK_SECRET',
 ] as const;
@@ -158,6 +163,8 @@ const WIRED_IMPORTS: Readonly<Record<string, readonly string[]>> = {
   // M034 S06: the runtime host (the lane, the sweep tick) and the attempt-outcome hook.
   'app/api/src/lib/r1/runtime.ts': [
     'app/api/src/lib/r1/meet/config.js',
+    // M034 S09: the scorecard-ready hook
+    'app/api/src/lib/r1/meet/feedback-notify.js',
     'app/api/src/lib/r1/meet/runtime.js',
   ],
   'app/api/src/routes/r1.ts': [

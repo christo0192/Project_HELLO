@@ -7,6 +7,8 @@ Scope: `app/api/src/integrations/ashby/scorecard.ts` (binding + normalization),
 of `operation-worker.ts`, and the Mission Control preview route
 `GET /mappings/:id/scorecard-binding`.
 
+Not this card: Dex's R1 scorecard on a Google Meet interview is a separate path with its own form and binder (`lib/r1/meet/feedback-form.ts`) and never uses the Christy binding; see `r1-operations.md`, "R1 over Google Meet: Dex's scorecard as Ashby feedback (M034 S09, dark)".
+
 ## v2 metrics bind to the form BY NAME (issue #275)
 
 **The rule for the Ashby form is one sentence:** for every metric a role's
