@@ -251,17 +251,20 @@ export function createR1MeetFeedbackStore(client: Db): R1MeetFeedbackStore {
     async settleReceipt(id: string, outcome: R1MeetFeedbackSettle, nowIso: string) {
       if (outcome !== 'processed' && outcome !== 'failed') throw new RangeError('r1_meet_feedback_invalid_outcome');
       // A posted card is never marked failed; a failed one is re-postable (D-S09-11).
-      const from = outcome === 'processed' ? ['recorded', 'enqueued', 'failed'] : ['recorded', 'enqueued'];
+      // Each branch filters on its own fixed list (scale-guard: no `.in` over a variable).
       const updated = rowsOf(
-        await run(() =>
-          client
+        await run(() => {
+          const update = client
             .from('r1_meet_receipts')
             .update({ outcome, processed_at: nowIso })
             .eq('id', id)
-            .eq('source', 'ashby')
-            .in('outcome', from)
-            .select('id'),
-        ),
+            .eq('source', 'ashby');
+          const guarded =
+            outcome === 'processed'
+              ? update.in('outcome', ['recorded', 'enqueued', 'failed'])
+              : update.in('outcome', ['recorded', 'enqueued']);
+          return guarded.select('id');
+        }),
       );
       return updated.length > 0;
     },
