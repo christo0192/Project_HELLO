@@ -73,6 +73,8 @@ function fakeReader() {
       results: [application(p.status === 'Hired' ? APP_HIRED : APP_ARCHIVED, String(p.status))],
       moreDataAvailable: false,
     })),
+    // M035 probe: a reserved address, so an empty page; its results are never read.
+    candidateSearch: vi.fn(async () => ({ results: [] as unknown[], moreDataAvailable: false })),
   };
 }
 
@@ -114,7 +116,7 @@ function allowedPaths(): Set<string> {
   for (const p of ['candidatesRead', 'jobsRead', 'interviewsRead']) {
     for (const f of ['state', 'error']) out.add(`permissions.${p}.${f}`);
   }
-  for (const o of ['applicationInfo', 'applicationListHistory', 'applicationList', 'jobInterviewPlanInfo', 'interviewStageList']) {
+  for (const o of ['applicationInfo', 'applicationListHistory', 'applicationList', 'jobInterviewPlanInfo', 'interviewStageList', 'candidateSearch']) {
     for (const f of ['state', 'error', 'calls', 'ok', 'missingPermission', 'failed']) out.add(`operations.${o}.${f}`);
   }
   for (const s of ['imported', 'hired', 'archived']) {
@@ -205,6 +207,13 @@ describe('GET /access-check — what the body may hold', () => {
     expect(validateNamed(leaking, 'AshbyAccessCheckResponse', SPEC)).not.toEqual([]);
     const badState = { ...res.body, permissions: { ...res.body.permissions, jobsRead: { state: 'maybe', error: null } } };
     expect(validateNamed(badState, 'AshbyAccessCheckResponse', SPEC)).not.toEqual([]);
+    // candidateSearch (M035) is documented and required.
+    expect(res.body.operations.candidateSearch).toEqual({
+      state: 'ok', error: null, calls: 1, ok: 1, missingPermission: 0, failed: 0,
+    });
+    const withoutSearch: Record<string, unknown> = { ...res.body.operations };
+    delete withoutSearch.candidateSearch;
+    expect(validateNamed({ ...res.body, operations: withoutSearch }, 'AshbyAccessCheckResponse', SPEC)).not.toEqual([]);
   });
 
   it('a body with missing permissions and empty samples also matches the schema', async () => {
@@ -252,7 +261,8 @@ describe('GET /access-check — audit and failures', () => {
         permissions_error: 0,
         permissions_not_tried: 0,
         jobs_checked: 2,
-        provider_calls: 9,
+        // 2 plans + 1 stage list + 1 info + 3 histories + 2 lists + 1 search probe.
+        provider_calls: 10,
         deadline_hit: false,
       });
       const text = JSON.stringify(entries[0]);

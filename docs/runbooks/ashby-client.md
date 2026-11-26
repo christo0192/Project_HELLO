@@ -42,7 +42,22 @@ makes **no** claim of tenant validation or live Ashby connectivity.
 `feedbackFormDefinition.info`, `job.list`, `applicationFeedback.list`,
 `applicationFeedbackRequest.create`, `applicationFeedback.submit`,
 `application.changeStage`, `candidateTag.list`, `candidate.addTag`,
-`candidate.removeTag`, `interviewStage.list`, and `interviewStage.info`.
+`candidate.removeTag`, `interviewStage.list`, `interviewStage.info`, and
+`candidate.search`.
+
+`candidate.search` (read; needs `candidatesRead`, M035) looks a person up by
+EMAIL only. `candidateSearch(email, options?)` sends a body of exactly
+`{email, limit: 20}` (`ASHBY_CANDIDATE_SEARCH_LIMIT`): the endpoint is
+`additionalProperties: false`, takes only email, name and limit, and has no
+phone search and no cursor, so there is no `extra` passthrough and a name is
+never sent. The address is validated first (3..254 characters, exactly one
+`@` with text either side, no whitespace, control or format character) and a
+bad one throws `invalid_request` / `invalid_email` before any call, with no
+part of the value in the error. Ashby may match partially, and whether it
+ignores case is UNVERIFIED (live spike), so exact-match filtering is the
+caller's: the M035 public booking matcher keeps only results whose own address
+equals the normalised one it typed, and treats `moreDataAvailable: true` as
+ambiguous.
 
 `interviewStage.list` and `interviewStage.info` (reads; need `interviewsRead`,
 M031) return interview-plan STRUCTURE: one plan's stages in order, or one stage,
@@ -82,6 +97,13 @@ would outlast the check's ~25 s budget is not waited on: it reads at once as
 `not_tried`), and the remaining reads still run; a short wait that fits is
 slept and the call retried. `rate_limited` means try the check again later. It
 returns states, coarse codes, counts and stage types, never an id or a name.
+Last, once, and only when an enabled mapping exists, it also probes
+`candidate.search` (M035) on `access-check@example.invalid`, a reserved
+address (RFC 2606) that can match no one; its results are never read. The
+answer is reported as `operations.candidateSearch` and joins Candidates read
+(a `missing_endpoint_permission` there makes Candidates read missing, as on
+any other Candidates-read call). Whether the production key passes this probe
+is UNVERIFIED until the live spike.
 
 The stage-catalogue refresh (`POST …/mission-control/stage-catalog/refresh`,
 `integrations/ashby/stage-catalog.ts`, M031) makes one read,

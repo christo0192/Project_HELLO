@@ -18,6 +18,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { createAshbyClient, type AshbyTransportRequest, type AshbyTransportResponse } from '../integrations/ashby/client.js';
 import {
   ACCESS_CHECK_READ_OPERATIONS,
+  ACCESS_CHECK_SEARCH_PROBE_EMAIL,
   assertAccessCheckReadOnly,
   classifyAccessError,
   createAshbyAccessCheckSource,
@@ -105,6 +106,8 @@ const TENANT: Routes = {
     if (body.status === 'Archived') return success([application(APP_ARCHIVED, 'Archived')], { moreDataAvailable: true, nextCursor: 'c2' });
     return success([]);
   },
+  // The probe address matches no one: an empty page, as documented.
+  '/candidate.search': () => success([], { moreDataAvailable: false }),
 };
 
 function tenant(overrides: Routes = {}, clientOptions: Record<string, unknown> = {}) {
@@ -158,6 +161,8 @@ describe('every permission granted', () => {
       jobInterviewPlanInfo: { ...OK, calls: 2, ok: 2, missingPermission: 0, failed: 0 },
       // Both jobs share one plan: one stage list.
       interviewStageList: { ...OK, calls: 1, ok: 1, missingPermission: 0, failed: 0 },
+      // One probe on the reserved address, last.
+      candidateSearch: { ...OK, calls: 1, ok: 1, missingPermission: 0, failed: 0 },
     });
     expect(r.mappings).toEqual({ enabled: 2, jobsChecked: 2, truncated: false });
     expect(r.deadlineHit).toBe(false);
@@ -217,6 +222,9 @@ describe('every permission granted', () => {
       { applicationId: APP_HIRED, limit: 100 },
       { applicationId: APP_ARCHIVED, limit: 100 },
     ]);
+    expect(byPath('/candidate.search')).toEqual([{ email: ACCESS_CHECK_SEARCH_PROBE_EMAIL, limit: 20 }]);
+    // The probe is the last call the check makes.
+    expect(t.requests.at(-1)?.path).toBe('/candidate.search');
     const allowed = new Set(ACCESS_CHECK_READ_OPERATIONS.map((op) => ASHBY_OPERATIONS[op].path));
     for (const q of t.requests) {
       expect(allowed.has(q.path), q.path).toBe(true);
@@ -296,6 +304,153 @@ describe('a missing permission', () => {
     const missing = () => json(403, { success: false, errors: ['missing_endpoint_permission'] });
     const r = await runAccessCheck(tenant({ '/interviewStage.list': missing }).client, TARGETS);
     expect(r.permissions.interviewsRead).toEqual({ state: 'missing_permission', error: null });
+  });
+});
+
+// ── M035: the candidate.search probe (Candidates read, candidate module) ────
+
+describe('the candidate.search probe', () => {
+  const SEARCH_NAME = 'Probe Leak Person';
+  const SEARCH_EMAIL = 'probe.leak.person@example.com';
+  const SEARCH_PHONE = '+91 98123 45679';
+  const SEARCH_ID = '0b6f3c1e-7777-4a00-8000-00000000c009';
+  /** A documented Candidate, as if Ashby had matched someone after all. */
+  const searchHit = {
+    id: SEARCH_ID,
+    name: SEARCH_NAME,
+    primaryEmailAddress: { value: SEARCH_EMAIL, type: 'Personal', isPrimary: true },
+    emailAddresses: [{ value: SEARCH_EMAIL, type: 'Personal', isPrimary: true }],
+    primaryPhoneNumber: { value: SEARCH_PHONE, type: 'Personal', isPrimary: true },
+    phoneNumbers: [{ value: SEARCH_PHONE, type: 'Personal', isPrimary: true }],
+    applicationIds: [APP_IMPORTED],
+    doNotContact: false,
+    fraudStatus: 'Unreviewed',
+  };
+
+  it('sends a reserved, non-routable address built at run time', () => {
+    expect(ACCESS_CHECK_SEARCH_PROBE_EMAIL).toMatch(/^[a-z-]+@example\.invalid$/);
+  });
+
+  it.each([
+    ['HTTP 403', MISSING_403],
+    ['HTTP 200 success:false', MISSING_200],
+  ])('missing_endpoint_permission on the search (%s): Candidates read is missing while the application reads are ok', async (_label, missing) => {
+    const r = await runAccessCheck(tenant({ '/candidate.search': missing }).client, TARGETS);
+    expect(r.permissions.candidatesRead).toEqual({ state: 'missing_permission', error: null });
+    expect(r.operations.candidateSearch).toEqual({
+      state: 'missing_permission', error: null, calls: 1, ok: 0, missingPermission: 1, failed: 0,
+    });
+    expect(r.operations.applicationInfo).toMatchObject({ state: 'ok', ok: 1 });
+    expect(r.operations.applicationListHistory).toMatchObject({ state: 'ok', ok: 3 });
+    expect(r.operations.applicationList).toMatchObject({ state: 'ok', ok: 2 });
+    expect(r.permissions.jobsRead).toEqual(OK);
+    expect(r.permissions.interviewsRead).toEqual(OK);
+    // The samples do not depend on the search.
+    expect(r.samples.hired.state).toBe('ok');
+  });
+
+  it.each([
+    [503, 'server_error'],
+    [400, 'client_error'],
+    [403, 'forbidden'],
+  ] as const)('a search failing alone with HTTP %i leaves Candidates read ok and reports %s on the operation', async (status, code) => {
+    const r = await runAccessCheck(tenant({ '/candidate.search': () => json(status, {}) }).client, TARGETS);
+    expect(r.permissions.candidatesRead).toEqual(OK);
+    expect(r.operations.candidateSearch).toEqual({
+      state: 'error', error: code, calls: 1, ok: 0, missingPermission: 0, failed: 1,
+    });
+  });
+
+  it('when no other Candidates-read call answers, the first failure is the verdict', async () => {
+    const r = await runAccessCheck(tenant({
+      '/application.list': () => json(503, {}),
+      '/candidate.search': () => json(400, {}),
+    }).client, { ...TARGETS, imported: null });
+    expect(r.operations.applicationInfo).toMatchObject({ state: 'not_tried', calls: 0 });
+    expect(r.permissions.candidatesRead).toEqual({ state: 'error', error: 'server_error' });
+    expect(r.operations.candidateSearch).toMatchObject({ state: 'error', error: 'client_error' });
+  });
+
+  it('no enabled mapping: no search, even when an imported application is read', async () => {
+    const t = tenant();
+    const r = await runAccessCheck(t.client, {
+      enabledMappings: 0, jobIds: [], truncated: false, imported: { applicationId: APP_IMPORTED, jobId: JOB_A },
+    });
+    expect(t.requests.some((q) => q.path === '/candidate.search')).toBe(false);
+    expect(r.operations.candidateSearch).toEqual({
+      state: 'not_tried', error: null, calls: 0, ok: 0, missingPermission: 0, failed: 0,
+    });
+    // application.info still answered, so the permission reads ok.
+    expect(r.permissions.candidatesRead).toEqual(OK);
+  });
+
+  it('only job ids that are not well formed: no job is checked, and no search is made', async () => {
+    const reader = readerFrom();
+    const r = await runAccessCheck(reader, { enabledMappings: 1, jobIds: ['has space'], truncated: false, imported: null });
+    expect(reader.candidateSearch).not.toHaveBeenCalled();
+    expect(r.operations.candidateSearch).toMatchObject({ state: 'not_tried', error: null, calls: 0 });
+  });
+
+  it('a deadline reached just before the search: it is not tried, flagged deadline, and never made', async () => {
+    const reader = readerFrom();
+    let t = Date.now();
+    // The clock jumps past the deadline during the last history read, the call before the search.
+    reader.applicationListHistory.mockImplementation(async (p: { applicationId: string }) => {
+      if (p.applicationId === APP_ARCHIVED) t += 60_000;
+      return { results: HISTORY[p.applicationId] ?? [], moreDataAvailable: false };
+    });
+    const r = await runAccessCheck(reader, TARGETS, { now: () => t });
+    expect(reader.candidateSearch).not.toHaveBeenCalled();
+    expect(r.deadlineHit).toBe(true);
+    expect(r.operations.candidateSearch).toEqual({
+      state: 'not_tried', error: 'deadline', calls: 0, ok: 0, missingPermission: 0, failed: 0,
+    });
+    // The application reads answered before the deadline, so the permission is proven.
+    expect(r.permissions.candidatesRead).toEqual(OK);
+  });
+
+  it('a deadline reached before every Candidates-read call: Candidates read is not tried, deadline', async () => {
+    const reader = readerFrom();
+    let t = Date.now();
+    reader.interviewStageList.mockImplementation(async () => {
+      t += 60_000;
+      return { results: STAGES };
+    });
+    const r = await runAccessCheck(reader, TARGETS, { now: () => t });
+    expect(reader.candidateSearch).not.toHaveBeenCalled();
+    expect(r.permissions.candidatesRead).toEqual({ state: 'not_tried', error: 'deadline' });
+    expect(r.operations.candidateSearch).toMatchObject({ state: 'not_tried', error: 'deadline', calls: 0 });
+  });
+
+  it('what the search returns never reaches the output', async () => {
+    const t = tenant({ '/candidate.search': () => success([searchHit], { moreDataAvailable: true }) });
+    const r = await runAccessCheck(t.client, TARGETS);
+    expect(r.operations.candidateSearch).toMatchObject({ state: 'ok', ok: 1 });
+    const text = JSON.stringify(r);
+    for (const secret of [...SECRETS, SEARCH_NAME, SEARCH_EMAIL, SEARCH_PHONE, SEARCH_ID, 'probe.leak', '98123', 'Unreviewed']) {
+      expect(text, secret).not.toContain(secret);
+    }
+    // Nor does the probe address itself.
+    expect(text).not.toContain('example.invalid');
+  });
+
+  it('a malformed search answer is an error on the operation, never a verdict read from its body', async () => {
+    const t = tenant({
+      '/candidate.search': () => ({ status: 200, ok: true, headers: { get: () => null }, text: async () => '<html>' }),
+    });
+    const r = await runAccessCheck(t.client, TARGETS);
+    expect(r.operations.candidateSearch).toMatchObject({ state: 'error', error: 'malformed_response' });
+    expect(r.permissions.candidatesRead).toEqual(OK);
+  });
+
+  it('the search shares the one deadline and the fail-fast flag of every other call', async () => {
+    const reader = readerFrom();
+    await runAccessCheck(reader, TARGETS);
+    expect(reader.candidateSearch).toHaveBeenCalledTimes(1);
+    const [email, options] = reader.candidateSearch.mock.calls[0] as unknown as [string, { deadlineAt: number; failFastPastDeadline: boolean }];
+    expect(email).toBe(ACCESS_CHECK_SEARCH_PROBE_EMAIL);
+    const planOptions = (reader.jobInterviewPlanInfo.mock.calls[0] as unknown[])[2] as { deadlineAt: number };
+    expect(options).toEqual({ deadlineAt: planOptions.deadlineAt, failFastPastDeadline: true });
   });
 });
 
@@ -450,6 +605,7 @@ function readerFrom(over: Partial<Record<keyof AccessCheckReader, (...args: neve
       results: p.status === 'Hired' ? [application(APP_HIRED, 'Hired')] : [application(APP_ARCHIVED, 'Archived')],
       moreDataAvailable: false,
     })),
+    candidateSearch: vi.fn(async (_email: string, _options?: unknown) => ({ results: [] as unknown[], moreDataAvailable: false })),
   };
   return { ...base, ...over } as unknown as AccessCheckReader & typeof base;
 }
@@ -484,7 +640,9 @@ describe('one deadline for the whole check', () => {
       ...reader.jobInterviewPlanInfo.mock.calls.map((c) => (c as unknown[])[2] as { deadlineAt: number }),
       ...reader.interviewStageList.mock.calls.map((c) => (c as unknown[])[0] as { deadlineAt: number }),
       ...reader.applicationList.mock.calls.map((c) => (c as unknown[])[0] as { deadlineAt: number }),
+      ...reader.candidateSearch.mock.calls.map((c) => (c as unknown[])[1] as { deadlineAt: number }),
     ].map((o) => o.deadlineAt);
+    expect(reader.candidateSearch).toHaveBeenCalledTimes(1);
     expect(new Set(deadlines).size).toBe(1);
     expect(deadlines[0]).toBeGreaterThan(start);
     expect(deadlines[0]).toBeLessThanOrEqual(start + 25_000 + 1_000);
@@ -508,6 +666,8 @@ describe('one deadline for the whole check', () => {
     expect(reader.interviewStageList).not.toHaveBeenCalled();
     expect(reader.applicationInfo).not.toHaveBeenCalled();
     expect(reader.applicationList).not.toHaveBeenCalled();
+    expect(reader.candidateSearch).not.toHaveBeenCalled();
+    expect(r.operations.candidateSearch).toMatchObject({ state: 'not_tried', error: 'deadline', calls: 0 });
   });
 
   it('asks every call to fail at once rather than sleep past the deadline', async () => {
@@ -519,7 +679,9 @@ describe('one deadline for the whole check', () => {
       ...reader.applicationInfo.mock.calls.map((c) => (c as unknown[])[2]),
       ...reader.applicationListHistory.mock.calls.map((c) => (c as unknown[])[0]),
       ...reader.applicationList.mock.calls.map((c) => (c as unknown[])[0]),
+      ...reader.candidateSearch.mock.calls.map((c) => (c as unknown[])[1]),
     ] as Array<{ failFastPastDeadline?: boolean }>;
+    expect(reader.candidateSearch).toHaveBeenCalledTimes(1);
     expect(options.length).toBeGreaterThan(0);
     for (const o of options) expect(o.failFastPastDeadline).toBe(true);
   });
