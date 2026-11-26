@@ -795,3 +795,10 @@ export function isFinalRefusal(error: unknown): boolean {
       return error instanceof ApiError && R1_FINAL_REFUSAL_CODES.includes(error.message);
   }
 }
+
+/**
+ * The one transport of the candidate routes (see `send`), shared with the public booking client
+ * (r1-book-api.ts, M035 S07) so credentials-free, no-store, no-referrer requests and the error
+ * envelope live in one place. Nothing else may call fetch for R1 (r1-structure.test.ts).
+ */
+export const r1Request = send;

@@ -118,12 +118,23 @@ describe('R1 never touches the legacy or recording paths', () => {
     });
   }
 
-  it('declares every /api path in the one client module', () => {
+  it('declares every /api path in the client modules', () => {
+    // r1-api.ts (the candidate routes and the one transport) and r1-book-api.ts (the public
+    // booking routes, M035 S07, which reuses that transport) are the only client modules.
+    const CLIENT_MODULES = ['src/lib/r1/r1-api.ts', 'src/lib/r1/r1-book-api.ts'];
     for (const file of R1_FILES) {
       const code = read(file).replace(/\/\*[\s\S]*?\*\//g, '');
       if (file === 'src/lib/r1/r1-api.ts') continue;
-      expect(code, `${file} hard-codes an API path`).not.toMatch(/['"`]\/api\//);
+      if (!CLIENT_MODULES.includes(file)) {
+        expect(code, `${file} hard-codes an API path`).not.toMatch(/['"`]\/api\//);
+      }
       expect(code, `${file} calls fetch directly`).not.toMatch(/\bfetch\(/);
+    }
+    const book = read('src/lib/r1/r1-book-api.ts').replace(/\/\*[\s\S]*?\*\//g, '');
+    const paths = [...book.matchAll(/['"`](\/api\/[^'"`]*)/g)].map((match) => match[1]);
+    expect(paths.length, 'r1-book-api.ts declares the booking routes').toBeGreaterThan(0);
+    for (const path of paths) {
+      expect(path, 'r1-book-api.ts declares only booking routes').toMatch(/^\/api\/r1\/book/);
     }
   });
 
