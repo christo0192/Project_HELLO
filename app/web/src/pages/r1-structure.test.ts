@@ -39,6 +39,7 @@ const R1_FILES = [
   ...walk('src/components/candidate-r1'),
   'src/pages/R1JoinPage.tsx',
   'src/pages/R1MeetBridgePage.tsx',
+  'src/pages/R1BookPage.tsx',
 ].filter((file) => /\.(ts|tsx)$/.test(file) && !/\.test\.(ts|tsx)$/.test(file));
 
 const R1_TSX = R1_FILES.filter((file) => file.endsWith('.tsx'));
@@ -410,5 +411,99 @@ describe('the Meet bridge is audio-only and narrow', () => {
     expect(read(PAGE)).toMatch(/<meta name="referrer" content="no-referrer" \/>/);
     const tile = codeOf('src/components/candidate-r1/R1MeetTile.tsx');
     expect(tile).not.toMatch(/<(button|a|input|select|textarea)\b|onClick|tabIndex|R1ReadyButton|R1ConsentExit/);
+  });
+});
+
+describe('the public booking pages', () => {
+  // M035 S07: `/book` is the one public link the hiring team sends every candidate. It is
+  // unauthenticated, it holds what the person types (name, email, mobile number) in the browser,
+  // and an outsider can load it: these checks pin what it may call, read, store and load.
+  const BOOK_FILES = [
+    'src/lib/r1/r1-book-api.ts',
+    'src/lib/r1/r1-book-link.ts',
+    'src/lib/r1/r1-book.ts',
+    'src/components/candidate-r1/r1-book-copy.ts',
+    'src/components/candidate-r1/R1BookStatusCard.tsx',
+    'src/components/candidate-r1/R1BookNotice.tsx',
+    'src/components/candidate-r1/R1BookSlotPicker.tsx',
+    'src/components/candidate-r1/R1BookErrorSummary.tsx',
+    'src/pages/R1BookPage.tsx',
+  ];
+  const BOOK_PAGE = 'src/pages/R1BookPage.tsx';
+  const codeOf = (file: string): string =>
+    read(file).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+
+  it('guards files that exist, and every one of them is also under the R1 guards above', () => {
+    for (const file of BOOK_FILES) expect(R1_FILES, file).toContain(file);
+  });
+
+  it('routes /book as its own public, lazy page before the recruiter routes', () => {
+    const app = read('src/App.tsx');
+    expect(app).toMatch(/lazyPage\(\(\) => import\('\.\/pages\/R1BookPage'\), 'R1BookPage'\)/);
+    expect(app).not.toMatch(/import \{[^}]*\bR1BookPage\b[^}]*\} from/);
+    expect(app).toMatch(
+      /<Route\s+path="\/book"\s+element=\{\s*<Suspense fallback=\{<LoadingPanel \/>\}>\s*<R1BookPage \/>\s*<\/Suspense>\s*\}\s*\/>/,
+    );
+    expect(app.split('path="/book"').length - 1, 'routed once').toBe(1);
+    // Public like /candidate/r1: the route sits before the protected recruiter routes.
+    expect(app.indexOf('path="/book"')).toBeGreaterThan(-1);
+    expect(app.indexOf('path="/book"')).toBeLessThan(app.indexOf('<ProtectedRoute />'));
+  });
+
+  it('calls the notice, the grid and the booking, and no other route', () => {
+    const page = codeOf(BOOK_PAGE);
+    const calls = [...new Set([...page.matchAll(/\br1BookApi\.(\w+)/g)].map((match) => match[1]))];
+    expect(calls.sort()).toEqual(['book', 'consentTemplate', 'slots']);
+    expect(page, 'the booking page uses the candidate client').not.toMatch(/\br1Api\b/);
+    expect(page).toContain("from '../lib/r1/r1-book-api'");
+    expect(page).not.toMatch(/from '\.\.\/lib\/r1\/r1-api'/);
+  });
+
+  it('loads nothing from a third party and never reads a Meet link or a seat count', () => {
+    for (const file of BOOK_FILES) {
+      const source = read(file);
+      expect(source, `${file} has a URL literal`).not.toMatch(/https?:\/\//);
+      expect(source, `${file} injects a script`).not.toMatch(/createElement\(\s*['"]script/);
+      expect(source, `${file} adds a link element`).not.toMatch(/<link\b/);
+      expect(codeOf(file), `${file} reads a Meet link or a capacity`).not.toMatch(
+        /meet_url|meeting_uri|hangout|\bseats?\b|capacity/i,
+      );
+    }
+  });
+
+  it('never touches the address bar, web storage or cookies', () => {
+    const page = codeOf(BOOK_PAGE);
+    expect(page).not.toMatch(/\bhistory\b/);
+    expect(page).not.toMatch(/\blocation\b/);
+    expect(page).not.toMatch(/\b(?:pushState|replaceState)\b/);
+    expect(page).not.toMatch(/\b(?:sessionStorage|localStorage|indexedDB)\b|document\.cookie/);
+  });
+
+  it('sends a honeypot: an aria-hidden text field named website, out of the Tab order', () => {
+    const page = read(BOOK_PAGE);
+    const trap = page.match(/<div className="r1-book__trap" aria-hidden="true">([\s\S]*?)<\/div>/);
+    expect(trap, 'the honeypot wrapper').not.toBeNull();
+    const input = trap![1].match(/<input\b[^>]*\/>/);
+    expect(input, 'the honeypot input').not.toBeNull();
+    expect(input![0]).toContain('name="website"');
+    expect(input![0]).toContain('type="text"');
+    expect(input![0]).toContain('tabIndex={-1}');
+    expect(input![0]).toContain('autoComplete="off"');
+    // The one named control on the page (the referrer meta aside): a typed field with a name
+    // could reach a native submit.
+    const named = [...page.matchAll(/\sname=["{]([^"}]*)/g)].map((match) => match[1]);
+    expect(named.sort()).toEqual(['referrer', 'website']);
+  });
+
+  it('declares a no-referrer policy and a form a native submit cannot leak', () => {
+    const page = read(BOOK_PAGE);
+    expect(page).toMatch(/<meta name="referrer" content="no-referrer" \/>/);
+    expect(page).toMatch(/<form noValidate method="post" onSubmit=\{onSubmit\}>/);
+    expect(page).toMatch(
+      /const onSubmit = \(event: FormEvent<HTMLFormElement>\): void => \{\s*event\.preventDefault\(\);/,
+    );
+    expect(page).toContain('autoComplete="name"');
+    expect(page).toContain('autoComplete="email"');
+    expect(page).toContain('autoComplete="tel"');
   });
 });

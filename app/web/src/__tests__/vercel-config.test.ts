@@ -122,6 +122,8 @@ describe('app/web/vercel.json', () => {
         '/privacy-notice',
         // The Meet bridge the Recall bot loads (its ticket rides in the fragment, never sent).
         '/candidate/r1/meet',
+        // The public booking page (M035): the one link the hiring team sends every candidate.
+        '/book',
         // A route that merely starts with the word is not an asset.
         '/assets',
         '/assets-old/x.js',

@@ -63,6 +63,8 @@ const R1JoinPage = lazyPage(() => import('./pages/R1JoinPage'), 'R1JoinPage');
 // The Meet bridge (M034): loaded by the Recall bot's Output Media as the AI interviewer's camera
 // tile; public, audio-only, and lazy for the same LiveKit reason.
 const R1MeetBridgePage = lazyPage(() => import('./pages/R1MeetBridgePage'), 'R1MeetBridgePage');
+// The public Dex booking page (M035): LiveKit-free, lazy so it stays out of the recruiter chunk.
+const R1BookPage = lazyPage(() => import('./pages/R1BookPage'), 'R1BookPage');
 const ScreeningPage = lazyPage(() => import('./pages/ScreeningPage'), 'ScreeningPage');
 const CandidateDetailPage = lazyPage(
   () => import('./pages/CandidateDetailPage'),
@@ -159,6 +161,14 @@ export default function App() {
           element={
             <Suspense fallback={<LoadingPanel />}>
               <R1MeetBridgePage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/book"
+          element={
+            <Suspense fallback={<LoadingPanel />}>
+              <R1BookPage />
             </Suspense>
           }
         />
