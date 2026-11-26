@@ -22,6 +22,19 @@
 --   T1-G the terminal trigger (calendar cancel + tag removal, exact payloads and keys) and the
 --        purge trigger (incl. the DSAR cascade beside 0142's bot release, and its dedup).
 --   T1-H the throttle table's CHECKs and key.
+--   T2-A the slot and IST-day counts (§10, §11) and r1_meet_public_capacity (§13): overlap only,
+--        live only, both sources, the IST midnight boundary, zero days, the 15-day window, the
+--        0131 effective concurrency, admits, the settings mirror and a missing settings row.
+--   T2-B r1_meet_public_precheck over r1_meet_public_refusal (§12, §14): every refusal code in
+--        order, precedence pairs, the expirable and reusable rounds that stay eligible, the field
+--        refusals, and no write.
+--   T2-C r1_meet_public_set_manage_digest (§16).
+--   T2-D r1_meet_public_manage_read (§17).
+--   T2-E r1_meet_public_set_calendar_state (§21).
+--   T2-F r1_meet_public_throttle_hit (§22).
+--   T2-G r1_meet_public_throttle_prune (§23).
+--   T2-H catalog posture of the T2 functions (definer RPCs, invoker helpers, volatility,
+--        search_path, EXECUTE).
 --
 -- The clock is pinned: every time is written explicitly (p_now = 2026-12-01 04:00 UTC, 09:30 IST;
 -- the default slot is 2026-12-02 05:00-05:45 UTC, 10:30-11:15 IST); nothing asserts on now().
@@ -1064,6 +1077,1310 @@ begin
   values (k, '2026-12-01 04:01:00+00');
   perform _r1_meet_public_tests.assert('T1-H the same key in another bucket is another row',
     (select count(*) = 2 from screening_v2.r1_meet_public_throttle x where x.key_digest = k));
+end;
+$$;
+
+-- =============================================================================================
+-- T2 fixtures. Fixture numbers 300-499; p_now is 2026-12-01 04:00 UTC unless a call says
+-- otherwise. Rounds and bookings are inserted directly, holds come from r1_send_round, and the
+-- one Ashby round comes from r1_meet_create_round_from_ashby (T3 adds the create-based cases).
+-- =============================================================================================
+
+-- A slot of p_minutes starting at p_start, as booking columns.
+create function _r1_meet_public_tests.slot(p_start timestamptz, p_minutes integer default 45)
+returns jsonb language sql stable as $$
+  select jsonb_build_object('start_at', p_start, 'end_at', p_start + make_interval(mins => p_minutes))
+$$;
+
+-- A live public booking that needs no candidate or round (pairs with public_row): blocked.
+create function _r1_meet_public_tests.blocked() returns jsonb
+language sql immutable as $$
+  select '{"status": "blocked", "reason": "bot_cap_reached", "candidate_id": null, "round_id": null}'::jsonb
+$$;
+
+-- Another round of candidate p_candidate (round id(11, p_round)), inserted directly.
+create function _r1_meet_public_tests.round_of(p_round integer, p_candidate integer, p_status text,
+                                               p_channel text default 'meet',
+                                               p_expires_at timestamptz default '2026-12-02 07:45:00+00')
+returns uuid language plpgsql as $$
+begin
+  insert into screening_v2.interview_rounds
+    (id, candidate_id, role_id, link_token_digest, expires_at, created_by, status, channel)
+  values (_r1_meet_public_tests.id(11, p_round), _r1_meet_public_tests.id(10, p_candidate),
+          _r1_meet_public_tests.id(2, 1), _r1_meet_public_tests.digest('link-of-' || p_round::text),
+          p_expires_at, _r1_meet_public_tests.id(1, 1), p_status, p_channel);
+  return _r1_meet_public_tests.id(11, p_round);
+end;
+$$;
+
+-- A browser call session of round p_round (status `created`, as every new session starts).
+create function _r1_meet_public_tests.session(p_n integer, p_round uuid)
+returns uuid language plpgsql as $$
+begin
+  insert into screening_v2.call_sessions
+    (id, candidate_id, role_id, mode, provider, external_call_id, status, interview_round_id, owner_id)
+  select _r1_meet_public_tests.id(12, p_n), x.candidate_id, x.role_id, 'browser', 'livekit',
+         'screening-' || _r1_meet_public_tests.id(12, p_n)::text, 'created', x.id,
+         _r1_meet_public_tests.id(1, 1)
+    from screening_v2.interview_rounds x
+   where x.id = p_round;
+  return _r1_meet_public_tests.id(12, p_n);
+end;
+$$;
+
+-- A candidate_web consent of round p_round on our notice (every required key).
+create function _r1_meet_public_tests.consent(p_round uuid,
+                                              p_granted_at timestamptz default '2026-12-01 03:00:00+00')
+returns uuid language plpgsql as $$
+declare
+  v_id uuid;
+begin
+  insert into screening_v2.interview_round_consents (round_id, template_id, consents, proof, granted_at)
+  values (p_round, _r1_meet_public_tests.id(3, 1),
+          '["ai_interview", "video_audio_recording", "ai_evaluation", "data_processing"]'::jsonb,
+          '{"decision": "granted"}'::jsonb, p_granted_at)
+  returning id into v_id;
+  return v_id;
+end;
+$$;
+
+-- The precheck of candidate n for its own application n: 'eligible', the refusal code, or
+-- '<status>:<field>'.
+create function _r1_meet_public_tests.pre(p_n integer, p_now timestamptz default '2026-12-01 04:00:00+00')
+returns text language plpgsql as $$
+declare
+  v_res jsonb := screening_v2.r1_meet_public_precheck(_r1_meet_public_tests.id(10, p_n),
+                                                     _r1_meet_public_tests.id(22, p_n)::text, p_now);
+begin
+  return case v_res ->> 'status'
+           when 'eligible' then 'eligible'
+           when 'refused' then v_res ->> 'code'
+           else coalesce(v_res ->> 'status', 'null') || ':' || coalesce(v_res ->> 'field', '')
+         end;
+end;
+$$;
+
+-- Runs the statements p_setup, then the query p_sql (one jsonb), inside a subtransaction that is
+-- ALWAYS rolled back, and returns the answer. A real error (a failed assertion too) is re-raised,
+-- never mistaken for the sentinel.
+create function _r1_meet_public_tests.in_rollback(p_setup text[], p_sql text)
+returns jsonb language plpgsql as $$
+declare
+  v_res jsonb;
+  v_done boolean := false;
+  v_stmt text;
+begin
+  begin
+    foreach v_stmt in array p_setup loop
+      execute v_stmt;
+    end loop;
+    execute p_sql into v_res;
+    v_done := true;
+    raise exception 'r1 meet public rollback sentinel' using errcode = 'P0001';
+  exception when sqlstate 'P0001' then
+    if not v_done then
+      raise;
+    end if;
+  end;
+  return v_res;
+end;
+$$;
+
+-- Runs p_sql under one more active consent release (newer than ours), rolled back as above
+-- (releases are immutable and could not be removed otherwise).
+create function _r1_meet_public_tests.under_release(p_version text, p_locale text, p_required jsonb,
+                                                    p_sql text)
+returns jsonb language plpgsql as $$
+declare
+  v_res jsonb;
+  v_done boolean := false;
+begin
+  begin
+    insert into screening_v2.interview_round_consent_templates
+      (version, locale, title, body_md, required_consents, is_active)
+    values (p_version, p_locale, 'R1 Meet public assertion newer notice', 'fixture', p_required, true);
+    perform _r1_meet_public_tests.assert('T2 fixture release ' || p_version || ' (' || p_locale
+                                         || ') is the newest active release',
+      (select max(x.version) = p_version
+         from screening_v2.interview_round_consent_templates x where x.is_active));
+    execute p_sql into v_res;
+    v_done := true;
+    raise exception 'r1 meet public rollback sentinel' using errcode = 'P0001';
+  exception when sqlstate 'P0001' then
+    if not v_done then
+      raise;
+    end if;
+  end;
+  return v_res;
+end;
+$$;
+
+-- Everything a read-only call must leave alone, as one value: row counts and row digests of the
+-- bookings, rounds, consents, jobs, budget months and throttle rows.
+create function _r1_meet_public_tests.counts() returns jsonb
+language sql stable as $$
+  select jsonb_build_object(
+    'bookings', (select count(*) || ':' || coalesce(md5(string_agg(x::text, '|' order by x.id)), '')
+                   from screening_v2.r1_meet_bookings x),
+    'rounds', (select count(*) || ':' || coalesce(md5(string_agg(x::text, '|' order by x.id)), '')
+                 from screening_v2.interview_rounds x),
+    'consents', (select count(*) || ':' || coalesce(md5(string_agg(x::text, '|' order by x.id)), '')
+                   from screening_v2.interview_round_consents x),
+    'jobs', (select count(*) || ':' || coalesce(md5(string_agg(x::text, '|' order by x.id)), '')
+               from screening_v2.job_queue x),
+    'months', (select count(*) || ':' || coalesce(md5(string_agg(x::text, '|' order by x.month_start)), '')
+                 from screening_v2.r1_budget_month x),
+    'throttle', (select count(*) || ':' || coalesce(md5(string_agg(x::text, '|'
+                                                                  order by x.key_digest, x.bucket_start)), '')
+                   from screening_v2.r1_meet_public_throttle x))
+$$;
+
+-- The hits of one throttle row (NULL when the row does not exist).
+create function _r1_meet_public_tests.hits(p_key text, p_bucket timestamptz) returns integer
+language sql stable as $$
+  select x.hits from screening_v2.r1_meet_public_throttle x
+   where x.key_digest = p_key and x.bucket_start = p_bucket
+$$;
+
+-- =============================================================================================
+-- T2-A. Slot and day counts (§10, §11) and r1_meet_public_capacity (§13).
+-- =============================================================================================
+-- Every booking here starts on IST 2026-12-09 or 2026-12-10, days no other section uses.
+do $$
+declare
+  p_now constant timestamptz := '2026-12-01 04:00:00+00';
+  c_from constant timestamptz := '2026-12-08 18:30:00+00';
+  c_to constant timestamptz := '2026-12-10 18:30:00+00';
+  res jsonb;
+  res2 jsonb;
+  v_pool integer;
+begin
+  perform _r1_meet_public_tests.assert('T2-A fixture: no booking starts on IST 2026-12-08 .. 2026-12-24 yet',
+    not exists (select 1 from screening_v2.r1_meet_bookings x
+                 where x.start_at >= '2026-12-07 18:30:00+00' and x.start_at < '2026-12-24 18:30:00+00'));
+
+  -- IST 2026-12-09 is UTC 2026-12-08 18:30 .. 2026-12-09 18:30. Live, both sources:
+  perform _r1_meet_public_tests.public_booking(300, _r1_meet_public_tests.blocked()
+    || _r1_meet_public_tests.slot('2026-12-09 05:00:00+00'));
+  perform _r1_meet_public_tests.ashby_booking(301, '{"status": "blocked", "reason": "not_scheduled"}'::jsonb
+    || _r1_meet_public_tests.slot('2026-12-09 05:30:00+00'));
+  perform _r1_meet_public_tests.candidate(302, false);
+  perform _r1_meet_public_tests.round(302);
+  perform _r1_meet_public_tests.public_booking(302, _r1_meet_public_tests.slot('2026-12-09 05:45:00+00'));
+  perform _r1_meet_public_tests.ashby_booking(303, '{"status": "blocked", "reason": "not_scheduled"}'::jsonb
+    || _r1_meet_public_tests.slot('2026-12-09 04:15:00+00'));
+  -- Terminal on the same day: completed/attempt_settled and failed/no_show used a bot (they count);
+  -- failed/in_past, failed/invite_undeliverable, failed/bot_create_failed and both cancels did not.
+  perform _r1_meet_public_tests.candidate(304, false);
+  perform _r1_meet_public_tests.round(304);
+  perform _r1_meet_public_tests.public_booking(304, jsonb_build_object(
+    'status', 'completed', 'reason', 'attempt_settled', 'recall_bot_id', _r1_meet_public_tests.id(30, 304))
+    || _r1_meet_public_tests.slot('2026-12-09 07:00:00+00'));
+  perform _r1_meet_public_tests.public_booking(305, _r1_meet_public_tests.unbound()
+    || '{"status": "failed", "reason": "no_show"}'::jsonb || _r1_meet_public_tests.slot('2026-12-09 08:00:00+00'));
+  perform _r1_meet_public_tests.ashby_booking(306, '{"status": "failed", "reason": "in_past"}'::jsonb
+    || _r1_meet_public_tests.slot('2026-12-09 08:00:00+00'));
+  perform _r1_meet_public_tests.public_booking(307, _r1_meet_public_tests.unbound()
+    || '{"status": "failed", "reason": "invite_undeliverable"}'::jsonb
+    || _r1_meet_public_tests.slot('2026-12-09 09:00:00+00'));
+  perform _r1_meet_public_tests.public_booking(308, _r1_meet_public_tests.unbound()
+    || _r1_meet_public_tests.slot('2026-12-09 09:00:00+00'));
+  perform _r1_meet_public_tests.ashby_booking(309, '{"status": "cancelled", "reason": "cancelled"}'::jsonb
+    || _r1_meet_public_tests.slot('2026-12-09 09:00:00+00'));
+  perform _r1_meet_public_tests.ashby_booking(310, '{"status": "failed", "reason": "bot_create_failed"}'::jsonb
+    || _r1_meet_public_tests.slot('2026-12-09 10:00:00+00'));
+  -- Not live either: an unmatched Ashby booking (the ashby_row default).
+  perform _r1_meet_public_tests.ashby_booking(311, _r1_meet_public_tests.slot('2026-12-09 10:00:00+00'));
+  -- The IST midnight: 23:59:59 IST on the 9th, then 00:00 IST on the 10th.
+  perform _r1_meet_public_tests.public_booking(312, _r1_meet_public_tests.blocked()
+    || _r1_meet_public_tests.slot('2026-12-09 18:29:59+00'));
+  perform _r1_meet_public_tests.ashby_booking(313, '{"status": "blocked", "reason": "not_scheduled"}'::jsonb
+    || _r1_meet_public_tests.slot('2026-12-09 18:30:00+00'));
+
+  -- §10: overlap only, live only, both sources, one booking left out on request.
+  perform _r1_meet_public_tests.assert('T2-A slot count 05:00-05:45: one public and one Ashby live booking; the touching ones are out',
+    screening_v2.r1_meet_public_slot_count('2026-12-09 05:00:00+00', '2026-12-09 05:45:00+00', null) = 2);
+  perform _r1_meet_public_tests.assert('T2-A slot count leaves the excluded booking out',
+    screening_v2.r1_meet_public_slot_count('2026-12-09 05:00:00+00', '2026-12-09 05:45:00+00',
+                                           _r1_meet_public_tests.id(40, 300)) = 1);
+  perform _r1_meet_public_tests.assert('T2-A slot count 05:30-06:00 overlaps three live bookings',
+    screening_v2.r1_meet_public_slot_count('2026-12-09 05:30:00+00', '2026-12-09 06:00:00+00', null) = 3);
+  perform _r1_meet_public_tests.assert('T2-A slot count: a booking that starts when the slot ends is out',
+    screening_v2.r1_meet_public_slot_count('2026-12-09 03:30:00+00', '2026-12-09 04:15:00+00', null) = 0);
+  perform _r1_meet_public_tests.assert('T2-A slot count: completed, failed, cancelled and unmatched bookings are out',
+    screening_v2.r1_meet_public_slot_count('2026-12-09 07:00:00+00', '2026-12-09 07:45:00+00', null) = 0
+    and screening_v2.r1_meet_public_slot_count('2026-12-09 08:00:00+00', '2026-12-09 08:45:00+00', null) = 0
+    and screening_v2.r1_meet_public_slot_count('2026-12-09 09:00:00+00', '2026-12-09 09:45:00+00', null) = 0
+    and screening_v2.r1_meet_public_slot_count('2026-12-09 10:00:00+00', '2026-12-09 10:45:00+00', null) = 0);
+  perform _r1_meet_public_tests.assert('T2-A slot count across the IST midnight sees both sides',
+    screening_v2.r1_meet_public_slot_count('2026-12-09 18:00:00+00', '2026-12-09 19:00:00+00', null) = 2);
+
+  -- §11: by IST start date; live or used a bot; total and public.
+  res := screening_v2.r1_meet_public_day_count('2026-12-09', null);
+  perform _r1_meet_public_tests.assert('T2-A day count IST 2026-12-09: total 7 (5 live + attempt_settled + no_show), public 5',
+    res = '{"total": 7, "public": 5}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_day_count('2026-12-09', _r1_meet_public_tests.id(40, 300));
+  perform _r1_meet_public_tests.assert('T2-A day count leaves an excluded public booking out of both counts',
+    res = '{"total": 6, "public": 4}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_day_count('2026-12-09', (select x.id from screening_v2.r1_meet_bookings x
+                                                             where x.ashby_interview_event_id = _r1_meet_public_tests.id(20, 301)));
+  perform _r1_meet_public_tests.assert('T2-A day count leaves an excluded Ashby booking out of the total only',
+    res = '{"total": 6, "public": 5}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_day_count('2026-12-10', null);
+  perform _r1_meet_public_tests.assert('T2-A day count IST 2026-12-10 holds the 18:30 UTC booking only',
+    res = '{"total": 1, "public": 0}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_day_count('2026-12-11', null);
+  perform _r1_meet_public_tests.assert('T2-A day count of an empty day is zero',
+    res = '{"total": 0, "public": 0}'::jsonb, res::text);
+
+  -- §13: the full answer for IST 2026-12-09 .. 2026-12-10.
+  res := screening_v2.r1_meet_public_capacity(c_from, c_to, p_now);
+  perform _r1_meet_public_tests.assert('T2-A capacity answers exactly the contract keys',
+    array(select jsonb_object_keys(res) order by 1)
+      = array['admits', 'day_counts', 'effective_concurrency', 'enabled', 'intervals', 'paused', 'status'],
+    res::text);
+  perform _r1_meet_public_tests.assert('T2-A capacity: ok, enabled, not paused, admits, effective concurrency 1',
+    res ->> 'status' = 'ok' and (res -> 'enabled') = 'true'::jsonb and (res -> 'paused') = 'false'::jsonb
+    and (res -> 'admits') = 'true'::jsonb and (res -> 'effective_concurrency') = '1'::jsonb, res::text);
+  perform _r1_meet_public_tests.assert('T2-A capacity intervals: the live bookings of both sources, by start, no ids',
+    res -> 'intervals' = jsonb_build_array(
+      _r1_meet_public_tests.slot('2026-12-09 04:15:00+00'), _r1_meet_public_tests.slot('2026-12-09 05:00:00+00'),
+      _r1_meet_public_tests.slot('2026-12-09 05:30:00+00'), _r1_meet_public_tests.slot('2026-12-09 05:45:00+00'),
+      _r1_meet_public_tests.slot('2026-12-09 18:29:59+00'), _r1_meet_public_tests.slot('2026-12-09 18:30:00+00')),
+    (res -> 'intervals')::text);
+  perform _r1_meet_public_tests.assert('T2-A capacity intervals carry start_at and end_at only',
+    (select bool_and(array(select jsonb_object_keys(e) order by 1) = array['end_at', 'start_at'])
+       from jsonb_array_elements(res -> 'intervals') e));
+  perform _r1_meet_public_tests.assert('T2-A capacity day_counts: one entry per IST date, ascending',
+    res -> 'day_counts' = '[{"ist_date": "2026-12-09", "total": 7, "public": 5},
+                            {"ist_date": "2026-12-10", "total": 1, "public": 0}]'::jsonb,
+    (res -> 'day_counts')::text);
+  res := screening_v2.r1_meet_public_capacity('2026-12-09 05:40:00+00', '2026-12-09 05:50:00+00', p_now);
+  perform _r1_meet_public_tests.assert('T2-A capacity of a 10-minute window: the three overlapping intervals and its one day',
+    res -> 'intervals' = jsonb_build_array(
+      _r1_meet_public_tests.slot('2026-12-09 05:00:00+00'), _r1_meet_public_tests.slot('2026-12-09 05:30:00+00'),
+      _r1_meet_public_tests.slot('2026-12-09 05:45:00+00'))
+    and res -> 'day_counts' = '[{"ist_date": "2026-12-09", "total": 7, "public": 5}]'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_capacity('2026-12-09 06:30:00+00', '2026-12-09 07:00:00+00', p_now);
+  perform _r1_meet_public_tests.assert('T2-A capacity: a booking that ends when the window starts is out (empty intervals)',
+    res -> 'intervals' = '[]'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_capacity('2026-12-09 18:30:00+00', '2026-12-12 18:30:00+00', p_now);
+  perform _r1_meet_public_tests.assert('T2-A capacity lists the zero days too',
+    res -> 'day_counts' = '[{"ist_date": "2026-12-10", "total": 1, "public": 0},
+                            {"ist_date": "2026-12-11", "total": 0, "public": 0},
+                            {"ist_date": "2026-12-12", "total": 0, "public": 0}]'::jsonb,
+    (res -> 'day_counts')::text);
+  res := screening_v2.r1_meet_public_capacity('2026-12-09 00:00:00+00', '2026-12-24 00:00:00+00', p_now);
+  perform _r1_meet_public_tests.assert('T2-A a 15-day window answers 16 ascending IST dates, 2026-12-09 .. 2026-12-24',
+    res ->> 'status' = 'ok' and jsonb_array_length(res -> 'day_counts') = 16
+    and res -> 'day_counts' -> 0 ->> 'ist_date' = '2026-12-09'
+    and res -> 'day_counts' -> 15 ->> 'ist_date' = '2026-12-24'
+    and (select bool_and((e.value ->> 'ist_date')::date = '2026-12-09'::date + (e.ordinality - 1)::integer)
+           from jsonb_array_elements(res -> 'day_counts') with ordinality e), res::text);
+
+  -- The window and now.
+  res := screening_v2.r1_meet_public_capacity('2026-12-09 00:00:00+00', '2026-12-24 00:00:01+00', p_now);
+  perform _r1_meet_public_tests.assert('T2-A capacity refuses 15 days + 1 s',
+    res = '{"status": "invalid_request", "field": "window"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_capacity(c_from, c_from, p_now);
+  perform _r1_meet_public_tests.assert('T2-A capacity refuses an empty window',
+    res = '{"status": "invalid_request", "field": "window"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_capacity(c_to, c_from, p_now);
+  perform _r1_meet_public_tests.assert('T2-A capacity refuses a reversed window',
+    res = '{"status": "invalid_request", "field": "window"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_capacity(null, c_to, p_now);
+  perform _r1_meet_public_tests.assert('T2-A capacity refuses a NULL bound',
+    res = '{"status": "invalid_request", "field": "window"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_capacity(c_from, c_to, null);
+  perform _r1_meet_public_tests.assert('T2-A capacity refuses a NULL now',
+    res = '{"status": "invalid_request", "field": "now"}'::jsonb, res::text);
+
+  -- effective_concurrency: the 0131 admission limit.
+  select count(*) into v_pool from screening_v2.voice_worker_leases x
+   where x.app = 'project-hello-voice' and x.pipeline = 'browser';
+  update screening_v2.r1_settings set max_concurrent_sessions = 3 where singleton;
+  res := screening_v2.r1_meet_public_capacity(c_from, c_to, p_now);
+  perform _r1_meet_public_tests.assert('T2-A target r1, max 3: least(3, greatest(browser pool, 1)), 1 with no pool',
+    (res ->> 'effective_concurrency')::integer = least(3, greatest(v_pool, 1))
+    and (v_pool > 0 or (res ->> 'effective_concurrency')::integer = 1), res::text || ' pool ' || v_pool);
+  insert into screening_v2.voice_worker_leases (app, machine_id, pipeline)
+  values ('project-hello-voice', 'meet-public-assert-1', 'browser'),
+         ('project-hello-voice', 'meet-public-assert-2', 'browser'),
+         ('project-hello-voice', 'meet-public-assert-3', 'phone'),
+         ('meet-public-assert-other-app', 'meet-public-assert-4', 'browser');
+  res := screening_v2.r1_meet_public_capacity(c_from, c_to, p_now);
+  perform _r1_meet_public_tests.assert('T2-A two more browser machines of the browser app raise it (phone and other apps do not count)',
+    (res ->> 'effective_concurrency')::integer = least(3, v_pool + 2), res::text || ' pool ' || v_pool);
+  update screening_v2.r1_settings set livekit_target = 'cloud' where singleton;
+  res := screening_v2.r1_meet_public_capacity(c_from, c_to, p_now);
+  perform _r1_meet_public_tests.assert('T2-A target cloud: effective concurrency 1',
+    (res ->> 'effective_concurrency')::integer = 1, res::text);
+  update screening_v2.r1_settings set livekit_target = 'r1', max_concurrent_sessions = 1 where singleton;
+
+  -- enabled and paused mirror the settings.
+  update screening_v2.r1_settings set paused = true where singleton;
+  res := screening_v2.r1_meet_public_capacity(c_from, c_to, p_now);
+  perform _r1_meet_public_tests.assert('T2-A paused settings: paused true, enabled true',
+    (res -> 'paused') = 'true'::jsonb and (res -> 'enabled') = 'true'::jsonb, res::text);
+  update screening_v2.r1_settings set paused = false, enabled = false where singleton;
+  res := screening_v2.r1_meet_public_capacity(c_from, c_to, p_now);
+  perform _r1_meet_public_tests.assert('T2-A disabled settings: enabled false, paused false',
+    (res -> 'enabled') = 'false'::jsonb and (res -> 'paused') = 'false'::jsonb, res::text);
+  update screening_v2.r1_settings set enabled = true where singleton;
+
+  -- admits: r1_send_round's capacity rule (one more 65-minute hold must fit).
+  perform _r1_meet_public_tests.candidate(314, false);
+  res := screening_v2.r1_send_round(_r1_meet_public_tests.id(10, 314), _r1_meet_public_tests.id(2, 1),
+                                    _r1_meet_public_tests.id(1, 1), _r1_meet_public_tests.digest('send-314'),
+                                    'queued', '2026-12-02 07:45:00+00', p_now);
+  perform _r1_meet_public_tests.assert('T2-A fixture: r1_send_round leaves a 65-minute hold outstanding',
+    res ->> 'status' = 'ok'
+    and (select x.held_minutes = 65 from screening_v2.interview_rounds x where x.id = (res ->> 'id')::uuid), res::text);
+  update screening_v2.r1_settings set monthly_cap_minutes = 65 where singleton;
+  res := screening_v2.r1_meet_public_capacity(c_from, c_to, p_now);
+  perform _r1_meet_public_tests.assert('T2-A a 65-minute cap with a hold outstanding: admits false',
+    (res -> 'admits') = 'false'::jsonb, res::text);
+  update screening_v2.r1_settings set monthly_cap_minutes = 100000 where singleton;
+  res := screening_v2.r1_meet_public_capacity(c_from, c_to, p_now);
+  perform _r1_meet_public_tests.assert('T2-A the cap restored: admits true',
+    (res -> 'admits') = 'true'::jsonb, res::text);
+
+  -- No settings row: closed defaults, the intervals and day counts still answered (rolled back).
+  res2 := _r1_meet_public_tests.in_rollback(array['delete from screening_v2.r1_settings'],
+    format('select screening_v2.r1_meet_public_capacity(%L, %L, %L)', c_from, c_to, p_now));
+  perform _r1_meet_public_tests.assert('T2-A no settings row: enabled false, paused false, admits false, effective concurrency 1',
+    res2 = res || '{"enabled": false, "paused": false, "admits": false, "effective_concurrency": 1}'::jsonb,
+    res2::text);
+  perform _r1_meet_public_tests.assert('T2-A the settings row is back after the rolled-back delete',
+    exists (select 1 from screening_v2.r1_settings x where x.singleton and x.enabled));
+end;
+$$;
+
+-- =============================================================================================
+-- T2-B. r1_meet_public_precheck and the shared refusal predicates (§12, §14), in order.
+-- =============================================================================================
+do $$
+declare
+  p_now constant timestamptz := '2026-12-01 04:00:00+00';
+  res jsonb;
+  r uuid;
+  v_link uuid;
+begin
+  -- The fields, before anything is read.
+  res := screening_v2.r1_meet_public_precheck(null, _r1_meet_public_tests.id(22, 320)::text, p_now);
+  perform _r1_meet_public_tests.assert('T2-B precheck refuses a NULL candidate id',
+    res = '{"status": "invalid_request", "field": "candidate_id"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_precheck(_r1_meet_public_tests.id(10, 320), null, p_now);
+  perform _r1_meet_public_tests.assert('T2-B precheck refuses a NULL application id',
+    res = '{"status": "invalid_request", "field": "application_id"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_precheck(_r1_meet_public_tests.id(10, 320), 'not-a-uuid', p_now);
+  perform _r1_meet_public_tests.assert('T2-B precheck refuses an application id that is not UUID-shaped',
+    res = '{"status": "invalid_request", "field": "application_id"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_precheck(_r1_meet_public_tests.id(10, 320),
+                                             _r1_meet_public_tests.id(22, 320)::text, null);
+  perform _r1_meet_public_tests.assert('T2-B precheck refuses a NULL now',
+    res = '{"status": "invalid_request", "field": "now"}'::jsonb, res::text);
+
+  -- 1. application_unknown.
+  perform _r1_meet_public_tests.candidate(320, false);
+  perform _r1_meet_public_tests.assert('T2-B no Ashby link: application_unknown',
+    _r1_meet_public_tests.pre(320) = 'application_unknown', _r1_meet_public_tests.pre(320));
+  res := screening_v2.r1_meet_public_precheck(_r1_meet_public_tests.id(10, 320),
+                                             _r1_meet_public_tests.id(22, 320)::text, p_now);
+  perform _r1_meet_public_tests.assert('T2-B a refusal answers exactly {status refused, code}',
+    res = '{"status": "refused", "code": "application_unknown"}'::jsonb, res::text);
+  perform _r1_meet_public_tests.candidate(321);
+  res := screening_v2.r1_meet_public_precheck(_r1_meet_public_tests.id(10, 321),
+                                             _r1_meet_public_tests.id(22, 399)::text, p_now);
+  perform _r1_meet_public_tests.assert('T2-B an application id nobody has: application_unknown',
+    res ->> 'code' = 'application_unknown', res::text);
+  res := screening_v2.r1_meet_public_precheck(_r1_meet_public_tests.id(10, 321),
+                                             upper(_r1_meet_public_tests.id(22, 321)::text), p_now);
+  perform _r1_meet_public_tests.assert('T2-B the application id is matched verbatim (the upper-case form is unknown)',
+    res ->> 'code' = 'application_unknown', res::text);
+  perform _r1_meet_public_tests.candidate(322);
+  perform _r1_meet_public_tests.candidate(323, false);
+  res := screening_v2.r1_meet_public_precheck(_r1_meet_public_tests.id(10, 323),
+                                             _r1_meet_public_tests.id(22, 322)::text, p_now);
+  perform _r1_meet_public_tests.assert('T2-B a link bound to another candidate: application_unknown',
+    res ->> 'code' = 'application_unknown', res::text);
+  perform _r1_meet_public_tests.assert('T2-B ... while its own candidate is eligible',
+    _r1_meet_public_tests.pre(322) = 'eligible', _r1_meet_public_tests.pre(322));
+
+  -- 2. application_terminal, also before a DSAR hold.
+  perform _r1_meet_public_tests.candidate(324);
+  update screening_v2.ashby_application_links set terminal_state = 'withdrawn'
+   where provider = 'ashby' and external_application_id = _r1_meet_public_tests.id(22, 324)::text;
+  perform _r1_meet_public_tests.assert('T2-B a terminal link: application_terminal',
+    _r1_meet_public_tests.pre(324) = 'application_terminal', _r1_meet_public_tests.pre(324));
+  insert into screening_v2.data_subject_requests (candidate_id, request_type, requested_by)
+  values (_r1_meet_public_tests.id(10, 324), 'delete', _r1_meet_public_tests.id(1, 1));
+  perform _r1_meet_public_tests.assert('T2-B a terminal link and a DSAR hold: application_terminal first',
+    _r1_meet_public_tests.pre(324) = 'application_terminal', _r1_meet_public_tests.pre(324));
+
+  -- 3. mapping_unavailable: paused, archived, none; also before a DSAR hold.
+  perform _r1_meet_public_tests.candidate(326, true, 'paused');
+  perform _r1_meet_public_tests.assert('T2-B a paused mapping: mapping_unavailable',
+    _r1_meet_public_tests.pre(326) = 'mapping_unavailable', _r1_meet_public_tests.pre(326));
+  perform _r1_meet_public_tests.candidate(327, true, 'archived');
+  perform _r1_meet_public_tests.assert('T2-B an archived mapping: mapping_unavailable',
+    _r1_meet_public_tests.pre(327) = 'mapping_unavailable', _r1_meet_public_tests.pre(327));
+  perform _r1_meet_public_tests.candidate(328, true, null);
+  perform _r1_meet_public_tests.assert('T2-B a link without a mapping: mapping_unavailable',
+    _r1_meet_public_tests.pre(328) = 'mapping_unavailable', _r1_meet_public_tests.pre(328));
+  insert into screening_v2.data_subject_requests (candidate_id, request_type, requested_by)
+  values (_r1_meet_public_tests.id(10, 328), 'restrict', _r1_meet_public_tests.id(1, 1));
+  perform _r1_meet_public_tests.assert('T2-B no mapping and a DSAR hold: mapping_unavailable first',
+    _r1_meet_public_tests.pre(328) = 'mapping_unavailable', _r1_meet_public_tests.pre(328));
+
+  -- 4. dsar_hold (the 0130 predicate), also before a decision-use block.
+  perform _r1_meet_public_tests.candidate(329);
+  insert into screening_v2.data_subject_requests (candidate_id, request_type, requested_by)
+  values (_r1_meet_public_tests.id(10, 329), 'delete', _r1_meet_public_tests.id(1, 1));
+  perform _r1_meet_public_tests.assert('T2-B a pending delete request: dsar_hold',
+    _r1_meet_public_tests.pre(329) = 'dsar_hold', _r1_meet_public_tests.pre(329));
+  update screening_v2.candidates set decision_use_blocked_at = '2026-12-01 03:00:00+00'
+   where id = _r1_meet_public_tests.id(10, 329);
+  perform _r1_meet_public_tests.assert('T2-B a DSAR hold and a decision-use block: dsar_hold first',
+    _r1_meet_public_tests.pre(329) = 'dsar_hold', _r1_meet_public_tests.pre(329));
+  perform _r1_meet_public_tests.candidate(330);
+  insert into screening_v2.data_subject_requests (candidate_id, request_type, requested_by)
+  values (_r1_meet_public_tests.id(10, 330), 'export', _r1_meet_public_tests.id(1, 1));
+  insert into screening_v2.data_subject_requests (candidate_id, request_type, requested_by, request_status, rejection_reason)
+  values (_r1_meet_public_tests.id(10, 330), 'delete', _r1_meet_public_tests.id(1, 1), 'rejected', 'fixture');
+  perform _r1_meet_public_tests.assert('T2-B an export request and a rejected delete hold nothing: eligible',
+    _r1_meet_public_tests.pre(330) = 'eligible', _r1_meet_public_tests.pre(330));
+
+  -- 5. candidate_ineligible.
+  perform _r1_meet_public_tests.candidate(331);
+  update screening_v2.candidates set decision_use_blocked_at = '2026-12-01 03:00:00+00'
+   where id = _r1_meet_public_tests.id(10, 331);
+  perform _r1_meet_public_tests.assert('T2-B a decision-use block: candidate_ineligible',
+    _r1_meet_public_tests.pre(331) = 'candidate_ineligible', _r1_meet_public_tests.pre(331));
+
+  -- 6. already_booked.
+  perform _r1_meet_public_tests.candidate(332);
+  perform _r1_meet_public_tests.round(332);
+  perform _r1_meet_public_tests.public_booking(332);
+  perform _r1_meet_public_tests.assert('T2-B a live public booking (its Meet round has a live booking): already_booked',
+    _r1_meet_public_tests.pre(332) = 'already_booked', _r1_meet_public_tests.pre(332));
+  perform _r1_meet_public_tests.candidate(333);
+  perform _r1_meet_public_tests.ashby_booking(333, jsonb_build_object('status', 'blocked', 'reason', 'not_scheduled',
+    'candidate_id', _r1_meet_public_tests.id(10, 333)));
+  perform _r1_meet_public_tests.assert('T2-B a live Ashby booking (blocked, no round): already_booked',
+    _r1_meet_public_tests.pre(333) = 'already_booked', _r1_meet_public_tests.pre(333));
+  perform _r1_meet_public_tests.candidate(334);
+  perform _r1_meet_public_tests.round(334, 'invited', 'browser', '2026-12-05 00:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-B a live browser round: already_booked',
+    _r1_meet_public_tests.pre(334) = 'already_booked', _r1_meet_public_tests.pre(334));
+  perform _r1_meet_public_tests.candidate(335);
+  perform _r1_meet_public_tests.round(335, 'invited', 'browser', '2026-11-30 00:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-B a lapsed browser round: already_booked',
+    _r1_meet_public_tests.pre(335) = 'already_booked', _r1_meet_public_tests.pre(335));
+  perform _r1_meet_public_tests.candidate(336);
+  r := _r1_meet_public_tests.round(336, 'in_progress', 'meet', '2026-11-30 00:00:00+00');
+  update screening_v2.interview_rounds set starts_used = 1 where id = r;
+  perform _r1_meet_public_tests.assert('T2-B an in-progress lapsed Meet round: already_booked',
+    _r1_meet_public_tests.pre(336) = 'already_booked', _r1_meet_public_tests.pre(336));
+  perform _r1_meet_public_tests.candidate(337);
+  r := _r1_meet_public_tests.round(337);
+  perform _r1_meet_public_tests.session(337, r);
+  perform _r1_meet_public_tests.assert('T2-B a Meet round with a live session: already_booked',
+    _r1_meet_public_tests.pre(337) = 'already_booked', _r1_meet_public_tests.pre(337));
+  perform _r1_meet_public_tests.candidate(338);
+  r := _r1_meet_public_tests.round(338);
+  update screening_v2.interview_rounds set attempts_counted = 2 where id = r;
+  perform _r1_meet_public_tests.assert('T2-B a Meet round with no attempt left: already_booked',
+    _r1_meet_public_tests.pre(338) = 'already_booked', _r1_meet_public_tests.pre(338));
+  perform _r1_meet_public_tests.candidate(345);
+  r := _r1_meet_public_tests.round(345);
+  update screening_v2.interview_rounds set starts_used = 3 where id = r;
+  perform _r1_meet_public_tests.assert('T2-B a Meet round with no start left: already_booked',
+    _r1_meet_public_tests.pre(345) = 'already_booked', _r1_meet_public_tests.pre(345));
+  perform _r1_meet_public_tests.candidate(339);
+  perform _r1_meet_public_tests.round_of(1339, 339, 'completed');
+  perform _r1_meet_public_tests.round(339);
+  perform _r1_meet_public_tests.public_booking(339);
+  perform _r1_meet_public_tests.assert('T2-B a live booking and a completed round: already_booked first',
+    _r1_meet_public_tests.pre(339) = 'already_booked', _r1_meet_public_tests.pre(339));
+
+  -- Eligible: a Meet round the create would re-link, or expire first.
+  perform _r1_meet_public_tests.candidate(340);
+  perform _r1_meet_public_tests.round(340);
+  perform _r1_meet_public_tests.assert('T2-B a reusable Meet round (live, no booking, no session): eligible',
+    _r1_meet_public_tests.pre(340) = 'eligible', _r1_meet_public_tests.pre(340));
+  perform _r1_meet_public_tests.candidate(341);
+  res := screening_v2.r1_meet_create_round_from_ashby(
+    _r1_meet_public_tests.id(20, 341), _r1_meet_public_tests.id(21, 341)::text,
+    _r1_meet_public_tests.id(22, 341)::text, null, null, _r1_meet_public_tests.id(25, 1)::text,
+    '2026-11-30 09:00:00+00', '2026-11-30 09:00:05+00', 'https://meet.google.com/abc-defg-hij',
+    '2026-12-02 05:00:00+00', '2026-12-02 05:45:00+00', _r1_meet_public_tests.id(1, 1),
+    'r1_dex_sales', 7200, p_now);
+  perform _r1_meet_public_tests.assert('T2-B fixture: HR booked Dex in Ashby (0142 created the round and the booking)',
+    res ->> 'status' = 'created', res::text);
+  perform _r1_meet_public_tests.assert('T2-B ... so the candidate is already_booked',
+    _r1_meet_public_tests.pre(341) = 'already_booked', _r1_meet_public_tests.pre(341));
+  res := screening_v2.r1_meet_cancel_booking((res ->> 'booking_id')::uuid, 'cancelled', p_now);
+  perform _r1_meet_public_tests.assert('T2-B ... HR cancels that booking (round, consent untouched), and the candidate is eligible',
+    res ->> 'status' = 'ok' and _r1_meet_public_tests.pre(341) = 'eligible', res::text);
+  perform _r1_meet_public_tests.candidate(342);
+  perform _r1_meet_public_tests.round(342, 'invited', 'meet', '2026-11-30 00:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-B an expirable lapsed Meet round (unstarted, unused): eligible',
+    _r1_meet_public_tests.pre(342) = 'eligible', _r1_meet_public_tests.pre(342));
+  perform _r1_meet_public_tests.candidate(343);
+  r := _r1_meet_public_tests.round(343);
+  update screening_v2.interview_rounds set attempts_counted = 1, starts_used = 1 where id = r;
+  perform _r1_meet_public_tests.assert('T2-B the round HR grant-retake leaves (invited, 1 of 2 attempts, 1 start): eligible',
+    _r1_meet_public_tests.pre(343) = 'eligible', _r1_meet_public_tests.pre(343));
+
+  -- 7. r1_completed: a completed round and nothing to re-link (no public retake).
+  perform _r1_meet_public_tests.candidate(346);
+  perform _r1_meet_public_tests.round(346, 'completed');
+  perform _r1_meet_public_tests.assert('T2-B a completed R1 and no live round: r1_completed',
+    _r1_meet_public_tests.pre(346) = 'r1_completed', _r1_meet_public_tests.pre(346));
+  perform _r1_meet_public_tests.candidate(347);
+  perform _r1_meet_public_tests.round_of(1347, 347, 'completed');
+  perform _r1_meet_public_tests.round(347, 'invited', 'meet', '2026-11-30 00:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-B a completed R1 and an expirable lapsed round: r1_completed',
+    _r1_meet_public_tests.pre(347) = 'r1_completed', _r1_meet_public_tests.pre(347));
+  perform _r1_meet_public_tests.candidate(348);
+  perform _r1_meet_public_tests.round_of(1348, 348, 'completed');
+  perform _r1_meet_public_tests.round(348);
+  perform _r1_meet_public_tests.assert('T2-B a completed R1 and a reusable Meet round: eligible (the round is re-linked)',
+    _r1_meet_public_tests.pre(348) = 'eligible', _r1_meet_public_tests.pre(348));
+  update screening_v2.r1_settings set paused = true where singleton;
+  perform _r1_meet_public_tests.assert('T2-B a completed R1 while paused: r1_completed first',
+    _r1_meet_public_tests.pre(346) = 'r1_completed', _r1_meet_public_tests.pre(346));
+  update screening_v2.r1_settings set paused = false where singleton;
+
+  -- 8. phone_engagement_active (the 0128 predicate); a terminal engagement holds nothing.
+  perform _r1_meet_public_tests.candidate(349);
+  insert into screening_v2.phone_engagements (application_link_id, candidate_id, role_id, state)
+  select x.id, x.candidate_id, _r1_meet_public_tests.id(2, 1), 'pending_prereqs'
+    from screening_v2.ashby_application_links x
+   where x.provider = 'ashby' and x.external_application_id = _r1_meet_public_tests.id(22, 349)::text;
+  perform _r1_meet_public_tests.assert('T2-B a live phone engagement: phone_engagement_active',
+    _r1_meet_public_tests.pre(349) = 'phone_engagement_active', _r1_meet_public_tests.pre(349));
+  insert into screening_v2.roles (id, title, interview_kind)
+  values (_r1_meet_public_tests.id(2, 3), 'R1 Meet public assertion second role', 'sales_r1');
+  perform _r1_meet_public_tests.assert('T2-B a live phone engagement and two sales_r1 roles: phone_engagement_active first',
+    _r1_meet_public_tests.pre(349) = 'phone_engagement_active', _r1_meet_public_tests.pre(349));
+  update screening_v2.roles set interview_kind = null where id = _r1_meet_public_tests.id(2, 3);
+  perform _r1_meet_public_tests.candidate(350);
+  select x.id into v_link from screening_v2.ashby_application_links x
+   where x.provider = 'ashby' and x.external_application_id = _r1_meet_public_tests.id(22, 350)::text;
+  insert into screening_v2.phone_engagements (application_link_id, candidate_id, role_id, state, terminal_at)
+  values (v_link, _r1_meet_public_tests.id(10, 350), _r1_meet_public_tests.id(2, 1), 'completed',
+          '2026-11-30 00:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-B a completed phone engagement: eligible',
+    _r1_meet_public_tests.pre(350) = 'eligible', _r1_meet_public_tests.pre(350));
+
+  -- 9. phone_assessment_pending (the 0128 predicate); a settled job holds nothing.
+  perform _r1_meet_public_tests.candidate(351);
+  insert into screening_v2.call_sessions (id, candidate_id, role_id, mode, provider, external_call_id, status)
+  values (_r1_meet_public_tests.id(12, 351), _r1_meet_public_tests.id(10, 351), _r1_meet_public_tests.id(2, 1),
+          'live', 'livekit', 'phone-' || _r1_meet_public_tests.id(12, 351)::text, 'created');
+  insert into screening_v2.job_queue (name, payload)
+  values ('phone.assessment', jsonb_build_object('session_id', _r1_meet_public_tests.id(12, 351)));
+  perform _r1_meet_public_tests.assert('T2-B a pending phone assessment: phone_assessment_pending',
+    _r1_meet_public_tests.pre(351) = 'phone_assessment_pending', _r1_meet_public_tests.pre(351));
+  perform _r1_meet_public_tests.candidate(352);
+  insert into screening_v2.call_sessions (id, candidate_id, role_id, mode, provider, external_call_id, status)
+  values (_r1_meet_public_tests.id(12, 352), _r1_meet_public_tests.id(10, 352), _r1_meet_public_tests.id(2, 1),
+          'live', 'livekit', 'phone-' || _r1_meet_public_tests.id(12, 352)::text, 'created');
+  insert into screening_v2.job_queue (name, payload, status)
+  values ('phone.assessment', jsonb_build_object('session_id', _r1_meet_public_tests.id(12, 352)), 'completed');
+  perform _r1_meet_public_tests.assert('T2-B a completed phone assessment job: eligible',
+    _r1_meet_public_tests.pre(352) = 'eligible', _r1_meet_public_tests.pre(352));
+
+  -- 10. role_not_configured: two sales_r1 roles, or none.
+  perform _r1_meet_public_tests.candidate(353);
+  update screening_v2.roles set interview_kind = 'sales_r1' where id = _r1_meet_public_tests.id(2, 3);
+  perform _r1_meet_public_tests.assert('T2-B two sales_r1 roles: role_not_configured',
+    _r1_meet_public_tests.pre(353) = 'role_not_configured', _r1_meet_public_tests.pre(353));
+  update screening_v2.roles set interview_kind = null where id = _r1_meet_public_tests.id(2, 3);
+  update screening_v2.roles set interview_kind = null where id = _r1_meet_public_tests.id(2, 1);
+  perform _r1_meet_public_tests.assert('T2-B no sales_r1 role: role_not_configured',
+    _r1_meet_public_tests.pre(353) = 'role_not_configured', _r1_meet_public_tests.pre(353));
+  update screening_v2.roles set interview_kind = 'sales_r1' where id = _r1_meet_public_tests.id(2, 1);
+  perform _r1_meet_public_tests.assert('T2-B one sales_r1 role again: eligible',
+    _r1_meet_public_tests.pre(353) = 'eligible', _r1_meet_public_tests.pre(353));
+
+  -- 11. consent_template_unavailable.
+  perform _r1_meet_public_tests.candidate(354);
+  res := _r1_meet_public_tests.under_release('zzz-meet-public-assert-newer', 'en-GB', '["ai_interview"]'::jsonb,
+    format('select screening_v2.r1_meet_public_precheck(%L, %L, %L)', _r1_meet_public_tests.id(10, 354),
+           _r1_meet_public_tests.id(22, 354)::text, p_now));
+  perform _r1_meet_public_tests.assert('T2-B the newest release has no en-IN notice: consent_template_unavailable',
+    res = '{"status": "refused", "code": "consent_template_unavailable"}'::jsonb, res::text);
+  res := _r1_meet_public_tests.under_release('zzz-meet-public-assert-newer', 'en-IN', '[]'::jsonb,
+    format('select screening_v2.r1_meet_public_precheck(%L, %L, %L)', _r1_meet_public_tests.id(10, 354),
+           _r1_meet_public_tests.id(22, 354)::text, p_now));
+  perform _r1_meet_public_tests.assert('T2-B the newest en-IN notice requires nothing: consent_template_unavailable',
+    res = '{"status": "refused", "code": "consent_template_unavailable"}'::jsonb, res::text);
+  perform _r1_meet_public_tests.assert('T2-B with our notice the newest again: eligible',
+    _r1_meet_public_tests.pre(354) = 'eligible', _r1_meet_public_tests.pre(354));
+  perform _r1_meet_public_tests.candidate(355);
+  r := _r1_meet_public_tests.round(355);
+  update screening_v2.interview_rounds set consent_locale = 'en-IN-x-staff' where id = r;
+  perform _r1_meet_public_tests.assert('T2-B a reusable round for the staff audience with no staff notice: consent_template_unavailable',
+    _r1_meet_public_tests.pre(355) = 'consent_template_unavailable', _r1_meet_public_tests.pre(355));
+
+  -- 12-13. disabled, paused (disabled first).
+  perform _r1_meet_public_tests.candidate(356);
+  update screening_v2.r1_settings set enabled = false, paused = true where singleton;
+  perform _r1_meet_public_tests.assert('T2-B R1 disabled (and paused): disabled',
+    _r1_meet_public_tests.pre(356) = 'disabled', _r1_meet_public_tests.pre(356));
+  update screening_v2.r1_settings set enabled = true where singleton;
+  perform _r1_meet_public_tests.assert('T2-B R1 paused: paused',
+    _r1_meet_public_tests.pre(356) = 'paused', _r1_meet_public_tests.pre(356));
+  update screening_v2.r1_settings set paused = false where singleton;
+
+  -- 14. capacity_exhausted, skipped when a round is re-linked (no new hold).
+  perform _r1_meet_public_tests.candidate(357);
+  update screening_v2.r1_settings set monthly_cap_minutes = 65 where singleton;
+  perform _r1_meet_public_tests.assert('T2-B capacity fixture: a 65-minute hold is outstanding',
+    exists (select 1 from screening_v2.interview_rounds x
+             where x.held_minutes > 0 and x.status in ('invited', 'in_progress') and x.expires_at > p_now));
+  perform _r1_meet_public_tests.assert('T2-B a 65-minute cap with a hold outstanding: capacity_exhausted',
+    _r1_meet_public_tests.pre(357) = 'capacity_exhausted', _r1_meet_public_tests.pre(357));
+  perform _r1_meet_public_tests.assert('T2-B the same cap with a reusable Meet round: eligible',
+    _r1_meet_public_tests.pre(340) = 'eligible' and _r1_meet_public_tests.pre(341) = 'eligible',
+    _r1_meet_public_tests.pre(340) || ' ' || _r1_meet_public_tests.pre(341));
+  perform _r1_meet_public_tests.assert('T2-B the same cap with an expirable round only: capacity_exhausted',
+    _r1_meet_public_tests.pre(342) = 'capacity_exhausted', _r1_meet_public_tests.pre(342));
+  update screening_v2.r1_settings set monthly_cap_minutes = 100000 where singleton;
+  perform _r1_meet_public_tests.assert('T2-B the cap restored: eligible',
+    _r1_meet_public_tests.pre(357) = 'eligible', _r1_meet_public_tests.pre(357));
+end;
+$$;
+
+-- T2-B (continued): the precheck writes nothing; every T2-B candidate checked again changes nothing.
+do $$
+declare
+  v_before jsonb := _r1_meet_public_tests.counts();
+  v_codes text := '';
+  n integer;
+begin
+  for n in 320..357 loop
+    v_codes := v_codes || ' ' || _r1_meet_public_tests.pre(n);
+  end loop;
+  perform _r1_meet_public_tests.assert('T2-B the precheck writes nothing (bookings, rounds, consents, jobs, months, throttle)',
+    _r1_meet_public_tests.counts() = v_before, v_codes);
+end;
+$$;
+
+-- =============================================================================================
+-- T2-C. r1_meet_public_set_manage_digest (§16).
+-- =============================================================================================
+do $$
+declare
+  p_now constant timestamptz := '2026-12-01 04:00:00+00';
+  d1 text := _r1_meet_public_tests.digest('t2c-1');
+  d2 text := _r1_meet_public_tests.digest('t2c-2');
+  b uuid;
+  b2 uuid;
+  res jsonb;
+begin
+  perform _r1_meet_public_tests.candidate(380, false);
+  perform _r1_meet_public_tests.round(380);
+  b := _r1_meet_public_tests.public_booking(380);
+  res := screening_v2.r1_meet_public_set_manage_digest(b, d1, p_now);
+  perform _r1_meet_public_tests.assert('T2-C a live public booking takes a digest: ok',
+    res = '{"status": "ok"}'::jsonb
+    and (select x.manage_token_digest = d1 from screening_v2.r1_meet_bookings x where x.id = b), res::text);
+  res := screening_v2.r1_meet_public_set_manage_digest(b, d2, p_now + interval '1 hour');
+  perform _r1_meet_public_tests.assert('T2-C a new digest rotates the old one out',
+    res = '{"status": "ok"}'::jsonb
+    and (select x.manage_token_digest = d2 from screening_v2.r1_meet_bookings x where x.id = b)
+    and not exists (select 1 from screening_v2.r1_meet_bookings x where x.manage_token_digest = d1), res::text);
+  perform _r1_meet_public_tests.assert('T2-C setting the digest leaves updated_at and the status alone',
+    (select x.updated_at = '2026-12-01 04:00:00+00' and x.status = 'pending'
+       from screening_v2.r1_meet_bookings x where x.id = b));
+
+  res := screening_v2.r1_meet_public_set_manage_digest(_r1_meet_public_tests.id(40, 389), d1, p_now);
+  perform _r1_meet_public_tests.assert('T2-C an unknown booking: not_found',
+    res = '{"status": "not_found"}'::jsonb, res::text);
+  b2 := _r1_meet_public_tests.ashby_booking(381);
+  res := screening_v2.r1_meet_public_set_manage_digest(b2, d1, p_now);
+  perform _r1_meet_public_tests.assert('T2-C an Ashby booking: not_public',
+    res = '{"status": "not_public"}'::jsonb
+    and (select x.manage_token_digest is null from screening_v2.r1_meet_bookings x where x.id = b2), res::text);
+  b2 := _r1_meet_public_tests.public_booking(382, _r1_meet_public_tests.unbound());
+  res := screening_v2.r1_meet_public_set_manage_digest(b2, d1, p_now);
+  perform _r1_meet_public_tests.assert('T2-C a cancelled public booking: booking_terminal',
+    res = '{"status": "booking_terminal"}'::jsonb, res::text);
+  b2 := _r1_meet_public_tests.public_booking(384, _r1_meet_public_tests.unbound()
+    || '{"status": "failed", "reason": "invite_undeliverable"}'::jsonb);
+  res := screening_v2.r1_meet_public_set_manage_digest(b2, d1, p_now);
+  perform _r1_meet_public_tests.assert('T2-C a failed public booking: booking_terminal',
+    res = '{"status": "booking_terminal"}'::jsonb, res::text);
+
+  res := screening_v2.r1_meet_public_set_manage_digest(b, upper(d1), p_now);
+  perform _r1_meet_public_tests.assert('T2-C an upper-case digest: invalid_request digest',
+    res = '{"status": "invalid_request", "field": "digest"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_set_manage_digest(b, left(d1, 63), p_now);
+  perform _r1_meet_public_tests.assert('T2-C a 63-character digest: invalid_request digest',
+    res = '{"status": "invalid_request", "field": "digest"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_set_manage_digest(b, null, p_now);
+  perform _r1_meet_public_tests.assert('T2-C a NULL digest: invalid_request digest',
+    res = '{"status": "invalid_request", "field": "digest"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_set_manage_digest(null, null, p_now);
+  perform _r1_meet_public_tests.assert('T2-C a NULL booking id (and digest): invalid_request booking_id',
+    res = '{"status": "invalid_request", "field": "booking_id"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_set_manage_digest(b, d1, null);
+  perform _r1_meet_public_tests.assert('T2-C a NULL now: invalid_request now',
+    res = '{"status": "invalid_request", "field": "now"}'::jsonb, res::text);
+  perform _r1_meet_public_tests.assert('T2-C no refusal changed the digest',
+    (select x.manage_token_digest = d2 from screening_v2.r1_meet_bookings x where x.id = b));
+
+  perform _r1_meet_public_tests.candidate(383, false);
+  perform _r1_meet_public_tests.round(383);
+  b2 := _r1_meet_public_tests.public_booking(383);
+  perform _r1_meet_public_tests.raises('T2-C a digest another booking holds',
+    format('select screening_v2.r1_meet_public_set_manage_digest(%L, %L, %L)', b2, d2, p_now), '23505');
+end;
+$$;
+
+-- =============================================================================================
+-- T2-D. r1_meet_public_manage_read (§17).
+-- =============================================================================================
+do $$
+declare
+  p_now constant timestamptz := '2026-12-01 04:00:00+00';
+  d text := _r1_meet_public_tests.digest('t2d-390');
+  d391 text := _r1_meet_public_tests.digest('t2d-391');
+  d392 text := _r1_meet_public_tests.digest('t2d-392');
+  d394 text := _r1_meet_public_tests.digest('t2d-394');
+  b uuid;
+  r uuid;
+  ab uuid;
+  res jsonb;
+begin
+  perform _r1_meet_public_tests.candidate(390, false);
+  r := _r1_meet_public_tests.round(390);
+  b := _r1_meet_public_tests.public_booking(390);
+  perform _r1_meet_public_tests.consent(r);
+  perform screening_v2.r1_meet_public_set_manage_digest(b, d, p_now);
+
+  res := screening_v2.r1_meet_public_manage_read(d, 3600, 2, p_now);
+  perform _r1_meet_public_tests.assert('T2-D the full ok answer of a pending booking with a current consent',
+    res = jsonb_build_object('status', 'ok', 'booking_id', b, 'booking_status', 'pending', 'version', 0,
+                             'has_bot', false, 'start_at', '2026-12-02 05:00:00+00'::timestamptz,
+                             'end_at', '2026-12-02 05:45:00+00'::timestamptz, 'can_move', true,
+                             'can_cancel', true, 'moves_left', 2, 'consent_current', true), res::text);
+  res := screening_v2.r1_meet_public_manage_read(d, 3600, 2, '2026-12-02 03:59:59+00');
+  perform _r1_meet_public_tests.assert('T2-D one second before start - cutoff: can_move and can_cancel',
+    (res -> 'can_move') = 'true'::jsonb and (res -> 'can_cancel') = 'true'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_manage_read(d, 3600, 2, '2026-12-02 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-D at start - cutoff: neither can_move nor can_cancel',
+    res ->> 'status' = 'ok' and (res -> 'can_move') = 'false'::jsonb and (res -> 'can_cancel') = 'false'::jsonb,
+    res::text);
+  res := screening_v2.r1_meet_public_manage_read(d, 900, 2, '2026-12-02 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-D the same instant with a 15-minute cutoff: both again',
+    (res -> 'can_move') = 'true'::jsonb and (res -> 'can_cancel') = 'true'::jsonb, res::text);
+
+  update screening_v2.r1_meet_bookings set move_count = 2 where id = b;
+  res := screening_v2.r1_meet_public_manage_read(d, 3600, 2, p_now);
+  perform _r1_meet_public_tests.assert('T2-D move_count at the limit: can_move false, moves_left 0, can_cancel still',
+    (res -> 'can_move') = 'false'::jsonb and (res -> 'moves_left') = '0'::jsonb
+    and (res -> 'can_cancel') = 'true'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_manage_read(d, 3600, 1, p_now);
+  perform _r1_meet_public_tests.assert('T2-D moves_left floors at 0 when the limit is below move_count',
+    (res -> 'moves_left') = '0'::jsonb and (res -> 'can_move') = 'false'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_manage_read(d, 3600, 5, p_now);
+  perform _r1_meet_public_tests.assert('T2-D a higher limit: moves_left 3, can_move',
+    (res -> 'moves_left') = '3'::jsonb and (res -> 'can_move') = 'true'::jsonb, res::text);
+  update screening_v2.r1_meet_bookings set move_count = 0 where id = b;
+
+  -- A dispatched bot: neither move nor cancel; an undispatched bot: both.
+  perform _r1_meet_public_tests.candidate(391, false);
+  r := _r1_meet_public_tests.round(391);
+  perform _r1_meet_public_tests.public_booking(391, jsonb_build_object(
+    'status', 'bot_joining', 'recall_bot_id', _r1_meet_public_tests.id(30, 391), 'manage_token_digest', d391));
+  res := screening_v2.r1_meet_public_manage_read(d391, 3600, 2, p_now);
+  perform _r1_meet_public_tests.assert('T2-D bot_joining: has_bot, neither can_move nor can_cancel',
+    res ->> 'booking_status' = 'bot_joining' and (res -> 'has_bot') = 'true'::jsonb
+    and (res -> 'can_move') = 'false'::jsonb and (res -> 'can_cancel') = 'false'::jsonb, res::text);
+  perform _r1_meet_public_tests.assert('T2-D no consent on the round: consent_current false',
+    (res -> 'consent_current') = 'false'::jsonb, res::text);
+  perform _r1_meet_public_tests.consent(r, '2026-12-01 05:00:00+00');
+  res := screening_v2.r1_meet_public_manage_read(d391, 3600, 2, p_now);
+  perform _r1_meet_public_tests.assert('T2-D a consent granted after now: consent_current false',
+    (res -> 'consent_current') = 'false'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_manage_read(d391, 3600, 2, '2026-12-01 05:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-D ... and true once now reaches its grant',
+    (res -> 'consent_current') = 'true'::jsonb, res::text);
+  perform _r1_meet_public_tests.candidate(392, false);
+  perform _r1_meet_public_tests.round(392);
+  perform _r1_meet_public_tests.public_booking(392, jsonb_build_object(
+    'status', 'bot_scheduled', 'recall_bot_id', _r1_meet_public_tests.id(30, 392), 'manage_token_digest', d392));
+  res := screening_v2.r1_meet_public_manage_read(d392, 3600, 2, p_now);
+  perform _r1_meet_public_tests.assert('T2-D bot_scheduled: has_bot, can_move and can_cancel',
+    res ->> 'booking_status' = 'bot_scheduled' and (res -> 'has_bot') = 'true'::jsonb
+    and (res -> 'can_move') = 'true'::jsonb and (res -> 'can_cancel') = 'true'::jsonb, res::text);
+
+  -- consent_current follows admission: a newer release, then a withdrawal.
+  res := _r1_meet_public_tests.under_release('zzz-meet-public-assert-newer', 'en-IN', '["ai_interview"]'::jsonb,
+    format('select screening_v2.r1_meet_public_manage_read(%L, 3600, 2, %L)', d, p_now));
+  perform _r1_meet_public_tests.assert('T2-D a newer active release: consent_current false (the rest unchanged)',
+    res ->> 'status' = 'ok' and (res -> 'consent_current') = 'false'::jsonb
+    and (res -> 'can_move') = 'true'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_manage_read(d, 3600, 2, p_now);
+  perform _r1_meet_public_tests.assert('T2-D with our release the newest again: consent_current true',
+    (res -> 'consent_current') = 'true'::jsonb, res::text);
+  perform screening_v2.r1_withdraw_consent(_r1_meet_public_tests.id(11, 390), '{}'::jsonb, p_now, 'withdrawn');
+  res := screening_v2.r1_meet_public_manage_read(d, 3600, 2, p_now);
+  perform _r1_meet_public_tests.assert('T2-D after a withdrawal: consent_current false',
+    res ->> 'status' = 'ok' and (res -> 'consent_current') = 'false'::jsonb, res::text);
+
+  -- not_found: unknown, terminal, slot ended, and an Ashby row (the source filter).
+  res := screening_v2.r1_meet_public_manage_read(_r1_meet_public_tests.digest('t2d-unknown'), 3600, 2, p_now);
+  perform _r1_meet_public_tests.assert('T2-D an unknown digest: not_found',
+    res = '{"status": "not_found"}'::jsonb, res::text);
+  perform _r1_meet_public_tests.public_booking(393, _r1_meet_public_tests.unbound()
+    || jsonb_build_object('manage_token_digest', _r1_meet_public_tests.digest('t2d-393')));
+  res := screening_v2.r1_meet_public_manage_read(_r1_meet_public_tests.digest('t2d-393'), 3600, 2, p_now);
+  perform _r1_meet_public_tests.assert('T2-D a terminal booking: not_found',
+    res = '{"status": "not_found"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_manage_read(d, 3600, 2, '2026-12-02 05:44:59+00');
+  perform _r1_meet_public_tests.assert('T2-D one second before the slot ends: ok',
+    res ->> 'status' = 'ok', res::text);
+  res := screening_v2.r1_meet_public_manage_read(d, 3600, 2, '2026-12-02 05:45:00+00');
+  perform _r1_meet_public_tests.assert('T2-D at the slot end: not_found',
+    res = '{"status": "not_found"}'::jsonb, res::text);
+  ab := _r1_meet_public_tests.ashby_booking(394, '{"status": "blocked", "reason": "not_scheduled"}'::jsonb);
+  res := _r1_meet_public_tests.in_rollback(array[
+      'alter table screening_v2.r1_meet_bookings drop constraint chk_r1_meet_bookings_public_columns',
+      format('update screening_v2.r1_meet_bookings set manage_token_digest = %L where id = %L', d394, ab)],
+    format('select jsonb_build_object(''read'', screening_v2.r1_meet_public_manage_read(%L, 3600, 2, %L), '
+           '''held'', (select x.manage_token_digest = %L from screening_v2.r1_meet_bookings x where x.id = %L))',
+           d394, p_now, d394, ab));
+  perform _r1_meet_public_tests.assert('T2-D a live Ashby booking holding the digest (CHECK lifted, rolled back): not_found',
+    res = '{"read": {"status": "not_found"}, "held": true}'::jsonb, res::text);
+  perform _r1_meet_public_tests.assert('T2-D ... and the public-columns CHECK is back',
+    exists (select 1 from pg_constraint x
+             where x.conrelid = 'screening_v2.r1_meet_bookings'::regclass
+               and x.conname = 'chk_r1_meet_bookings_public_columns' and x.convalidated));
+
+  -- The fields.
+  res := screening_v2.r1_meet_public_manage_read(null, 3600, 2, p_now);
+  perform _r1_meet_public_tests.assert('T2-D a NULL digest: invalid_request digest',
+    res = '{"status": "invalid_request", "field": "digest"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_manage_read(upper(d), 3600, 2, p_now);
+  perform _r1_meet_public_tests.assert('T2-D an upper-case digest: invalid_request digest',
+    res = '{"status": "invalid_request", "field": "digest"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_manage_read(d, 899, 2, p_now);
+  perform _r1_meet_public_tests.assert('T2-D a cutoff of 899 s: invalid_request cutoff',
+    res = '{"status": "invalid_request", "field": "cutoff"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_manage_read(d, 43201, 2, p_now);
+  perform _r1_meet_public_tests.assert('T2-D a cutoff of 43201 s: invalid_request cutoff',
+    res = '{"status": "invalid_request", "field": "cutoff"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_manage_read(d, null, 2, p_now);
+  perform _r1_meet_public_tests.assert('T2-D a NULL cutoff: invalid_request cutoff',
+    res = '{"status": "invalid_request", "field": "cutoff"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_manage_read(d, 43200, 0, p_now);
+  perform _r1_meet_public_tests.assert('T2-D cutoff 43200 s and max_moves 0 are accepted (no move left)',
+    res ->> 'status' = 'ok' and (res -> 'moves_left') = '0'::jsonb and (res -> 'can_move') = 'false'::jsonb,
+    res::text);
+  res := screening_v2.r1_meet_public_manage_read(d, 3600, -1, p_now);
+  perform _r1_meet_public_tests.assert('T2-D max_moves -1: invalid_request max_moves',
+    res = '{"status": "invalid_request", "field": "max_moves"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_manage_read(d, 3600, 11, p_now);
+  perform _r1_meet_public_tests.assert('T2-D max_moves 11: invalid_request max_moves',
+    res = '{"status": "invalid_request", "field": "max_moves"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_manage_read(d, 3600, null, p_now);
+  perform _r1_meet_public_tests.assert('T2-D a NULL max_moves: invalid_request max_moves',
+    res = '{"status": "invalid_request", "field": "max_moves"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_manage_read(d, 3600, 2, null);
+  perform _r1_meet_public_tests.assert('T2-D a NULL now: invalid_request now',
+    res = '{"status": "invalid_request", "field": "now"}'::jsonb, res::text);
+end;
+$$;
+
+-- =============================================================================================
+-- T2-E. r1_meet_public_set_calendar_state (§21).
+-- =============================================================================================
+do $$
+declare
+  p_now constant timestamptz := '2026-12-01 04:00:00+00';
+  b uuid;
+  b2 uuid;
+  res jsonb;
+begin
+  perform _r1_meet_public_tests.candidate(400, false);
+  perform _r1_meet_public_tests.round(400);
+  b := _r1_meet_public_tests.public_booking(400);
+  res := screening_v2.r1_meet_public_set_calendar_state(b, array['created'], 'invited', p_now);
+  perform _r1_meet_public_tests.assert('T2-E created -> invited: ok, invite_sent_at = now',
+    res = '{"status": "ok", "calendar_state": "invited"}'::jsonb
+    and (select x.calendar_state = 'invited' and x.invite_sent_at = p_now
+           from screening_v2.r1_meet_bookings x where x.id = b), res::text);
+  res := screening_v2.r1_meet_public_set_calendar_state(b, array['created', 'invited'], 'invited',
+                                                         p_now + interval '1 hour');
+  perform _r1_meet_public_tests.assert('T2-E invited -> invited (a re-send) keeps the first invite time',
+    res = '{"status": "ok", "calendar_state": "invited"}'::jsonb
+    and (select x.invite_sent_at = p_now from screening_v2.r1_meet_bookings x where x.id = b), res::text);
+  res := screening_v2.r1_meet_public_set_calendar_state(b, array['invited'], 'cancelled', p_now);
+  perform _r1_meet_public_tests.assert('T2-E invited -> cancelled: ok, the invite time kept',
+    res = '{"status": "ok", "calendar_state": "cancelled"}'::jsonb
+    and (select x.calendar_state = 'cancelled' and x.invite_sent_at = p_now
+           from screening_v2.r1_meet_bookings x where x.id = b), res::text);
+  res := screening_v2.r1_meet_public_set_calendar_state(b, array['cancelled'], 'purged', p_now);
+  perform _r1_meet_public_tests.assert('T2-E cancelled -> purged: ok',
+    res = '{"status": "ok", "calendar_state": "purged"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_set_calendar_state(b, array['created', 'invited'], 'invited', p_now);
+  perform _r1_meet_public_tests.assert('T2-E a purged event is not invited again: state_conflict (+current)',
+    res = '{"status": "state_conflict", "current": "purged"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_set_calendar_state(b, array['created', 'invited', 'cancelled'], 'purged', p_now);
+  perform _r1_meet_public_tests.assert('T2-E purged -> purged: state_conflict',
+    res = '{"status": "state_conflict", "current": "purged"}'::jsonb, res::text);
+  perform _r1_meet_public_tests.assert('T2-E the calendar moves left updated_at, the status and the jobs alone',
+    (select x.updated_at = '2026-12-01 04:00:00+00' and x.status = 'pending' and x.reason = 'eligible'
+       from screening_v2.r1_meet_bookings x where x.id = b)
+    and _r1_meet_public_tests.jobs_of(b) = '[]'::jsonb, _r1_meet_public_tests.jobs_of(b)::text);
+
+  b2 := _r1_meet_public_tests.public_booking(401, _r1_meet_public_tests.blocked());
+  res := screening_v2.r1_meet_public_set_calendar_state(b2, array['created'], 'cancelled', p_now);
+  perform _r1_meet_public_tests.assert('T2-E created -> cancelled: ok, no invite time',
+    res = '{"status": "ok", "calendar_state": "cancelled"}'::jsonb
+    and (select x.invite_sent_at is null from screening_v2.r1_meet_bookings x where x.id = b2), res::text);
+  b2 := _r1_meet_public_tests.public_booking(402, _r1_meet_public_tests.blocked());
+  res := screening_v2.r1_meet_public_set_calendar_state(b2, array['created'], 'purged', p_now);
+  perform _r1_meet_public_tests.assert('T2-E created -> purged: ok',
+    res = '{"status": "ok", "calendar_state": "purged"}'::jsonb, res::text);
+  b2 := _r1_meet_public_tests.public_booking(403, _r1_meet_public_tests.blocked());
+  perform screening_v2.r1_meet_public_set_calendar_state(b2, array['created'], 'invited', p_now);
+  res := screening_v2.r1_meet_public_set_calendar_state(b2, array['invited'], 'purged', p_now);
+  perform _r1_meet_public_tests.assert('T2-E invited -> purged: ok',
+    res = '{"status": "ok", "calendar_state": "purged"}'::jsonb, res::text);
+  b2 := _r1_meet_public_tests.public_booking(404, _r1_meet_public_tests.blocked());
+  res := screening_v2.r1_meet_public_set_calendar_state(b2, array['invited'], 'cancelled', p_now);
+  perform _r1_meet_public_tests.assert('T2-E an expected state that is not the current one: state_conflict created',
+    res = '{"status": "state_conflict", "current": "created"}'::jsonb
+    and (select x.calendar_state = 'created' from screening_v2.r1_meet_bookings x where x.id = b2), res::text);
+
+  b2 := _r1_meet_public_tests.ashby_booking(405);
+  res := screening_v2.r1_meet_public_set_calendar_state(b2, array['created'], 'invited', p_now);
+  perform _r1_meet_public_tests.assert('T2-E an Ashby booking: not_public',
+    res = '{"status": "not_public"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_set_calendar_state(_r1_meet_public_tests.id(40, 409), array['created'],
+                                                         'invited', p_now);
+  perform _r1_meet_public_tests.assert('T2-E an unknown booking: not_found',
+    res = '{"status": "not_found"}'::jsonb, res::text);
+
+  -- The fields: to, then from (closed, one-dimensional, 1..3, each a legal source of to).
+  b2 := _r1_meet_public_tests.id(40, 404);
+  res := screening_v2.r1_meet_public_set_calendar_state(b2, array['created'], 'created', p_now);
+  perform _r1_meet_public_tests.assert('T2-E to created: invalid_request to',
+    res = '{"status": "invalid_request", "field": "to"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_set_calendar_state(b2, array['created'], 'bogus', p_now);
+  perform _r1_meet_public_tests.assert('T2-E to bogus: invalid_request to',
+    res = '{"status": "invalid_request", "field": "to"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_set_calendar_state(b2, '{}'::text[], null, p_now);
+  perform _r1_meet_public_tests.assert('T2-E a NULL to (and an empty from): invalid_request to',
+    res = '{"status": "invalid_request", "field": "to"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_set_calendar_state(b2, '{}'::text[], 'invited', p_now);
+  perform _r1_meet_public_tests.assert('T2-E an empty from: invalid_request from',
+    res = '{"status": "invalid_request", "field": "from"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_set_calendar_state(b2, null, 'invited', p_now);
+  perform _r1_meet_public_tests.assert('T2-E a NULL from: invalid_request from',
+    res = '{"status": "invalid_request", "field": "from"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_set_calendar_state(b2, array['created', null], 'invited', p_now);
+  perform _r1_meet_public_tests.assert('T2-E a NULL element in from: invalid_request from',
+    res = '{"status": "invalid_request", "field": "from"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_set_calendar_state(b2, array['purged'], 'purged', p_now);
+  perform _r1_meet_public_tests.assert('T2-E purged as a source: invalid_request from',
+    res = '{"status": "invalid_request", "field": "from"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_set_calendar_state(b2, array['cancelled'], 'invited', p_now);
+  perform _r1_meet_public_tests.assert('T2-E cancelled as a source of invited: invalid_request from',
+    res = '{"status": "invalid_request", "field": "from"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_set_calendar_state(b2, array['cancelled'], 'cancelled', p_now);
+  perform _r1_meet_public_tests.assert('T2-E cancelled as a source of cancelled: invalid_request from',
+    res = '{"status": "invalid_request", "field": "from"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_set_calendar_state(b2, array[['created'], ['invited']], 'invited', p_now);
+  perform _r1_meet_public_tests.assert('T2-E a two-dimensional from: invalid_request from',
+    res = '{"status": "invalid_request", "field": "from"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_set_calendar_state(b2, array['created', 'invited', 'cancelled', 'created'],
+                                                         'purged', p_now);
+  perform _r1_meet_public_tests.assert('T2-E four sources: invalid_request from',
+    res = '{"status": "invalid_request", "field": "from"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_set_calendar_state(null, array['created'], 'invited', p_now);
+  perform _r1_meet_public_tests.assert('T2-E a NULL booking id: invalid_request booking_id',
+    res = '{"status": "invalid_request", "field": "booking_id"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_set_calendar_state(b2, array['created'], 'invited', null);
+  perform _r1_meet_public_tests.assert('T2-E a NULL now: invalid_request now',
+    res = '{"status": "invalid_request", "field": "now"}'::jsonb, res::text);
+  perform _r1_meet_public_tests.assert('T2-E no refusal changed the event state',
+    (select x.calendar_state = 'created' and x.invite_sent_at is null
+       from screening_v2.r1_meet_bookings x where x.id = b2));
+end;
+$$;
+
+-- =============================================================================================
+-- T2-F. r1_meet_public_throttle_hit (§22).
+-- =============================================================================================
+do $$
+declare
+  k1 text := _r1_meet_public_tests.digest('t2f-1');
+  k2 text := _r1_meet_public_tests.digest('t2f-2');
+  k3 text := _r1_meet_public_tests.digest('t2f-3');
+  k4 text := _r1_meet_public_tests.digest('t2f-4');
+  k5 text := _r1_meet_public_tests.digest('t2f-5');
+  k6 text := _r1_meet_public_tests.digest('t2f-6');
+  k7 text := _r1_meet_public_tests.digest('t2f-7');
+  nine text[];
+  v_before jsonb := _r1_meet_public_tests.counts();
+  res jsonb;
+begin
+  -- One key, a 60-second window: the bucket is p_now floored to the minute.
+  res := screening_v2.r1_meet_public_throttle_hit(array[k1], array[2], 60, '2026-12-01 04:00:37+00');
+  perform _r1_meet_public_tests.assert('T2-F the first hit: ok, nothing over, one hit in the floored bucket',
+    res = '{"status": "ok", "over": []}'::jsonb and _r1_meet_public_tests.hits(k1, '2026-12-01 04:00:00+00') = 1,
+    res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[k1], array[2], 60, '2026-12-01 04:00:50+00');
+  perform _r1_meet_public_tests.assert('T2-F the second hit in the same window shares the row (2 = the limit, not over)',
+    res = '{"status": "ok", "over": []}'::jsonb and _r1_meet_public_tests.hits(k1, '2026-12-01 04:00:00+00') = 2,
+    res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[k1], array[2], 60, '2026-12-01 04:00:59.999+00');
+  perform _r1_meet_public_tests.assert('T2-F the third hit exceeds the limit: over [0]',
+    res = '{"status": "ok", "over": [0]}'::jsonb and _r1_meet_public_tests.hits(k1, '2026-12-01 04:00:00+00') = 3,
+    res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[k1], array[2], 60, '2026-12-01 04:01:00+00');
+  perform _r1_meet_public_tests.assert('T2-F the next window is a new row',
+    res = '{"status": "ok", "over": []}'::jsonb and _r1_meet_public_tests.hits(k1, '2026-12-01 04:01:00+00') = 1
+    and (select count(*) = 2 from screening_v2.r1_meet_public_throttle x where x.key_digest = k1), res::text);
+
+  -- Several keys, an hour window, keys out of order: the indexes are the caller's.
+  res := screening_v2.r1_meet_public_throttle_hit(array[k3, k2], array[5, 1], 3600, '2026-12-01 04:59:59+00');
+  perform _r1_meet_public_tests.assert('T2-F two keys, a 3600 s window: both rows in the 04:00 bucket, nothing over',
+    res = '{"status": "ok", "over": []}'::jsonb
+    and _r1_meet_public_tests.hits(k2, '2026-12-01 04:00:00+00') = 1
+    and _r1_meet_public_tests.hits(k3, '2026-12-01 04:00:00+00') = 1, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[k3, k2], array[5, 1], 3600, '2026-12-01 04:30:00+00');
+  perform _r1_meet_public_tests.assert('T2-F the second key over its limit: over [1]',
+    res = '{"status": "ok", "over": [1]}'::jsonb, res::text);
+  perform screening_v2.r1_meet_public_throttle_hit(array[k4, k5, k6], array[1, 1, 1], 60, '2026-12-01 04:00:00+00');
+  res := screening_v2.r1_meet_public_throttle_hit(array[k6, k4, k5], array[1, 2, 1], 60, '2026-12-01 04:00:10+00');
+  perform _r1_meet_public_tests.assert('T2-F exact over indexes, ascending: [0, 2]',
+    res = '{"status": "ok", "over": [0, 2]}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[k1], array[100000], 86400, '2026-12-01 23:59:59+00');
+  perform _r1_meet_public_tests.assert('T2-F a 86400 s window floors to the UTC day; limit 100000 accepted',
+    res = '{"status": "ok", "over": []}'::jsonb and _r1_meet_public_tests.hits(k1, '2026-12-01 00:00:00+00') = 1,
+    res::text);
+  insert into screening_v2.r1_meet_public_throttle (key_digest, bucket_start, hits)
+  values (k7, '2026-12-01 04:00:00+00', 1000000000);
+  res := screening_v2.r1_meet_public_throttle_hit(array[k7], array[100000], 60, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F hits are capped at 1000000000',
+    res = '{"status": "ok", "over": [0]}'::jsonb
+    and _r1_meet_public_tests.hits(k7, '2026-12-01 04:00:00+00') = 1000000000, res::text);
+  perform _r1_meet_public_tests.assert('T2-F the hits wrote the throttle table only',
+    (_r1_meet_public_tests.counts() - 'throttle') = (v_before - 'throttle'));
+
+  -- The fields: keys, limits, window, now (first refusal wins).
+  select array_agg(_r1_meet_public_tests.digest('t2f-nine-' || n)) into nine from generate_series(1, 9) n;
+  v_before := _r1_meet_public_tests.counts();
+  res := screening_v2.r1_meet_public_throttle_hit(null, array[1], 60, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F NULL keys: refused (field keys)',
+    res = '{"status": "invalid_request", "field": "keys"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit('{}'::text[], '{}'::integer[], 60, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F no key: refused (field keys)',
+    res = '{"status": "invalid_request", "field": "keys"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(nine, array[1, 1, 1, 1, 1, 1, 1, 1, 1], 60, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F nine keys: refused (field keys)',
+    res = '{"status": "invalid_request", "field": "keys"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(nine[1:8], array[1, 1, 1, 1, 1, 1, 1, 1], 60, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F eight keys are accepted',
+    res = '{"status": "ok", "over": []}'::jsonb, res::text);
+  v_before := _r1_meet_public_tests.counts();
+  res := screening_v2.r1_meet_public_throttle_hit(array[k1, null], array[1, 1], 60, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F a NULL key: refused (field keys)',
+    res = '{"status": "invalid_request", "field": "keys"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[upper(k1)], array[1], 60, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F an upper-case key: refused (field keys)',
+    res = '{"status": "invalid_request", "field": "keys"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[left(k1, 63)], array[1], 60, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F a 63-character key: refused (field keys)',
+    res = '{"status": "invalid_request", "field": "keys"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[k1, k1], array[1, 1], 60, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F duplicate keys: refused (field keys)',
+    res = '{"status": "invalid_request", "field": "keys"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[[k1], [k2]], array[1, 1], 60, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F two-dimensional keys: refused (field keys)',
+    res = '{"status": "invalid_request", "field": "keys"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[k1, k1], array[1, 1], 59, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F bad keys and a bad window: keys first',
+    res = '{"status": "invalid_request", "field": "keys"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[k1], null, 60, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F NULL limits: invalid_request limits',
+    res = '{"status": "invalid_request", "field": "limits"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[k1], array[1, 2], 60, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F more limits than keys: refused (field limits)',
+    res = '{"status": "invalid_request", "field": "limits"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[k1], array[0], 60, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F a limit of 0: invalid_request limits',
+    res = '{"status": "invalid_request", "field": "limits"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[k1], array[100001], 60, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F a limit of 100001: invalid_request limits',
+    res = '{"status": "invalid_request", "field": "limits"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[k1], array[null::integer], 60, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F a NULL limit: invalid_request limits',
+    res = '{"status": "invalid_request", "field": "limits"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[k1], array[[1]], 60, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F two-dimensional limits: invalid_request limits',
+    res = '{"status": "invalid_request", "field": "limits"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[k1], array[1], 59, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F a 59 s window: invalid_request window',
+    res = '{"status": "invalid_request", "field": "window"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[k1], array[1], 86401, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F a 86401 s window: invalid_request window',
+    res = '{"status": "invalid_request", "field": "window"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[k1], array[1], null, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-F a NULL window: invalid_request window',
+    res = '{"status": "invalid_request", "field": "window"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_hit(array[k1], array[1], 60, null);
+  perform _r1_meet_public_tests.assert('T2-F a NULL now: invalid_request now',
+    res = '{"status": "invalid_request", "field": "now"}'::jsonb, res::text);
+  perform _r1_meet_public_tests.assert('T2-F no refusal wrote anything',
+    _r1_meet_public_tests.counts() = v_before);
+end;
+$$;
+
+-- =============================================================================================
+-- T2-G. r1_meet_public_throttle_prune (§23).
+-- =============================================================================================
+do $$
+declare
+  p_now constant timestamptz := '2026-12-01 04:00:00+00';
+  c_30d constant integer := 2592000;
+  res jsonb;
+begin
+  insert into screening_v2.r1_meet_public_throttle (key_digest, bucket_start, hits)
+  values (_r1_meet_public_tests.digest('t2g-1'), '2026-10-01 00:00:00+00', 1),
+         (_r1_meet_public_tests.digest('t2g-2'), '2026-10-02 00:00:00+00', 1),
+         (_r1_meet_public_tests.digest('t2g-3'), '2026-10-03 00:00:00+00', 1),
+         (_r1_meet_public_tests.digest('t2g-4'), '2026-11-15 00:00:00+00', 1);
+  perform _r1_meet_public_tests.assert('T2-G fixture: exactly our three rows are older than 30 days',
+    (select count(*) = 3 from screening_v2.r1_meet_public_throttle x
+      where x.bucket_start < p_now - interval '30 days'));
+
+  res := screening_v2.r1_meet_public_throttle_prune(3599, 10, p_now);
+  perform _r1_meet_public_tests.assert('T2-G an age under one hour: invalid_request older_than',
+    res = '{"status": "invalid_request", "field": "older_than"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_prune(31536001, 10, p_now);
+  perform _r1_meet_public_tests.assert('T2-G an age over 365 days: invalid_request older_than',
+    res = '{"status": "invalid_request", "field": "older_than"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_prune(null, 10, p_now);
+  perform _r1_meet_public_tests.assert('T2-G a NULL age: invalid_request older_than',
+    res = '{"status": "invalid_request", "field": "older_than"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_prune(c_30d, 0, p_now);
+  perform _r1_meet_public_tests.assert('T2-G a limit of 0: invalid_request limit',
+    res = '{"status": "invalid_request", "field": "limit"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_prune(c_30d, 5001, p_now);
+  perform _r1_meet_public_tests.assert('T2-G a limit of 5001: invalid_request limit',
+    res = '{"status": "invalid_request", "field": "limit"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_prune(c_30d, null, p_now);
+  perform _r1_meet_public_tests.assert('T2-G a NULL limit: invalid_request limit',
+    res = '{"status": "invalid_request", "field": "limit"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_prune(c_30d, 10, null);
+  perform _r1_meet_public_tests.assert('T2-G a NULL now: invalid_request now',
+    res = '{"status": "invalid_request", "field": "now"}'::jsonb, res::text);
+  perform _r1_meet_public_tests.assert('T2-G no refusal deleted anything',
+    (select count(*) = 4 from screening_v2.r1_meet_public_throttle x
+      where x.key_digest in (_r1_meet_public_tests.digest('t2g-1'), _r1_meet_public_tests.digest('t2g-2'),
+                             _r1_meet_public_tests.digest('t2g-3'), _r1_meet_public_tests.digest('t2g-4'))));
+
+  res := screening_v2.r1_meet_public_throttle_prune(31536000, 5000, p_now);
+  perform _r1_meet_public_tests.assert('T2-G 365 days and a limit of 5000 are accepted (nothing that old)',
+    res = '{"status": "ok", "deleted": 0}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_prune(3600, 1, '2026-01-01 00:00:00+00');
+  perform _r1_meet_public_tests.assert('T2-G one hour and a limit of 1 are accepted (nothing that old then)',
+    res = '{"status": "ok", "deleted": 0}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_throttle_prune(c_30d, 2, p_now);
+  perform _r1_meet_public_tests.assert('T2-G a limit of 2 deletes the two oldest buckets only',
+    res = '{"status": "ok", "deleted": 2}'::jsonb
+    and not exists (select 1 from screening_v2.r1_meet_public_throttle x
+                     where x.key_digest in (_r1_meet_public_tests.digest('t2g-1'), _r1_meet_public_tests.digest('t2g-2')))
+    and exists (select 1 from screening_v2.r1_meet_public_throttle x
+                 where x.key_digest = _r1_meet_public_tests.digest('t2g-3')), res::text);
+  res := screening_v2.r1_meet_public_throttle_prune(c_30d, 5000, p_now);
+  perform _r1_meet_public_tests.assert('T2-G the next call deletes the last old bucket and keeps the newer one',
+    res = '{"status": "ok", "deleted": 1}'::jsonb
+    and exists (select 1 from screening_v2.r1_meet_public_throttle x
+                 where x.key_digest = _r1_meet_public_tests.digest('t2g-4')), res::text);
+  res := screening_v2.r1_meet_public_throttle_prune(c_30d, 5000, p_now);
+  perform _r1_meet_public_tests.assert('T2-G nothing left that old: deleted 0',
+    res = '{"status": "ok", "deleted": 0}'::jsonb, res::text);
+end;
+$$;
+
+-- =============================================================================================
+-- T2-H. Catalog posture of the T2 functions.
+-- =============================================================================================
+do $$
+declare
+  fn record;
+begin
+  for fn in
+    select * from (values
+      ('screening_v2.r1_meet_public_capacity(timestamptz, timestamptz, timestamptz)', 's'),
+      ('screening_v2.r1_meet_public_precheck(uuid, text, timestamptz)', 's'),
+      ('screening_v2.r1_meet_public_set_manage_digest(uuid, text, timestamptz)', 'v'),
+      ('screening_v2.r1_meet_public_manage_read(text, integer, integer, timestamptz)', 's'),
+      ('screening_v2.r1_meet_public_set_calendar_state(uuid, text[], text, timestamptz)', 'v'),
+      ('screening_v2.r1_meet_public_throttle_hit(text[], integer[], integer, timestamptz)', 'v'),
+      ('screening_v2.r1_meet_public_throttle_prune(integer, integer, timestamptz)', 'v')
+    ) v(sig, volatility)
+  loop
+    perform _r1_meet_public_tests.assert('T2-H ' || fn.sig || ' is security definer, ' || fn.volatility
+                                         || ', search_path pg_catalog, screening_v2, returns jsonb',
+      (select x.prosecdef and x.provolatile = fn.volatility
+              and x.proconfig = array['search_path=pg_catalog, screening_v2']
+              and x.prorettype = 'jsonb'::regtype
+         from pg_proc x where x.oid = fn.sig::regprocedure));
+    perform _r1_meet_public_tests.assert('T2-H ' || fn.sig || ' is executable by service_role only',
+      has_function_privilege('service_role', fn.sig, 'execute')
+      and not has_function_privilege('anon', fn.sig, 'execute')
+      and not has_function_privilege('authenticated', fn.sig, 'execute')
+      and not has_function_privilege('public', fn.sig, 'execute'));
+  end loop;
+  for fn in
+    select * from (values
+      ('screening_v2.r1_meet_public_slot_count(timestamptz, timestamptz, uuid)', 'integer'),
+      ('screening_v2.r1_meet_public_day_count(date, uuid)', 'jsonb'),
+      ('screening_v2.r1_meet_public_refusal(uuid, text, timestamptz)', 'text')
+    ) v(sig, rettype)
+  loop
+    perform _r1_meet_public_tests.assert('T2-H ' || fn.sig || ' is an internal stable security invoker helper',
+      (select not x.prosecdef and x.provolatile = 's'
+              and x.proconfig = array['search_path=pg_catalog, screening_v2']
+              and x.prorettype = fn.rettype::regtype
+         from pg_proc x where x.oid = fn.sig::regprocedure));
+    perform _r1_meet_public_tests.assert('T2-H ' || fn.sig || ' is executable by no API role, service_role included',
+      not has_function_privilege('service_role', fn.sig, 'execute')
+      and not has_function_privilege('anon', fn.sig, 'execute')
+      and not has_function_privilege('authenticated', fn.sig, 'execute')
+      and not has_function_privilege('public', fn.sig, 'execute'));
+  end loop;
+  perform _r1_meet_public_tests.raises_as('service_role', 'T2-H execute r1_meet_public_refusal',
+    format('select screening_v2.r1_meet_public_refusal(%L, %L, %L)', _r1_meet_public_tests.id(10, 340),
+           _r1_meet_public_tests.id(22, 340)::text, '2026-12-01 04:00:00+00'), '42501');
+  -- The 0142 suite leaves the r1_meet_public_* names to this one (T4 adds its three to this list).
+  perform _r1_meet_public_tests.assert(
+    'T2-H the screening_v2 functions named r1_meet_public_* are exactly these ten, one overload each',
+    (select array_agg(x.oid order by x.oid) from pg_proc x
+      where x.pronamespace = 'screening_v2'::regnamespace and x.proname like 'r1\_meet\_public\_%')
+    = (select array_agg(f::regprocedure::oid order by f::regprocedure::oid) from unnest(array[
+         'screening_v2.r1_meet_public_slot_count(timestamptz, timestamptz, uuid)',
+         'screening_v2.r1_meet_public_day_count(date, uuid)',
+         'screening_v2.r1_meet_public_refusal(uuid, text, timestamptz)',
+         'screening_v2.r1_meet_public_capacity(timestamptz, timestamptz, timestamptz)',
+         'screening_v2.r1_meet_public_precheck(uuid, text, timestamptz)',
+         'screening_v2.r1_meet_public_set_manage_digest(uuid, text, timestamptz)',
+         'screening_v2.r1_meet_public_manage_read(text, integer, integer, timestamptz)',
+         'screening_v2.r1_meet_public_set_calendar_state(uuid, text[], text, timestamptz)',
+         'screening_v2.r1_meet_public_throttle_hit(text[], integer[], integer, timestamptz)',
+         'screening_v2.r1_meet_public_throttle_prune(integer, integer, timestamptz)']) f));
 end;
 $$;
 

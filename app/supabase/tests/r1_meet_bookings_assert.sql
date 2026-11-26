@@ -3824,10 +3824,13 @@ begin
         denied_calls[i], '42501');
     end loop;
   end loop;
+  -- 0143 (M035) adds the public booking functions (r1_meet_public_* and
+  -- r1_meet_create_round_from_public); r1_meet_public_bookings_assert.sql pins those.
   perform _r1_meet_tests.assert(
-    'T4-D the eleven RPCs are the only screening_v2 functions named r1_meet_*, one overload each',
+    'T4-D the eleven RPCs are the only screening_v2 functions named r1_meet_*, one overload each (the 0143 public ones aside)',
     (select array_agg(x.oid order by x.oid) from pg_proc x
-      where x.pronamespace = 'screening_v2'::regnamespace and x.proname like 'r1\_meet\_%')
+      where x.pronamespace = 'screening_v2'::regnamespace and x.proname like 'r1\_meet\_%'
+        and x.proname not like 'r1\_meet\_public\_%' and x.proname <> 'r1_meet_create_round_from_public')
     = (select array_agg(f::regprocedure::oid order by f::regprocedure::oid) from unnest(rpcs) f));
 
   foreach tbl in array array['r1_meet_bookings', 'r1_meet_receipts'] loop

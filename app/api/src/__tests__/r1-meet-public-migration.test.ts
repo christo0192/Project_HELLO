@@ -11,6 +11,14 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  R1_MEET_CAP_REASONS,
+  R1_MEET_CAP_STATUSES,
+  R1_MEET_DISPATCHED_STATUSES,
+  R1_MEET_LIVE_STATUSES,
+  R1_MEET_TERMINAL_STATUSES,
+  R1_MEET_UNDISPATCHED_STATUSES,
+} from '../lib/r1/meet/runtime-store.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const migrations = path.resolve(here, '../../../supabase/migrations');
@@ -100,7 +108,11 @@ describe('migration 0143: file and frame', () => {
   });
 
   it('keeps its sections in order, each exactly once', () => {
-    const markers = ['-- §1. ', '-- §2. ', '-- §3. ', '-- §4. ', '-- §90. '];
+    const markers = [
+      '-- §1. ', '-- §2. ', '-- §3. ', '-- §4. ',
+      '-- §10. ', '-- §11. ', '-- §12. ', '-- §13. ', '-- §14. ', '-- §16. ', '-- §17. ',
+      '-- §21. ', '-- §22. ', '-- §23. ', '-- §90. ',
+    ];
     let last = -1;
     for (const marker of markers) {
       expect(sql.split(marker).length - 1, marker).toBe(1);
@@ -451,6 +463,424 @@ describe('migration 0143: the terminal and purge triggers', () => {
   });
 });
 
+// ── T2: the internal helpers and the read, digest, calendar-state and throttle RPCs ─────────────
+
+/** Whole-line comments removed, whitespace collapsed (the `code` view of any SQL text). */
+const norm = (text: string): string => text.replace(/^\s*--.*$/gm, '').replace(/\s+/g, ' ').trim();
+const migration = (file: string): string => norm(readFileSync(path.join(migrations, file), 'utf8').replace(/\r\n/g, '\n'));
+const code0128 = migration('0128_r1_twenty_minute_roleplay.sql');
+const code0130 = migration('0130_ashby_phone_parsing_intake.sql');
+const code0131 = migration('0131_r1_concurrent_sessions.sql');
+
+/** The executable 0143 text that follows EACH whole-line occurrence of `marker` (later comments skipped). */
+function copiesAfter(marker: string): string[] {
+  const out: string[] = [];
+  for (let at = sql.indexOf(`${marker}\n`); at !== -1; at = sql.indexOf(`${marker}\n`, at + 1)) {
+    // A whole-line comment (indentation only before it), never a trailing one.
+    expect(sql.slice(sql.lastIndexOf('\n', at) + 1, at).trim(), marker).toBe('');
+    out.push(norm(sql.slice(at + marker.length + 1)));
+  }
+  expect(out.length, marker).toBeGreaterThan(0);
+  return out;
+}
+
+/** `text` from `start` through the first `end` after it (both included). */
+function through(text: string, start: string, end: string): string {
+  const i = text.indexOf(start);
+  expect(i, start).toBeGreaterThan(-1);
+  const j = text.indexOf(end, i + start.length);
+  expect(j, end).toBeGreaterThan(i);
+  return text.slice(i, j + end.length);
+}
+
+/** Consecutive duplicates collapsed: a code checked twice in a row counts once. */
+const runs = (values: string[]): string[] => values.filter((v, i) => i === 0 || values[i - 1] !== v);
+
+/** The migration that last (re)declares a function before 0143. */
+function lastDefiner(fn: string): string {
+  const files = readdirSync(migrations).filter((f) => /^\d{4}_.*\.sql$/.test(f) && f < FILE).sort();
+  const definers = files.filter((f) => readFileSync(path.join(migrations, f), 'utf8').toLowerCase()
+    .includes(`create or replace function screening_v2.${fn}(`));
+  expect(definers.length, fn).toBeGreaterThan(0);
+  return definers.at(-1)!;
+}
+
+interface T2Function {
+  name: string;
+  params: string;
+  types: string;
+  returns: string;
+  posture: string;
+  helper?: true;
+}
+const T2_FUNCTIONS: readonly T2Function[] = [
+  { name: 'r1_meet_public_slot_count', params: 'p_start_at timestamptz, p_end_at timestamptz, p_exclude_booking_id uuid',
+    types: 'timestamptz, timestamptz, uuid', returns: 'integer', posture: 'stable security invoker', helper: true },
+  { name: 'r1_meet_public_day_count', params: 'p_ist_date date, p_exclude_booking_id uuid',
+    types: 'date, uuid', returns: 'jsonb', posture: 'stable security invoker', helper: true },
+  { name: 'r1_meet_public_refusal', params: 'p_candidate_id uuid, p_ashby_application_id text, p_now timestamptz',
+    types: 'uuid, text, timestamptz', returns: 'text', posture: 'stable security invoker', helper: true },
+  { name: 'r1_meet_public_capacity', params: 'p_from timestamptz, p_to timestamptz, p_now timestamptz default now()',
+    types: 'timestamptz, timestamptz, timestamptz', returns: 'jsonb', posture: 'stable security definer' },
+  { name: 'r1_meet_public_precheck',
+    params: 'p_candidate_id uuid, p_ashby_application_id text, p_now timestamptz default now()',
+    types: 'uuid, text, timestamptz', returns: 'jsonb', posture: 'stable security definer' },
+  { name: 'r1_meet_public_set_manage_digest', params: 'p_booking_id uuid, p_digest text, p_now timestamptz default now()',
+    types: 'uuid, text, timestamptz', returns: 'jsonb', posture: 'security definer' },
+  { name: 'r1_meet_public_manage_read',
+    params: 'p_digest text, p_cutoff_sec integer, p_max_moves integer, p_now timestamptz default now()',
+    types: 'text, integer, integer, timestamptz', returns: 'jsonb', posture: 'stable security definer' },
+  { name: 'r1_meet_public_set_calendar_state',
+    params: 'p_booking_id uuid, p_from text[], p_to text, p_now timestamptz default now()',
+    types: 'uuid, text[], text, timestamptz', returns: 'jsonb', posture: 'security definer' },
+  { name: 'r1_meet_public_throttle_hit',
+    params: 'p_keys text[], p_limits integer[], p_window_sec integer, p_now timestamptz default now()',
+    types: 'text[], integer[], integer, timestamptz', returns: 'jsonb', posture: 'security definer' },
+  { name: 'r1_meet_public_throttle_prune',
+    params: 'p_older_than_sec integer, p_limit integer, p_now timestamptz default now()',
+    types: 'integer, integer, timestamptz', returns: 'jsonb', posture: 'security definer' },
+];
+const STABLE_T2 = T2_FUNCTIONS.filter((f) => f.posture.startsWith('stable ')).map((f) => f.name);
+
+/** Contracts section 4 "live": every status that holds the slot (the Ashby-only pre-round statuses never do). */
+const LIVE = ['pending', 'blocked', 'bot_scheduled', 'bot_joining', 'human_present', 'in_call'] as const;
+const sqlList = (values: readonly string[]): string => `(${values.map((v) => `'${v}'`).join(', ')})`;
+
+describe('migration 0143: T2 signatures, posture and privileges', () => {
+  it('declares every T2 function once with its contract signature, return type and posture', () => {
+    for (const fn of T2_FUNCTIONS) {
+      expect(code, fn.name).toContain(
+        `create or replace function screening_v2.${fn.name}( ${fn.params} ) returns ${fn.returns} `
+        + `language plpgsql ${fn.posture} set search_path = pg_catalog, screening_v2 as $$`,
+      );
+      expect(lc.split(`create or replace function screening_v2.${fn.name}(`), fn.name).toHaveLength(2);
+    }
+    // Exactly the three helpers are invoker and stable; the read RPCs are stable definers.
+    expect(T2_FUNCTIONS.filter((f) => f.helper).map((f) => f.name))
+      .toEqual(['r1_meet_public_slot_count', 'r1_meet_public_day_count', 'r1_meet_public_refusal']);
+    expect(STABLE_T2).toEqual([
+      'r1_meet_public_slot_count', 'r1_meet_public_day_count', 'r1_meet_public_refusal',
+      'r1_meet_public_capacity', 'r1_meet_public_precheck', 'r1_meet_public_manage_read',
+    ]);
+  });
+
+  it('grants every RPC to service_role only, with a revoke, a grant and a comment', () => {
+    for (const fn of T2_FUNCTIONS.filter((f) => !f.helper)) {
+      const sig = `screening_v2.${fn.name}(${fn.types})`;
+      expect(code, fn.name).toContain(`revoke all on function ${sig} from public, anon, authenticated;`);
+      expect(code, fn.name).toContain(`grant execute on function ${sig} to service_role;`);
+      expect(code, fn.name).toContain(`comment on function ${sig} is`);
+      expect(lc.split(`grant execute on function ${sig}`), fn.name).toHaveLength(2);
+    }
+  });
+
+  it('revokes the helpers from every API role, service_role included, and never grants them', () => {
+    for (const fn of T2_FUNCTIONS.filter((f) => f.helper)) {
+      const sig = `screening_v2.${fn.name}(${fn.types})`;
+      expect(code, fn.name).toContain(`revoke all on function ${sig} from public, anon, authenticated, service_role;`);
+      expect(code, fn.name).toContain(`comment on function ${sig} is`);
+      expect(lc, fn.name).not.toMatch(new RegExp(`\\bgrant\\b[^;]*\\bon function screening_v2\\.${fn.name}\\(`));
+    }
+  });
+
+  it('writes nothing and locks nothing in a stable function body', () => {
+    for (const name of STABLE_T2) {
+      const body = functionBody(name);
+      expect(body, name).not.toMatch(/\binsert\s+into\b|\bupdate\s+screening_v2\.|\bdelete\s+from\b|\bfor update\b|\bpg_advisory/);
+    }
+  });
+
+  it('validates every argument first, in the plan order, before reading anything', () => {
+    const FIELDS: Record<string, string[]> = {
+      r1_meet_public_capacity: ['window', 'now'],
+      r1_meet_public_precheck: ['candidate_id', 'application_id', 'now'],
+      r1_meet_public_set_manage_digest: ['booking_id', 'digest', 'now'],
+      r1_meet_public_manage_read: ['digest', 'cutoff', 'max_moves', 'now'],
+      r1_meet_public_set_calendar_state: ['booking_id', 'to', 'from', 'now'],
+      r1_meet_public_throttle_hit: ['keys', 'limits', 'window', 'now'],
+      r1_meet_public_throttle_prune: ['older_than', 'limit', 'now'],
+    };
+    for (const [name, fields] of Object.entries(FIELDS)) {
+      const body = functionBody(name);
+      const found = [...body.matchAll(/'status', 'invalid_request', 'field', '([a-z_]+)'/g)];
+      expect(runs(found.map((m) => m[1]!)), name).toEqual(fields);
+      // Nothing of the schema is touched before the last field check (the DECLARE types aside).
+      const statements = body.slice(body.indexOf(' begin ', body.indexOf('as $$')));
+      expect(statements.indexOf('screening_v2.'), name).toBeGreaterThan(statements.lastIndexOf("'invalid_request'"));
+    }
+  });
+
+  it('answers only its closed statuses, in order', () => {
+    const STATUSES: Record<string, string[]> = {
+      r1_meet_public_capacity: ['invalid_request', 'ok'],
+      r1_meet_public_precheck: ['invalid_request', 'eligible', 'refused'],
+      r1_meet_public_set_manage_digest: ['invalid_request', 'not_found', 'not_public', 'booking_terminal', 'ok'],
+      r1_meet_public_manage_read: ['invalid_request', 'not_found', 'ok'],
+      r1_meet_public_set_calendar_state: ['invalid_request', 'not_found', 'not_public', 'state_conflict', 'ok'],
+      r1_meet_public_throttle_hit: ['invalid_request', 'ok'],
+      r1_meet_public_throttle_prune: ['invalid_request', 'ok'],
+    };
+    for (const [name, statuses] of Object.entries(STATUSES)) {
+      expect(runs([...functionBody(name).matchAll(/'status', '([a-z_]+)'/g)].map((m) => m[1]!)), name).toEqual(statuses);
+    }
+  });
+});
+
+describe('migration 0143: T2 copied predicates equal their sources', () => {
+  it('copies from the latest definitions (0128 r1_send_round, 0131 r1_admit_attempt, 0142 create)', () => {
+    expect(lastDefiner('r1_send_round')).toBe('0128_r1_twenty_minute_roleplay.sql');
+    expect(lastDefiner('r1_admit_attempt')).toBe('0131_r1_concurrent_sessions.sql');
+    expect(lastDefiner('r1_capacity_snapshot')).toBe('0128_r1_twenty_minute_roleplay.sql');
+    expect(lastDefiner('r1_meet_create_round_from_ashby')).toBe('0142_r1_meet_bookings.sql');
+  });
+
+  it('copies the 0131 concurrent-limit block verbatim (same variable names)', () => {
+    const source = through(code0131, "if v_settings.livekit_target='r1' then", 'end if;');
+    expect(source).toContain('v_limit:=least(coalesce(v_settings.max_concurrent_sessions,1),greatest(v_pool,1));');
+    for (const copy of copiesAfter('-- copied from r1_admit_attempt (0131 concurrent-limit)')) {
+      expect(copy.startsWith(source), copy.slice(0, 200)).toBe(true);
+    }
+  });
+
+  it('copies the two 0128 phone predicates verbatim', () => {
+    const send = blockOf(code0128, 'create or replace function screening_v2.r1_send_round(', '$$;');
+    const engagement = through(send, 'if exists (select 1 from screening_v2.phone_engagements e', ') then');
+    const assessment = through(send, 'if exists (select 1 from screening_v2.call_sessions s join screening_v2.job_queue j', ') then');
+    expect(engagement).toContain('e.candidate_id=p_candidate_id');
+    expect(assessment).toContain("j.name='phone.assessment'");
+    for (const copy of copiesAfter('-- copied from r1_send_round (0128)')) {
+      expect(copy.startsWith(engagement), copy.slice(0, 200)).toBe(true);
+      const next = copy.indexOf('if exists (', engagement.length);
+      expect(copy.slice(next).startsWith(assessment), copy.slice(next, next + 200)).toBe(true);
+    }
+  });
+
+  it('decides admits with the r1_send_round capacity expression', () => {
+    const CAPACITY = "coalesce((screening_v2.r1_capacity_snapshot(p_now, 65)->>'admits')::boolean, false)";
+    const send = blockOf(code0128, 'create or replace function screening_v2.r1_send_round(', '$$;');
+    expect(send).toContain(`if ${CAPACITY} is not true then return jsonb_build_object('status','capacity_exhausted');`);
+    const copies = copiesAfter('-- copied from r1_send_round (0128) capacity');
+    expect(copies[0]!.startsWith(`if ${CAPACITY} is not true then return 'capacity_exhausted';`)).toBe(true);
+    for (const copy of copies) {
+      expect(copy.startsWith(`if ${CAPACITY} is not true then`) || copy.startsWith(`v_admits := ${CAPACITY};`), copy.slice(0, 200))
+        .toBe(true);
+    }
+    expect(functionBody('r1_meet_public_capacity')).toContain(`v_admits := ${CAPACITY};`);
+  });
+
+  it('copies the 0130 DSAR hold predicate, on the candidate parameter', () => {
+    const hold = code0130.indexOf("v_outcome := 'subject_request_hold';");
+    expect(hold).toBeGreaterThan(-1);
+    const source = code0130.slice(code0130.lastIndexOf('if exists (', hold), hold).trim();
+    expect(source).toContain('d.candidate_id = v_link.candidate_id');
+    const expected = source.replace('d.candidate_id = v_link.candidate_id', 'd.candidate_id = p_candidate_id');
+    for (const copy of copiesAfter('-- copied from 0130 subject_request_hold')) {
+      expect(copy.startsWith(expected), copy.slice(0, 300)).toBe(true);
+    }
+  });
+
+  it('copies the 0142 step 8a predicate without its event conjunct (the helper has no booking yet)', () => {
+    const source = through(code0142, 'select r.id, r.version into v_lapsed_id, v_lapsed_version', ' limit 1;');
+    const conjunct = ' and o.ashby_interview_event_id <> p_ashby_interview_event_id';
+    expect(source.split(conjunct)).toHaveLength(2);
+    const expected = source.replace(conjunct, '');
+    const copies = copiesAfter('-- copied from r1_meet_create_round_from_ashby (0142) step 8a, without the event conjunct');
+    expect(copies).toHaveLength(1);
+    expect(copies[0]!.startsWith(expected), copies[0]!.slice(0, 600)).toBe(true);
+    expect(functionBody('r1_meet_public_refusal')).toContain(expected);
+  });
+
+  it('copies the 0142 step 10 reuse condition verbatim', () => {
+    const source = through(code0142, "if v_round.id is null or v_round.channel <> 'meet'", ' then exit decide;')
+      .slice(0, -' exit decide;'.length);
+    expect(source).toContain("b.status not in ('completed', 'cancelled', 'failed', 'drained'))");
+    for (const copy of copiesAfter('-- copied from r1_meet_create_round_from_ashby (0142) step 10 reuse')) {
+      expect(copy.startsWith(source), copy.slice(0, 600)).toBe(true);
+    }
+    expect(functionBody('r1_meet_public_refusal')).toContain(`${source} v_reusable := false; end if;`);
+  });
+
+  it('reads the newest active notice with the 0142 step 7 predicate', () => {
+    const source = through(code0142, 'select t.* into v_template', "and t.locale = 'en-IN';");
+    const prefix = source.slice(0, -"'en-IN';".length);
+    for (const copy of copiesAfter('-- newest active notice (0142 step 7)')) {
+      expect(copy.startsWith(prefix), copy.slice(0, 300)).toBe(true);
+      expect(["'en-IN';", 'v_round.consent_locale;', 'v_locale;'].some((tail) => copy.startsWith(`${prefix}${tail}`)),
+        copy.slice(0, 300)).toBe(true);
+    }
+    expect(functionBody('r1_meet_public_refusal')).toContain(`${prefix}v_locale;`);
+  });
+
+  it('reads consent_current with the admission consent gate, on the booking round', () => {
+    const gate = through(code0131, 'exists(select 1 from screening_v2.interview_round_consents c', 't.required_consents <@ c.consents)');
+    expect(code0128).toContain(gate);
+    expect(gate.split('c.round_id=v_round.id')).toHaveLength(2);
+    const expected = `v_consent := ${gate.replace('c.round_id=v_round.id', 'c.round_id=v_booking.round_id')};`;
+    for (const copy of copiesAfter('-- copied from r1_admit_attempt (0128) consent gate')) {
+      expect(copy.startsWith(expected), copy.slice(0, 300)).toBe(true);
+    }
+  });
+});
+
+describe('migration 0143: T2 helpers and RPC bodies', () => {
+  it('names the live, cap, dispatched and terminal lists exactly as runtime-store.ts does', () => {
+    expect([...LIVE]).toEqual(R1_MEET_LIVE_STATUSES.filter((s) => s !== 'unmatched_application' && s !== 'unmapped_scheduler'));
+    const day = functionBody('r1_meet_public_day_count');
+    const m = /and \(b\.status in \(([^)]*)\) or \(b\.status in \(([^)]*)\) and b\.reason in \(([^)]*)\)\)\);/.exec(day);
+    expect(m, day).not.toBeNull();
+    expect(quoted(m![1]!)).toEqual([...LIVE]);
+    expect(quoted(m![2]!)).toEqual([...R1_MEET_CAP_STATUSES]);
+    expect(quoted(m![3]!)).toEqual([...R1_MEET_CAP_REASONS]);
+    expect(functionBody('r1_meet_public_slot_count')).toContain(`where b.status in ${sqlList(LIVE)}`);
+    expect(functionBody('r1_meet_public_capacity')).toContain(`where b.status in ${sqlList(LIVE)}`);
+    expect(functionBody('r1_meet_public_refusal')).toContain(`and b.status in ${sqlList(LIVE)}`);
+    expect(functionBody('r1_meet_public_manage_read')).toContain(`v_booking.status not in ${sqlList(LIVE)}`);
+    expect(functionBody('r1_meet_public_set_manage_digest'))
+      .toContain(`if v_booking.status in ${sqlList(R1_MEET_TERMINAL_STATUSES)} then`);
+    const read = functionBody('r1_meet_public_manage_read');
+    const undispatched = R1_MEET_UNDISPATCHED_STATUSES.filter((s) => s !== 'unmatched_application' && s !== 'unmapped_scheduler');
+    expect(read).toContain(
+      `'can_move', v_booking.status in ${sqlList(undispatched)} and v_before_cutoff and v_booking.move_count < p_max_moves,`,
+    );
+    expect(read).toContain(`'can_cancel', v_booking.status not in ${sqlList(R1_MEET_DISPATCHED_STATUSES)} and v_before_cutoff,`);
+  });
+
+  it('counts a slot by overlap and a day by its IST window', () => {
+    expect(functionBody('r1_meet_public_slot_count')).toContain(
+      'and b.start_at < p_end_at and b.end_at > p_start_at and b.id is distinct from p_exclude_booking_id);',
+    );
+    const day = functionBody('r1_meet_public_day_count');
+    expect(day).toContain("v_from timestamptz := p_ist_date::timestamp at time zone 'Asia/Kolkata';");
+    expect(day).toContain("v_to timestamptz := (p_ist_date + 1)::timestamp at time zone 'Asia/Kolkata';");
+    expect(day).toContain('where b.start_at >= v_from and b.start_at < v_to and b.id is distinct from p_exclude_booking_id');
+    expect(day).toContain("count(*)::integer, (count(*) filter (where b.source = 'public_page'))::integer");
+    expect(day).toContain("return jsonb_build_object('total', v_total, 'public', v_public);");
+  });
+
+  it('returns the refusal codes in exactly the contract order, then NULL', () => {
+    const body = functionBody('r1_meet_public_refusal');
+    expect(runs([...body.matchAll(/return '([a-z0-9_]+)';/g)].map((m) => m[1]!))).toEqual([
+      'application_unknown', 'application_terminal', 'mapping_unavailable', 'dsar_hold', 'candidate_ineligible',
+      'already_booked', 'r1_completed', 'phone_engagement_active', 'phone_assessment_pending',
+      'role_not_configured', 'consent_template_unavailable', 'disabled', 'paused', 'capacity_exhausted',
+    ]);
+    expect(body.trimEnd().endsWith('return null; end;')).toBe(true);
+    // The link is matched verbatim and must be bound to THIS candidate; a lapsed-only round is not "live".
+    expect(body).toContain("where l.provider = 'ashby' and l.external_application_id = p_ashby_application_id;");
+    expect(body).toContain('if not v_link_found or v_link_candidate is distinct from p_candidate_id then');
+    expect(body).toContain('if v_round.id is not null and not v_reusable and v_lapsed_id is null then return \'already_booked\';');
+    expect(body).toContain("if not v_reusable and exists (select 1 from screening_v2.interview_rounds r where r.candidate_id = p_candidate_id and r.kind = 'sales_r1' and r.status = 'completed') then return 'r1_completed';");
+    expect(body).toContain("if not v_reusable then if coalesce(");
+    expect(body).toContain("if v_reusable then v_locale := v_round.consent_locale; end if;");
+  });
+
+  it('precheck is the helper behind its field checks', () => {
+    const body = functionBody('r1_meet_public_precheck');
+    expect(body).toContain('v_code := screening_v2.r1_meet_public_refusal(p_candidate_id, p_ashby_application_id, p_now);');
+    expect(body).toContain("if v_code is null then return jsonb_build_object('status', 'eligible'); end if; "
+      + "return jsonb_build_object('status', 'refused', 'code', v_code);");
+    expect(body).toContain("if p_ashby_application_id is null or p_ashby_application_id !~* c_uuid then");
+  });
+
+  it('capacity: the 15-day window, ordered id-free intervals, every IST date, closed defaults without settings', () => {
+    const body = functionBody('r1_meet_public_capacity');
+    expect(body).toContain("if p_from is null or p_to is null or p_to <= p_from or p_to > p_from + interval '15 days' then");
+    expect(body).toContain(
+      "select coalesce(jsonb_agg(jsonb_build_object('start_at', b.start_at, 'end_at', b.end_at) "
+      + "order by b.start_at, b.end_at), '[]'::jsonb) into v_intervals",
+    );
+    expect(body).toContain("v_first := (p_from at time zone 'Asia/Kolkata')::date;");
+    expect(body).toContain("v_last := ((p_to - interval '1 microsecond') at time zone 'Asia/Kolkata')::date;");
+    expect(body).toContain('|| screening_v2.r1_meet_public_day_count(g.d, null) order by g.d) into v_days');
+    expect(body).toContain('from (select v_first + i as d from generate_series(0, v_last - v_first) i) g;');
+    expect(body).toContain(
+      "if not found then return jsonb_build_object('status', 'ok', 'enabled', false, 'paused', false, 'admits', false, "
+      + "'effective_concurrency', 1, 'intervals', v_intervals, 'day_counts', v_days); end if;",
+    );
+    // r1_capacity_snapshot raises on a missing settings row: it is only reached after the row was found.
+    expect(body.indexOf('if not found then return')).toBeLessThan(body.indexOf('r1_capacity_snapshot('));
+  });
+
+  it('set_manage_digest and set_calendar_state never touch updated_at (R19) and write one column set', () => {
+    const digest = functionBody('r1_meet_public_set_manage_digest');
+    const calendar = functionBody('r1_meet_public_set_calendar_state');
+    for (const body of [digest, calendar]) expect(body).not.toContain('updated_at');
+    expect(digest.match(/\bupdate screening_v2\./g)).toHaveLength(1);
+    expect(digest).toContain('update screening_v2.r1_meet_bookings set manage_token_digest = p_digest where id = v_booking.id;');
+    expect(digest).toContain("if p_digest is null or p_digest !~ '^[a-f0-9]{64}$' then");
+    expect(calendar.match(/\bupdate screening_v2\./g)).toHaveLength(1);
+    expect(calendar).toContain(
+      "update screening_v2.r1_meet_bookings set calendar_state = p_to, invite_sent_at = case when p_to = 'invited' "
+      + 'then coalesce(invite_sent_at, p_now) else invite_sent_at end where id = v_booking.id;',
+    );
+    expect(calendar).toContain("if p_to is null or p_to not in ('invited', 'cancelled', 'purged') then");
+    expect(calendar).toContain(
+      "v_allowed := case p_to when 'purged' then array['created', 'invited', 'cancelled'] else array['created', 'invited'] end;",
+    );
+    expect(calendar).toContain('if p_from is null or array_ndims(p_from) is distinct from 1 then');
+    expect(calendar).toContain('if cardinality(p_from) not between 1 and 3 or cardinality(array_remove(p_from, null)) <> cardinality(p_from) or not (p_from <@ v_allowed) then');
+    expect(calendar).toContain("if v_booking.calendar_state <> all(p_from) then return jsonb_build_object('status', 'state_conflict', 'current', v_booking.calendar_state);");
+  });
+
+  it('manage_read answers only for a live public booking before its slot ends', () => {
+    const body = functionBody('r1_meet_public_manage_read');
+    expect(body).toContain("where b.manage_token_digest = p_digest and b.source = 'public_page';");
+    expect(body).toContain('or p_now >= v_booking.end_at then return jsonb_build_object(\'status\', \'not_found\');');
+    expect(body).toContain('if p_cutoff_sec is null or p_cutoff_sec not between 900 and 43200 then');
+    expect(body).toContain('if p_max_moves is null or p_max_moves not between 0 and 10 then');
+    expect(body).toContain('v_before_cutoff := p_now < v_booking.start_at - make_interval(secs => p_cutoff_sec);');
+    expect(body).toContain("'moves_left', greatest(p_max_moves - v_booking.move_count, 0),");
+    // The whole ok answer: the contract keys in order, no digest, no Meet URL, no candidate data.
+    const undispatched = R1_MEET_UNDISPATCHED_STATUSES.filter((s) => s !== 'unmatched_application' && s !== 'unmapped_scheduler');
+    expect(body).toContain(
+      "return jsonb_build_object( 'status', 'ok', 'booking_id', v_booking.id, 'booking_status', v_booking.status, "
+      + "'version', v_booking.version, 'has_bot', v_booking.recall_bot_id is not null, "
+      + "'start_at', v_booking.start_at, 'end_at', v_booking.end_at, "
+      + `'can_move', v_booking.status in ${sqlList(undispatched)} and v_before_cutoff and v_booking.move_count < p_max_moves, `
+      + `'can_cancel', v_booking.status not in ${sqlList(R1_MEET_DISPATCHED_STATUSES)} and v_before_cutoff, `
+      + "'moves_left', greatest(p_max_moves - v_booking.move_count, 0), 'consent_current', v_consent);",
+    );
+    expect(body).not.toMatch(/manage_token_digest', |meet_url|ashby_application_id|public_request_id/);
+  });
+
+  it('throttle_hit: closed inputs, one upsert in key order, capped hits, epoch-floored bucket', () => {
+    const body = functionBody('r1_meet_public_throttle_hit');
+    expect(body).toContain('if p_keys is null or array_ndims(p_keys) is distinct from 1 then');
+    expect(body).toContain('if cardinality(p_keys) not between 1 and 8');
+    expect(body).toContain("where k.key_digest is null or k.key_digest !~ '^[a-f0-9]{64}$')");
+    expect(body).toContain('or (select count(distinct k.key_digest) from unnest(p_keys) k(key_digest)) <> cardinality(p_keys) then');
+    expect(body).toContain('or cardinality(p_limits) <> cardinality(p_keys)');
+    expect(body).toContain('where l.hit_limit is null or l.hit_limit not between 1 and 100000) then');
+    expect(body).toContain('if p_window_sec is null or p_window_sec not between 60 and 86400 then');
+    expect(body).toContain(
+      'v_bucket := to_timestamp((floor(extract(epoch from p_now) / p_window_sec) * p_window_sec)::double precision);',
+    );
+    expect(body).toContain(
+      'insert into screening_v2.r1_meet_public_throttle as t (key_digest, bucket_start, hits) '
+      + 'select k.key_digest, v_bucket, 1 from unnest(p_keys) k(key_digest) order by k.key_digest '
+      + 'on conflict (key_digest, bucket_start) do update set hits = least(t.hits + 1, 1000000000) '
+      + 'returning t.key_digest, t.hits',
+    );
+    expect(body.match(/\binsert into\b/g)).toHaveLength(1);
+    expect(body).not.toMatch(/\bupdate screening_v2\.|\bdelete from\b/);
+    expect(body).toContain('where h.hits > k.hit_limit;');
+    expect(body).toContain("return jsonb_build_object('status', 'ok', 'over', to_jsonb(v_over));");
+  });
+
+  it('throttle_prune deletes the oldest buckets first, bounded, skipping held rows', () => {
+    const body = functionBody('r1_meet_public_throttle_prune');
+    expect(body).toContain('if p_older_than_sec is null or p_older_than_sec not between 3600 and 31536000 then');
+    expect(body).toContain('if p_limit is null or p_limit not between 1 and 5000 then');
+    expect(body).toContain(
+      'delete from screening_v2.r1_meet_public_throttle where (key_digest, bucket_start) in ( '
+      + 'select t.key_digest, t.bucket_start from screening_v2.r1_meet_public_throttle t '
+      + 'where t.bucket_start < p_now - make_interval(secs => p_older_than_sec) '
+      + 'order by t.bucket_start, t.key_digest limit p_limit for update skip locked);',
+    );
+    expect(body).toContain("return jsonb_build_object('status', 'ok', 'deleted', v_deleted);");
+  });
+});
+
 describe('migration 0143: clock, handlers and redeclarations', () => {
   it('reads no machine clock inside a function body and swallows no error', () => {
     const bodies = [...lc.matchAll(/\$\$([\s\S]*?)\$\$/g)].map((m) => m[1]!);
@@ -552,10 +982,70 @@ describe('migration 0143: wiring and the SQL suite', () => {
     }
   });
 
+  it('covers the T2 sections in order, after T1', () => {
+    let last = suite.indexOf('-- T1-H. ');
+    for (const section of ['-- T2-A. ', '-- T2-B. ', '-- T2-C. ', '-- T2-D. ', '-- T2-E. ', '-- T2-F. ', '-- T2-G. ', '-- T2-H. ']) {
+      expect(suite.split(section).length - 1, section).toBe(1);
+      expect(suite.indexOf(section), section).toBeGreaterThan(last);
+      last = suite.indexOf(section);
+    }
+    for (const label of [
+      'T2-A slot count 05:00-05:45: one public and one Ashby live booking; the touching ones are out',
+      'T2-A day count IST 2026-12-09: total 7 (5 live + attempt_settled + no_show), public 5',
+      'T2-A capacity day_counts: one entry per IST date, ascending',
+      'T2-A a 15-day window answers 16 ascending IST dates',
+      'T2-A target r1, max 3: least(3, greatest(browser pool, 1)), 1 with no pool',
+      'T2-A a 65-minute cap with a hold outstanding: admits false',
+      'T2-A no settings row: enabled false, paused false, admits false, effective concurrency 1',
+      'T2-B a link bound to another candidate: application_unknown',
+      'T2-B a terminal link and a DSAR hold: application_terminal first',
+      'T2-B a live browser round: already_booked',
+      'T2-B an in-progress lapsed Meet round: already_booked',
+      'T2-B ... HR cancels that booking (round, consent untouched), and the candidate is eligible',
+      'T2-B an expirable lapsed Meet round (unstarted, unused): eligible',
+      'T2-B the round HR grant-retake leaves (invited, 1 of 2 attempts, 1 start): eligible',
+      'T2-B a completed R1 and an expirable lapsed round: r1_completed',
+      'T2-B a completed R1 while paused: r1_completed first',
+      'T2-B a pending phone assessment: phone_assessment_pending',
+      'T2-B the newest release has no en-IN notice: consent_template_unavailable',
+      'T2-B the same cap with a reusable Meet round: eligible',
+      'T2-B the precheck writes nothing',
+      'T2-C setting the digest leaves updated_at and the status alone',
+      'T2-C a digest another booking holds',
+      'T2-D at start - cutoff: neither can_move nor can_cancel',
+      'T2-D a newer active release: consent_current false',
+      'T2-D a live Ashby booking holding the digest (CHECK lifted, rolled back): not_found',
+      'T2-E invited -> invited (a re-send) keeps the first invite time',
+      'T2-E the calendar moves left updated_at, the status and the jobs alone',
+      'T2-F exact over indexes, ascending: [0, 2]',
+      'T2-F duplicate keys: refused (field keys)',
+      'T2-G a limit of 2 deletes the two oldest buckets only',
+      'T2-H execute r1_meet_public_refusal',
+    ]) {
+      expect(suite, label).toContain(label);
+    }
+  });
+
   it('keeps the 0142 suite inserting valid Ashby rows (its full-row insert names the 0143 NOT NULL columns)', () => {
     const suite0142 = read('app/supabase/tests/r1_meet_bookings_assert.sql');
     const row = blockOf(suite0142, 'create function _r1_meet_tests.booking_row(', '$$;');
     expect(row).toContain("'source', 'ashby',");
     expect(row).toContain("'move_count', 0,");
+  });
+
+  it('leaves exactly the 0143 public function names out of the 0142 suite name guard, and pins them itself', () => {
+    const suite0142 = read('app/supabase/tests/r1_meet_bookings_assert.sql');
+    const guard = through(suite0142, "x.proname like 'r1\\_meet\\_%'", ' = (select array_agg(');
+    expect(guard).toContain(
+      "x.proname like 'r1\\_meet\\_%'\n        and x.proname not like 'r1\\_meet\\_public\\_%' "
+      + "and x.proname <> 'r1_meet_create_round_from_public')",
+    );
+    expect(suite0142.split("x.proname not like 'r1\\_meet\\_public\\_%'")).toHaveLength(2);
+    // The mirror guard here lists every r1_meet_public_* function of the file so far.
+    const mirror = through(suite, "x.proname like 'r1\\_meet\\_public\\_%')", ']) f));');
+    const listed = [...mirror.matchAll(/'screening_v2\.(r1_meet_public_[a-z_]+)\(([^)]*)\)'/g)].map((m) => `${m[1]}(${m[2]})`);
+    const declared = [...lc.matchAll(/create or replace function screening_v2\.(r1_meet_public_[a-z_]+)\(/g)].map((m) => m[1]!);
+    expect(listed.map((s) => s.split('(')[0])).toEqual(declared);
+    for (const fn of T2_FUNCTIONS) expect(listed, fn.name).toContain(`${fn.name}(${fn.types})`);
   });
 });
