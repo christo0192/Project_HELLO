@@ -3,6 +3,8 @@
  * URL families and the other pre-transport refusals (zero transport calls), the request it sends,
  * the default fetch transport (redirects never followed), the status map for the api and token
  * contexts with bounded retry hints, the deadline, the byte cap, and metadata-only logging.
+ * T3 adds `sendAuthorizedGoogleRequest` (the Calendar and Meet clients' one path): the URL check
+ * before any token, the Bearer header, the single 401 re-mint, `onNotFound`, and one log per call.
  *
  * Deterministic: the network is a scripted transport, or `fetch` spied (never a real request).
  * Nothing sleeps except the timeout cases, which use a 20 ms deadline. Fixtures are low-entropy.
@@ -34,6 +36,7 @@ import {
   isAllowedGoogleUrl,
   resolveGoogleMaxResponseBytes,
   resolveGoogleTimeoutMs,
+  sendAuthorizedGoogleRequest,
   sendGoogleRequest,
   type GoogleLogRecord,
   type GoogleSendOptions,
@@ -854,5 +857,154 @@ describe('metadata-only logging', () => {
     const text = corpus.join('\n');
     expect(text.length).toBeGreaterThan(1000);
     for (const canary of [BEARER, canaryId, canaryText, 'evil.example.test']) expect(text).not.toContain(canary);
+  });
+});
+
+// ── sendAuthorizedGoogleRequest (M035 S03 T3: the Calendar and Meet clients' one path) ──────────
+
+describe('sendAuthorizedGoogleRequest', () => {
+  /** A token provider that hands out numbered low-entropy tokens and counts its calls. */
+  function provider(fail?: unknown) {
+    const state = { minted: 0, invalidated: 0 };
+    return {
+      state,
+      tokens: {
+        accessToken: async () => {
+          if (fail !== undefined) throw fail;
+          state.minted += 1;
+          return `at-core-${state.minted}-${'c'.repeat(16)}`;
+        },
+        invalidate: () => {
+          state.invalidated += 1;
+        },
+      },
+    };
+  }
+  const parseOk = { parse: (result: { status: number; json: unknown }) => result.json };
+
+  it('refuses a URL outside the families before any token is minted (one failure log, zero calls)', async () => {
+    const { state, tokens } = provider();
+    const { transport, calls } = scripted([res(200, '{}')]);
+    const logs: GoogleLogRecord[] = [];
+    const error = await sendAuthorizedGoogleRequest(
+      { operation: 'calendar.get', method: 'GET', url: 'https://www.googleapis.com/calendar/v3/users/me/calendarList' },
+      tokens,
+      { transport, logger: { event: (record) => logs.push(record) } },
+      parseOk,
+    ).catch((err: unknown) => err as GoogleError);
+    expect(error).toBeInstanceOf(GoogleError);
+    expect((error as GoogleError).code).toBe('invalid_request');
+    expect(state.minted).toBe(0);
+    expect(calls).toHaveLength(0);
+    expect(logs).toEqual([{ operation: 'calendar.get', outcome: 'failure', code: 'invalid_request', durationMs: expect.any(Number) }]);
+    // An unknown operation is refused without a log record.
+    await expect(
+      sendAuthorizedGoogleRequest({ operation: 'calendar.list' as never, method: 'GET', url: EVENT_URL }, tokens, { transport }, parseOk),
+    ).rejects.toMatchObject({ code: 'invalid_request' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('sends the Bearer token and JSON content type; logs one success record', async () => {
+    const { tokens } = provider();
+    const { transport, calls } = scripted([res(200, { name: 'spaces/x' })]);
+    const logs: GoogleLogRecord[] = [];
+    const value = await sendAuthorizedGoogleRequest(
+      { operation: 'meet.patch', method: 'PATCH', url: OPEN_URL, body: '{"config":{"accessType":"OPEN"}}' },
+      tokens,
+      { transport, logger: { event: (record) => logs.push(record) } },
+      parseOk,
+    );
+    expect(value).toEqual({ name: 'spaces/x' });
+    expect(calls[0]!.headers).toEqual({
+      accept: 'application/json',
+      'content-type': 'application/json',
+      authorization: `Bearer at-core-1-${'c'.repeat(16)}`,
+    });
+    expect(logs).toEqual([{ operation: 'meet.patch', outcome: 'success', httpStatus: 200, durationMs: expect.any(Number) }]);
+  });
+
+  it('401: invalidate once, mint once more, retry once; a second 401 is unauthorized', async () => {
+    const ok = provider();
+    const once = scripted([res(401), res(200, '{}')]);
+    await sendAuthorizedGoogleRequest({ operation: 'calendar.get', method: 'GET', url: EVENT_URL }, ok.tokens, { transport: once.transport }, parseOk);
+    expect(ok.state).toEqual({ minted: 2, invalidated: 1 });
+    expect(once.calls.map((call) => call.headers.authorization)).toEqual([
+      `Bearer at-core-1-${'c'.repeat(16)}`,
+      `Bearer at-core-2-${'c'.repeat(16)}`,
+    ]);
+
+    const twice = provider();
+    const always = scripted([res(401)]);
+    const logs: GoogleLogRecord[] = [];
+    const error = await sendAuthorizedGoogleRequest(
+      { operation: 'calendar.get', method: 'GET', url: EVENT_URL },
+      twice.tokens,
+      { transport: always.transport, logger: { event: (record) => logs.push(record) } },
+      parseOk,
+    ).catch((err: unknown) => err as GoogleError);
+    expect((error as GoogleError).code).toBe('unauthorized');
+    expect(always.calls).toHaveLength(2);
+    expect(twice.state).toEqual({ minted: 2, invalidated: 1 });
+    expect(logs).toHaveLength(1);
+  });
+
+  it('a provider whose invalidate throws still gets the single retry', async () => {
+    const { tokens } = provider();
+    const throwing = { ...tokens, invalidate: () => { throw new Error('nope'); } };
+    const { transport, calls } = scripted([res(401), res(200, '{}')]);
+    await expect(
+      sendAuthorizedGoogleRequest({ operation: 'calendar.get', method: 'GET', url: EVENT_URL }, throwing, { transport }, parseOk),
+    ).resolves.toEqual({});
+    expect(calls).toHaveLength(2);
+  });
+
+  it('onNotFound turns a final 404 / 410 into a value logged as a success; without it not_found is thrown', async () => {
+    for (const status of [404, 410]) {
+      const { tokens } = provider();
+      const { transport } = scripted([res(status)]);
+      const logs: GoogleLogRecord[] = [];
+      const value = await sendAuthorizedGoogleRequest(
+        { operation: 'calendar.delete', method: 'DELETE', url: `${EVENT_URL}?sendUpdates=none` },
+        tokens,
+        { transport, logger: { event: (record) => logs.push(record) } },
+        { parse: () => 'deleted', onNotFound: () => 'gone' },
+      );
+      expect(value).toBe('gone');
+      expect(logs).toEqual([{ operation: 'calendar.delete', outcome: 'success', httpStatus: status, durationMs: expect.any(Number) }]);
+    }
+    const { tokens } = provider();
+    const { transport } = scripted([res(404)]);
+    await expect(
+      sendAuthorizedGoogleRequest({ operation: 'calendar.get', method: 'GET', url: EVENT_URL }, tokens, { transport }, parseOk),
+    ).rejects.toMatchObject({ code: 'not_found', httpStatus: 404 });
+  });
+
+  it('a parse that throws something else is malformed_response with the 2xx status', async () => {
+    const { tokens } = provider();
+    const { transport } = scripted([res(200, '{}')]);
+    await expect(
+      sendAuthorizedGoogleRequest({ operation: 'calendar.get', method: 'GET', url: EVENT_URL }, tokens, { transport }, {
+        parse: () => {
+          throw new Error(`leak ${BEARER}`);
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'malformed_response', httpStatus: 200, message: 'google_malformed_response' });
+  });
+
+  it('a token failure propagates unchanged with zero API calls; a non-Google failure is unavailable', async () => {
+    const revoked = new GoogleError('auth_revoked', { operation: 'token.refresh', httpStatus: 400 });
+    const { transport, calls } = scripted([res(200, '{}')]);
+    await expect(
+      sendAuthorizedGoogleRequest({ operation: 'calendar.get', method: 'GET', url: EVENT_URL }, provider(revoked).tokens, { transport }, parseOk),
+    ).rejects.toBe(revoked);
+    await expect(
+      sendAuthorizedGoogleRequest(
+        { operation: 'calendar.get', method: 'GET', url: EVENT_URL },
+        provider(new Error('boom')).tokens,
+        { transport },
+        parseOk,
+      ),
+    ).rejects.toMatchObject({ code: 'unavailable', retryAfterMs: 5000 });
+    expect(calls).toHaveLength(0);
   });
 });

@@ -12,8 +12,28 @@
  *   `invalid_grant`); `sub` must be the Dex email and every `scope` claim a granted scope (else 401
  *   `unauthorized_client`, Google's answer for an undelegated client or scope). No `scope` in the
  *   answer, like Google.
- * - Any other URL answers 404 with a Google-style JSON error (T3 adds Calendar and Meet).
  * - `failNext` injects one canned response for the next call, served ahead of the simulation.
+ *
+ * T3 adds Dex's primary calendar and the Meet spaces. Every API call must carry
+ * `authorization: Bearer <a token this fake issued and has not expired>` (else 401, like Google), so
+ * the 401 re-mint path is testable (`expireAccessTokens()`), and a token only reaches what its scopes
+ * allow (else 403 `ACCESS_TOKEN_SCOPE_INSUFFICIENT`):
+ * - `POST /calendar/v3/calendars/primary/events`: stores the event (an id used before, deleted or
+ *   not, is 409 `duplicate`), answers the Google shape with `organizer.email` = the Dex email (or
+ *   `organizerEmail`), and with a `conferenceData.createRequest` the conference is `pending` on the
+ *   insert answer and on every get before the `conferenceReadyAfterGets`-th one (default 1, so the
+ *   first get; 0 = ready on the insert answer), which and later ones answer `success` with a
+ *   `conferenceId`, a `hangoutLink` and a Meet space (`TRUSTED` unless
+ *   `defaultAccessType`). Without `conferenceDataVersion=1` the create request is ignored, like
+ *   Google (so a test proves the client sends it). `conferenceFails` makes it `failure` instead. Extra Google fields (etag, htmlLink, entry points, signature, creator,
+ *   extended properties...) are in every answer, so tests can prove the parser drops them.
+ * - `GET|PATCH|DELETE .../events/<id>`: 404 for an unknown id, 410 once deleted. PATCH replaces
+ *   each given top-level field and `attendees` wholesale (Google's array rule) and keeps the
+ *   conference; DELETE answers 204.
+ * - `GET /v2/spaces/<meeting code>` and `GET /v2/spaces/<id>`; `PATCH /v2/spaces/<id>` honours
+ *   `updateMask` (`config.accessType` sets only that field; `*` and a meeting code are 400
+ *   `INVALID_ARGUMENT`); `POST /v2/spaces` creates a space from the body's config.
+ * - Any other URL answers 404 with a Google-style JSON error.
  *
  * `calls` records `{method, url, path, query, headers, body}`: the authorization value replaced by
  * `<redacted>`, a form body decoded to an object, a JSON body parsed, anything else null. Access
@@ -29,7 +49,11 @@ import type {
   GoogleTransportRequest,
   GoogleTransportResponse,
 } from '../../integrations/google/http.js';
-import { GOOGLE_TOKEN_URL } from '../../integrations/google/http.js';
+import {
+  GOOGLE_CALENDAR_EVENTS_URL,
+  GOOGLE_MEET_API_URL,
+  GOOGLE_TOKEN_URL,
+} from '../../integrations/google/http.js';
 import { GOOGLE_JWT_BEARER_GRANT_TYPE, GOOGLE_SCOPES } from '../../integrations/google/token.js';
 
 /** Low-entropy fixtures (never a real-looking credential). */
@@ -77,6 +101,35 @@ export interface FakeGoogleOptions {
   expiresIn?: number;
   /** Clock in ms for the JWT `exp` check. */
   now?: () => number;
+  /** The organizer the calendar answers with. Default: the Dex email. */
+  organizerEmail?: string;
+  /** How many event gets answer `pending` before the conference is `success`. Default 1; 0 = at once. */
+  conferenceReadyAfterGets?: number;
+  /** The conference create request ends in `failure`. */
+  conferenceFails?: boolean;
+  /** The access type of a space that Calendar creates. Default `TRUSTED`. */
+  defaultAccessType?: FakeGoogleAccessType;
+}
+
+export type FakeGoogleAccessType = 'OPEN' | 'TRUSTED' | 'RESTRICTED';
+
+export interface FakeGoogleEvent {
+  id: string;
+  /** The stored fields as sent (insert, then each patch merged in). */
+  fields: Record<string, unknown>;
+  deleted: boolean;
+  /** How many GETs this event answered. */
+  gets: number;
+  sequence: number;
+  /** Set when the insert asked for a conference (with conferenceDataVersion=1). */
+  conference: { requestId: string; code: string; spaceName: string } | null;
+}
+
+export interface FakeGoogleSpace {
+  name: string;
+  meetingCode: string;
+  accessType: string;
+  entryPointAccess: string;
 }
 
 export interface FakeGoogle {
@@ -84,12 +137,20 @@ export interface FakeGoogle {
   calls: FakeGoogleCall[];
   /** Every access token issued, in order. */
   tokensIssued: string[];
+  /** Dex's primary calendar, by event id. */
+  events: ReadonlyMap<string, FakeGoogleEvent>;
+  /** The Meet spaces, by name. */
+  spaces: ReadonlyMap<string, FakeGoogleSpace>;
   /** Answer the NEXT call with this response instead of the simulated API. */
   failNext(response: FakeGoogleCannedResponse): void;
   /** The refresh token is revoked: the refresh grant now answers `invalid_grant`. */
   revokeRefreshToken(): void;
   /** Replace the granted scopes (both grants). */
   setGrantedScopes(scopes: readonly string[]): void;
+  /** Every access token issued so far stops working: the next API call with one answers 401. */
+  expireAccessTokens(): void;
+  /** Seed a Meet space directly (default `TRUSTED`, `ALL`). */
+  addSpace(config?: { accessType?: FakeGoogleAccessType; entryPointAccess?: 'ALL' | 'CREATOR_APP_ONLY' }): FakeGoogleSpace;
 }
 
 export function fakeGoogleResponse(
@@ -147,10 +208,15 @@ export function createFakeGoogle(options: FakeGoogleOptions = {}): FakeGoogle {
   const canned: FakeGoogleCannedResponse[] = [];
   let grantedScopes: readonly string[] = [...(options.grantedScopes ?? FAKE_GOOGLE_DEFAULT_SCOPES)];
   let revoked = false;
+  /** The access tokens that still work, with the scopes each one carries. */
+  const liveTokens = new Map<string, readonly string[]>();
+  const events = new Map<string, FakeGoogleEvent>();
+  const spaces = new Map<string, FakeGoogleSpace>();
 
-  const issue = (): string => {
+  const issue = (scopes: readonly string[] = grantedScopes): string => {
     const token = `at-${tokensIssued.length + 1}-${'a'.repeat(24)}`;
     tokensIssued.push(token);
+    liveTokens.set(token, [...scopes]);
     return token;
   };
 
@@ -198,7 +264,229 @@ export function createFakeGoogle(options: FakeGoogleOptions = {}): FakeGoogle {
     if (requested.length === 0 || requested.some((scope) => !grantedScopes.includes(scope))) {
       return oauthError(401, 'unauthorized_client', 'Client is unauthorized for the requested scopes.');
     }
-    return { status: 200, body: { access_token: issue(), expires_in: expiresIn, token_type: 'Bearer' } };
+    return { status: 200, body: { access_token: issue(requested), expires_in: expiresIn, token_type: 'Bearer' } };
+  };
+
+  // ── Calendar (Dex's primary calendar) ─────────────────────────────────────
+
+  const organizerEmail = options.organizerEmail ?? dexEmail;
+  const readyAfterGets = options.conferenceReadyAfterGets ?? 1;
+  const defaultAccessType: FakeGoogleAccessType = options.defaultAccessType ?? 'TRUSTED';
+  let spaceCounter = 0;
+
+  /** A deterministic meeting code `xxx-xxxx-xxx` for the n-th space. */
+  const meetingCodeFor = (n: number): string => {
+    let value = n + 26 ** 6;
+    let letters = '';
+    for (let i = 0; i < 10; i += 1) {
+      letters = String.fromCharCode(97 + (value % 26)) + letters;
+      value = Math.floor(value / 26);
+    }
+    return `${letters.slice(0, 3)}-${letters.slice(3, 7)}-${letters.slice(7)}`;
+  };
+
+  const newSpace = (accessType: string, entryPointAccess: string): FakeGoogleSpace => {
+    spaceCounter += 1;
+    const space: FakeGoogleSpace = {
+      name: `spaces/fake-space-${spaceCounter}`,
+      meetingCode: meetingCodeFor(spaceCounter),
+      accessType,
+      entryPointAccess,
+    };
+    spaces.set(space.name, space);
+    return space;
+  };
+
+  const googleError = (status: number, statusWord: string, message: string, extra: Record<string, unknown> = {}) => ({
+    status,
+    body: { error: { code: status, message, status: statusWord, ...extra } },
+  });
+  const calendarError = (status: number, reason: string, message: string) => ({
+    status,
+    body: { error: { code: status, message, errors: [{ domain: 'global', reason, message }] } },
+  });
+
+  const conferenceStatus = (event: FakeGoogleEvent): 'pending' | 'success' | 'failure' => {
+    if (options.conferenceFails) return 'failure';
+    return event.gets >= readyAfterGets ? 'success' : 'pending';
+  };
+
+  const eventJson = (event: FakeGoogleEvent): Record<string, unknown> => {
+    const fields = event.fields;
+    const out: Record<string, unknown> = {
+      kind: 'calendar#event',
+      etag: `"${3_000_000_000_000 + event.sequence}"`,
+      id: event.id,
+      status: 'confirmed',
+      htmlLink: `https://www.google.com/calendar/event?eid=${event.id}`,
+      summary: fields.summary,
+      description: fields.description,
+      creator: { email: organizerEmail, self: true },
+      organizer: { email: organizerEmail, self: true, displayName: 'Dex (AI Interviewer)' },
+      start: fields.start,
+      end: fields.end,
+      iCalUID: `${event.id}@google.com`,
+      sequence: event.sequence,
+      guestsCanInviteOthers: fields.guestsCanInviteOthers,
+      guestsCanModify: fields.guestsCanModify,
+      guestsCanSeeOtherGuests: fields.guestsCanSeeOtherGuests,
+      reminders: fields.reminders,
+      extendedProperties: fields.extendedProperties,
+      eventType: 'default',
+    };
+    if (fields.location !== undefined) out.location = fields.location;
+    if (Array.isArray(fields.attendees)) {
+      out.attendees = (fields.attendees as Record<string, unknown>[]).map((attendee) => ({
+        ...attendee,
+        responseStatus: 'needsAction',
+      }));
+    }
+    if (event.conference !== null) {
+      const status = conferenceStatus(event);
+      const conferenceData: Record<string, unknown> = {
+        createRequest: {
+          requestId: event.conference.requestId,
+          conferenceSolutionKey: { type: 'hangoutsMeet' },
+          status: { statusCode: status },
+        },
+      };
+      if (status === 'success') {
+        const link = `https://meet.google.com/${event.conference.code}`;
+        conferenceData.entryPoints = [{ entryPointType: 'video', uri: link, label: `meet.google.com/${event.conference.code}` }];
+        conferenceData.conferenceSolution = { key: { type: 'hangoutsMeet' }, name: 'Google Meet' };
+        conferenceData.conferenceId = event.conference.code;
+        conferenceData.signature = 'sig-' + 'x'.repeat(20);
+        out.hangoutLink = link;
+      }
+      out.conferenceData = conferenceData;
+    }
+    return out;
+  };
+
+  const calendarEventsPath = new URL(GOOGLE_CALENDAR_EVENTS_URL).pathname;
+  const EVENT_ID_RE = /^[a-v0-9]{5,1024}$/;
+
+  const calendar = (req: GoogleTransportRequest, url: URL, body: unknown): { status: number; body?: unknown } => {
+    const query = url.searchParams;
+    if (url.pathname === calendarEventsPath) {
+      if (req.method !== 'POST') return calendarError(405, 'httpMethodNotAllowed', 'Method not allowed.');
+      const fields = (body && typeof body === 'object' && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
+      const id = fields.id;
+      if (typeof id !== 'string' || !EVENT_ID_RE.test(id)) return calendarError(400, 'invalid', 'Invalid resource id value.');
+      if (events.has(id)) return calendarError(409, 'duplicate', 'The requested identifier already exists.');
+      const request = (fields.conferenceData as { createRequest?: { requestId?: unknown } } | undefined)?.createRequest;
+      let conference: FakeGoogleEvent['conference'] = null;
+      if (request !== undefined && query.get('conferenceDataVersion') === '1') {
+        const space = newSpace(defaultAccessType, 'ALL');
+        conference = { requestId: String(request.requestId), code: space.meetingCode, spaceName: space.name };
+      }
+      const stored = { ...fields };
+      delete stored.conferenceData;
+      const event: FakeGoogleEvent = { id, fields: stored, deleted: false, gets: 0, sequence: 0, conference };
+      events.set(id, event);
+      return { status: 200, body: eventJson(event) };
+    }
+    const id = url.pathname.slice(calendarEventsPath.length + 1);
+    const event = events.get(id);
+    if (event === undefined) return calendarError(404, 'notFound', 'Not Found');
+    if (event.deleted) return calendarError(410, 'deleted', 'Resource has been deleted');
+    if (req.method === 'GET') {
+      event.gets += 1;
+      return { status: 200, body: eventJson(event) };
+    }
+    if (req.method === 'PATCH') {
+      const patch = (body && typeof body === 'object' && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
+      for (const [key, value] of Object.entries(patch)) {
+        // Google: unspecified fields are kept, and a given array REPLACES the stored one.
+        if (key === 'conferenceData' || key === 'id') continue;
+        event.fields[key] = value;
+      }
+      if ('start' in patch || 'end' in patch) event.sequence += 1;
+      return { status: 200, body: eventJson(event) };
+    }
+    if (req.method === 'DELETE') {
+      event.deleted = true;
+      return { status: 204 };
+    }
+    return calendarError(405, 'httpMethodNotAllowed', 'Method not allowed.');
+  };
+
+  // ── Meet spaces ───────────────────────────────────────────────────────────
+
+  const MEETING_CODE_RE = /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/;
+  const ACCESS_TYPES = ['OPEN', 'TRUSTED', 'RESTRICTED'];
+  const ENTRY_POINT_ACCESS = ['ALL', 'CREATOR_APP_ONLY'];
+  const meetSpacesPath = new URL(`${GOOGLE_MEET_API_URL}spaces`).pathname;
+
+  const spaceJson = (space: FakeGoogleSpace): Record<string, unknown> => ({
+    name: space.name,
+    meetingUri: `https://meet.google.com/${space.meetingCode}`,
+    meetingCode: space.meetingCode,
+    config: {
+      accessType: space.accessType,
+      entryPointAccess: space.entryPointAccess,
+      moderation: 'OFF',
+      attendanceReportGenerationType: 'DO_NOT_GENERATE',
+    },
+  });
+  const invalidArgument = (message: string) => googleError(400, 'INVALID_ARGUMENT', message);
+  const spaceNotFound = () => googleError(404, 'NOT_FOUND', 'Requested entity was not found.');
+
+  const meet = (req: GoogleTransportRequest, url: URL, body: unknown): { status: number; body?: unknown } => {
+    const config = ((body as { config?: unknown } | null)?.config ?? {}) as Record<string, unknown>;
+    if (url.pathname === meetSpacesPath) {
+      if (req.method !== 'POST') return googleError(405, 'UNIMPLEMENTED', 'Method not allowed.');
+      const accessType = config.accessType ?? defaultAccessType;
+      const entryPointAccess = config.entryPointAccess ?? 'ALL';
+      if (!ACCESS_TYPES.includes(String(accessType)) || !ENTRY_POINT_ACCESS.includes(String(entryPointAccess))) {
+        return invalidArgument('Invalid space config.');
+      }
+      return { status: 200, body: spaceJson(newSpace(String(accessType), String(entryPointAccess))) };
+    }
+    const key = url.pathname.slice(meetSpacesPath.length + 1);
+    const byCode = MEETING_CODE_RE.test(key);
+    if (req.method === 'GET') {
+      const space = byCode ? [...spaces.values()].find((item) => item.meetingCode === key) : spaces.get(`spaces/${key}`);
+      return space === undefined ? spaceNotFound() : { status: 200, body: spaceJson(space) };
+    }
+    if (req.method === 'PATCH') {
+      // Updates need the `spaces/<id>` name; the meeting-code alias is for reads only.
+      if (byCode) return invalidArgument('Space name must be in the format spaces/{space}.');
+      const space = spaces.get(`spaces/${key}`);
+      if (space === undefined) return spaceNotFound();
+      const mask = url.searchParams.get('updateMask');
+      if (mask === '*') return invalidArgument('Wildcard update masks are not allowed in this fake.');
+      const paths = mask === null || mask === '' ? ['config.accessType', 'config.entryPointAccess'] : mask.split(',');
+      const next = { ...space };
+      for (const path of paths) {
+        if (path === 'config.accessType') {
+          if (config.accessType === undefined && mask === null) continue;
+          if (!ACCESS_TYPES.includes(String(config.accessType))) return invalidArgument('Invalid access type.');
+          next.accessType = String(config.accessType);
+        } else if (path === 'config.entryPointAccess') {
+          if (config.entryPointAccess === undefined && mask === null) continue;
+          if (!ENTRY_POINT_ACCESS.includes(String(config.entryPointAccess))) return invalidArgument('Invalid entry point access.');
+          next.entryPointAccess = String(config.entryPointAccess);
+        } else {
+          return invalidArgument('Unknown update mask path.');
+        }
+      }
+      Object.assign(space, next);
+      return { status: 200, body: spaceJson(space) };
+    }
+    return googleError(405, 'UNIMPLEMENTED', 'Method not allowed.');
+  };
+
+  // ── Routing ───────────────────────────────────────────────────────────────
+
+  const calendarOrigin = new URL(GOOGLE_CALENDAR_EVENTS_URL).origin;
+  const meetOrigin = new URL(GOOGLE_MEET_API_URL).origin;
+
+  /** The scopes an API request needs (any one of them). */
+  const neededScopes = (req: GoogleTransportRequest, url: URL): readonly string[] => {
+    if (url.origin === calendarOrigin) return [GOOGLE_SCOPES.calendarEventsOwned];
+    if (req.method === 'POST') return [GOOGLE_SCOPES.meetSpaceCreated];
+    return [GOOGLE_SCOPES.meetSpaceSettings, GOOGLE_SCOPES.meetSpaceCreated];
   };
 
   const simulate = (req: GoogleTransportRequest, url: URL, body: unknown): { status: number; body?: unknown } => {
@@ -209,7 +497,22 @@ export function createFakeGoogle(options: FakeGoogleOptions = {}): FakeGoogle {
       if (form.grant_type === GOOGLE_JWT_BEARER_GRANT_TYPE) return jwtBearerGrant(form);
       return oauthError(400, 'unsupported_grant_type', 'Invalid grant_type.');
     }
-    return { status: 404, body: { error: { code: 404, message: 'Requested entity was not found.', status: 'NOT_FOUND' } } };
+    const isCalendar = url.origin === calendarOrigin && url.pathname.startsWith(calendarEventsPath);
+    const isMeet = url.origin === meetOrigin && url.pathname.startsWith(meetSpacesPath);
+    if (!isCalendar && !isMeet) return spaceNotFound();
+
+    const authorization = lowerHeaders(req.headers).authorization ?? '';
+    const bearer = authorization.startsWith('Bearer ') ? authorization.slice('Bearer '.length) : '';
+    const scopes = liveTokens.get(bearer);
+    if (scopes === undefined) {
+      return googleError(401, 'UNAUTHENTICATED', 'Request had invalid authentication credentials.');
+    }
+    if (!neededScopes(req, url).some((scope) => scopes.includes(scope))) {
+      return googleError(403, 'PERMISSION_DENIED', 'Request had insufficient authentication scopes.', {
+        details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'ACCESS_TOKEN_SCOPE_INSUFFICIENT' }],
+      });
+    }
+    return isCalendar ? calendar(req, url, body) : meet(req, url, body);
   };
 
   const transport: GoogleTransport = async (req) => {
@@ -234,6 +537,8 @@ export function createFakeGoogle(options: FakeGoogleOptions = {}): FakeGoogle {
     transport,
     calls,
     tokensIssued,
+    events,
+    spaces,
     failNext(response) {
       canned.push(response);
     },
@@ -242,6 +547,12 @@ export function createFakeGoogle(options: FakeGoogleOptions = {}): FakeGoogle {
     },
     setGrantedScopes(scopes) {
       grantedScopes = [...scopes];
+    },
+    expireAccessTokens() {
+      liveTokens.clear();
+    },
+    addSpace(config = {}) {
+      return newSpace(config.accessType ?? defaultAccessType, config.entryPointAccess ?? 'ALL');
     },
   };
 }

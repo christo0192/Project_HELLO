@@ -262,9 +262,10 @@ function sourceFiles(directory: string): string[] {
 
 /**
  * M034: the vendor modules R1-over-Meet uses. They sit outside lib/r1 but are R1 code. The booking
- * source is Ashby (D-M034-11), so there is no booking-vendor module.
+ * source is Ashby (D-M034-11), so there is no booking-vendor module. M035 S03 adds the Google
+ * Calendar and Meet client for Dex (integrations/google), fenced the same way.
  */
-const meetVendorDirs = ['recall', 'google-meet'].map((name) => path.join(src, 'integrations', name));
+const meetVendorDirs = ['recall', 'google-meet', 'google'].map((name) => path.join(src, 'integrations', name));
 const meetVendorSources = meetVendorDirs.flatMap((directory) => sourceFiles(directory));
 /**
  * The Meet routes (routes/, outside lib/r1, but R1 code: critic C6): the Recall webhook receivers
@@ -349,6 +350,10 @@ describe('R1 source fences', () => {
     for (const name of ['config.ts', 'profiles.ts']) {
       expect(r1Sources, name).toContain(path.join(src, 'lib', 'r1', 'meet', name));
     }
+    // M035 S03: the Google Calendar and Meet client for Dex is a fenced Meet vendor module.
+    for (const name of ['calendar.ts', 'client.ts', 'errors.ts', 'http.ts', 'meet.ts', 'token.ts']) {
+      expect(meetVendorSources, name).toContain(path.join(src, 'integrations', 'google', name));
+    }
     // M034 S03: the Recall receivers are fenced like lib/r1 (no egress, no legacy consent, no
     // quoted livekit literal).
     const recallRoute = path.join(src, 'routes', 'recall-webhook.ts');
@@ -403,9 +408,9 @@ describe('R1 source fences', () => {
     ];
     expect(phoneFiles.length).toBeGreaterThan(0);
     for (const file of phoneFiles) {
-      // M034: nor the R1-over-Meet vendor modules.
+      // M034: nor the R1-over-Meet vendor modules (M035 S03: the Google client for Dex too).
       expect(readFileSync(file, 'utf8'), file).not.toMatch(
-        /lib\/r1\/|routes\/r1|r1-candidate|integrations\/(?:recall|google-meet)/,
+        /lib\/r1\/|routes\/r1|r1-candidate|integrations\/(?:recall|google-meet|google)(?![\w-])/,
       );
     }
   });

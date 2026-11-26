@@ -1,8 +1,9 @@
 /**
  * google/http.ts — the shared, single-attempt HTTP core of the Google client for Dex (M035 S03).
  *
- * OUTBOUND BOUNDARY, DARK. Nothing imports this at runtime yet; the token sources, the Calendar
- * client and the Meet client send through `sendGoogleRequest`. It reads NO environment.
+ * OUTBOUND BOUNDARY, DARK. Nothing imports this at runtime yet; the token sources send through
+ * `sendGoogleRequest`, the Calendar and Meet clients through `sendAuthorizedGoogleRequest` (the
+ * Bearer token, the single re-mint on a 401, one log record per public call). It reads NO environment.
  *
  * What it guarantees (S03 plan R2, R5, R6, R16):
  * - Only three URL families are ever requested: exactly `https://oauth2.googleapis.com/token`
@@ -648,5 +649,133 @@ export async function sendGoogleRequest<T>(
     throw failure;
   }
   emitGoogleLog(logger, { operation: op, startedAt, httpStatus: result.status });
+  return value;
+}
+
+// ── Authorized API calls (Calendar, Meet) ───────────────────────────────────
+
+/** What the Calendar and Meet clients need from a token source (structurally a `GoogleTokenSource`). */
+export interface GoogleAccessTokenProvider {
+  accessToken(): Promise<string>;
+  invalidate(): void;
+}
+
+/** One Calendar or Meet request, built by the client from already-validated input. */
+export interface GoogleApiRequest {
+  operation: GoogleOperation;
+  method: GoogleHttpMethod;
+  url: string;
+  /** JSON text, sent with `content-type: application/json`. Absent on GET and DELETE. */
+  body?: string;
+}
+
+export interface GoogleApiCall<T> {
+  /** Map the parsed 2xx. A `GoogleError` it throws is the outcome; anything else is `malformed_response`. */
+  parse: (result: GoogleSendResult) => T;
+  /** When given, a final `not_found` (404 / 410) resolves this value instead, logged as a success. */
+  onNotFound?: () => T;
+}
+
+/** What an access token must look like before it is put into an Authorization header. */
+const API_ACCESS_TOKEN_RE = /^[\x21-\x7e]{1,4096}$/;
+
+/**
+ * One public Calendar or Meet call (S03 plan R5, R16): the URL family is checked BEFORE any token is
+ * minted (a refused call makes zero transport calls of any kind), then a token is taken from
+ * `tokens` and the request is sent once. On a 401 the cached token is dropped (`invalidate()`), ONE
+ * new token is minted and the same request is sent ONE more time; a second 401 is `unauthorized`. A
+ * token-source failure (`auth_revoked`, `setup_forbidden`, ...) propagates unchanged, with zero API
+ * requests. With a logger, exactly ONE record is emitted for the call, carrying the final outcome
+ * (the token source logs its own mint attempts separately, when it was given a logger).
+ */
+export async function sendAuthorizedGoogleRequest<T>(
+  request: GoogleApiRequest,
+  tokens: GoogleAccessTokenProvider,
+  options: GoogleSendOptions,
+  call: GoogleApiCall<T>,
+): Promise<T> {
+  const startedAt = Date.now();
+  const operation = request.operation;
+  const logger = options.logger;
+  const failed = (failure: GoogleError): GoogleError => {
+    emitGoogleLog(logger, { operation, startedAt, error: failure });
+    return failure;
+  };
+
+  if (!(GOOGLE_OPERATIONS as readonly unknown[]).includes(operation)) throw new GoogleError('invalid_request');
+  if (!METHODS.includes(request.method) || !isAllowedGoogleUrl(request.method, request.url)) {
+    throw failed(new GoogleError('invalid_request', { operation }));
+  }
+
+  // The per-attempt sends log nothing: this function emits the one record of the public call.
+  const sendOptions: GoogleSendOptions = {};
+  if (options.transport !== undefined) sendOptions.transport = options.transport;
+  if (options.timeoutMs !== undefined) sendOptions.timeoutMs = options.timeoutMs;
+  if (options.maxResponseBytes !== undefined) sendOptions.maxResponseBytes = options.maxResponseBytes;
+  const baseHeaders: Record<string, string> =
+    request.body === undefined ? {} : { 'content-type': 'application/json' };
+
+  let result: GoogleSendResult | undefined;
+  for (let attempt = 1; result === undefined; attempt += 1) {
+    let token: unknown;
+    try {
+      token = await tokens.accessToken();
+    } catch (error) {
+      throw failed(
+        error instanceof GoogleError
+          ? error
+          : new GoogleError('unavailable', { operation, retryAfterMs: GOOGLE_DEFAULT_RETRY_AFTER_MS.network }),
+      );
+    }
+    if (typeof token !== 'string' || !API_ACCESS_TOKEN_RE.test(token)) {
+      throw failed(new GoogleError('malformed_response', { operation }));
+    }
+    const send: GoogleSendRequest = {
+      operation,
+      context: 'api',
+      method: request.method,
+      url: request.url,
+      headers: { ...baseHeaders, authorization: `Bearer ${token}` },
+    };
+    if (request.body !== undefined) send.body = request.body;
+    try {
+      result = await sendGoogleRequest(send, sendOptions);
+    } catch (error) {
+      const failure =
+        error instanceof GoogleError
+          ? error
+          : new GoogleError('unavailable', { operation, retryAfterMs: GOOGLE_DEFAULT_RETRY_AFTER_MS.network });
+      if (failure.code === 'unauthorized' && attempt === 1) {
+        // The token was not accepted: drop it, mint ONE new token, send ONE more time.
+        try {
+          tokens.invalidate();
+        } catch {
+          // A provider that cannot invalidate still gets the single retry.
+        }
+        continue;
+      }
+      if (failure.code === 'not_found' && call.onNotFound !== undefined) {
+        const value = call.onNotFound();
+        const entry: { operation: GoogleOperation; startedAt: number; httpStatus?: number } = { operation, startedAt };
+        if (failure.httpStatus !== null) entry.httpStatus = failure.httpStatus;
+        emitGoogleLog(logger, entry);
+        return value;
+      }
+      throw failed(failure);
+    }
+  }
+
+  const final: GoogleSendResult = result;
+  let value: T;
+  try {
+    value = call.parse(final);
+  } catch (error) {
+    throw failed(
+      error instanceof GoogleError
+        ? error
+        : new GoogleError('malformed_response', { operation, httpStatus: final.status }),
+    );
+  }
+  emitGoogleLog(logger, { operation, startedAt, httpStatus: final.status });
   return value;
 }
