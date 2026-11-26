@@ -122,8 +122,12 @@ function sanitizeName(value: string): string | null {
   return name;
 }
 
-/** Trimmed, bounded, exactly one `@` with text either side, nothing invisible. */
-function sanitizeEmail(value: string): string | null {
+/**
+ * Trimmed, bounded, exactly one `@` with text either side, nothing invisible.
+ * Exported so the M035 public booking matcher applies these same rules to a
+ * typed address (it adds NFC and lower-casing on top; it never copies them).
+ */
+export function sanitizeEmail(value: string): string | null {
   const email = value.trim();
   if (email.length > MAX_PROFILE_EMAIL_LEN || EMAIL_FORBIDDEN_RE.test(email)) return null;
   const at = email.indexOf('@');
