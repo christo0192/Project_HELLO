@@ -21,6 +21,7 @@ on:
       - 'scripts/test-ashby-impact.sh'
       - 'scripts/test-r1-meet.sh'
       - 'scripts/test-r1-meet-public.sh'
+      - 'scripts/test-r1-meet-public-concurrency.sh'
       - 'scripts/phone-canary/**'
       - 'docs/runbooks/synthetic-*.md'
       - 'docs/runbooks/supabase-*.md'
@@ -53,6 +54,7 @@ on:
       - 'scripts/test-ashby-impact.sh'
       - 'scripts/test-r1-meet.sh'
       - 'scripts/test-r1-meet-public.sh'
+      - 'scripts/test-r1-meet-public-concurrency.sh'
       - 'scripts/phone-canary/**'
       - 'docs/runbooks/synthetic-*.md'
       - 'docs/runbooks/supabase-*.md'
@@ -222,6 +224,20 @@ jobs:
       # pool-capped, Cloud and the default, a second tab, the 65-minute charge, retire vs claim.
       - name: Concurrent R1 admission and pool retire 0131 (isolated real Postgres, parallel sessions)
         run: bash scripts/test-r1-concurrency.sh
+
+  r1-meet-public-race-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # 0143 (M035 S01) lets anyone holding the public booking link book an R1 Meet slot, from any
+      # number of tabs. Its advisory locks (the candidate's, then the slot's IST day) are the ONLY
+      # guard against two bookings for one candidate, a slot or a day over its limit and two rounds
+      # from one double click; r1_meet_public_bookings_assert.sql runs one call at a time and every
+      # vitest suite mocks Supabase, so only real parallel sessions prove them: two tabs, one request
+      # id twice, one seat, a full public day and two moves into one seat.
+      - name: Public R1 Meet booking create and move races 0143 (isolated real Postgres, parallel sessions)
+        run: bash scripts/test-r1-meet-public-concurrency.sh
 
   supabase-static-security:
     runs-on: ubuntu-latest

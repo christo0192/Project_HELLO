@@ -1,7 +1,9 @@
 /**
  * Static guarantees for migration 0143 (M035 S01: public R1 Meet bookings, one public booking
  * link). The behavioural SQL assertions run in supabase-ci
- * (app/supabase/tests/r1_meet_public_bookings_assert.sql, wired by scripts/test-r1-meet-public.sh);
+ * (app/supabase/tests/r1_meet_public_bookings_assert.sql, wired by scripts/test-r1-meet-public.sh),
+ * and the two-session races of the create and the move in its own job r1-meet-public-race-test
+ * (scripts/test-r1-meet-public-concurrency.sh, fixtures r1_meet_public_concurrency_setup.sql);
  * these text-level checks keep the file additive and dark, keep the one sanctioned DROP NOT NULL
  * exact, and keep the swapped CHECKs in step with 0142 (the reasons and their pairing) and with
  * the shared M035 contracts (the job payloads and dedup keys of section 5).
@@ -1834,5 +1836,206 @@ describe('migration 0143: wiring and the SQL suite', () => {
     // The retry is proved with a test-only trigger that is dropped again.
     expect(suite).toContain('create trigger t4_bump_round before update of status on screening_v2.r1_meet_bookings');
     expect(suite).toContain('drop trigger t4_bump_round on screening_v2.r1_meet_bookings;');
+  });
+});
+
+/** The arguments of the first `<callee>(...)` call in `text`, split on top-level commas only. */
+function callArgs(text: string, callee: string): string[] {
+  const start = text.indexOf(`${callee}(`);
+  expect(start, callee).toBeGreaterThan(-1);
+  const out: string[] = [];
+  let depth = 0;
+  let quoted = false;
+  let current = '';
+  for (let i = start + callee.length + 1; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === "'") quoted = !quoted;
+    if (!quoted && ch === '(') depth += 1;
+    if (!quoted && ch === ')') {
+      if (depth === 0) {
+        out.push(current.trim());
+        return out;
+      }
+      depth -= 1;
+    }
+    if (!quoted && depth === 0 && ch === ',') {
+      out.push(current.trim());
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  throw new Error(`unterminated call ${callee}`);
+}
+
+describe('migration 0143: T5 two-session race harness (CI)', () => {
+  const script = read('scripts/test-r1-meet-public-concurrency.sh');
+  const base = read('scripts/test-r1-concurrency.sh');
+  const setup = read('app/supabase/tests/r1_meet_public_concurrency_setup.sql');
+  const ci = read('.github/workflows/supabase-ci.yml');
+
+  /** The `race <tag> <key> <winner> <expected>` head of each race call, in script order. */
+  const races = [...script.matchAll(/^race (c[1-5]-[a-z-]+) ("[^"\n]+"|'[^'\n]+') '([^'\n]+)' \\\n {2}'([^'\n]+)' \\$/gm)]
+    .map((m) => ({ tag: m[1]!, key: m[2]!.slice(1, -1), win: m[3]!, expected: m[4]! }));
+
+  it('is its own throwaway Postgres: own container and log prefix, strict bash, the 0131 harness parts copied', () => {
+    expect(script.startsWith('#!/usr/bin/env bash\n')).toBe(true);
+    expect(script).toMatch(/^set -euo pipefail$/m);
+    expect(script).toContain('readonly CTR="r1-meet-public-race-pg-$$"');
+    expect(script).toContain("log() { printf '[r1-meet-public-race] %s %s\\n'");
+    expect(script).not.toContain('r1-concurrency-test-pg-');
+    expect(script).not.toContain('[r1-concurrency]');
+    // Readiness (3 consecutive TCP select 1), the Supabase role stubs and the apply-every-migration
+    // loop are the 0131 harness's, byte for byte.
+    for (const [start, end] of [
+      ['ready=0\nfor _ in $(seq 1 90); do', "log 'postgres is ready (3 consecutive TCP select 1)'"],
+      ["psql_q <<'SQL' >/dev/null\n", '\nSQL\n'],
+      ["log 'applying every migration in order...'", '\ndone\n'],
+      ['BLOCKER_PID=\'\'\nblocker_open() {', '\n}\nblocker_commit() {'],
+      ['blocker_commit() {', '\n}\n'],
+    ] as const) {
+      expect(through(script, start, end), start).toBe(through(base, start, end));
+    }
+    expect(script).not.toMatch(/docker exec [^\n]*pg_isready/);
+  });
+
+  it('applies every migration, then 0143 a second time (idempotency), then seeds its own fixtures', () => {
+    const every = script.indexOf('for f in "$MIG"/*.sql; do');
+    const again = script.indexOf("log 'applying 0143 a second time (idempotency)...'");
+    const seed = script.indexOf('psql_q < "$TESTS/r1_meet_public_concurrency_setup.sql"');
+    expect(every).toBeGreaterThan(-1);
+    expect(again).toBeGreaterThan(every);
+    expect(seed).toBeGreaterThan(again);
+    expect(script).toContain('target=("$MIG"/0143_*.sql)');
+    expect(script).toContain('[ "${#target[@]}" -eq 1 ] || fail "expected exactly one 0143_*.sql');
+    expect(script.slice(again, seed)).toContain('-f "/tmp/$(basename "${target[0]}")"');
+    expect(script.slice(again, seed)).toContain("fail '0143 is not idempotent'");
+    expect(script.split('ON_ERROR_STOP=1').length - 1).toBeGreaterThanOrEqual(6);
+  });
+
+  it('holds the RPC\'s own advisory key in a blocker and waits until every racer waits on it (pg_locks, at most 30 s)', () => {
+    expect(script).toContain("readonly RACER_OPTS='-c statement_timeout=60000'");
+    expect(script).toContain('-e "PGOPTIONS=$RACER_OPTS"');
+    expect(script).toContain(`"select pg_advisory_xact_lock(hashtextextended('$key', 0));"`);
+    const wait = through(script, 'await_advisory_waiters() {', '\n}\n');
+    expect(wait).toContain('for _ in $(seq 1 300); do');
+    expect(wait).toContain('sleep .1');
+    expect(wait).toContain("from pg_locks w join pg_stat_activity a on a.pid = w.pid");
+    expect(wait).toContain("where w.locktype = 'advisory' and not w.granted");
+    expect(wait).toContain('and h.objid = w.objid and h.objsubid = w.objsubid');
+    expect(wait).toContain('[ "$got" = "${want}:${want}" ] && return 0');
+    const race = through(script, 'race() {', '\n}\n');
+    expect(race.indexOf('await_advisory_waiters "r1mp-race-$tag-" "$n" "r1mp-block-$tag"'))
+      .toBeLessThan(race.indexOf('blocker_commit'));
+    expect(race).toContain('psql -U postgres -d postgres -t -A -v ON_ERROR_STOP=1 -c "select \'racer:\' || ${exprs[$i]};"');
+    // The answers must be exactly the expected ones; any error, deadlock or unique violation fails.
+    expect(race).toContain('[ "$got" != "$expect" ]');
+    expect(race).toContain("deadlock detected|duplicate key value|violates|error");
+    expect(race).toContain('LC_ALL=C sort');
+    // The key each scenario holds is one the RPCs take (0143 create and move).
+    const prefixes = [...lc.matchAll(/pg_advisory_xact_lock\(hashtextextended\('([a-z0-9_]+:[a-z]+:)' \|\|/g)].map((m) => m[1]!);
+    expect([...new Set(prefixes)].sort()).toEqual(['r1_meet_public:candidate:', 'r1_meet_public:day:']);
+    expect(races.map((r) => r.tag)).toEqual(['c1-two-tabs', 'c2-same-request', 'c3-one-seat', 'c4-public-day-limit', 'c5-move-one-seat']);
+    for (const r of races) expect(prefixes.some((p) => r.key.startsWith(p)), r.tag).toBe(true);
+    expect(script).toContain('cand() { psql_v "select _r1mp.id(10, $1)"; }');
+  });
+
+  it('names C1-C5 with their exact answers and verifies each from the database', () => {
+    expect(races).toEqual([
+      { tag: 'c1-two-tabs', key: 'r1_meet_public:candidate:$(cand 1)', win: 'booked:created',
+        expected: 'racer:booked:created racer:refused:already_booked' },
+      { tag: 'c2-same-request', key: 'r1_meet_public:candidate:$(cand 2)', win: 'booked:created',
+        expected: 'racer:booked:created racer:replayed:' },
+      { tag: 'c3-one-seat', key: 'r1_meet_public:day:2026-12-04', win: 'booked:created',
+        expected: 'racer:booked:created racer:refused:slot_full' },
+      { tag: 'c4-public-day-limit', key: 'r1_meet_public:day:2026-12-05', win: 'booked:created',
+        expected: 'racer:booked:created racer:refused:day_full' },
+      { tag: 'c5-move-one-seat', key: 'r1_meet_public:day:2026-12-08', win: 'moved:',
+        expected: 'racer:moved: racer:refused:slot_full' },
+    ]);
+    // Each scenario is explained where it runs; each race has exactly two racers, each its own session.
+    for (const tag of ['C1', 'C2', 'C3', 'C4', 'C5']) {
+      expect(script.split(`\n# ${tag} — `).length - 1, tag).toBe(1);
+    }
+    expect(script.match(/^ {2}"_r1mp\.(create|move)\(/gm)).toHaveLength(10);
+    for (const call of [
+      "_r1mp.create(1, 11, 11, '2026-12-02 05:00:00+00', '2026-12-02 05:45:00+00', 2, 20)",
+      "_r1mp.create(1, 12, 12, '2026-12-02 05:00:00+00', '2026-12-02 05:45:00+00', 2, 20)",
+      "_r1mp.create(2, 21, 20, '2026-12-03 05:00:00+00', '2026-12-03 05:45:00+00', 2, 20)",
+      "_r1mp.create(2, 22, 20, '2026-12-03 05:00:00+00', '2026-12-03 05:45:00+00', 2, 20)",
+      "_r1mp.create(3, 31, 31, '2026-12-04 05:00:00+00', '2026-12-04 05:45:00+00', 1, 20)",
+      "_r1mp.create(4, 32, 32, '2026-12-04 05:00:00+00', '2026-12-04 05:45:00+00', 1, 20)",
+      "_r1mp.create(5, 41, 41, '2026-12-05 05:00:00+00', '2026-12-05 05:45:00+00', 2, 1)",
+      "_r1mp.create(6, 42, 42, '2026-12-05 07:00:00+00', '2026-12-05 07:45:00+00', 2, 1)",
+      "_r1mp.move(51, '2026-12-08 05:00:00+00', '2026-12-08 05:45:00+00', 1)",
+      "_r1mp.move(52, '2026-12-08 05:00:00+00', '2026-12-08 05:45:00+00', 1)",
+    ]) {
+      expect(script.split(`"${call}"`).length - 1, call).toBe(1);
+    }
+    for (const verify of [
+      "_r1mp.verify_create('c1-two-tabs', array[1], array[11, 12], array[11, 12], ${c1[$WINNER]})",
+      "_r1mp.verify_create('c2-same-request', array[2], array[21, 22], array[20, 20], ${c2[$WINNER]})",
+      "_r1mp.verify_create('c3-one-seat', array[3, 4], array[31, 32], array[31, 32], ${c3[$WINNER]})",
+      "_r1mp.verify_create('c4-public-day-limit', array[5, 6], array[41, 42], array[41, 42], ${c4[$WINNER]})",
+      "_r1mp.verify_move('c5-move-one-seat', ${c5[$WINNER]}, ${c5[$((1 - WINNER))]}, '2026-12-08 05:00:00+00', '2026-12-08 05:45:00+00')",
+    ]) {
+      expect(script, verify).toContain(`psql_q -c "select ${verify};" >/dev/null`);
+    }
+    // Each verify follows its own race.
+    for (const r of races) {
+      expect(script.indexOf(`'${r.tag}'`), r.tag).toBeGreaterThan(script.indexOf(`race ${r.tag} `));
+    }
+    // C5's two bookings sit on a LATER IST day than the target, so both moves wait on the target's lock.
+    expect(setup).toContain("(51, 7, '2026-12-09 05:00:00+00', '2026-12-09 05:45:00+00')");
+    expect(setup).toContain("(52, 8, '2026-12-09 07:00:00+00', '2026-12-09 07:45:00+00')");
+  });
+
+  it('calls the two RPCs with every argument at a pinned clock, and checks the contract jobs exactly', () => {
+    const create = blockOf(setup, 'create or replace function _r1mp.create(', '$$;');
+    expect(callArgs(create, 'screening_v2.r1_meet_create_round_from_public')).toHaveLength(15);
+    const move = blockOf(setup, 'create or replace function _r1mp.move(', '$$;');
+    expect(callArgs(move, 'screening_v2.r1_meet_public_move_booking')).toHaveLength(12);
+    expect(setup).toContain("select '2026-12-01 04:00:00+00'::timestamptz");
+    expect(norm(setup)).not.toMatch(/\bnow\s*\(|\bcurrent_timestamp\b|\bclock_timestamp\s*\(|\bstatement_timestamp\s*\(/i);
+    // The job keys are the migration's (contracts section 5).
+    for (const key of ["'r1-meet:ensure-bot:' ||", "':invite'", "':add'", "'r1-meet:calendar:' ||", "'r1-meet:ashby-tag:' ||"]) {
+      expect(sql, key).toContain(key);
+      expect(setup, key).toContain(key);
+    }
+    expect(sql).toContain("|| ':move:' || v_booking.move_count::text");
+    expect(setup).toContain("'r1-meet:calendar:' || w.id::text || ':move:1'");
+    // Winner: one booking, round and live consent; loser: nothing; the month: 65 per round, once.
+    expect(setup).toContain("format('candidate %s: bookings=1 rounds=1 consents=1 live_consents=1', v_n)");
+    expect(setup).toContain("format('candidate %s: bookings=0 rounds=0 consents=0 live_consents=0', v_n)");
+    expect(setup).toContain('or v_held <> 65 * v_rounds or v_reserved is distinct from v_held then');
+    expect(setup).toContain('if _r1mp.jobs_of(b.id) is distinct from _r1mp.create_jobs(b.id) then');
+    // verify_create proves itself not vacuous before any race.
+    expect(setup).toContain("perform _r1mp.verify_create('self-test', array[7, 8], array[51, 52], array[51, 52], 51);");
+    expect(setup).toContain("perform _r1mp.verify_create('self-test', array[7], array[51, 59], array[51, 59], 59);");
+  });
+
+  it('keeps the fixtures synthetic: 7f000000 ids, runtime digests, example.test, no key-shaped literal', () => {
+    const ids = [...setup.matchAll(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-/gi)].map((m) => m[0]);
+    expect(ids.length).toBeGreaterThan(0);
+    for (const id of ids) expect(id.startsWith('7f000000-'), id).toBe(true);
+    expect(setup).toContain('encode(sha256(convert_to(');
+    expect(setup).not.toMatch(/[a-f0-9]{40,}/i);
+    expect(setup).not.toMatch(/whsec_/i);
+    for (const m of setup.matchAll(/[\w.+-]+@[\w.-]+/g)) expect(m[0]).toMatch(/@example\.test$/);
+    expect(script).not.toMatch(/[a-f0-9]{40,}/i);
+  });
+
+  it('is its own supabase-ci job right after r1-concurrency-test, triggered on its script', () => {
+    const jobs = [...ci.matchAll(/^ {2}([a-z0-9-]+):$/gm)].map((m) => m[1]!);
+    expect(jobs[jobs.indexOf('r1-concurrency-test') + 1]).toBe('r1-meet-public-race-test');
+    const body = through(ci, '  r1-meet-public-race-test:\n', '\n\n');
+    expect(body).toContain('    runs-on: ubuntu-latest\n');
+    expect(body).toContain('    timeout-minutes: 15\n');
+    expect(body).toContain('      - uses: actions/checkout@v4\n');
+    expect(body).toContain('        run: bash scripts/test-r1-meet-public-concurrency.sh');
+    expect(body).toMatch(/ {6}# 0143 \(M035 S01\)/);
+    expect(ci.match(/^ {6}- 'scripts\/test-r1-meet-public\.sh'\n {6}- 'scripts\/test-r1-meet-public-concurrency\.sh'$/gm))
+      .toHaveLength(2);
+    expect(ci.split('scripts/test-r1-meet-public-concurrency.sh').length - 1).toBe(3);
   });
 });
