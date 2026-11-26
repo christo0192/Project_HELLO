@@ -153,6 +153,12 @@ export const R1_MEET_ALERTS = Object.freeze({
   malformedPayload: 'r1_meet_malformed_payload',
   unknownKind: 'r1_meet_unknown_kind',
   jobFailed: 'r1_meet_job_failed',
+  /** M035 S09: the bot sits in a waiting room (the meeting is not OPEN, or nobody admitted Dex). */
+  botWaitingRoom: 'r1_meet_bot_waiting_room',
+  /** M035 S09: the bot was held, denied or blocked at the door (`error_type` = the Recall sub-code). */
+  botAdmissionBlocked: 'r1_meet_bot_admission_blocked',
+  /** M035 S09: the signed-in bot could not sign in to Google (`error_type` = the Recall sub-code). */
+  botSignInFailed: 'r1_meet_bot_sign_in_failed',
 } as const);
 
 /**

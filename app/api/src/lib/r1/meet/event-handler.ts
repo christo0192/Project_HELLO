@@ -2,7 +2,8 @@
  * The call side of the `r1-meet` runtime (M034 S06, dark): what a Recall bot's real-time events do to
  * its booking, the human-present arm, the multi-human policy, the end of an attempt and the bridge
  * recovery check. Four job definitions: `recall_event`, `attempt_ended`, `bridge_check` and
- * `multi_human_check` (D-S06-22..29), plus two pure functions, `decideBridgeCheck` and `countHumans`.
+ * `multi_human_check` (D-S06-22..29), plus pure functions: `decideBridgeCheck`, `countHumans`, and
+ * (M035 S09) `r1MeetBotAlertFor` and `r1MeetPreCallVerdict` with the three frozen sub-code lists.
  *
  * WHICH BOOKING (D-S06-22). The event's `booking_id` (from the bot's metadata) first, else the booking
  * that holds the bot. The event acts only when that booking's CURRENT bot is the event's bot. A bot
@@ -18,23 +19,44 @@
  * removes a bot a live booking holds, so a stray attached in the meantime survives. A LIVE event of a
  * TERMINAL booking's own bot (an owed release) also queues its `bot_release`.
  *
- * STATUS MAPPING (D-S06-24), on the current bot of a live booking:
+ * STATUS MAPPING (D-S06-24, M035 S09 D-S09-3/4), on the current bot of a live booking:
  *   joining_call, in_waiting_room, in_call_not_recording, recording_permission_*
- *                                  bot_scheduled -> bot_joining; anything else: no change;
+ *                                  bot_scheduled -> bot_joining; anything else: no change. A FRESH
+ *                                  run of `in_waiting_room` also alerts `r1_meet_bot_waiting_room`
+ *                                  at once, before the status step (the meeting is not OPEN, or
+ *                                  nobody admitted Dex: HR must fix it before more candidates are
+ *                                  stranded); once per run, never on a re-run;
  *   in_call_recording, or a participant join that is not a bot
  *                                  a human is present (below);
- *   call_ended, done, fatal        bot_scheduled | bot_joining -> failed (`no_show`, or `bot_fatal` for
- *                                  `bot.fatal` and the sub-codes of a waiting-room timeout, a kick,
- *                                  `meeting_not_started` or a recording-permission timeout);
+ *   call_ended, done, fatal        bot_scheduled | bot_joining -> failed/bot_fatal for `bot.fatal` or
+ *                                  a FATAL sub-code (below). Otherwise the bot is read ONCE before
+ *                                  the move (`r1MeetPreCallVerdict`): a `fatal` status, a fatal
+ *                                  sub-code, or NO `in_call_*` status anywhere in its history (a bot
+ *                                  that never got into the call cannot have seen a candidate stay
+ *                                  away) -> failed/bot_fatal; else failed/no_show. Svix does not order
+ *                                  deliveries and Recall follows `fatal` with `done`, so the event
+ *                                  alone would race. A Recall failure of that read defers the job
+ *                                  BEFORE the move (the booking stays live); 404 keeps the event's
+ *                                  own reason and the release is `gone`.
  *                                  human_present -> failed/bot_fatal; in_call without a session ->
  *                                  failed/admission_refused; in_call WITH a session: no move, the
  *                                  attempt's own outcome decides (`attempt_ended`).
- * Sub-codes are not an enum (Recall adds them at will): an unknown one is simply not fatal. A terminal
- * event whose sub-code is `bot_received_leave_call` is usually OUR leave (outcome, multi-human,
- * give-up, cancel, drain), whose job marks the booking itself: it waits once, 60 s, before it maps.
- * After a terminal move the bot is released at Recall (the one GET says it ended: no other call),
- * then `set_bot('release')`. A run that dies in between replays through the terminal branch, which
- * finishes the owed release.
+ * FATAL SUB-CODES (frozen, exported): M034's six (waiting-room timeouts, kicks, `meeting_not_started`,
+ * a recording-permission timeout), then the guest bot's refusals at the door (blocked, knocking
+ * disabled, a meeting that needs a signed-in user, one restricted to the host's organisation), then
+ * the signed-in bot's sign-in failures. Sub-codes are not an enum (Recall adds them at will): an
+ * unknown one is simply not fatal.
+ * ALERTS of a refused bot: when THIS job's move of a `bot_scheduled` / `bot_joining` booking to
+ * `failed` wins and a sub-code of the admission list (`r1_meet_bot_admission_blocked`) or of the
+ * sign-in list (`r1_meet_bot_sign_in_failed`) is known (the event's, else the oldest in the history
+ * read above), one error line names that sub-code as `error_type`. A move lost to another job never
+ * alerts, so a booking alerts once. `bot_fatal` without a listed sub-code alerts nothing new.
+ * A terminal event whose sub-code is `bot_received_leave_call` is usually OUR leave (outcome,
+ * multi-human, give-up, cancel, drain), whose job marks the booking itself: it waits once, 60 s,
+ * before it maps (and before any Recall read). After a terminal move the bot is released at Recall:
+ * when the read before the move already says the call ended (the common case) nothing else is sent;
+ * otherwise one GET and whatever the bot's state allows (a leave). Then `set_bot('release')`. A run
+ * that dies in between replays through the terminal branch, which finishes the owed release.
  *
  * HUMAN PRESENT (D-S06-25). The compare-and-set `-> human_present` elects ONE winner among the jobs
  * of the two signals (and their duplicates). The winner, or a RE-RUN of a job (a crash or a deferral
@@ -85,6 +107,8 @@
  * in `R1MeetFlowDeps`.
  */
 
+import { isRecallError } from '../../../integrations/recall/errors.js';
+import type { RecallBot, RecallBotStatusChange } from '../../../integrations/recall/types.js';
 import { R1_MEET_BRIDGE_CHECK_DELAY_SEC, armBridge } from './arm.js';
 import type { R1MeetBookingReason, R1MeetBookingStatus } from './bookings-read.js';
 import {
@@ -111,6 +135,7 @@ import {
   R1_MEET_ALERTS,
   R1_MEET_RECALL_UNAVAILABLE,
   R1_MEET_RELEASE_RETRY_SECONDS,
+  r1MeetBotEnded,
   r1MeetRecallFailure,
   releaseRecallBot,
   type R1MeetFlowDeps,
@@ -163,9 +188,48 @@ export const R1_MEET_OUTCOME_WAIT_MAX = 4;
 export const R1_MEET_REARM_WATCH_MS = (R1_MEET_BRIDGE_CHECK_DELAY_SEC + R1_MEET_BRIDGE_UNCLAIMED_SEC) * SECOND_MS;
 
 /**
- * The sub-codes of a terminal event that mean the bot could not get or stay in (D-S06-24): a
- * waiting-room timeout, a kick, a meeting that had not started, a recording-permission timeout. Any
- * other sub-code, known or not, is a no-show. Frozen.
+ * The refusals at the door (M035 S09 D-S09-2): the bot never got into the meeting. The first four
+ * arrive on `call_ended` (a waiting-room timeout, Recall's or Meet's; a kick from the waiting room; a
+ * meeting that had not started); the last four are the guest bot's refusals on `fatal` (blocked by
+ * the meeting's settings, knocking disabled, a meeting that needs a signed-in user, one restricted to
+ * the host's organisation). Alert `r1_meet_bot_admission_blocked`. Every entry is a logger safe
+ * identifier (it is logged as `error_type`). Frozen.
+ */
+export const R1_MEET_ADMISSION_SUB_CODES = Object.freeze([
+  'call_ended_by_platform_waiting_room_timeout',
+  'timeout_exceeded_waiting_room',
+  'bot_kicked_from_waiting_room',
+  'meeting_not_started',
+  'google_meet_bot_blocked',
+  'google_meet_knocking_disabled',
+  'google_meet_sign_in_missing_login_credentials',
+  'google_meet_organisation_restricted',
+] as const);
+
+/**
+ * The signed-in bot's sign-in failures (M035 S09 D-S09-2; only with a Recall Login Group, never the
+ * default guest bot): Google or the SSO provider did not let Recall sign Dex in. All arrive on
+ * `fatal`. Alert `r1_meet_bot_sign_in_failed`. Disjoint from the admission list. Frozen.
+ */
+export const R1_MEET_SIGN_IN_SUB_CODES = Object.freeze([
+  'google_meet_sso_sign_in_failed',
+  'google_meet_sign_in_failed',
+  'sso_not_configured',
+  'google_meet_login_not_available',
+  'google_meet_sign_in_captcha_failed',
+  'google_meet_sign_in_missing_recovery_credentials',
+  'google_meet_sso_sign_in_missing_login_credentials',
+  'google_meet_sso_sign_in_missing_totp_secret',
+  'sso_login_account_disabled',
+  'sso_login_invalid_recipient',
+] as const);
+
+/**
+ * The sub-codes of a terminal event that make it a BOT failure (`bot_fatal`), never a candidate
+ * no-show: M034's six in their order (D-S06-24: a waiting-room timeout, a kick, a meeting that had not
+ * started, a recording-permission timeout), then the admission refusals not already among them, then
+ * the sign-in failures (20). Both alert lists are inside it. Any other sub-code, known or not, is not
+ * fatal by itself. Frozen.
  */
 export const R1_MEET_FATAL_SUB_CODES = Object.freeze([
   'call_ended_by_platform_waiting_room_timeout',
@@ -174,9 +238,20 @@ export const R1_MEET_FATAL_SUB_CODES = Object.freeze([
   'bot_kicked_from_waiting_room',
   'meeting_not_started',
   'timeout_exceeded_recording_permission_denied',
+  'google_meet_bot_blocked',
+  'google_meet_knocking_disabled',
+  'google_meet_sign_in_missing_login_credentials',
+  'google_meet_organisation_restricted',
+  ...R1_MEET_SIGN_IN_SUB_CODES,
 ] as const);
 
 const FATAL_SUB_CODES: ReadonlySet<string> = new Set(R1_MEET_FATAL_SUB_CODES);
+const ADMISSION_SUB_CODES: ReadonlySet<string> = new Set(R1_MEET_ADMISSION_SUB_CODES);
+const SIGN_IN_SUB_CODES: ReadonlySet<string> = new Set(R1_MEET_SIGN_IN_SUB_CODES);
+/** The statuses a bot inside the call reports (Recall's bot status codes). */
+const IN_CALL_CODES: ReadonlySet<string> = new Set(['in_call_not_recording', 'in_call_recording']);
+/** The statuses whose terminal event may be a no-show: no human was seen yet. */
+const PRE_HUMAN: ReadonlySet<R1MeetBookingStatus> = new Set<R1MeetBookingStatus>(['bot_scheduled', 'bot_joining']);
 const JOINING_EVENTS: ReadonlySet<string> = new Set([
   'bot.joining_call',
   'bot.in_waiting_room',
@@ -223,6 +298,51 @@ export function countHumans(
   let humans = 0;
   for (const count of net.values()) if (count > 0) humans += 1;
   return humans;
+}
+
+// ── Pure: a bot that was refused or never got in (M035 S09) ─────────────────
+
+/**
+ * The alert word of a refused bot's sub-code (D-S09-4): `r1_meet_bot_admission_blocked` for the
+ * admission list, `r1_meet_bot_sign_in_failed` for the sign-in list, null for anything else
+ * (another fatal sub-code, an unknown one, none).
+ */
+export function r1MeetBotAlertFor(
+  subCode: string | null,
+): typeof R1_MEET_ALERTS.botAdmissionBlocked | typeof R1_MEET_ALERTS.botSignInFailed | null {
+  if (subCode === null) return null;
+  if (ADMISSION_SUB_CODES.has(subCode)) return R1_MEET_ALERTS.botAdmissionBlocked;
+  if (SIGN_IN_SUB_CODES.has(subCode)) return R1_MEET_ALERTS.botSignInFailed;
+  return null;
+}
+
+/** What a bot's own status history says about a call that ended before any human was seen. */
+export interface R1MeetPreCallVerdict {
+  /** The BOT failed (`bot_fatal`), so this was never a candidate no-show. */
+  readonly botFailed: boolean;
+  /** The oldest sub-code of either alert list in the history, or null. */
+  readonly alertSubCode: string | null;
+}
+
+/**
+ * D-S09-3, pure. The bot FAILED when its history (oldest first) holds a `fatal` status, a fatal
+ * sub-code, or NO `in_call_not_recording` / `in_call_recording` status at all: a bot that never got
+ * into the call cannot have seen a candidate stay away, whatever sub-code Recall gave (one it adds
+ * later included). Otherwise it was in the call and nobody came: a no-show.
+ */
+export function r1MeetPreCallVerdict(
+  changes: readonly Pick<RecallBotStatusChange, 'code' | 'subCode'>[],
+): R1MeetPreCallVerdict {
+  let inCall = false;
+  let fatal = false;
+  let alertSubCode: string | null = null;
+  for (const change of changes) {
+    if (IN_CALL_CODES.has(change.code)) inCall = true;
+    if (change.code === 'fatal') fatal = true;
+    if (change.subCode !== null && FATAL_SUB_CODES.has(change.subCode)) fatal = true;
+    if (alertSubCode === null && r1MeetBotAlertFor(change.subCode) !== null) alertSubCode = change.subCode;
+  }
+  return Object.freeze({ botFailed: fatal || !inCall, alertSubCode });
 }
 
 /** What `decideBridgeCheck` reads. */
@@ -572,11 +692,38 @@ async function ended(
   booking: R1MeetBooking,
   meta: Meta,
 ): Promise<Step> {
-  const reason = endedReason(job, booking);
-  if (reason === null) return r1MeetIgnored('attempt_decides');
+  const eventReason = endedReason(job, booking);
+  if (eventReason === null) return r1MeetIgnored('attempt_decides');
   if (job.subCode === R1_MEET_OWN_LEAVE_SUB_CODE && meta.deferCount === 0 && canDeferR1MeetJob(meta, deps.now())) {
     // Probably our own leave: let the job that sent it mark the booking first.
     return r1MeetDefer('own_leave', R1_MEET_OWN_LEAVE_DEFER_SEC);
+  }
+  const botId = booking.recallBotId!;
+  const preHuman = PRE_HUMAN.has(booking.status);
+  let reason: R1MeetBookingReason = eventReason;
+  // D-S09-4(a): the event's own sub-code first, else the oldest listed one in the history read below.
+  let alertSubCode = preHuman && r1MeetBotAlertFor(job.subCode) !== null ? job.subCode : null;
+  // What the read before the move already settled about the release; null = ask Recall after it.
+  let releasedAs: 'gone' | 'ended' | null = null;
+  if (preHuman && eventReason === 'no_show') {
+    // D-S09-3: the event alone says no-show. Recall first, the database second: read the bot ONCE.
+    let bot: RecallBot | null = null;
+    try {
+      bot = await deps.recall.getBot(botId);
+    } catch (error) {
+      // Nothing is guessed: the booking stays live and the job defers (or throws) before the move.
+      if (!(isRecallError(error) && error.category === 'not_found')) {
+        return r1MeetRecallFailure(error, { meta, nowMs: deps.now(), log: deps.log });
+      }
+      // Recall no longer knows the bot: the event's own reason, and nothing is left to release.
+      releasedAs = 'gone';
+    }
+    if (bot !== null) {
+      const verdict = r1MeetPreCallVerdict(bot.statusChanges);
+      if (verdict.botFailed) reason = 'bot_fatal';
+      alertSubCode ??= verdict.alertSubCode;
+      if (r1MeetBotEnded(bot)) releasedAs = 'ended';
+    }
   }
   const answer = await deps.store.transition({
     bookingId: booking.id,
@@ -588,9 +735,15 @@ async function ended(
   if (answer.status === 'status_conflict') return AGAIN;
   if (answer.status === 'not_found') return r1MeetIgnored('booking_gone');
   if (answer.status !== 'ok') return unexpected();
-  // The call is over, so the GET says ended and nothing else is sent; a re-run settles a lost mark.
-  const released = await release(deps, booking.recallBotId!, meta);
-  if ('result' in released) return released.result;
+  // THIS job's move won (a lost one returned above): one alert per booking, never on a no-show.
+  const alert = reason === 'bot_fatal' ? r1MeetBotAlertFor(alertSubCode) : null;
+  if (alert !== null) deps.log.error({ error_category: alert, error_type: alertSubCode! });
+  if (releasedAs === null) {
+    // The bot is usually over, so the GET says ended and nothing else is sent; a re-run settles a
+    // lost mark.
+    const released = await release(deps, botId, meta);
+    if ('result' in released) return released.result;
+  }
   await markReleased(deps, booking);
   return r1MeetProcessed(`failed_${reason}`);
 }
@@ -630,11 +783,24 @@ export const r1MeetRecallEventDefinition: R1MeetJobDefinition<R1MeetRecallEventJ
   kind: 'recall_event',
   parse: parseRecallEventJob,
   async run(deps: R1MeetFlowDeps, job: R1MeetRecallEventJob, meta: R1MeetJobMeta): Promise<R1MeetJobResult> {
+    // D-S09-4(b): at most one waiting-room alert per run, whatever the compare-and-set retries do.
+    let waitingRoomAlerted = false;
     for (let pass = 0; pass < R1_MEET_EVENT_MAX_PASSES; pass += 1) {
       const match = await matchBooking(deps, job);
       // Not one of ours: never touched (no Recall call, no job).
       if (match.kind === 'unknown') return r1MeetIgnored('unknown_bot');
       if (match.kind === 'stray') return strayBot(deps, job, match, meta);
+      if (
+        !waitingRoomAlerted
+        && job.eventType === 'bot.in_waiting_room'
+        && !meta.isRerun
+        && HOLDS_BOT.has(match.booking.status)
+      ) {
+        // The live booking's own bot is held at the door: the meeting is not OPEN (or nobody admits
+        // Dex). Receipts de-duplicate redeliveries, so a fresh run is one Recall status change.
+        waitingRoomAlerted = true;
+        deps.log.error({ error_category: R1_MEET_ALERTS.botWaitingRoom });
+      }
       const step = await currentBotEvent(deps, job, match.booking, meta);
       if (step !== AGAIN) return step;
     }
