@@ -14,8 +14,9 @@
  * Of migration 0143 (M035) it ports only what the runtime reads (M035 S02): the booking `source`
  * column (`'ashby'` on every row the create RPC and `seedBooking` write), `chk_r1_meet_bookings_source`
  * and `chk_r1_meet_bookings_source_ids` (the three Ashby schedule ids all set for `ashby`, all null for
- * `public_page`), and `seedPublicBooking`. Not the calendar, manage or request columns, and not the
- * public create RPC.
+ * `public_page`), the two status/reason pairs it adds (`cancelled`/`candidate_cancelled`,
+ * `failed`/`invite_undeliverable`), and `seedPublicBooking`. Not the calendar, manage or request
+ * columns, and not the public create RPC.
  *
  * What it is NOT: the SQL. `r1_send_round` (capacity, holds, the month counter) is a knob
  * (`settings.sendRound`), and so are the consent template and the sales_r1 role. The SQL itself is
@@ -47,7 +48,10 @@ export interface FakeAnswer {
 
 // ── The 0142 vocabulary this port enforces (pinned to the migration by r1-meet-fake-db.test.ts) ──
 
-/** `chk_r1_meet_bookings_status_reason`: the reasons each status accepts. */
+/**
+ * `chk_r1_meet_bookings_status_reason`: the reasons each status accepts. As 0143 swaps it (M035,
+ * contracts 3.1): `cancelled` also accepts `candidate_cancelled`, `failed` also `invite_undeliverable`.
+ */
 export const FAKE_STATUS_REASONS: Readonly<Record<string, readonly string[]>> = Object.freeze({
   pending: ['eligible'],
   bot_scheduled: ['eligible'],
@@ -62,8 +66,8 @@ export const FAKE_STATUS_REASONS: Readonly<Record<string, readonly string[]>> = 
     'capacity_exhausted', 'consent_template_unavailable', 'slot_too_far', 'bot_cap_reached',
   ],
   completed: ['attempt_settled'],
-  cancelled: ['cancelled', 'dex_absent', 'event_removed', 'round_cancelled'],
-  failed: ['in_past', 'bot_create_failed', 'bot_fatal', 'no_show', 'admission_refused', 'multiple_humans', 'round_expired'],
+  cancelled: ['cancelled', 'dex_absent', 'event_removed', 'round_cancelled', 'candidate_cancelled'],
+  failed: ['in_past', 'bot_create_failed', 'bot_fatal', 'no_show', 'admission_refused', 'multiple_humans', 'round_expired', 'invite_undeliverable'],
   drained: ['flag_off'],
 });
 

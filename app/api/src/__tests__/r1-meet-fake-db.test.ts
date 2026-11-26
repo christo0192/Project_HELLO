@@ -165,8 +165,18 @@ function expectAnswerSet(name: string, seen: Set<string>, expected: readonly str
 
 // ── The port's vocabulary is the migration's ─────────────────────────────────
 
+/**
+ * What 0143 (M035 S01) adds to 0142's `chk_r1_meet_bookings_status_reason` (contracts 3.1): one reason
+ * each for `cancelled` and `failed`, every other family unchanged. A literal until 0143 is on main;
+ * M035 S02 T6 swaps in the pairs parsed from 0143.
+ */
+const PUBLIC_PAIR_DELTA: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  cancelled: ['candidate_cancelled'],
+  failed: ['invite_undeliverable'],
+});
+
 describe('the port is pinned to the 0142 text', () => {
-  it('chk_r1_meet_bookings_status_reason: the reasons of each status', () => {
+  it('chk_r1_meet_bookings_status_reason: the reasons of each status (0142, then the 0143 delta)', () => {
     const start = sql.indexOf('constraint chk_r1_meet_bookings_status_reason check (');
     const block = sql.slice(start, sql.indexOf('constraint chk_r1_meet_bookings_version', start));
     const pairs = [...block.matchAll(/status in \(([^)]*)\) and reason in \(([^)]*)\)/g)];
@@ -174,6 +184,15 @@ describe('the port is pinned to the 0142 text', () => {
     const fromSql: Record<string, string[]> = {};
     for (const [, statuses, reasons] of pairs) {
       for (const s of quoted(statuses!)) fromSql[s] = [...(fromSql[s] ?? []), ...quoted(reasons!)];
+    }
+    // The delta is new to 0142: no status already accepts it.
+    for (const reason of Object.values(PUBLIC_PAIR_DELTA).flat()) {
+      expect(Object.values(fromSql).flat(), reason).not.toContain(reason);
+    }
+    for (const [s, added] of Object.entries(PUBLIC_PAIR_DELTA)) {
+      // Appended to the fake's list, after 0142's reasons of that status.
+      expect(FAKE_STATUS_REASONS[s]!.slice(-added.length), s).toEqual([...added]);
+      fromSql[s] = [...fromSql[s]!, ...added];
     }
     const sorted = (record: Readonly<Record<string, readonly string[]>>): Record<string, string[]> =>
       Object.fromEntries(
@@ -183,7 +202,39 @@ describe('the port is pinned to the 0142 text', () => {
       );
     expect(sorted(FAKE_STATUS_REASONS)).toEqual(sorted(fromSql));
     expect(Object.keys(FAKE_STATUS_REASONS).sort()).toEqual([...R1_MEET_BOOKING_STATUSES].sort());
-    expect([...new Set(Object.values(FAKE_STATUS_REASONS).flat())].sort()).toEqual([...R1_MEET_BOOKING_REASONS].sort());
+    // The flat reason set is the runtime's closed list, the two public reasons included (34).
+    const flat = [...new Set(Object.values(FAKE_STATUS_REASONS).flat())];
+    expect(flat).toHaveLength(34);
+    expect(flat.sort()).toEqual([...R1_MEET_BOOKING_REASONS].sort());
+  });
+
+  it('the 0143 pairs: cancelled/candidate_cancelled and failed/invite_undeliverable write; crossed over they are 23514', async () => {
+    const h = createR1MeetHarness();
+    // Seeded (the CHECK alone): either source, terminal and bot-less.
+    for (const seed of [h.db.seedBooking.bind(h.db), h.db.seedPublicBooking.bind(h.db)]) {
+      expect(seed({ status: 'cancelled', reason: 'candidate_cancelled' })).toMatchObject({ status: 'cancelled', reason: 'candidate_cancelled' });
+      expect(seed({ status: 'failed', reason: 'invite_undeliverable' })).toMatchObject({ status: 'failed', reason: 'invite_undeliverable' });
+    }
+    const written = h.db.tables.r1_meet_bookings.length;
+    expect(() => h.db.seedBooking({ status: 'cancelled', reason: 'invite_undeliverable' })).toThrow('23514 chk_r1_meet_bookings_status_reason');
+    expect(() => h.db.seedPublicBooking({ status: 'failed', reason: 'candidate_cancelled' })).toThrow('23514 chk_r1_meet_bookings_status_reason');
+    expect(h.db.tables.r1_meet_bookings).toHaveLength(written);
+
+    // Through the transition RPC (pending -> failed is in the matrix): the new failed reason writes,
+    // the new cancelled reason on failed is the pairing CHECK and rolls back.
+    const pb = h.createPublicBooking();
+    const before = structuredClone(h.db.booking(pb.bookingId));
+    const refused = await call(h.db, 'r1_meet_transition_booking', {
+      p_booking_id: pb.bookingId, p_from_status: 'pending', p_to_status: 'failed', p_reason: 'candidate_cancelled', p_now: NOW,
+    });
+    expect(refused).toEqual({ data: null, error: { code: '23514', message: 'chk_r1_meet_bookings_status_reason' } });
+    expect(h.db.booking(pb.bookingId)).toEqual(before);
+    expect(await status(h.db, 'r1_meet_transition_booking', {
+      p_booking_id: pb.bookingId, p_from_status: 'pending', p_to_status: 'failed', p_reason: 'invite_undeliverable', p_now: NOW,
+    })).toBe('ok');
+    expect(h.db.booking(pb.bookingId)).toMatchObject({ status: 'failed', reason: 'invite_undeliverable' });
+    // And the store reads it back with its reason.
+    expect(await h.db.store.getBooking(pb.bookingId)).toMatchObject({ status: 'failed', reason: 'invite_undeliverable', source: 'public_page' });
   });
 
   it('r1_meet_transition_booking: the matrix', () => {

@@ -580,6 +580,21 @@ describe('two sources (M035 S02): the Ashby and the public-page booking', () => 
     expect(list).toEqual([BOOKING_PARSED, { ...PUBLIC_PARSED, id: id('d9') }]);
     expect(Object.isFrozen(list)).toBe(true);
   });
+
+  it.each([
+    ['cancelled', 'candidate_cancelled'],
+    ['failed', 'invite_undeliverable'],
+  ])('the reason reader takes the 0143 pair %s/%s on either source', async (status, reason) => {
+    for (const r of [row({ status, reason, recall_bot_id: null }), publicRow({ status, reason, recall_bot_id: null })]) {
+      const booking = await fakeDb(rows(r)).store.getBooking(BOOKING);
+      expect(booking).toMatchObject({ status, reason, recallBotId: null });
+      expect(Object.isFrozen(booking)).toBe(true);
+    }
+    // In a list read too (the owed-release sweep reads terminal rows).
+    expect(await fakeDb(rows([publicRow({ status, reason })])).store.listOwedReleases(20)).toEqual([
+      { ...PUBLIC_PARSED, status, reason },
+    ]);
+  });
 });
 
 describe('newerAshbyDelivery: the order of Ashby deliveries', () => {
