@@ -65,7 +65,10 @@ const MEET_SUPPORT_FILES = ['recall-fake.ts', 'meet-webhook-signing.ts', 'ashby-
   (name) => path.join(TESTS_DIR, 'support', name),
 );
 
-/** The twelve Meet variables (config/environment.schema.json, api), in `R1_MEET_ENV_VARIABLES` order. */
+/**
+ * The thirty-five Meet variables (config/environment.schema.json, api), in `R1_MEET_ENV_VARIABLES`
+ * order: the twelve M034 ones, then the twenty-three M035 public booking ones.
+ */
 const MEET_ENV_NAMES = [
   'R1_MEET_ENABLED',
   'R1_MEET_BOT_NAME',
@@ -79,6 +82,30 @@ const MEET_ENV_NAMES = [
   'R1_MEET_ASHBY_FEEDBACK_FORM_ID',
   'RECALL_API_KEY',
   'RECALL_WEBHOOK_SECRET',
+  // M035 public booking link (S03), in R1_MEET_PUBLIC_ENV_VARIABLES order.
+  'R1_MEET_PUBLIC_BOOKING_ENABLED',
+  'R1_MEET_GOOGLE_AUTH_MODE', // oauth_refresh (default) or service_account
+  'R1_MEET_GOOGLE_OAUTH_CLIENT_ID', // oauth_refresh mode
+  'R1_MEET_GOOGLE_OAUTH_CLIENT_SECRET', // oauth_refresh mode, a Fly secret
+  'R1_MEET_GOOGLE_OAUTH_REFRESH_TOKEN', // oauth_refresh mode, a Fly secret
+  'R1_MEET_GOOGLE_SA_KEY_B64', // service_account mode, a Fly secret
+  'R1_MEET_GOOGLE_DEX_EMAIL',
+  'R1_MEET_GOOGLE_MEET_MODE',
+  'R1_MEET_PUBLIC_SLOT_MINUTES',
+  'R1_MEET_PUBLIC_SLOT_STEP_MINUTES',
+  'R1_MEET_PUBLIC_HOURS_IST',
+  'R1_MEET_PUBLIC_DAYS',
+  'R1_MEET_PUBLIC_CLOSED_DATES',
+  'R1_MEET_PUBLIC_MIN_NOTICE_MINUTES',
+  'R1_MEET_PUBLIC_HORIZON_DAYS',
+  'R1_MEET_PUBLIC_SLOT_CAPACITY',
+  'R1_MEET_PUBLIC_BROWSER_HEADROOM',
+  'R1_MEET_PUBLIC_DAILY_CAP',
+  'R1_MEET_PUBLIC_MAX_MOVES',
+  'R1_MEET_PUBLIC_MANAGE_CUTOFF_MINUTES',
+  'R1_MEET_PUBLIC_REQUIRE_R1_STAGE',
+  'R1_MEET_PUBLIC_CALENDAR_RETENTION_DAYS',
+  'R1_MEET_PUBLIC_PRESLOT_RECHECK',
 ] as const;
 
 /** D-M034-11 retired this booking vendor; built from halves so this file never names it. */
