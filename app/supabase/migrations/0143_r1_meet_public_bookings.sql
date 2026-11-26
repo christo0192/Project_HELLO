@@ -1253,6 +1253,476 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------------------------
+-- §18. r1_meet_public_move_booking: a new slot through the manage digest.
+-- ---------------------------------------------------------------------------------------------
+-- S06 calls this from the manage page with the booking id and the version it read through
+-- r1_meet_public_manage_read. The booking keeps its round, its consent and its Meet link: 0142's
+-- r1_meet_reschedule_booking (unchanged, not redeclared) moves the slot and the round's expiry
+-- and starts a new bot generation (version + 1, key_attempt 0, pending/eligible); then
+-- move_count + 1 and two r1-meet jobs: ensure_bot (a still-pending one absorbs it) and
+-- calendar_sync move, keyed by the new move_count. The first answer wins:
+--   1. invalid_request (+field: booking_id, digest, version (0..50), slot (30 to 60 minutes),
+--      seats, day_limit, max_moves, cutoff, grace, now). Nothing is read or written;
+--   2. refused not_found: the digest does not name this LIVE public booking, or its slot has
+--      ended (the manage token is dead at slot end or once the booking is terminal);
+--   3. refused cutoff_passed (now >= start - cutoff) | moves_exhausted (move_count >= p_max_moves)
+--      | same_slot | booking_dispatched (the bot is joining or in the call) | in_past (the new
+--      slot has started) | slot_too_far (new end + grace beyond now + 14 days) | slot_full |
+--      day_full (counted under the IST-day locks with the booking itself left out) |
+--      version_conflict (the bot generation moved since the read) | bot_attached (S06 removes the
+--      bot at Recall, calls r1_meet_set_bot replace and moves again with the new version);
+--   4. the reschedule: version_exhausted answers moves_exhausted, round_not_live (or no_round)
+--      answers round_not_live; any other answer but ok raises (fail closed);
+--   5. moved (+booking_id, start_at, end_at, version, key_attempt, move_count).
+-- booking_dispatched and version_conflict come before bot_attached, so S06 never removes a
+-- dispatched or stale bot; capacity comes before bot_attached, so a full slot never costs the bot.
+-- A refusal writes nothing. No clock read (p_now only); no digest or Meet URL in any answer.
+--
+-- Lock order: the IST-day advisory locks of the current and the new slot, the earlier date first
+-- and the later one only when the dates differ (two moves never wait on each other in a cycle; the
+-- create takes its candidate lock, then one day lock, and never waits for a booking row), then the
+-- booking row, then (inside r1_meet_reschedule_booking) settings, the round's hold month and the
+-- round: 0142's reschedule order behind the advisory locks. The current slot's day is read without
+-- a lock; if a concurrent move changed it meanwhile, the version check refuses, and the lock that
+-- guards the count (the new day's) is always held.
+create or replace function screening_v2.r1_meet_public_move_booking(
+  p_booking_id uuid,
+  p_digest text,
+  p_expected_version integer,
+  p_start_at timestamptz,
+  p_end_at timestamptz,
+  p_slot_seats integer,
+  p_public_day_limit integer,
+  p_bot_day_limit integer,
+  p_max_moves integer,
+  p_cutoff_sec integer,
+  p_expiry_grace_sec integer default 7200,
+  p_now timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_current_start timestamptz;
+  v_old_day date;
+  v_new_day date;
+  v_booking screening_v2.r1_meet_bookings%rowtype;
+  v_counts jsonb;
+  v_res jsonb;
+  v_code text;
+begin
+  -- 1. Validation. Nothing is read or written.
+  if p_booking_id is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'booking_id');
+  end if;
+  if p_digest is null or p_digest !~ '^[a-f0-9]{64}$' then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'digest');
+  end if;
+  if p_expected_version is null or p_expected_version not between 0 and 50 then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'version');
+  end if;
+  if p_start_at is null or p_end_at is null
+     or p_end_at - p_start_at not between interval '30 minutes' and interval '60 minutes' then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'slot');
+  end if;
+  if p_slot_seats is null or p_slot_seats not between 1 and 15 then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'seats');
+  end if;
+  if p_public_day_limit is null or p_public_day_limit not between 1 and 200
+     or p_bot_day_limit is null or p_bot_day_limit not between 1 and 200 then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'day_limit');
+  end if;
+  if p_max_moves is null or p_max_moves not between 0 and 10 then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'max_moves');
+  end if;
+  if p_cutoff_sec is null or p_cutoff_sec not between 900 and 43200 then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'cutoff');
+  end if;
+  if p_expiry_grace_sec is null or p_expiry_grace_sec not between 900 and 86400 then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'grace');
+  end if;
+  if p_now is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'now');
+  end if;
+
+  -- 2. The current slot's IST day (no lock yet), the two day locks in ascending date order, then
+  -- the booking row, read again with the same predicate.
+  select b.start_at into v_current_start
+    from screening_v2.r1_meet_bookings b
+   where b.id = p_booking_id and b.source = 'public_page' and b.manage_token_digest = p_digest;
+  if not found then
+    return jsonb_build_object('status', 'refused', 'code', 'not_found');
+  end if;
+  v_old_day := (v_current_start at time zone 'Asia/Kolkata')::date;
+  v_new_day := (p_start_at at time zone 'Asia/Kolkata')::date;
+  perform pg_advisory_xact_lock(hashtextextended('r1_meet_public:day:' || to_char(least(v_old_day, v_new_day), 'YYYY-MM-DD'), 0));
+  if v_new_day <> v_old_day then
+    perform pg_advisory_xact_lock(hashtextextended('r1_meet_public:day:' || to_char(greatest(v_old_day, v_new_day), 'YYYY-MM-DD'), 0));
+  end if;
+  select * into v_booking
+    from screening_v2.r1_meet_bookings b
+   where b.id = p_booking_id and b.source = 'public_page' and b.manage_token_digest = p_digest
+   for update;
+  if not found
+     or v_booking.status not in ('pending', 'blocked', 'bot_scheduled', 'bot_joining', 'human_present', 'in_call')
+     or p_now >= v_booking.end_at then
+    return jsonb_build_object('status', 'refused', 'code', 'not_found');
+  end if;
+
+  -- 3. The refusals, in order; capacity under the day locks, without the booking itself.
+  if p_now >= v_booking.start_at - make_interval(secs => p_cutoff_sec) then
+    return jsonb_build_object('status', 'refused', 'code', 'cutoff_passed');
+  end if;
+  if v_booking.move_count >= p_max_moves then
+    return jsonb_build_object('status', 'refused', 'code', 'moves_exhausted');
+  end if;
+  if p_start_at = v_booking.start_at and p_end_at = v_booking.end_at then
+    return jsonb_build_object('status', 'refused', 'code', 'same_slot');
+  end if;
+  if v_booking.status in ('bot_joining', 'human_present', 'in_call') then
+    return jsonb_build_object('status', 'refused', 'code', 'booking_dispatched');
+  end if;
+  if p_start_at <= p_now then
+    return jsonb_build_object('status', 'refused', 'code', 'in_past');
+  end if;
+  if p_end_at + make_interval(secs => p_expiry_grace_sec) > p_now + interval '14 days' then
+    return jsonb_build_object('status', 'refused', 'code', 'slot_too_far');
+  end if;
+  if screening_v2.r1_meet_public_slot_count(p_start_at, p_end_at, v_booking.id) >= p_slot_seats then
+    return jsonb_build_object('status', 'refused', 'code', 'slot_full');
+  end if;
+  v_counts := screening_v2.r1_meet_public_day_count(v_new_day, v_booking.id);
+  if (v_counts ->> 'public')::integer >= p_public_day_limit
+     or (v_counts ->> 'total')::integer >= p_bot_day_limit then
+    return jsonb_build_object('status', 'refused', 'code', 'day_full');
+  end if;
+  if v_booking.version is distinct from p_expected_version then
+    return jsonb_build_object('status', 'refused', 'code', 'version_conflict');
+  end if;
+  if v_booking.recall_bot_id is not null then
+    return jsonb_build_object('status', 'refused', 'code', 'bot_attached');
+  end if;
+
+  -- 4. The 0142 reschedule, the stored Meet link unchanged, no Ashby time.
+  v_res := screening_v2.r1_meet_reschedule_booking(
+    v_booking.id, p_expected_version, p_start_at, p_end_at, v_booking.meet_url, null,
+    p_expiry_grace_sec, p_now);
+  v_code := v_res ->> 'status';
+  if v_code in ('version_conflict', 'booking_dispatched', 'bot_attached', 'in_past', 'slot_too_far') then
+    return jsonb_build_object('status', 'refused', 'code', v_code);
+  end if;
+  if v_code = 'version_exhausted' then
+    return jsonb_build_object('status', 'refused', 'code', 'moves_exhausted');
+  end if;
+  if v_code in ('round_not_live', 'no_round') then
+    return jsonb_build_object('status', 'refused', 'code', 'round_not_live');
+  end if;
+  if v_code in ('not_found', 'booking_terminal') then
+    return jsonb_build_object('status', 'refused', 'code', 'not_found');
+  end if;
+  if v_code is distinct from 'ok' then
+    raise exception 'r1_meet_public_move_booking: unexpected answer from r1_meet_reschedule_booking'
+      using errcode = 'P0001';
+  end if;
+
+  -- 5. One more move, the bot for the new generation and the calendar move (contracts section 5).
+  update screening_v2.r1_meet_bookings
+     set move_count = move_count + 1
+   where id = v_booking.id
+  returning * into v_booking;
+  insert into screening_v2.job_queue (name, payload, dedup_key, max_attempts)
+  values ('r1-meet', jsonb_build_object('kind', 'ensure_bot', 'booking_id', v_booking.id),
+          'r1-meet:ensure-bot:' || v_booking.id::text, 10)
+  on conflict do nothing;
+  insert into screening_v2.job_queue (name, payload, dedup_key, max_attempts)
+  values ('r1-meet', jsonb_build_object('kind', 'calendar_sync', 'op', 'move', 'booking_id', v_booking.id),
+          'r1-meet:calendar:' || v_booking.id::text || ':move:' || v_booking.move_count::text, 10)
+  on conflict do nothing;
+
+  return jsonb_build_object(
+    'status', 'moved', 'booking_id', v_booking.id,
+    'start_at', v_booking.start_at, 'end_at', v_booking.end_at,
+    'version', v_booking.version, 'key_attempt', v_booking.key_attempt,
+    'move_count', v_booking.move_count);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------------------------
+-- §19. r1_meet_public_cancel_booking: the candidate's cancel through the manage digest.
+-- ---------------------------------------------------------------------------------------------
+-- S06 calls this from the manage page. ONE transaction, in this order: the booking becomes
+-- cancelled/candidate_cancelled (an unclaimed ticket is cleared, a claimed one stays as evidence,
+-- exactly as 0142's r1_meet_cancel_booking does); the round, when it is invited or in progress, is
+-- cancelled through r1_transition_round (unchanged: the hold is refunded; one retry on
+-- version_conflict, then anything but ok or round_terminal raises and the whole cancel rolls back:
+-- S06 answers 503); on request the round's consent is withdrawn through r1_withdraw_consent
+-- (unchanged: decision withdrawn, which also queues the existing 0127 recording erase); a
+-- bot_release job when a bot is attached (0142's key, so the delete trigger's job is the same
+-- one). The §3 trigger adds the calendar cancel and the Ashby tag removal; 0142's round_cancelled
+-- trigger finds no live booking on the round (this one is already cancelled) and adds nothing.
+-- A cancel is not a completed R1: the candidate may book again (a new round). The first answer
+-- wins:
+--   invalid_request (+field: digest, withdraw_consent, cutoff, now). Nothing is read or written;
+--   refused not_found: the digest names no public booking, or its slot has ended;
+--   already_cancelled: the booking is already cancelled by the candidate (nothing changes);
+--   refused not_found: any other terminal booking (the manage token is dead);
+--   refused cutoff_passed (now >= start - cutoff) | booking_dispatched (the bot is joining or in
+--     the call: the runtime ends it);
+--   cancelled (+booking_id).
+-- No clock read (p_now only); no digest in any answer.
+--
+-- Lock order: the booking row, then (inside r1_transition_round) settings, the round's hold month
+-- and the round, then (inside r1_withdraw_consent) the round again: 0142's booking-then-settings
+-- order. No advisory lock: a cancel only frees capacity.
+create or replace function screening_v2.r1_meet_public_cancel_booking(
+  p_digest text,
+  p_withdraw_consent boolean,
+  p_cutoff_sec integer,
+  p_now timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_booking screening_v2.r1_meet_bookings%rowtype;
+  v_round_status text;
+  v_round_version integer;
+  v_res jsonb;
+begin
+  if p_digest is null or p_digest !~ '^[a-f0-9]{64}$' then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'digest');
+  end if;
+  if p_withdraw_consent is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'withdraw_consent');
+  end if;
+  if p_cutoff_sec is null or p_cutoff_sec not between 900 and 43200 then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'cutoff');
+  end if;
+  if p_now is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'now');
+  end if;
+
+  select * into v_booking
+    from screening_v2.r1_meet_bookings b
+   where b.manage_token_digest = p_digest and b.source = 'public_page'
+   for update;
+  if not found or p_now >= v_booking.end_at then
+    return jsonb_build_object('status', 'refused', 'code', 'not_found');
+  end if;
+  if v_booking.status = 'cancelled' and v_booking.reason = 'candidate_cancelled' then
+    return jsonb_build_object('status', 'already_cancelled');
+  end if;
+  if v_booking.status in ('completed', 'cancelled', 'failed', 'drained') then
+    return jsonb_build_object('status', 'refused', 'code', 'not_found');
+  end if;
+  if p_now >= v_booking.start_at - make_interval(secs => p_cutoff_sec) then
+    return jsonb_build_object('status', 'refused', 'code', 'cutoff_passed');
+  end if;
+  if v_booking.status in ('bot_joining', 'human_present', 'in_call') then
+    return jsonb_build_object('status', 'refused', 'code', 'booking_dispatched');
+  end if;
+
+  -- The round as the cancel finds it (no lock: r1_transition_round takes settings, the hold month
+  -- and then the round, and re-checks this version under its own lock).
+  select r.status, r.version into v_round_status, v_round_version
+    from screening_v2.interview_rounds r
+   where r.id = v_booking.round_id;
+
+  -- 1. The booking first.
+  update screening_v2.r1_meet_bookings
+     set status = 'cancelled',
+         reason = 'candidate_cancelled',
+         ticket_digest = case when ticket_claimed_at is null then null else ticket_digest end,
+         ticket_not_before = case when ticket_claimed_at is null then null else ticket_not_before end,
+         ticket_expires_at = case when ticket_claimed_at is null then null else ticket_expires_at end,
+         updated_at = p_now
+   where id = v_booking.id;
+
+  -- 2. The round (hold refunded), one retry when its version moved meanwhile.
+  if v_round_status in ('invited', 'in_progress') then
+    v_res := screening_v2.r1_transition_round(v_booking.round_id, 'cancel', v_round_version, null, null, p_now);
+    if v_res ->> 'status' = 'version_conflict' then
+      select r.version into v_round_version
+        from screening_v2.interview_rounds r
+       where r.id = v_booking.round_id;
+      v_res := screening_v2.r1_transition_round(v_booking.round_id, 'cancel', v_round_version, null, null, p_now);
+    end if;
+    if v_res ->> 'status' is distinct from 'ok' and v_res ->> 'status' is distinct from 'round_terminal' then
+      raise exception 'r1_meet_public_cancel_booking: the round could not be cancelled'
+        using errcode = 'P0001';
+    end if;
+  end if;
+
+  -- 3. The consent, when the candidate also withdrew it.
+  if p_withdraw_consent and v_booking.round_id is not null then
+    v_res := screening_v2.r1_withdraw_consent(v_booking.round_id,
+               jsonb_build_object('source', 'r1_public_booking'), p_now, 'withdrawn');
+    if v_res ->> 'status' is distinct from 'ok' then
+      raise exception 'r1_meet_public_cancel_booking: the consent could not be withdrawn'
+        using errcode = 'P0001';
+    end if;
+  end if;
+
+  -- 4. The attached bot is removed by the r1-meet worker (contracts section 5).
+  if v_booking.recall_bot_id is not null then
+    insert into screening_v2.job_queue (name, payload, dedup_key, max_attempts)
+    values ('r1-meet',
+            jsonb_build_object('kind', 'bot_release', 'recall_bot_id', v_booking.recall_bot_id,
+                               'booking_id', v_booking.id),
+            'r1-meet:bot-release:' || v_booking.recall_bot_id::text, 10)
+    on conflict do nothing;
+  end if;
+
+  return jsonb_build_object('status', 'cancelled', 'booking_id', v_booking.id);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------------------------
+-- §20. r1_meet_public_reconsent: a fresh consent on the newest notice through the manage digest.
+-- ---------------------------------------------------------------------------------------------
+-- S06 calls this from the manage page when manage_read answered consent_current false (a newer
+-- notice was released, or the candidate withdrew). The form's consent is checked exactly as the
+-- create checks it, against the newest active notice of the ROUND's audience; the round's live
+-- consent (if any) is superseded, never edited in place, and a new candidate_web row is inserted
+-- with the nine proof fields of the create. The first answer wins:
+--   invalid_request (+field: digest, consent (the closed p_consent shape of the create), now).
+--     Nothing is read or written;
+--   refused not_found: the digest names no LIVE public booking, its slot has ended, or its round
+--     is no longer a live, unexpired Meet round (invited or in progress);
+--   refused booking_dispatched (the bot is joining or in the call);
+--   refused consent_stale (the form's notice is not the newest active one of the round's
+--     audience, or that audience has no usable notice: S06 re-reads the notice) |
+--     consent_incomplete (a required key not granted, or no India tick);
+--   ok.
+-- No capacity change, no booking change, no clock read (p_now only).
+--
+-- Lock order: the booking row, then the round row (a prefix of 0142's order: no settings or month
+-- lock is needed, nothing about capacity changes).
+create or replace function screening_v2.r1_meet_public_reconsent(
+  p_digest text,
+  p_consent jsonb,
+  p_now timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_consent_ok boolean;
+  v_booking screening_v2.r1_meet_bookings%rowtype;
+  v_round screening_v2.interview_rounds%rowtype;
+  v_round_id uuid;
+  v_template screening_v2.interview_round_consent_templates%rowtype;
+begin
+  if p_digest is null or p_digest !~ '^[a-f0-9]{64}$' then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'digest');
+  end if;
+  -- The form's consent, the create's closed shape, checked in the same steps.
+  v_consent_ok := p_consent is not null and jsonb_typeof(p_consent) = 'object';
+  if v_consent_ok then
+    v_consent_ok := not exists (select 1 from jsonb_object_keys(p_consent) k(key)
+                                 where k.key not in ('template_version', 'consents', 'in_india',
+                                                     'ip_prefix', 'user_agent'))
+      and coalesce(jsonb_typeof(p_consent -> 'template_version') = 'string', false)
+      and coalesce(jsonb_typeof(p_consent -> 'consents') = 'array', false)
+      and coalesce(jsonb_typeof(p_consent -> 'in_india') = 'boolean', false)
+      and coalesce(jsonb_typeof(p_consent -> 'ip_prefix'), 'null') in ('null', 'string')
+      and coalesce(jsonb_typeof(p_consent -> 'user_agent'), 'null') in ('null', 'string');
+  end if;
+  if v_consent_ok then
+    v_consent_ok := char_length(p_consent ->> 'template_version') between 1 and 64
+      and jsonb_array_length(p_consent -> 'consents') between 1 and 8
+      and not exists (select 1 from jsonb_array_elements(p_consent -> 'consents') e(item)
+                       where jsonb_typeof(e.item) <> 'string')
+      and coalesce(char_length(p_consent ->> 'ip_prefix') between 1 and 64, true)
+      and coalesce(char_length(p_consent ->> 'user_agent') between 1 and 256, true);
+  end if;
+  if v_consent_ok then
+    v_consent_ok := not exists (select 1 from jsonb_array_elements_text(p_consent -> 'consents') e(item)
+                                 where e.item !~ '^[a-z][a-z0-9_]{0,63}$')
+      and (select count(distinct e.item) from jsonb_array_elements_text(p_consent -> 'consents') e(item))
+          = jsonb_array_length(p_consent -> 'consents');
+  end if;
+  if not v_consent_ok then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'consent');
+  end if;
+  if p_now is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'now');
+  end if;
+
+  select * into v_booking
+    from screening_v2.r1_meet_bookings b
+   where b.manage_token_digest = p_digest and b.source = 'public_page'
+   for update;
+  if not found
+     or v_booking.status not in ('pending', 'blocked', 'bot_scheduled', 'bot_joining', 'human_present', 'in_call')
+     or p_now >= v_booking.end_at then
+    return jsonb_build_object('status', 'refused', 'code', 'not_found');
+  end if;
+  if v_booking.status in ('bot_joining', 'human_present', 'in_call') then
+    return jsonb_build_object('status', 'refused', 'code', 'booking_dispatched');
+  end if;
+  -- Live: the claim RPC's definition (an invited or in-progress Meet round that has not lapsed).
+  select * into v_round
+    from screening_v2.interview_rounds r
+   where r.id = v_booking.round_id
+   for update;
+  if not found
+     or v_round.channel <> 'meet'
+     or v_round.status not in ('invited', 'in_progress')
+     or v_round.expires_at <= p_now then
+    return jsonb_build_object('status', 'refused', 'code', 'not_found');
+  end if;
+
+  -- The notice for the ROUND's audience, and the form's consent against it.
+  -- newest active notice (0142 step 7)
+  select t.* into v_template
+    from screening_v2.interview_round_consent_templates t
+   where t.is_active
+     and t.version = (select max(x.version) from screening_v2.interview_round_consent_templates x
+                       where x.is_active)
+     and t.locale = v_round.consent_locale;
+  if not found or jsonb_array_length(v_template.required_consents) = 0 then
+    return jsonb_build_object('status', 'refused', 'code', 'consent_stale');
+  end if;
+  if p_consent ->> 'template_version' <> v_template.version then
+    return jsonb_build_object('status', 'refused', 'code', 'consent_stale');
+  end if;
+  if not (v_template.required_consents <@ (p_consent -> 'consents'))
+     or p_consent -> 'in_india' is distinct from 'true'::jsonb then
+    return jsonb_build_object('status', 'refused', 'code', 'consent_incomplete');
+  end if;
+
+  -- The live consent is superseded, never edited in place (as the create's re-link does); the
+  -- recording erase trigger (0127) ignores `superseded`.
+  update screening_v2.interview_round_consents
+     set withdrawn_at = p_now,
+         proof = coalesce(proof, '{}'::jsonb)
+           || jsonb_build_object('decision', 'superseded', 'superseded_at', p_now)
+   where round_id = v_round.id and withdrawn_at is null;
+  v_round_id := v_round.id;
+
+  -- The candidate's own consent from the form, exactly as the create writes it.
+  insert into screening_v2.interview_round_consents
+    (round_id, template_id, consents, proof, granted_at)
+  values (v_round_id, v_template.id, v_template.required_consents,
+          jsonb_build_object(
+            'decision', 'granted', 'captured_at', p_now,
+            'template_version', v_template.version, 'locale', v_template.locale,
+            'ip_prefix', p_consent ->> 'ip_prefix', 'user_agent', p_consent ->> 'user_agent',
+            'source', 'r1_public_booking', 'channel', 'meet',
+            'india_location_confirmed', true),
+          p_now);
+  return jsonb_build_object('status', 'ok');
+end;
+$$;
+
+-- ---------------------------------------------------------------------------------------------
 -- §21. r1_meet_public_set_calendar_state: the calendar event's state, compare-and-set.
 -- ---------------------------------------------------------------------------------------------
 -- S05 records what it did on Dex's calendar. Allowed moves: created|invited -> invited (a re-send
@@ -1531,6 +2001,36 @@ comment on function screening_v2.r1_meet_public_manage_read(text, integer, integ
   'M035: read only. The live public booking of a manage digest before its slot ends: status, '
   'version, has_bot, slot, can_move, can_cancel, moves_left and consent_current. Answers ok | '
   'not_found | invalid_request (+field). Service-role only.';
+
+revoke all on function screening_v2.r1_meet_public_move_booking(uuid, text, integer, timestamptz, timestamptz, integer, integer, integer, integer, integer, integer, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.r1_meet_public_move_booking(uuid, text, integer, timestamptz, timestamptz, integer, integer, integer, integer, integer, integer, timestamptz)
+  to service_role;
+comment on function screening_v2.r1_meet_public_move_booking(uuid, text, integer, timestamptz, timestamptz, integer, integer, integer, integer, integer, integer, timestamptz) is
+  'M035: moves a live public booking to a new slot through its manage digest, under the IST-day '
+  'advisory locks (earlier date first): capacity re-checked without the booking itself, then the '
+  '0142 reschedule (a new bot generation, the round expiry moved), move_count + 1, and the '
+  'ensure_bot and calendar move jobs. Answers moved | refused (+code) | invalid_request (+field). '
+  'Service-role only.';
+
+revoke all on function screening_v2.r1_meet_public_cancel_booking(text, boolean, integer, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.r1_meet_public_cancel_booking(text, boolean, integer, timestamptz)
+  to service_role;
+comment on function screening_v2.r1_meet_public_cancel_booking(text, boolean, integer, timestamptz) is
+  'M035: the candidate cancels a live public booking through its manage digest: the booking '
+  'cancelled (candidate_cancelled), its round cancelled with the hold refunded, the consent '
+  'withdrawn on request, a bot_release job when a bot is attached. Answers cancelled | '
+  'already_cancelled | refused (+code) | invalid_request (+field). Service-role only.';
+
+revoke all on function screening_v2.r1_meet_public_reconsent(text, jsonb, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.r1_meet_public_reconsent(text, jsonb, timestamptz)
+  to service_role;
+comment on function screening_v2.r1_meet_public_reconsent(text, jsonb, timestamptz) is
+  'M035: a fresh candidate_web consent on the newest notice of the round''s audience for a live '
+  'public booking, through its manage digest; the live consent is superseded. Answers ok | refused '
+  '(+code) | invalid_request (+field). Service-role only.';
 
 revoke all on function screening_v2.r1_meet_public_set_calendar_state(uuid, text[], text, timestamptz)
   from public, anon, authenticated;

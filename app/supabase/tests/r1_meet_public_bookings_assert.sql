@@ -48,6 +48,18 @@
 --   T3-G the step-8a expiry of a lapsed Meet round, and a lapsed round that still has a booking.
 --   T3-H the settings refusals through the create, the re-link under a full cap, and the catalog
 --        posture of the create.
+--   T4-A r1_meet_public_move_booking (§18): a move to another day and within a day (the jobs and
+--        their keys), capacity without the booking itself, every refusal in the plan order with a
+--        precedence pair for each adjacent pair that can co-occur, the S06 bot path (set_bot
+--        replace, then move), version_exhausted as moves_exhausted, round_not_live, every field,
+--        no write on any refusal, and the catalog posture.
+--   T4-B r1_meet_public_cancel_booking (§19): from pending and from bot_scheduled (ticket, bot,
+--        invite, withdrawal), the hold refund, the jobs (no round_cancelled), already_cancelled,
+--        not_found, cutoff_passed, booking_dispatched, an expired round, the one retry, the fail
+--        closed raise, a round-less booking, re-booking after a cancel, every field, the catalog.
+--   T4-C r1_meet_public_reconsent (§20): the same notice, a newer release, after a withdrawal,
+--        consent_stale, consent_incomplete, booking_dispatched, not_found, every field, the
+--        catalog.
 --
 -- The clock is pinned: every time is written explicitly (p_now = 2026-12-01 04:00 UTC, 09:30 IST;
 -- the default slot is 2026-12-02 05:00-05:45 UTC, 10:30-11:15 IST); nothing asserts on now().
@@ -2378,9 +2390,10 @@ begin
   perform _r1_meet_public_tests.raises_as('service_role', 'T2-H execute r1_meet_public_refusal',
     format('select screening_v2.r1_meet_public_refusal(%L, %L, %L)', _r1_meet_public_tests.id(10, 340),
            _r1_meet_public_tests.id(22, 340)::text, '2026-12-01 04:00:00+00'), '42501');
-  -- The 0142 suite leaves the r1_meet_public_* names to this one (T4 adds its three to this list).
+  -- The 0142 suite leaves the r1_meet_public_* names to this one (the T4 three included, in file
+  -- order; T4-A, T4-B and T4-C check their posture).
   perform _r1_meet_public_tests.assert(
-    'T2-H the screening_v2 functions named r1_meet_public_* are exactly these ten, one overload each',
+    'T2-H the screening_v2 functions named r1_meet_public_* are exactly these thirteen, one overload each',
     (select array_agg(x.oid order by x.oid) from pg_proc x
       where x.pronamespace = 'screening_v2'::regnamespace and x.proname like 'r1\_meet\_public\_%')
     = (select array_agg(f::regprocedure::oid order by f::regprocedure::oid) from unnest(array[
@@ -2391,6 +2404,9 @@ begin
          'screening_v2.r1_meet_public_precheck(uuid, text, timestamptz)',
          'screening_v2.r1_meet_public_set_manage_digest(uuid, text, timestamptz)',
          'screening_v2.r1_meet_public_manage_read(text, integer, integer, timestamptz)',
+         'screening_v2.r1_meet_public_move_booking(uuid, text, integer, timestamptz, timestamptz, integer, integer, integer, integer, integer, integer, timestamptz)',
+         'screening_v2.r1_meet_public_cancel_booking(text, boolean, integer, timestamptz)',
+         'screening_v2.r1_meet_public_reconsent(text, jsonb, timestamptz)',
          'screening_v2.r1_meet_public_set_calendar_state(uuid, text[], text, timestamptz)',
          'screening_v2.r1_meet_public_throttle_hit(text[], integer[], integer, timestamptz)',
          'screening_v2.r1_meet_public_throttle_prune(integer, integer, timestamptz)']) f));
@@ -3278,6 +3294,1038 @@ begin
     perform _r1_meet_public_tests.raises_as(role_name, 'T3-H execute r1_meet_create_round_from_public',
       'select screening_v2.r1_meet_create_round_from_public(null, null, null, null, null, null, null, null, '
       || 'null, null, null, null)', '42501');
+  end loop;
+end;
+$$;
+
+-- =============================================================================================
+-- T4 fixtures. Fixture numbers 600-689 for candidates booked through the create RPC, 690-699 for
+-- rows inserted directly, 6001-6999 for a second booking or request id of candidate n/10. p_now is
+-- 2026-12-20 04:00 UTC (09:30 IST) unless a call says otherwise, so every T4 day (IST 2026-12-20 and
+-- later) is free of earlier bookings. t4_book(n) books candidate n's application n into t4_slot(n)
+-- (one hour apart, twelve per IST day from 2026-12-21 09:00 IST) and sets the manage digest md(n);
+-- moves that leave the day land on IST 2026-12-30 and later, where no T4 booking starts.
+-- =============================================================================================
+
+-- The slot start of t4_book(n).
+create function _r1_meet_public_tests.t4_slot(p_n integer) returns timestamptz
+language sql stable as $$
+  select '2026-12-21 03:30:00+00'::timestamptz
+         + make_interval(days => (p_n - 600) / 12, hours => (p_n - 600) % 12)
+$$;
+
+-- The manage digest of candidate n's T4 booking (computed at run time, never a literal).
+create function _r1_meet_public_tests.md(p_n integer) returns text
+language sql immutable as $$
+  select _r1_meet_public_tests.digest('t4-manage-' || p_n::text)
+$$;
+
+-- A new candidate n (with its link) booked through the create RPC into t4_slot(n) at the T4 now,
+-- with the manage digest md(n). Returns the booking id, id(40, n).
+create function _r1_meet_public_tests.t4_book(p_n integer) returns uuid
+language plpgsql as $$
+declare
+  v_res jsonb;
+  v_set jsonb;
+begin
+  perform _r1_meet_public_tests.candidate(p_n);
+  v_res := _r1_meet_public_tests.create(p_n, jsonb_build_object(
+    'start_at', _r1_meet_public_tests.t4_slot(p_n),
+    'end_at', _r1_meet_public_tests.t4_slot(p_n) + interval '45 minutes',
+    'now', '2026-12-20T04:00:00+00:00'));
+  v_set := screening_v2.r1_meet_public_set_manage_digest(_r1_meet_public_tests.id(40, p_n),
+             _r1_meet_public_tests.md(p_n), '2026-12-20 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T4 fixture: candidate ' || p_n || ' booked, with its manage digest',
+    _r1_meet_public_tests.outcome(v_res) = 'booked:created' and v_set ->> 'status' = 'ok',
+    v_res::text || ' ' || coalesce(v_set::text, 'null'));
+  return _r1_meet_public_tests.id(40, p_n);
+end;
+$$;
+
+-- The round of a booking.
+create function _r1_meet_public_tests.round_of_booking(p_booking uuid) returns uuid
+language sql stable as $$
+  select x.round_id from screening_v2.r1_meet_bookings x where x.id = p_booking
+$$;
+
+-- The version of a round.
+create function _r1_meet_public_tests.round_version(p_round uuid) returns integer
+language sql stable as $$
+  select x.version from screening_v2.interview_rounds x where x.id = p_round
+$$;
+
+-- Attaches Recall bot id(30, n) to booking id(40, n) through 0142's r1_meet_set_bot: bot_scheduled.
+create function _r1_meet_public_tests.attach(p_n integer) returns void
+language plpgsql as $$
+declare
+  v_res jsonb;
+begin
+  select screening_v2.r1_meet_set_bot(x.id, 'attach', x.version, x.key_attempt,
+                                      _r1_meet_public_tests.id(30, p_n), '2026-12-20 04:00:00+00')
+    into v_res
+    from screening_v2.r1_meet_bookings x where x.id = _r1_meet_public_tests.id(40, p_n);
+  perform _r1_meet_public_tests.assert('T4 fixture: bot ' || p_n || ' attached (bot_scheduled)',
+    v_res ->> 'status' = 'ok' and v_res ->> 'booking_status' = 'bot_scheduled', coalesce(v_res::text, 'null'));
+end;
+$$;
+
+-- Attaches the bot, then Recall dispatches it (0142 r1_meet_transition_booking: bot_joining).
+create function _r1_meet_public_tests.dispatch(p_n integer) returns void
+language plpgsql as $$
+declare
+  v_res jsonb;
+begin
+  perform _r1_meet_public_tests.attach(p_n);
+  v_res := screening_v2.r1_meet_transition_booking(_r1_meet_public_tests.id(40, p_n), 'bot_scheduled',
+                                                   'bot_joining', 'eligible', '2026-12-20 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T4 fixture: bot ' || p_n || ' dispatched (bot_joining)',
+    v_res ->> 'status' = 'ok', v_res::text);
+end;
+$$;
+
+-- Calls the move RPC as S06 would for booking id(40, n): its manage digest md(n), the booking's
+-- current version, the slot t4_slot(n) + 15 min (45 min long: it overlaps only the booking's own
+-- slot), seats 2, limits 20/20, at most 3 moves, a one-hour cutoff, grace 7200, the T4 now;
+-- overridden by p_args (a JSON null is SQL NULL).
+create function _r1_meet_public_tests.move(p_n integer, p_args jsonb default '{}'::jsonb)
+returns jsonb language plpgsql as $$
+declare
+  a jsonb := jsonb_build_object(
+    'booking_id', _r1_meet_public_tests.id(40, p_n),
+    'digest', _r1_meet_public_tests.md(p_n),
+    'version', (select x.version from screening_v2.r1_meet_bookings x
+                 where x.id = _r1_meet_public_tests.id(40, p_n)),
+    'start_at', _r1_meet_public_tests.t4_slot(p_n) + interval '15 minutes',
+    'end_at', _r1_meet_public_tests.t4_slot(p_n) + interval '60 minutes',
+    'seats', 2,
+    'public_limit', 20,
+    'bot_limit', 20,
+    'max_moves', 3,
+    'cutoff', 3600,
+    'grace', 7200,
+    'now', '2026-12-20T04:00:00+00:00') || p_args;
+begin
+  return screening_v2.r1_meet_public_move_booking(
+    (a ->> 'booking_id')::uuid, a ->> 'digest', (a ->> 'version')::integer,
+    (a ->> 'start_at')::timestamptz, (a ->> 'end_at')::timestamptz,
+    (a ->> 'seats')::integer, (a ->> 'public_limit')::integer, (a ->> 'bot_limit')::integer,
+    (a ->> 'max_moves')::integer, (a ->> 'cutoff')::integer, (a ->> 'grace')::integer,
+    (a ->> 'now')::timestamptz);
+end;
+$$;
+
+-- Calls the cancel RPC for candidate n's digest md(n): no withdrawal, a one-hour cutoff, the T4 now.
+create function _r1_meet_public_tests.cancel(p_n integer, p_args jsonb default '{}'::jsonb)
+returns jsonb language plpgsql as $$
+declare
+  a jsonb := jsonb_build_object('digest', _r1_meet_public_tests.md(p_n), 'withdraw', false,
+                                'cutoff', 3600, 'now', '2026-12-20T04:00:00+00:00') || p_args;
+begin
+  return screening_v2.r1_meet_public_cancel_booking(
+    a ->> 'digest', (a ->> 'withdraw')::boolean, (a ->> 'cutoff')::integer, (a ->> 'now')::timestamptz);
+end;
+$$;
+
+-- Calls the re-consent RPC for candidate n's digest md(n): the form's default consent, the T4 now.
+create function _r1_meet_public_tests.reconsent(p_n integer, p_args jsonb default '{}'::jsonb)
+returns jsonb language plpgsql as $$
+declare
+  a jsonb := jsonb_build_object('digest', _r1_meet_public_tests.md(p_n),
+                                'consent', _r1_meet_public_tests.form_consent(),
+                                'now', '2026-12-20T04:00:00+00:00') || p_args;
+begin
+  return screening_v2.r1_meet_public_reconsent(
+    a ->> 'digest', nullif(a -> 'consent', 'null'::jsonb), (a ->> 'now')::timestamptz);
+end;
+$$;
+
+-- p_sql (one jsonb answer) must answer p_outcome (the outcome() word); every answer but the three
+-- that write (moved, cancelled, ok) must leave counts() unchanged.
+create function _r1_meet_public_tests.expect_rpc(p_label text, p_sql text, p_outcome text)
+returns jsonb language plpgsql as $$
+declare
+  v_before jsonb := _r1_meet_public_tests.counts();
+  v_res jsonb;
+begin
+  execute p_sql into v_res;
+  perform _r1_meet_public_tests.assert(p_label || ' answers ' || p_outcome,
+    _r1_meet_public_tests.outcome(v_res) = p_outcome, coalesce(v_res::text, 'null'));
+  if p_outcome not in ('moved:', 'cancelled:', 'ok:') then
+    perform _r1_meet_public_tests.assert(p_label || ' writes nothing',
+      _r1_meet_public_tests.counts() = v_before, coalesce(v_res::text, 'null'));
+  end if;
+  return v_res;
+end;
+$$;
+
+create function _r1_meet_public_tests.expect_move(p_label text, p_n integer, p_args jsonb, p_outcome text)
+returns jsonb language sql as $$
+  select _r1_meet_public_tests.expect_rpc(p_label,
+    format('select _r1_meet_public_tests.move(%s, %L::jsonb)', p_n, p_args), p_outcome)
+$$;
+
+create function _r1_meet_public_tests.expect_cancel(p_label text, p_n integer, p_args jsonb, p_outcome text)
+returns jsonb language sql as $$
+  select _r1_meet_public_tests.expect_rpc(p_label,
+    format('select _r1_meet_public_tests.cancel(%s, %L::jsonb)', p_n, p_args), p_outcome)
+$$;
+
+create function _r1_meet_public_tests.expect_reconsent(p_label text, p_n integer, p_args jsonb, p_outcome text)
+returns jsonb language sql as $$
+  select _r1_meet_public_tests.expect_rpc(p_label,
+    format('select _r1_meet_public_tests.reconsent(%s, %L::jsonb)', p_n, p_args), p_outcome)
+$$;
+
+-- The expected jobs of the T4 RPCs (contracts section 5), and a job list in jobs_of order.
+create function _r1_meet_public_tests.move_job(p_booking uuid, p_count integer) returns jsonb
+language sql immutable as $$
+  select _r1_meet_public_tests.job(
+           jsonb_build_object('kind', 'calendar_sync', 'op', 'move', 'booking_id', p_booking),
+           'r1-meet:calendar:' || p_booking::text || ':move:' || p_count::text)
+$$;
+
+create function _r1_meet_public_tests.ensure_job(p_booking uuid) returns jsonb
+language sql immutable as $$
+  select _r1_meet_public_tests.job(jsonb_build_object('kind', 'ensure_bot', 'booking_id', p_booking),
+                                   'r1-meet:ensure-bot:' || p_booking::text)
+$$;
+
+create function _r1_meet_public_tests.release_job(p_booking uuid, p_bot uuid) returns jsonb
+language sql immutable as $$
+  select _r1_meet_public_tests.job(
+           jsonb_build_object('kind', 'bot_release', 'recall_bot_id', p_bot, 'booking_id', p_booking),
+           'r1-meet:bot-release:' || p_bot::text)
+$$;
+
+create function _r1_meet_public_tests.by_key(p_jobs jsonb) returns jsonb
+language sql immutable as $$
+  select coalesce(jsonb_agg(e.item order by e.item ->> 'dedup_key' collate "C"), '[]'::jsonb)
+    from jsonb_array_elements(p_jobs) e(item)
+$$;
+
+-- Whether a round_cancelled job names the booking (0142's trigger on a Meet round's cancel).
+create function _r1_meet_public_tests.round_cancelled_job(p_booking uuid) returns boolean
+language sql stable as $$
+  select exists (select 1 from screening_v2.job_queue x
+                  where x.dedup_key = 'r1-meet:round-cancelled:' || p_booking::text
+                     or (x.name = 'r1-meet' and x.payload ->> 'kind' = 'round_cancelled'
+                         and x.payload ->> 'booking_id' = p_booking::text))
+$$;
+
+-- A test-only BEFORE UPDATE trigger function: bumps the booking's round version, as a concurrent
+-- writer would between the cancel's read of the round and r1_transition_round.
+create function _r1_meet_public_tests.bump_round() returns trigger
+language plpgsql as $$
+begin
+  update screening_v2.interview_rounds set version = version + 1 where id = new.round_id;
+  return new;
+end;
+$$;
+
+-- Under the newer release 'zzz-meet-public-assert-newer' (inside under_release): the manage page
+-- reads consent_current false, the older notice is stale, the newer one is accepted; the old
+-- consent is superseded and the new candidate_web row is on the newer notice. Returns the answer.
+create function _r1_meet_public_tests.t4_newer(p_n integer, p_now timestamptz) returns jsonb
+language plpgsql as $$
+declare
+  v_round uuid := _r1_meet_public_tests.round_of_booking(_r1_meet_public_tests.id(40, p_n));
+  v_old uuid := _r1_meet_public_tests.live_consent(
+                  _r1_meet_public_tests.round_of_booking(_r1_meet_public_tests.id(40, p_n)));
+  v_tpl uuid := (select x.id from screening_v2.interview_round_consent_templates x
+                  where x.version = 'zzz-meet-public-assert-newer' and x.locale = 'en-IN');
+  v_res jsonb;
+  v_new uuid;
+begin
+  perform _r1_meet_public_tests.assert('T4-C under a newer release the manage page reads consent_current false',
+    (screening_v2.r1_meet_public_manage_read(_r1_meet_public_tests.md(p_n), 3600, 3, p_now)
+      -> 'consent_current') = 'false'::jsonb);
+  perform _r1_meet_public_tests.expect_reconsent('T4-C under a newer release, the older notice', p_n,
+    jsonb_build_object('now', p_now), 'refused:consent_stale');
+  v_res := _r1_meet_public_tests.expect_reconsent('T4-C under a newer release, the newer notice', p_n,
+    jsonb_build_object('now', p_now, 'consent', _r1_meet_public_tests.form_consent()
+      || '{"template_version": "zzz-meet-public-assert-newer"}'::jsonb), 'ok:');
+  v_new := _r1_meet_public_tests.live_consent(v_round);
+  perform _r1_meet_public_tests.assert(
+    'T4-C ... supersedes the old consent (no recording erase) and stores the newer notice''s candidate_web consent',
+    (select x.withdrawn_at = p_now and x.proof ->> 'decision' = 'superseded'
+       from screening_v2.interview_round_consents x where x.id = v_old)
+    and not exists (select 1 from screening_v2.job_queue x
+                     where x.name = 'r1.recording.erase' and x.dedup_key = 'r1.recording.erase:' || v_old::text)
+    and v_new is distinct from v_old and v_tpl is not null
+    and _r1_meet_public_tests.form_consent_ok(v_new, v_tpl, p_now));
+  perform _r1_meet_public_tests.assert('T4-C ... and the manage page reads consent_current true',
+    (screening_v2.r1_meet_public_manage_read(_r1_meet_public_tests.md(p_n), 3600, 3, p_now)
+      -> 'consent_current') = 'true'::jsonb);
+  return v_res;
+end;
+$$;
+
+-- =============================================================================================
+-- T4-A. r1_meet_public_move_booking (§18): moves, every refusal in order, the S06 bot path.
+-- =============================================================================================
+do $$
+declare
+  t4 constant timestamptz := '2026-12-20 04:00:00+00';
+  t5 constant timestamptz := '2026-12-20 05:00:00+00';
+  d30 constant timestamptz := '2026-12-30 05:00:00+00';
+  far constant timestamptz := '2027-01-03 01:15:00+00';
+  sig constant text :=
+    'screening_v2.r1_meet_public_move_booking(uuid, text, integer, timestamptz, timestamptz, integer, '
+    || 'integer, integer, integer, integer, integer, timestamptz)';
+  b uuid;
+  r uuid;
+  ab uuid;
+  res jsonb;
+  bk screening_v2.r1_meet_bookings%rowtype;
+  rd screening_v2.interview_rounds%rowtype;
+  r_version integer;
+  reserved_before numeric;
+  v_public integer;
+  v_total integer;
+  bad jsonb;
+  f text;
+  role_name text;
+  s timestamptz;
+  n integer;
+begin
+  -- Every booking of this section first (IST 2026-12-21, 09:00 to 16:00 IST).
+  for n in 600..607 loop
+    perform _r1_meet_public_tests.t4_book(n);
+  end loop;
+
+  -- (1) A move to another IST day: the new slot, a new bot generation, move_count 1, the round's
+  -- expiry moved, the calendar move job; the create's ensure_bot job (still pending) absorbs the
+  -- move's.
+  b := _r1_meet_public_tests.id(40, 600);
+  select * into rd from screening_v2.interview_rounds x where x.id = _r1_meet_public_tests.round_of_booking(b);
+  r := rd.id;
+  r_version := rd.version;
+  reserved_before := _r1_meet_public_tests.reserved('2026-12-01');
+  res := _r1_meet_public_tests.expect_move('T4-A a move to another IST day', 600,
+    jsonb_build_object('start_at', d30, 'end_at', d30 + interval '45 minutes', 'now', t5), 'moved:');
+  perform _r1_meet_public_tests.assert('T4-A ... answers moved with exactly the contract fields',
+    res = jsonb_build_object('status', 'moved', 'booking_id', b, 'start_at', d30,
+                             'end_at', d30 + interval '45 minutes', 'version', 1, 'key_attempt', 0,
+                             'move_count', 1), res::text);
+  select * into bk from screening_v2.r1_meet_bookings x where x.id = b;
+  perform _r1_meet_public_tests.assert(
+    'T4-A ... the booking has the new slot, a new bot generation, move_count 1, pending/eligible, the same link, round and digest',
+    bk.start_at = d30 and bk.end_at = d30 + interval '45 minutes' and bk.version = 1 and bk.key_attempt = 0
+    and bk.move_count = 1 and bk.status = 'pending' and bk.reason = 'eligible' and bk.updated_at = t5
+    and bk.meet_url = 'https://meet.google.com/abc-defg-hij' and bk.round_id = r
+    and bk.manage_token_digest = _r1_meet_public_tests.md(600) and bk.calendar_state = 'created'
+    and bk.ticket_digest is null and bk.recall_bot_id is null and bk.source = 'public_page'
+    and bk.ashby_updated_at is null and bk.ashby_interview_event_id is null, to_jsonb(bk)::text);
+  select * into rd from screening_v2.interview_rounds x where x.id = r;
+  perform _r1_meet_public_tests.assert(
+    'T4-A ... the round expires at the new end + 7200 s, version + 1, the same hold and month counter',
+    rd.expires_at = d30 + interval '45 minutes' + interval '7200 seconds' and rd.version = r_version + 1
+    and rd.updated_at = t5 and rd.status = 'invited' and rd.held_minutes = 65
+    and rd.hold_month = '2026-12-01' and _r1_meet_public_tests.reserved('2026-12-01') = reserved_before,
+    to_jsonb(rd)::text);
+  perform _r1_meet_public_tests.assert(
+    'T4-A ... the jobs: the create''s three and calendar move:1 (the pending ensure_bot absorbed the move''s)',
+    _r1_meet_public_tests.jobs_of(b)
+      = _r1_meet_public_tests.by_key(_r1_meet_public_tests.create_jobs(b)
+                                     || jsonb_build_array(_r1_meet_public_tests.move_job(b, 1))),
+    _r1_meet_public_tests.jobs_of(b)::text);
+
+  -- (2) A second move within the new day: move_count 2, key move:2. The first ensure_bot job has
+  -- completed by then, so the move queues a fresh one (one live ensure_bot either way).
+  update screening_v2.job_queue set status = 'completed', completed_at = t5
+   where dedup_key = 'r1-meet:ensure-bot:' || b::text;
+  res := _r1_meet_public_tests.expect_move('T4-A a second move within the new IST day', 600,
+    jsonb_build_object('start_at', d30 + interval '1 hour', 'end_at', d30 + interval '105 minutes', 'now', t5),
+    'moved:');
+  perform _r1_meet_public_tests.assert('T4-A ... answers move_count 2, version 2, key_attempt 0',
+    res = jsonb_build_object('status', 'moved', 'booking_id', b, 'start_at', d30 + interval '1 hour',
+                             'end_at', d30 + interval '105 minutes', 'version', 2, 'key_attempt', 0,
+                             'move_count', 2), res::text);
+  perform _r1_meet_public_tests.assert(
+    'T4-A ... queues calendar move:2 and, the first ensure_bot done, one new live ensure_bot',
+    _r1_meet_public_tests.jobs_of(b)
+      = _r1_meet_public_tests.by_key(_r1_meet_public_tests.create_jobs(b)
+          || jsonb_build_array(_r1_meet_public_tests.move_job(b, 1), _r1_meet_public_tests.move_job(b, 2),
+                               _r1_meet_public_tests.ensure_job(b)))
+    and (select count(*) = 1 from screening_v2.job_queue x
+          where x.dedup_key = 'r1-meet:ensure-bot:' || b::text and x.status in ('pending', 'active', 'delayed')),
+    _r1_meet_public_tests.jobs_of(b)::text);
+  perform _r1_meet_public_tests.assert('T4-A ... the round follows: expiry at the second end + 7200 s, version + 2',
+    (select x.expires_at = d30 + interval '105 minutes' + interval '7200 seconds' and x.version = r_version + 2
+       from screening_v2.interview_rounds x where x.id = r));
+
+  -- (3) Capacity leaves the booking itself out: one seat and a slot overlapping only its own; the
+  -- day's counts (the booking included) as the limits move it, one below them is day_full.
+  s := _r1_meet_public_tests.t4_slot(601);
+  perform _r1_meet_public_tests.expect_move('T4-A one seat and a slot overlapping only the booking''s own', 601,
+    '{"seats": 1}'::jsonb, 'moved:');
+  v_public := (screening_v2.r1_meet_public_day_count((s at time zone 'Asia/Kolkata')::date, null) ->> 'public')::integer;
+  v_total := (screening_v2.r1_meet_public_day_count((s at time zone 'Asia/Kolkata')::date, null) ->> 'total')::integer;
+  perform _r1_meet_public_tests.assert('T4-A fixture: the booking''s IST day counts it and the other T4 bookings',
+    v_public >= 2 and v_total >= v_public, format('public %s, total %s', v_public, v_total));
+  perform _r1_meet_public_tests.expect_move('T4-A the public limit one below the day''s public count', 601,
+    jsonb_build_object('start_at', s + interval '5 minutes', 'end_at', s + interval '50 minutes',
+                       'public_limit', v_public - 1), 'refused:day_full');
+  perform _r1_meet_public_tests.expect_move('T4-A the bot limit one below the day''s total', 601,
+    jsonb_build_object('start_at', s + interval '5 minutes', 'end_at', s + interval '50 minutes',
+                       'bot_limit', v_total - 1), 'refused:day_full');
+  perform _r1_meet_public_tests.expect_move('T4-A the day''s own counts (the booking included) as the limits, one seat',
+    601, jsonb_build_object('start_at', s + interval '5 minutes', 'end_at', s + interval '50 minutes',
+                            'public_limit', v_public, 'bot_limit', v_total, 'seats', 1), 'moved:');
+
+  -- (4) invalid_request: every field wrong, then fixed one at a time, answers each field in order.
+  s := _r1_meet_public_tests.t4_slot(602);
+  bad := jsonb_build_object('booking_id', null, 'digest', 'not-a-digest', 'version', 51, 'start_at', null,
+                            'seats', 0, 'public_limit', 0, 'max_moves', 11, 'cutoff', 899, 'grace', 899,
+                            'now', null);
+  foreach f in array array['booking_id', 'digest', 'version', 'slot', 'seats', 'day_limit', 'max_moves',
+                           'cutoff', 'grace', 'now'] loop
+    perform _r1_meet_public_tests.expect_move('T4-A every field wrong from ' || f || ' on', 602, bad,
+      'invalid_request:' || f);
+    bad := bad - case f when 'slot' then 'start_at' when 'day_limit' then 'public_limit' else f end;
+  end loop;
+  perform _r1_meet_public_tests.expect_move('T4-A an upper-case digest', 602,
+    jsonb_build_object('digest', upper(_r1_meet_public_tests.md(602))), 'invalid_request:digest');
+  perform _r1_meet_public_tests.expect_move('T4-A a 63-character digest', 602,
+    jsonb_build_object('digest', left(_r1_meet_public_tests.md(602), 63)), 'invalid_request:digest');
+  perform _r1_meet_public_tests.expect_move('T4-A version -1', 602, '{"version": -1}'::jsonb, 'invalid_request:version');
+  perform _r1_meet_public_tests.expect_move('T4-A no version', 602, '{"version": null}'::jsonb, 'invalid_request:version');
+  perform _r1_meet_public_tests.expect_move('T4-A a 29-minute slot', 602,
+    jsonb_build_object('start_at', s + interval '1 day', 'end_at', s + interval '1 day 29 minutes'), 'invalid_request:slot');
+  perform _r1_meet_public_tests.expect_move('T4-A a 61-minute slot', 602,
+    jsonb_build_object('start_at', s + interval '1 day', 'end_at', s + interval '1 day 61 minutes'), 'invalid_request:slot');
+  perform _r1_meet_public_tests.expect_move('T4-A an end before the start', 602,
+    jsonb_build_object('start_at', s + interval '1 day', 'end_at', s + interval '23 hours'), 'invalid_request:slot');
+  perform _r1_meet_public_tests.expect_move('T4-A no end', 602, '{"end_at": null}'::jsonb, 'invalid_request:slot');
+  perform _r1_meet_public_tests.expect_move('T4-A 16 seats', 602, '{"seats": 16}'::jsonb, 'invalid_request:seats');
+  perform _r1_meet_public_tests.expect_move('T4-A a public limit of 201', 602, '{"public_limit": 201}'::jsonb,
+    'invalid_request:day_limit');
+  perform _r1_meet_public_tests.expect_move('T4-A a bot limit of 0', 602, '{"bot_limit": 0}'::jsonb,
+    'invalid_request:day_limit');
+  perform _r1_meet_public_tests.expect_move('T4-A no bot limit', 602, '{"bot_limit": null}'::jsonb,
+    'invalid_request:day_limit');
+  perform _r1_meet_public_tests.expect_move('T4-A max_moves -1', 602, '{"max_moves": -1}'::jsonb,
+    'invalid_request:max_moves');
+  perform _r1_meet_public_tests.expect_move('T4-A a cutoff of 43201 s', 602, '{"cutoff": 43201}'::jsonb,
+    'invalid_request:cutoff');
+  perform _r1_meet_public_tests.expect_move('T4-A a grace of 86401 s', 602, '{"grace": 86401}'::jsonb,
+    'invalid_request:grace');
+  perform _r1_meet_public_tests.expect_move('T4-A an unknown digest and no now: the field first', 602,
+    jsonb_build_object('digest', _r1_meet_public_tests.digest('t4-unknown'), 'now', null), 'invalid_request:now');
+
+  -- (5) not_found: the digest must name THIS live public booking before its slot ends.
+  perform _r1_meet_public_tests.expect_move('T4-A an unknown digest', 602,
+    jsonb_build_object('digest', _r1_meet_public_tests.digest('t4-unknown')), 'refused:not_found');
+  perform _r1_meet_public_tests.expect_move('T4-A another booking''s digest', 602,
+    jsonb_build_object('digest', _r1_meet_public_tests.md(603)), 'refused:not_found');
+  ab := _r1_meet_public_tests.ashby_booking(692, jsonb_build_object('status', 'blocked', 'reason', 'not_scheduled',
+          'start_at', '2026-12-31 05:00:00+00'::timestamptz, 'end_at', '2026-12-31 05:45:00+00'::timestamptz));
+  perform _r1_meet_public_tests.expect_move('T4-A an Ashby booking id', 602,
+    jsonb_build_object('booking_id', ab, 'version', 0), 'refused:not_found');
+  res := screening_v2.r1_meet_transition_booking(_r1_meet_public_tests.id(40, 603), 'pending', 'failed',
+                                                 'bot_create_failed', t4);
+  perform _r1_meet_public_tests.assert('T4-A fixture: booking 603 failed (bot_create_failed)',
+    res ->> 'status' = 'ok', res::text);
+  perform _r1_meet_public_tests.expect_move('T4-A a failed booking', 603, '{}'::jsonb, 'refused:not_found');
+  perform _r1_meet_public_tests.expect_move('T4-A at the slot end (the cutoff has passed too)', 602,
+    jsonb_build_object('now', s + interval '45 minutes'), 'refused:not_found');
+
+  -- (6) cutoff_passed, moves_exhausted, same_slot.
+  perform _r1_meet_public_tests.expect_move('T4-A one second before the slot end', 602,
+    jsonb_build_object('now', s + interval '44 minutes 59 seconds'), 'refused:cutoff_passed');
+  perform _r1_meet_public_tests.expect_move('T4-A at start - cutoff with no moves left', 602,
+    jsonb_build_object('now', s - interval '1 hour', 'max_moves', 0), 'refused:cutoff_passed');
+  perform _r1_meet_public_tests.expect_move('T4-A one second before start - cutoff with no moves left', 602,
+    jsonb_build_object('now', s - interval '1 hour 1 second', 'max_moves', 0), 'refused:moves_exhausted');
+  perform _r1_meet_public_tests.expect_move('T4-A no moves left and the same slot', 602,
+    jsonb_build_object('max_moves', 0, 'start_at', s, 'end_at', s + interval '45 minutes'), 'refused:moves_exhausted');
+  perform _r1_meet_public_tests.expect_move('T4-A the same slot', 602,
+    jsonb_build_object('start_at', s, 'end_at', s + interval '45 minutes'), 'refused:same_slot');
+
+  -- (7) booking_dispatched (its bot attached, the slot in the past or not), then in_past.
+  perform _r1_meet_public_tests.dispatch(605);
+  perform _r1_meet_public_tests.expect_move('T4-A a dispatched booking and the same slot', 605,
+    jsonb_build_object('start_at', _r1_meet_public_tests.t4_slot(605),
+                       'end_at', _r1_meet_public_tests.t4_slot(605) + interval '45 minutes'), 'refused:same_slot');
+  perform _r1_meet_public_tests.expect_move('T4-A a dispatched booking (its bot attached)', 605, '{}'::jsonb,
+    'refused:booking_dispatched');
+  perform _r1_meet_public_tests.expect_move('T4-A a dispatched booking and a slot in the past', 605,
+    jsonb_build_object('start_at', t4 - interval '1 hour', 'end_at', t4 - interval '15 minutes'),
+    'refused:booking_dispatched');
+  perform _r1_meet_public_tests.public_booking(690, _r1_meet_public_tests.blocked()
+    || _r1_meet_public_tests.slot(t4 - interval '1 hour'));
+  perform _r1_meet_public_tests.assert('T4-A fixture: a live blocked booking holds the past hour',
+    screening_v2.r1_meet_public_slot_count(t4 - interval '1 hour', t4 - interval '15 minutes', null) >= 1);
+  perform _r1_meet_public_tests.expect_move('T4-A a slot starting now', 602,
+    jsonb_build_object('start_at', t4, 'end_at', t4 + interval '45 minutes'), 'refused:in_past');
+  perform _r1_meet_public_tests.expect_move('T4-A one seat in a past slot a live booking holds', 602,
+    jsonb_build_object('start_at', t4 - interval '1 hour', 'end_at', t4 - interval '15 minutes', 'seats', 1),
+    'refused:in_past');
+
+  -- (8) slot_too_far, slot_full, day_full (public and total), version_conflict. A live blocked
+  -- public booking sits at the 14-day bound (end + 7200 s = now + 14 days), a live blocked Ashby
+  -- booking on IST 2026-12-31.
+  perform _r1_meet_public_tests.public_booking(691, _r1_meet_public_tests.blocked()
+    || jsonb_build_object('start_at', far, 'end_at', far + interval '45 minutes'));
+  perform _r1_meet_public_tests.expect_move('T4-A an expiry one second past now + 14 days, one seat, a live booking there',
+    602, jsonb_build_object('start_at', far + interval '1 second', 'end_at', far + interval '45 minutes 1 second',
+                            'seats', 1), 'refused:slot_too_far');
+  perform _r1_meet_public_tests.expect_move('T4-A an expiry exactly at now + 14 days, one seat, the day''s public limit 1',
+    602, jsonb_build_object('start_at', far, 'end_at', far + interval '45 minutes', 'seats', 1, 'public_limit', 1),
+    'refused:slot_full');
+  perform _r1_meet_public_tests.expect_move('T4-A two seats there and the day''s public limit 1', 602,
+    jsonb_build_object('start_at', far, 'end_at', far + interval '45 minutes', 'public_limit', 1), 'refused:day_full');
+  perform _r1_meet_public_tests.expect_move('T4-A the bot limit 1 on a day with one live Ashby booking, a stale version too',
+    602, jsonb_build_object('start_at', '2026-12-31 08:00:00+00'::timestamptz,
+                            'end_at', '2026-12-31 08:45:00+00'::timestamptz, 'bot_limit', 1, 'version', 7),
+    'refused:day_full');
+  perform _r1_meet_public_tests.expect_move('T4-A a stale version', 602,
+    jsonb_build_object('start_at', '2026-12-31 08:00:00+00'::timestamptz,
+                       'end_at', '2026-12-31 08:45:00+00'::timestamptz, 'version', 7), 'refused:version_conflict');
+
+  -- (9) A bot attached: version_conflict and capacity come first, then bot_attached; the S06 path
+  -- (Recall removes the bot, r1_meet_set_bot replace, the move with the new version) moves it.
+  perform _r1_meet_public_tests.attach(604);
+  perform _r1_meet_public_tests.expect_move('T4-A a stale version and a bot attached', 604, '{"version": 1}'::jsonb,
+    'refused:version_conflict');
+  perform _r1_meet_public_tests.expect_move('T4-A one seat in a slot a live booking holds, a bot attached', 604,
+    jsonb_build_object('start_at', _r1_meet_public_tests.t4_slot(605),
+                       'end_at', _r1_meet_public_tests.t4_slot(605) + interval '45 minutes', 'seats', 1),
+    'refused:slot_full');
+  perform _r1_meet_public_tests.expect_move('T4-A a bot attached', 604, '{}'::jsonb, 'refused:bot_attached');
+  res := screening_v2.r1_meet_set_bot(_r1_meet_public_tests.id(40, 604), 'replace', 0, 0, null, t4);
+  perform _r1_meet_public_tests.assert('T4-A fixture: S06 replaces the bot (a new generation, pending)',
+    res ->> 'status' = 'ok' and (res ->> 'version')::integer = 1 and res ->> 'booking_status' = 'pending', res::text);
+  perform _r1_meet_public_tests.expect_move('T4-A after set_bot replace, the version read before it', 604,
+    '{"version": 0}'::jsonb, 'refused:version_conflict');
+  res := _r1_meet_public_tests.expect_move('T4-A after set_bot replace, the new version: the S06 bot path moves', 604,
+    '{"version": 1}'::jsonb, 'moved:');
+  perform _r1_meet_public_tests.assert('T4-A ... a further generation, no bot, move_count 1',
+    (res ->> 'version')::integer = 2 and (res ->> 'key_attempt')::integer = 0 and (res ->> 'move_count')::integer = 1
+    and (select x.recall_bot_id is null and x.status = 'pending'
+           from screening_v2.r1_meet_bookings x where x.id = _r1_meet_public_tests.id(40, 604)), res::text);
+
+  -- (10) The reschedule's version_exhausted at generation 50 answers moves_exhausted.
+  update screening_v2.r1_meet_bookings set version = 50 where id = _r1_meet_public_tests.id(40, 606);
+  perform _r1_meet_public_tests.expect_move('T4-A at bot generation 50 with a stale version', 606,
+    '{"version": 49}'::jsonb, 'refused:version_conflict');
+  perform _r1_meet_public_tests.expect_move('T4-A at bot generation 50 (the reschedule''s version_exhausted)', 606,
+    '{"version": 50}'::jsonb, 'refused:moves_exhausted');
+
+  -- (11) round_not_live: HR cancels the round in the app (0142 queues its round_cancelled job);
+  -- with the bot still attached the move answers bot_attached, after the replace round_not_live.
+  perform _r1_meet_public_tests.attach(607);
+  r := _r1_meet_public_tests.round_of_booking(_r1_meet_public_tests.id(40, 607));
+  res := screening_v2.r1_transition_round(r, 'cancel', _r1_meet_public_tests.round_version(r), null, null, t4);
+  perform _r1_meet_public_tests.assert('T4-A fixture: HR cancels the round of booking 607',
+    res ->> 'status' = 'ok', res::text);
+  perform _r1_meet_public_tests.expect_move('T4-A a bot attached and the round cancelled', 607, '{}'::jsonb,
+    'refused:bot_attached');
+  res := screening_v2.r1_meet_set_bot(_r1_meet_public_tests.id(40, 607), 'replace', 0, 0, null, t4);
+  perform _r1_meet_public_tests.assert('T4-A fixture: booking 607''s bot replaced', res ->> 'status' = 'ok', res::text);
+  perform _r1_meet_public_tests.expect_move('T4-A the round cancelled by HR', 607, '{}'::jsonb, 'refused:round_not_live');
+
+  -- (12) Catalog posture.
+  perform _r1_meet_public_tests.assert('T4-A the move is one security definer, volatile function returning jsonb',
+    (select x.prosecdef and x.provolatile = 'v'
+            and x.proconfig = array['search_path=pg_catalog, screening_v2']
+            and x.prorettype = 'jsonb'::regtype and x.pronargs = 12 and x.pronargdefaults = 2
+       from pg_proc x where x.oid = sig::regprocedure)
+    and (select count(*) = 1 from pg_proc x
+          where x.pronamespace = 'screening_v2'::regnamespace and x.proname = 'r1_meet_public_move_booking'));
+  perform _r1_meet_public_tests.assert('T4-A the move is executable by service_role only',
+    has_function_privilege('service_role', sig, 'execute')
+    and not has_function_privilege('anon', sig, 'execute')
+    and not has_function_privilege('authenticated', sig, 'execute')
+    and not has_function_privilege('public', sig, 'execute'));
+  foreach role_name in array array['anon', 'authenticated'] loop
+    perform _r1_meet_public_tests.raises_as(role_name, 'T4-A execute r1_meet_public_move_booking',
+      'select screening_v2.r1_meet_public_move_booking(null, null, null, null, null, null, null, null, null, null)',
+      '42501');
+  end loop;
+end;
+$$;
+
+-- =============================================================================================
+-- T4-B. r1_meet_public_cancel_booking (§19).
+-- =============================================================================================
+do $$
+declare
+  t4 constant timestamptz := '2026-12-20 04:00:00+00';
+  t5 constant timestamptz := '2026-12-20 05:00:00+00';
+  sig constant text := 'screening_v2.r1_meet_public_cancel_booking(text, boolean, integer, timestamptz)';
+  b uuid;
+  r uuid;
+  k uuid;
+  ab uuid;
+  bot uuid;
+  res jsonb;
+  bk screening_v2.r1_meet_bookings%rowtype;
+  rd screening_v2.interview_rounds%rowtype;
+  r_version integer;
+  reserved_before numeric;
+  s timestamptz;
+  bad jsonb;
+  f text;
+  role_name text;
+begin
+  -- (1) A pending booking, the consent kept: the booking, then the round (hold refunded), the
+  -- §3 trigger's two jobs, and no round_cancelled job.
+  b := _r1_meet_public_tests.t4_book(620);
+  r := _r1_meet_public_tests.round_of_booking(b);
+  k := _r1_meet_public_tests.live_consent(r);
+  r_version := _r1_meet_public_tests.round_version(r);
+  reserved_before := _r1_meet_public_tests.reserved('2026-12-01');
+  res := _r1_meet_public_tests.expect_cancel('T4-B a pending booking, the consent kept', 620,
+    jsonb_build_object('now', t5), 'cancelled:');
+  perform _r1_meet_public_tests.assert('T4-B ... answers exactly cancelled and the booking id',
+    res = jsonb_build_object('status', 'cancelled', 'booking_id', b), res::text);
+  select * into bk from screening_v2.r1_meet_bookings x where x.id = b;
+  perform _r1_meet_public_tests.assert('T4-B ... the booking is cancelled/candidate_cancelled at now',
+    bk.status = 'cancelled' and bk.reason = 'candidate_cancelled' and bk.updated_at = t5 and bk.round_id = r
+    and bk.calendar_state = 'created' and bk.move_count = 0 and bk.manage_token_digest = _r1_meet_public_tests.md(620),
+    to_jsonb(bk)::text);
+  select * into rd from screening_v2.interview_rounds x where x.id = r;
+  perform _r1_meet_public_tests.assert(
+    'T4-B ... the round is cancelled through r1_transition_round and its 65-minute hold refunded',
+    rd.status = 'cancelled' and rd.version = r_version + 1 and rd.held_minutes = 0 and rd.updated_at = t5
+    and _r1_meet_public_tests.reserved('2026-12-01') = reserved_before - 65, to_jsonb(rd)::text);
+  perform _r1_meet_public_tests.assert('T4-B ... the consent stays live (no withdrawal asked), no erase job',
+    _r1_meet_public_tests.live_consent(r) = k
+    and not exists (select 1 from screening_v2.job_queue x
+                     where x.name = 'r1.recording.erase' and x.dedup_key = 'r1.recording.erase:' || k::text));
+  perform _r1_meet_public_tests.assert(
+    'T4-B ... the jobs: the create''s three, the calendar cancel and the Ashby tag removal (the terminal trigger)',
+    _r1_meet_public_tests.jobs_of(b)
+      = _r1_meet_public_tests.by_key(_r1_meet_public_tests.create_jobs(b) || _r1_meet_public_tests.terminal_jobs(b, true)),
+    _r1_meet_public_tests.jobs_of(b)::text);
+  perform _r1_meet_public_tests.assert(
+    'T4-B ... and no round_cancelled job (0142''s trigger found no live booking on the round)',
+    not _r1_meet_public_tests.round_cancelled_job(b));
+
+  res := _r1_meet_public_tests.expect_cancel('T4-B the same cancel again', 620, jsonb_build_object('now', t5),
+    'already_cancelled:');
+  perform _r1_meet_public_tests.assert('T4-B ... answers exactly already_cancelled',
+    res = '{"status": "already_cancelled"}'::jsonb, res::text);
+  perform _r1_meet_public_tests.expect_cancel('T4-B ... and again, withdrawing the consent', 620,
+    jsonb_build_object('now', t5, 'withdraw', true), 'already_cancelled:');
+  perform _r1_meet_public_tests.expect_cancel('T4-B ... and after its slot ended', 620,
+    jsonb_build_object('now', _r1_meet_public_tests.t4_slot(620) + interval '45 minutes'), 'refused:not_found');
+  perform _r1_meet_public_tests.assert('T4-B ... the manage page reads not_found',
+    screening_v2.r1_meet_public_manage_read(_r1_meet_public_tests.md(620), 3600, 3, t5) = '{"status": "not_found"}'::jsonb);
+
+  -- A cancel is not a completed R1: the candidate books the freed slot again (one seat), a new round.
+  perform _r1_meet_public_tests.assert('T4-B after the cancel the precheck answers eligible',
+    _r1_meet_public_tests.pre(620, t5) = 'eligible', _r1_meet_public_tests.pre(620, t5));
+  res := _r1_meet_public_tests.create(620, jsonb_build_object(
+    'booking_id', _r1_meet_public_tests.id(40, 6201), 'request_id', _r1_meet_public_tests.id(41, 6201),
+    'start_at', _r1_meet_public_tests.t4_slot(620), 'end_at', _r1_meet_public_tests.t4_slot(620) + interval '45 minutes',
+    'seats', 1, 'now', t5));
+  perform _r1_meet_public_tests.assert('T4-B after the cancel the candidate books the freed slot again: a new round',
+    _r1_meet_public_tests.outcome(res) = 'booked:created' and (res ->> 'round_id')::uuid <> r
+    and _r1_meet_public_tests.reserved('2026-12-01') = reserved_before, res::text);
+
+  -- (2) A booking with a bot, an unclaimed ticket and a sent invite, withdrawing the consent.
+  b := _r1_meet_public_tests.t4_book(621);
+  r := _r1_meet_public_tests.round_of_booking(b);
+  k := _r1_meet_public_tests.live_consent(r);
+  bot := _r1_meet_public_tests.id(30, 621);
+  res := screening_v2.r1_meet_public_set_calendar_state(b, array['created'], 'invited', t4);
+  perform _r1_meet_public_tests.assert('T4-B fixture: the invite was sent', res ->> 'status' = 'ok', res::text);
+  perform _r1_meet_public_tests.attach(621);
+  update screening_v2.r1_meet_bookings
+     set ticket_digest = _r1_meet_public_tests.digest('t4-ticket-621'), ticket_not_before = t4,
+         ticket_expires_at = t4 + interval '1 day'
+   where id = b;
+  reserved_before := _r1_meet_public_tests.reserved('2026-12-01');
+  res := _r1_meet_public_tests.expect_cancel(
+    'T4-B a booking with a bot, an unclaimed ticket and a sent invite, withdrawing the consent', 621,
+    jsonb_build_object('now', t5, 'withdraw', true), 'cancelled:');
+  select * into bk from screening_v2.r1_meet_bookings x where x.id = b;
+  perform _r1_meet_public_tests.assert(
+    'T4-B ... the unclaimed ticket is cleared; the bot id stays until its release is confirmed',
+    bk.status = 'cancelled' and bk.reason = 'candidate_cancelled' and bk.ticket_digest is null
+    and bk.ticket_not_before is null and bk.ticket_expires_at is null and bk.ticket_claimed_at is null
+    and bk.recall_bot_id = bot and bk.updated_at = t5 and bk.calendar_state = 'invited', to_jsonb(bk)::text);
+  perform _r1_meet_public_tests.assert('T4-B ... the round is cancelled and its hold refunded',
+    (select x.status = 'cancelled' and x.held_minutes = 0 from screening_v2.interview_rounds x where x.id = r)
+    and _r1_meet_public_tests.reserved('2026-12-01') = reserved_before - 65);
+  perform _r1_meet_public_tests.assert(
+    'T4-B ... the consent is withdrawn through r1_withdraw_consent (decision withdrawn, the source in its withdrawal proof)',
+    (select x.withdrawn_at = t5 and x.proof ->> 'decision' = 'withdrawn'
+            and x.proof -> 'withdrawal' = '{"source": "r1_public_booking"}'::jsonb
+            and (x.proof ->> 'withdrawn_at')::timestamptz = t5
+            and x.proof ->> 'source' = 'r1_public_booking' and x.proof ->> 'india_location_confirmed' = 'true'
+       from screening_v2.interview_round_consents x where x.id = k)
+    and _r1_meet_public_tests.live_consent(r) is null);
+  perform _r1_meet_public_tests.assert('T4-B ... which queues exactly the existing 0127 recording erase job',
+    (select count(*) = 1
+            and bool_and(x.payload = jsonb_build_object('round_id', r, 'reason', 'consent_withdrawn')
+                         and x.max_attempts = 5)
+       from screening_v2.job_queue x
+      where x.name = 'r1.recording.erase' and x.dedup_key = 'r1.recording.erase:' || k::text));
+  perform _r1_meet_public_tests.assert(
+    'T4-B ... the jobs: the create''s three, the calendar cancel, the tag removal and the bot release (0142 key)',
+    _r1_meet_public_tests.jobs_of(b)
+      = _r1_meet_public_tests.by_key(_r1_meet_public_tests.create_jobs(b) || _r1_meet_public_tests.terminal_jobs(b, true)
+                                     || jsonb_build_array(_r1_meet_public_tests.release_job(b, bot))),
+    _r1_meet_public_tests.jobs_of(b)::text);
+  perform _r1_meet_public_tests.assert('T4-B ... and no round_cancelled job', not _r1_meet_public_tests.round_cancelled_job(b));
+
+  -- (3) A claimed ticket stays as evidence.
+  b := _r1_meet_public_tests.t4_book(622);
+  perform _r1_meet_public_tests.attach(622);
+  update screening_v2.r1_meet_bookings
+     set ticket_digest = _r1_meet_public_tests.digest('t4-ticket-622'), ticket_not_before = t4,
+         ticket_expires_at = t4 + interval '1 day', ticket_claimed_at = t4
+   where id = b;
+  perform _r1_meet_public_tests.expect_cancel('T4-B a booking whose ticket was claimed', 622, '{}'::jsonb, 'cancelled:');
+  perform _r1_meet_public_tests.assert('T4-B ... the claimed ticket stays as evidence',
+    (select x.status = 'cancelled' and x.ticket_digest = _r1_meet_public_tests.digest('t4-ticket-622')
+            and x.ticket_not_before = t4 and x.ticket_expires_at = t4 + interval '1 day' and x.ticket_claimed_at = t4
+       from screening_v2.r1_meet_bookings x where x.id = b));
+
+  -- (4) not_found: unknown, another terminal booking, another cancel reason, an Ashby row, the end.
+  perform _r1_meet_public_tests.expect_cancel('T4-B an unknown digest', 620,
+    jsonb_build_object('digest', _r1_meet_public_tests.digest('t4-unknown')), 'refused:not_found');
+  b := _r1_meet_public_tests.t4_book(623);
+  res := screening_v2.r1_meet_transition_booking(b, 'pending', 'failed', 'bot_create_failed', t4);
+  perform _r1_meet_public_tests.assert('T4-B fixture: booking 623 failed', res ->> 'status' = 'ok', res::text);
+  perform _r1_meet_public_tests.expect_cancel('T4-B a failed booking', 623, '{}'::jsonb, 'refused:not_found');
+  b := _r1_meet_public_tests.t4_book(624);
+  res := screening_v2.r1_meet_cancel_booking(b, 'event_removed', t4);
+  perform _r1_meet_public_tests.assert('T4-B fixture: booking 624 cancelled (event_removed)', res ->> 'status' = 'ok', res::text);
+  perform _r1_meet_public_tests.expect_cancel('T4-B a booking cancelled for another reason (event_removed)', 624,
+    '{}'::jsonb, 'refused:not_found');
+  ab := _r1_meet_public_tests.ashby_booking(694, jsonb_build_object('status', 'blocked', 'reason', 'not_scheduled',
+          'start_at', '2026-12-31 07:00:00+00'::timestamptz, 'end_at', '2026-12-31 07:45:00+00'::timestamptz));
+  res := _r1_meet_public_tests.in_rollback(array[
+      'alter table screening_v2.r1_meet_bookings drop constraint chk_r1_meet_bookings_public_columns',
+      format('update screening_v2.r1_meet_bookings set manage_token_digest = %L where id = %L',
+             _r1_meet_public_tests.md(694), ab)],
+    format('select jsonb_build_object(''cancel'', screening_v2.r1_meet_public_cancel_booking(%L, false, 3600, %L), '
+           '''status'', (select x.status from screening_v2.r1_meet_bookings x where x.id = %L))',
+           _r1_meet_public_tests.md(694), t4, ab));
+  perform _r1_meet_public_tests.assert(
+    'T4-B a live Ashby booking holding the digest (CHECK lifted, rolled back): not_found, untouched',
+    res = '{"cancel": {"status": "refused", "code": "not_found"}, "status": "blocked"}'::jsonb, res::text);
+
+  -- (5) The slot end, the cutoff, a dispatched bot.
+  b := _r1_meet_public_tests.t4_book(625);
+  s := _r1_meet_public_tests.t4_slot(625);
+  perform _r1_meet_public_tests.expect_cancel('T4-B at the slot end', 625,
+    jsonb_build_object('now', s + interval '45 minutes'), 'refused:not_found');
+  perform _r1_meet_public_tests.expect_cancel('T4-B at start - cutoff', 625,
+    jsonb_build_object('now', s - interval '1 hour'), 'refused:cutoff_passed');
+  b := _r1_meet_public_tests.t4_book(626);
+  perform _r1_meet_public_tests.dispatch(626);
+  perform _r1_meet_public_tests.expect_cancel('T4-B a dispatched booking at start - cutoff', 626,
+    jsonb_build_object('now', _r1_meet_public_tests.t4_slot(626) - interval '1 hour'), 'refused:cutoff_passed');
+  perform _r1_meet_public_tests.expect_cancel('T4-B a dispatched booking', 626, '{}'::jsonb, 'refused:booking_dispatched');
+  perform _r1_meet_public_tests.expect_cancel('T4-B one second before start - cutoff', 625,
+    jsonb_build_object('now', s - interval '1 hour 1 second'), 'cancelled:');
+
+  -- (6) The round already expired (as the sweep would): the booking is cancelled, the round left
+  -- as it is (r1_transition_round is not called), the consent still withdrawn on request.
+  b := _r1_meet_public_tests.t4_book(627);
+  r := _r1_meet_public_tests.round_of_booking(b);
+  res := screening_v2.r1_transition_round(r, 'expire', _r1_meet_public_tests.round_version(r), null, null, t4);
+  perform _r1_meet_public_tests.assert('T4-B fixture: the round of booking 627 expired', res ->> 'status' = 'ok', res::text);
+  select * into rd from screening_v2.interview_rounds x where x.id = r;
+  reserved_before := _r1_meet_public_tests.reserved('2026-12-01');
+  perform _r1_meet_public_tests.expect_cancel('T4-B a booking whose round already expired, withdrawing the consent', 627,
+    jsonb_build_object('withdraw', true), 'cancelled:');
+  perform _r1_meet_public_tests.assert('T4-B ... the booking is cancelled; the expired round is left as it was',
+    (select x.status = 'cancelled' and x.reason = 'candidate_cancelled' from screening_v2.r1_meet_bookings x where x.id = b)
+    and (select to_jsonb(x) = to_jsonb(rd) from screening_v2.interview_rounds x where x.id = r)
+    and _r1_meet_public_tests.reserved('2026-12-01') = reserved_before);
+  perform _r1_meet_public_tests.assert('T4-B ... and its consent is withdrawn', _r1_meet_public_tests.live_consent(r) is null);
+
+  -- (7) The round's version moves after the cancel read it (a concurrent writer): one retry.
+  b := _r1_meet_public_tests.t4_book(628);
+  r := _r1_meet_public_tests.round_of_booking(b);
+  r_version := _r1_meet_public_tests.round_version(r);
+  execute format('create trigger t4_bump_round before update of status on screening_v2.r1_meet_bookings '
+                 'for each row when (new.id = %L::uuid and new.status = %L) '
+                 'execute function _r1_meet_public_tests.bump_round()', b, 'cancelled');
+  perform _r1_meet_public_tests.expect_cancel('T4-B the round version moves during the cancel: one retry cancels it', 628,
+    '{}'::jsonb, 'cancelled:');
+  drop trigger t4_bump_round on screening_v2.r1_meet_bookings;
+  perform _r1_meet_public_tests.assert('T4-B ... the round is cancelled at the moved version, its hold refunded',
+    (select x.status = 'cancelled' and x.version = r_version + 2 and x.held_minutes = 0
+       from screening_v2.interview_rounds x where x.id = r));
+
+  -- (8) Fail closed: a round r1_transition_round cannot cancel (its hold month row is missing).
+  b := _r1_meet_public_tests.t4_book(629);
+  r := _r1_meet_public_tests.round_of_booking(b);
+  perform _r1_meet_public_tests.assert('T4-B fixture: no budget month 2031-07',
+    not exists (select 1 from screening_v2.r1_budget_month x where x.month_start = '2031-07-01'));
+  update screening_v2.interview_rounds set hold_month = '2031-07-01' where id = r;
+  perform _r1_meet_public_tests.raises(
+    'T4-B a round whose hold month row is missing: the cancel raises',
+    'select _r1_meet_public_tests.cancel(629)', 'P0001');
+  perform _r1_meet_public_tests.assert('T4-B ... and nothing of it stays: booking pending, round invited, the create''s jobs',
+    (select x.status = 'pending' from screening_v2.r1_meet_bookings x where x.id = b)
+    and (select x.status = 'invited' and x.held_minutes = 65 from screening_v2.interview_rounds x where x.id = r)
+    and _r1_meet_public_tests.jobs_of(b) = _r1_meet_public_tests.create_jobs(b));
+  update screening_v2.interview_rounds set hold_month = '2026-12-01' where id = r;
+
+  -- (9) A live public booking without a round (blocked, inserted directly): cancelled, no round
+  -- touched, the withdrawal skipped.
+  b := _r1_meet_public_tests.public_booking(695, _r1_meet_public_tests.blocked()
+    || _r1_meet_public_tests.slot(_r1_meet_public_tests.t4_slot(695))
+    || jsonb_build_object('manage_token_digest', _r1_meet_public_tests.md(695)));
+  perform _r1_meet_public_tests.expect_cancel('T4-B a live public booking with no round, withdrawing the consent', 695,
+    jsonb_build_object('withdraw', true), 'cancelled:');
+  perform _r1_meet_public_tests.assert('T4-B ... is cancelled with the calendar cancel and the tag removal only',
+    (select x.status = 'cancelled' and x.reason = 'candidate_cancelled' from screening_v2.r1_meet_bookings x where x.id = b)
+    and _r1_meet_public_tests.jobs_of(b) = _r1_meet_public_tests.terminal_jobs(b, true),
+    _r1_meet_public_tests.jobs_of(b)::text);
+
+  -- (10) invalid_request: every field wrong, then fixed one at a time.
+  bad := jsonb_build_object('digest', null, 'withdraw', null, 'cutoff', 899, 'now', null);
+  foreach f in array array['digest', 'withdraw_consent', 'cutoff', 'now'] loop
+    perform _r1_meet_public_tests.expect_cancel('T4-B every field wrong from ' || f || ' on', 620, bad,
+      'invalid_request:' || f);
+    bad := bad - case f when 'withdraw_consent' then 'withdraw' else f end;
+  end loop;
+  perform _r1_meet_public_tests.expect_cancel('T4-B an upper-case digest', 620,
+    jsonb_build_object('digest', upper(_r1_meet_public_tests.md(620))), 'invalid_request:digest');
+  perform _r1_meet_public_tests.expect_cancel('T4-B a cutoff of 43201 s', 620, '{"cutoff": 43201}'::jsonb,
+    'invalid_request:cutoff');
+
+  -- (11) Catalog posture.
+  perform _r1_meet_public_tests.assert('T4-B the cancel is one security definer, volatile function returning jsonb',
+    (select x.prosecdef and x.provolatile = 'v'
+            and x.proconfig = array['search_path=pg_catalog, screening_v2']
+            and x.prorettype = 'jsonb'::regtype and x.pronargs = 4 and x.pronargdefaults = 1
+       from pg_proc x where x.oid = sig::regprocedure)
+    and (select count(*) = 1 from pg_proc x
+          where x.pronamespace = 'screening_v2'::regnamespace and x.proname = 'r1_meet_public_cancel_booking'));
+  perform _r1_meet_public_tests.assert('T4-B the cancel is executable by service_role only',
+    has_function_privilege('service_role', sig, 'execute')
+    and not has_function_privilege('anon', sig, 'execute')
+    and not has_function_privilege('authenticated', sig, 'execute')
+    and not has_function_privilege('public', sig, 'execute'));
+  foreach role_name in array array['anon', 'authenticated'] loop
+    perform _r1_meet_public_tests.raises_as(role_name, 'T4-B execute r1_meet_public_cancel_booking',
+      'select screening_v2.r1_meet_public_cancel_booking(null, null, null)', '42501');
+  end loop;
+end;
+$$;
+
+-- =============================================================================================
+-- T4-C. r1_meet_public_reconsent (§20).
+-- =============================================================================================
+do $$
+declare
+  t4 constant timestamptz := '2026-12-20 04:00:00+00';
+  t5 constant timestamptz := '2026-12-20 05:00:00+00';
+  tpl constant uuid := _r1_meet_public_tests.id(3, 1);
+  sig constant text := 'screening_v2.r1_meet_public_reconsent(text, jsonb, timestamptz)';
+  older constant jsonb := _r1_meet_public_tests.form_consent()
+                          || '{"template_version": "zz-meet-public-assert-older"}'::jsonb;
+  b uuid;
+  r uuid;
+  k uuid;
+  k2 uuid;
+  res jsonb;
+  bk screening_v2.r1_meet_bookings%rowtype;
+  rd screening_v2.interview_rounds%rowtype;
+  bad jsonb;
+  f text;
+  shape jsonb;
+  stored jsonb;
+  i integer := 0;
+  role_name text;
+begin
+  -- (1) The same notice again: the live consent superseded, a new candidate_web row; nothing else.
+  b := _r1_meet_public_tests.t4_book(640);
+  r := _r1_meet_public_tests.round_of_booking(b);
+  k := _r1_meet_public_tests.live_consent(r);
+  select * into bk from screening_v2.r1_meet_bookings x where x.id = b;
+  select * into rd from screening_v2.interview_rounds x where x.id = r;
+  res := _r1_meet_public_tests.expect_reconsent('T4-C a re-consent on the current notice', 640,
+    jsonb_build_object('now', t5), 'ok:');
+  perform _r1_meet_public_tests.assert('T4-C ... answers exactly ok', res = '{"status": "ok"}'::jsonb, res::text);
+  perform _r1_meet_public_tests.assert('T4-C ... supersedes the live consent (no recording erase)',
+    (select x.withdrawn_at = t5 and x.proof ->> 'decision' = 'superseded'
+            and (x.proof ->> 'superseded_at')::timestamptz = t5
+       from screening_v2.interview_round_consents x where x.id = k)
+    and not exists (select 1 from screening_v2.job_queue x
+                     where x.name = 'r1.recording.erase' and x.dedup_key = 'r1.recording.erase:' || k::text));
+  k2 := _r1_meet_public_tests.live_consent(r);
+  perform _r1_meet_public_tests.assert(
+    'T4-C ... and inserts the candidate_web consent of the form, the nine proof fields exactly',
+    k2 is distinct from k and _r1_meet_public_tests.form_consent_ok(k2, tpl, t5)
+    and (select count(*) = 2 from screening_v2.interview_round_consents x where x.round_id = r));
+  perform _r1_meet_public_tests.assert('T4-C ... the booking, the round and the jobs are untouched',
+    (select to_jsonb(x) = to_jsonb(bk) from screening_v2.r1_meet_bookings x where x.id = b)
+    and (select to_jsonb(x) = to_jsonb(rd) from screening_v2.interview_rounds x where x.id = r)
+    and _r1_meet_public_tests.jobs_of(b) = _r1_meet_public_tests.create_jobs(b));
+
+  -- (2) A newer release: the older notice is stale, the newer one is accepted (rolled back).
+  perform _r1_meet_public_tests.t4_book(641);
+  res := _r1_meet_public_tests.under_release('zzz-meet-public-assert-newer', 'en-IN',
+    '["ai_interview", "video_audio_recording", "ai_evaluation", "data_processing"]'::jsonb,
+    format('select _r1_meet_public_tests.t4_newer(%s, %L)', 641, t5));
+  perform _r1_meet_public_tests.assert('T4-C under a newer release the newer notice answers ok (rolled back)',
+    res = '{"status": "ok"}'::jsonb, coalesce(res::text, 'null'));
+
+  -- (3) After a withdrawal: the withdrawn row keeps its decision, the new one is live and current.
+  b := _r1_meet_public_tests.t4_book(642);
+  r := _r1_meet_public_tests.round_of_booking(b);
+  k := _r1_meet_public_tests.live_consent(r);
+  perform screening_v2.r1_withdraw_consent(r, '{}'::jsonb, t4, 'withdrawn');
+  perform _r1_meet_public_tests.assert('T4-C fixture: withdrawn, the manage page reads consent_current false',
+    (screening_v2.r1_meet_public_manage_read(_r1_meet_public_tests.md(642), 3600, 3, t4) -> 'consent_current')
+      = 'false'::jsonb);
+  perform _r1_meet_public_tests.expect_reconsent('T4-C after the candidate withdrew', 642,
+    jsonb_build_object('now', t5), 'ok:');
+  perform _r1_meet_public_tests.assert('T4-C ... the withdrawn consent keeps its decision; the new one is live and current',
+    (select x.proof ->> 'decision' = 'withdrawn' and x.withdrawn_at = t4
+       from screening_v2.interview_round_consents x where x.id = k)
+    and _r1_meet_public_tests.form_consent_ok(_r1_meet_public_tests.live_consent(r), tpl, t5)
+    and (screening_v2.r1_meet_public_manage_read(_r1_meet_public_tests.md(642), 3600, 3, t5) -> 'consent_current')
+      = 'true'::jsonb);
+
+  -- (4) consent_stale and consent_incomplete.
+  perform _r1_meet_public_tests.t4_book(643);
+  res := _r1_meet_public_tests.under_release('zzz-meet-public-assert-staff-only', 'en-IN-x-staff',
+    '["ai_interview"]'::jsonb,
+    format('select _r1_meet_public_tests.expect_reconsent(%L, %s, %L::jsonb, %L)',
+           'T4-C the newest release has no notice for the round''s audience', 643,
+           jsonb_build_object('consent', _r1_meet_public_tests.form_consent()
+             || '{"template_version": "zzz-meet-public-assert-staff-only"}'::jsonb),
+           'refused:consent_stale'));
+  perform _r1_meet_public_tests.assert('T4-C ... (rolled back) answered consent_stale',
+    res = '{"status": "refused", "code": "consent_stale"}'::jsonb, coalesce(res::text, 'null'));
+  perform _r1_meet_public_tests.expect_reconsent('T4-C a notice that is not the newest', 643,
+    jsonb_build_object('consent', older), 'refused:consent_stale');
+  perform _r1_meet_public_tests.expect_reconsent('T4-C a stale notice and no India tick: consent_stale first', 643,
+    jsonb_build_object('consent', older || '{"in_india": false}'::jsonb), 'refused:consent_stale');
+  perform _r1_meet_public_tests.expect_reconsent('T4-C a required consent not granted', 643,
+    jsonb_build_object('consent', _r1_meet_public_tests.form_consent()
+      || '{"consents": ["ai_interview", "video_audio_recording", "ai_evaluation"]}'::jsonb),
+    'refused:consent_incomplete');
+  perform _r1_meet_public_tests.expect_reconsent('T4-C no India tick', 643,
+    jsonb_build_object('consent', _r1_meet_public_tests.form_consent() || '{"in_india": false}'::jsonb),
+    'refused:consent_incomplete');
+
+  -- (4b) The round's audience decides the notice: a staff round (inserted directly, its public
+  -- booking too) is re-checked against the staff notice of the newest release (rolled back), which
+  -- may require more than the en-IN one.
+  perform _r1_meet_public_tests.candidate(696, false);
+  r := _r1_meet_public_tests.round(696, 'invited', 'meet',
+         _r1_meet_public_tests.t4_slot(696) + interval '45 minutes' + interval '7200 seconds');
+  update screening_v2.interview_rounds set consent_locale = 'en-IN-x-staff' where id = r;
+  perform _r1_meet_public_tests.public_booking(696, _r1_meet_public_tests.slot(_r1_meet_public_tests.t4_slot(696))
+    || jsonb_build_object('manage_token_digest', _r1_meet_public_tests.md(696)));
+  res := _r1_meet_public_tests.in_rollback(array[
+      'insert into screening_v2.interview_round_consent_templates (version, locale, title, body_md, required_consents, is_active) '
+      || 'values (''zzz-meet-public-assert-staff'', ''en-IN'', ''R1 Meet public assertion newer notice'', ''fixture'', '
+      || '''["ai_interview"]''::jsonb, true)',
+      'insert into screening_v2.interview_round_consent_templates (version, locale, title, body_md, required_consents, is_active) '
+      || 'values (''zzz-meet-public-assert-staff'', ''en-IN-x-staff'', ''R1 Meet public assertion staff notice'', ''fixture'', '
+      || '''["ai_interview", "staff_recording"]''::jsonb, true)'],
+    format('select _r1_meet_public_tests.reconsent(696, %L::jsonb)', jsonb_build_object('consent',
+      _r1_meet_public_tests.form_consent()
+      || '{"template_version": "zzz-meet-public-assert-staff", "consents": ["ai_interview"]}'::jsonb)));
+  perform _r1_meet_public_tests.assert(
+    'T4-C a staff round whose staff notice requires more than the form granted: consent_incomplete',
+    res = '{"status": "refused", "code": "consent_incomplete"}'::jsonb, coalesce(res::text, 'null'));
+  stored := _r1_meet_public_tests.in_rollback(array[
+      'insert into screening_v2.interview_round_consent_templates (version, locale, title, body_md, required_consents, is_active) '
+      || 'values (''zzz-meet-public-assert-staff'', ''en-IN'', ''R1 Meet public assertion newer notice'', ''fixture'', '
+      || '''["ai_interview"]''::jsonb, true)',
+      'insert into screening_v2.interview_round_consent_templates (version, locale, title, body_md, required_consents, is_active) '
+      || 'values (''zzz-meet-public-assert-staff'', ''en-IN-x-staff'', ''R1 Meet public assertion staff notice'', ''fixture'', '
+      || '''["ai_interview", "staff_recording"]''::jsonb, true)',
+      format('select _r1_meet_public_tests.assert(%L, _r1_meet_public_tests.reconsent(696, %L::jsonb) = %L::jsonb)',
+             'T4-C ... granting the staff notice''s set re-consents the staff round (rolled back)',
+             jsonb_build_object('consent', _r1_meet_public_tests.form_consent()
+               || '{"template_version": "zzz-meet-public-assert-staff", "consents": ["ai_interview", "staff_recording"]}'::jsonb),
+             '{"status": "ok"}')],
+    format('select to_jsonb(x) from screening_v2.interview_round_consents x where x.round_id = %L and x.withdrawn_at is null', r));
+  perform _r1_meet_public_tests.assert('T4-C ... and stores the staff notice''s required set and locale',
+    stored -> 'consents' = '["ai_interview", "staff_recording"]'::jsonb
+    and stored -> 'proof' ->> 'locale' = 'en-IN-x-staff'
+    and stored -> 'proof' ->> 'template_version' = 'zzz-meet-public-assert-staff'
+    and stored ->> 'method' = 'candidate_web', coalesce(stored::text, 'null'));
+
+  -- (5) booking_dispatched; an undispatched bot is fine.
+  perform _r1_meet_public_tests.t4_book(644);
+  perform _r1_meet_public_tests.dispatch(644);
+  perform _r1_meet_public_tests.expect_reconsent('T4-C a dispatched booking', 644, '{}'::jsonb,
+    'refused:booking_dispatched');
+  perform _r1_meet_public_tests.expect_reconsent('T4-C a dispatched booking and a stale notice', 644,
+    jsonb_build_object('consent', older), 'refused:booking_dispatched');
+  perform _r1_meet_public_tests.t4_book(645);
+  perform _r1_meet_public_tests.attach(645);
+  perform _r1_meet_public_tests.expect_reconsent('T4-C a booking whose bot is scheduled, not dispatched', 645,
+    jsonb_build_object('now', t5), 'ok:');
+
+  -- (6) not_found: unknown, terminal, the slot end, a round HR cancelled.
+  perform _r1_meet_public_tests.expect_reconsent('T4-C an unknown digest', 640,
+    jsonb_build_object('digest', _r1_meet_public_tests.digest('t4-unknown')), 'refused:not_found');
+  b := _r1_meet_public_tests.t4_book(646);
+  res := screening_v2.r1_meet_transition_booking(b, 'pending', 'failed', 'bot_create_failed', t4);
+  perform _r1_meet_public_tests.assert('T4-C fixture: booking 646 failed', res ->> 'status' = 'ok', res::text);
+  perform _r1_meet_public_tests.expect_reconsent('T4-C a failed booking', 646, '{}'::jsonb, 'refused:not_found');
+  perform _r1_meet_public_tests.expect_reconsent('T4-C at the slot end', 643,
+    jsonb_build_object('now', _r1_meet_public_tests.t4_slot(643) + interval '45 minutes'), 'refused:not_found');
+  b := _r1_meet_public_tests.t4_book(647);
+  r := _r1_meet_public_tests.round_of_booking(b);
+  res := screening_v2.r1_transition_round(r, 'cancel', _r1_meet_public_tests.round_version(r), null, null, t4);
+  perform _r1_meet_public_tests.assert('T4-C fixture: HR cancels the round of booking 647', res ->> 'status' = 'ok', res::text);
+  perform _r1_meet_public_tests.expect_reconsent('T4-C a booking whose round HR cancelled', 647, '{}'::jsonb,
+    'refused:not_found');
+  perform _r1_meet_public_tests.expect_reconsent('T4-C a cancelled round and a stale notice', 647,
+    jsonb_build_object('consent', older), 'refused:not_found');
+
+  -- (7) invalid_request: every field wrong, then fixed one at a time; every consent shape failure.
+  bad := jsonb_build_object('digest', null, 'consent', 'not an object', 'now', null);
+  foreach f in array array['digest', 'consent', 'now'] loop
+    perform _r1_meet_public_tests.expect_reconsent('T4-C every field wrong from ' || f || ' on', 640, bad,
+      'invalid_request:' || f);
+    bad := bad - f;
+  end loop;
+  perform _r1_meet_public_tests.expect_reconsent('T4-C an upper-case digest', 640,
+    jsonb_build_object('digest', upper(_r1_meet_public_tests.md(640))), 'invalid_request:digest');
+  foreach shape in array array[
+      'null'::jsonb,
+      '[]'::jsonb,
+      _r1_meet_public_tests.form_consent() || '{"name": "meet public assert"}'::jsonb,
+      _r1_meet_public_tests.form_consent() || '{"in_india": "yes"}'::jsonb,
+      _r1_meet_public_tests.form_consent() - 'in_india',
+      _r1_meet_public_tests.form_consent() || '{"consents": []}'::jsonb,
+      _r1_meet_public_tests.form_consent() || '{"consents": ["a", "b", "c", "d", "e", "f", "g", "h", "i"]}'::jsonb,
+      _r1_meet_public_tests.form_consent() || '{"consents": ["ai_interview", "ai_interview"]}'::jsonb,
+      _r1_meet_public_tests.form_consent() || '{"consents": ["AI_interview"]}'::jsonb,
+      _r1_meet_public_tests.form_consent() || jsonb_build_object('template_version', repeat('v', 65)),
+      _r1_meet_public_tests.form_consent() || jsonb_build_object('user_agent', repeat('u', 257)),
+      _r1_meet_public_tests.form_consent() || jsonb_build_object('ip_prefix', repeat('1', 65))] loop
+    i := i + 1;
+    perform _r1_meet_public_tests.expect_reconsent('T4-C a consent of the wrong shape (' || i || ')', 640,
+      jsonb_build_object('consent', shape), 'invalid_request:consent');
+  end loop;
+
+  -- (8) Catalog posture.
+  perform _r1_meet_public_tests.assert('T4-C the re-consent is one security definer, volatile function returning jsonb',
+    (select x.prosecdef and x.provolatile = 'v'
+            and x.proconfig = array['search_path=pg_catalog, screening_v2']
+            and x.prorettype = 'jsonb'::regtype and x.pronargs = 3 and x.pronargdefaults = 1
+       from pg_proc x where x.oid = sig::regprocedure)
+    and (select count(*) = 1 from pg_proc x
+          where x.pronamespace = 'screening_v2'::regnamespace and x.proname = 'r1_meet_public_reconsent'));
+  perform _r1_meet_public_tests.assert('T4-C the re-consent is executable by service_role only',
+    has_function_privilege('service_role', sig, 'execute')
+    and not has_function_privilege('anon', sig, 'execute')
+    and not has_function_privilege('authenticated', sig, 'execute')
+    and not has_function_privilege('public', sig, 'execute'));
+  foreach role_name in array array['anon', 'authenticated'] loop
+    perform _r1_meet_public_tests.raises_as(role_name, 'T4-C execute r1_meet_public_reconsent',
+      'select screening_v2.r1_meet_public_reconsent(null, null)', '42501');
   end loop;
 end;
 $$;

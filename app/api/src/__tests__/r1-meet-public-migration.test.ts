@@ -19,7 +19,13 @@ import {
   R1_MEET_TERMINAL_STATUSES,
   R1_MEET_UNDISPATCHED_STATUSES,
 } from '../lib/r1/meet/runtime-store.js';
-import { R1_MEET_JOB_MAX_ATTEMPTS, parseEnsureBotJob, r1MeetDedupKeys, r1MeetJobs } from '../lib/r1/meet/jobs.js';
+import {
+  R1_MEET_JOB_MAX_ATTEMPTS,
+  parseBotReleaseJob,
+  parseEnsureBotJob,
+  r1MeetDedupKeys,
+  r1MeetJobs,
+} from '../lib/r1/meet/jobs.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const migrations = path.resolve(here, '../../../supabase/migrations');
@@ -112,7 +118,7 @@ describe('migration 0143: file and frame', () => {
     const markers = [
       '-- §1. ', '-- §2. ', '-- §3. ', '-- §4. ',
       '-- §10. ', '-- §11. ', '-- §12. ', '-- §13. ', '-- §14. ', '-- §15. ', '-- §16. ', '-- §17. ',
-      '-- §21. ', '-- §22. ', '-- §23. ', '-- §90. ',
+      '-- §18. ', '-- §19. ', '-- §20. ', '-- §21. ', '-- §22. ', '-- §23. ', '-- §90. ',
     ];
     let last = -1;
     for (const marker of markers) {
@@ -1189,12 +1195,341 @@ describe('migration 0143: T3 r1_meet_create_round_from_public', () => {
     expect(parseEnsureBotJob({ kind: 'ensure_bot', booking_id: id })).toEqual({ kind: 'ensure_bot', bookingId: id });
   });
 
-  it('calls r1_transition_round only for the 8a expiry, and never reissues a link', () => {
+  it('calls r1_transition_round only for the 8a expiry and the T4 cancel (with its one retry), never reissuing a link', () => {
     expect([...lc.matchAll(/\br1_transition_round\(([^)]*)\)/g)].map((m) => m[1])).toEqual([
       "v_lapsed_id, 'expire', v_lapsed_version, null, null, p_now",
+      "v_booking.round_id, 'cancel', v_round_version, null, null, p_now",
+      "v_booking.round_id, 'cancel', v_round_version, null, null, p_now",
     ]);
+    expect(functionBody('r1_meet_public_cancel_booking').match(/\br1_transition_round\(/g)).toHaveLength(2);
     expect(lc).not.toContain("'reissue'");
     expect(body).not.toMatch(/\br1_withdraw_consent\(|\bcall_sessions\b[^;]*\binsert\b|insert into screening_v2\.call_sessions/);
+  });
+});
+
+// ── T4: move, cancel and re-consent through the manage digest ──────────────────────────────────
+
+const MOVE = 'r1_meet_public_move_booking';
+const CANCEL = 'r1_meet_public_cancel_booking';
+const RECONSENT = 'r1_meet_public_reconsent';
+const T4_FUNCTIONS: readonly T2Function[] = [
+  { name: MOVE,
+    params: 'p_booking_id uuid, p_digest text, p_expected_version integer, p_start_at timestamptz, p_end_at timestamptz, '
+      + 'p_slot_seats integer, p_public_day_limit integer, p_bot_day_limit integer, p_max_moves integer, '
+      + 'p_cutoff_sec integer, p_expiry_grace_sec integer default 7200, p_now timestamptz default now()',
+    types: 'uuid, text, integer, timestamptz, timestamptz, integer, integer, integer, integer, integer, integer, timestamptz',
+    returns: 'jsonb', posture: 'security definer' },
+  { name: CANCEL,
+    params: 'p_digest text, p_withdraw_consent boolean, p_cutoff_sec integer, p_now timestamptz default now()',
+    types: 'text, boolean, integer, timestamptz', returns: 'jsonb', posture: 'security definer' },
+  { name: RECONSENT,
+    params: 'p_digest text, p_consent jsonb, p_now timestamptz default now()',
+    types: 'text, jsonb, timestamptz', returns: 'jsonb', posture: 'security definer' },
+];
+/** The body of a 0142 function, as executable text. */
+const body0142 = (name: string): string => blockOf(code0142, `create or replace function screening_v2.${name}(`, '$$;');
+/** Every refusal code of a body, in text order (`v_*` for a passed-through variable). */
+const refusalCodes = (text: string): string[] =>
+  [...text.matchAll(/'status', 'refused', 'code', (?:'([a-z_]+)'|(v_[a-z_]+))\)/g)].map((m) => m[1] ?? m[2]!);
+/** `steps` must appear in `text` in this order. */
+function inOrder(text: string, steps: readonly string[]): void {
+  let at = -1;
+  for (const step of steps) {
+    const i = text.indexOf(step, at + 1);
+    expect(i, step).toBeGreaterThan(at);
+    at = i;
+  }
+}
+
+describe('migration 0143: T4 move, cancel and re-consent', () => {
+  const move = (): string => functionBody(MOVE);
+  const cancel = (): string => functionBody(CANCEL);
+  const reconsent = (): string => functionBody(RECONSENT);
+  const create = (): string => functionBody(CREATE);
+
+  it('declares the three once with their contract signatures, as volatile security definers, service_role only', () => {
+    for (const fn of T4_FUNCTIONS) {
+      expect(code, fn.name).toContain(
+        `create or replace function screening_v2.${fn.name}( ${fn.params} ) returns ${fn.returns} `
+        + `language plpgsql ${fn.posture} set search_path = pg_catalog, screening_v2 as $$`,
+      );
+      expect(lc.split(`create or replace function screening_v2.${fn.name}(`), fn.name).toHaveLength(2);
+      const sig = `screening_v2.${fn.name}(${fn.types})`;
+      expect(code, fn.name).toContain(`revoke all on function ${sig} from public, anon, authenticated;`);
+      expect(code, fn.name).toContain(`grant execute on function ${sig} to service_role;`);
+      expect(code, fn.name).toContain(`comment on function ${sig} is`);
+      expect(lc.split(`grant execute on function ${sig}`), fn.name).toHaveLength(2);
+      expect(lc, fn.name).not.toMatch(
+        new RegExp(`\\bgrant\\b[^;]*\\bon function screening_v2\\.${fn.name}\\([^;]*\\bto\\b[^;]*\\b(anon|authenticated|public)\\b`),
+      );
+    }
+  });
+
+  it('validates every argument first, in the plan order, before reading anything', () => {
+    const FIELDS: Record<string, string[]> = {
+      [MOVE]: ['booking_id', 'digest', 'version', 'slot', 'seats', 'day_limit', 'max_moves', 'cutoff', 'grace', 'now'],
+      [CANCEL]: ['digest', 'withdraw_consent', 'cutoff', 'now'],
+      [RECONSENT]: ['digest', 'consent', 'now'],
+    };
+    for (const [name, fields] of Object.entries(FIELDS)) {
+      const body = functionBody(name);
+      const found = [...body.matchAll(/'status', 'invalid_request', 'field', '([a-z_]+)'/g)].map((m) => m[1]!);
+      expect(runs(found), name).toEqual(fields);
+      const statements = body.slice(body.indexOf(' begin ', body.indexOf('as $$')));
+      expect(statements.indexOf('screening_v2.'), name).toBeGreaterThan(statements.lastIndexOf("'invalid_request'"));
+      expect(body, name).toContain("if p_digest is null or p_digest !~ '^[a-f0-9]{64}$' then");
+      expect(body, name).toContain('if p_now is null then');
+    }
+    // The bounds are the create's and manage_read's, word for word.
+    for (const text of [
+      'if p_expected_version is null or p_expected_version not between 0 and 50 then',
+      "or p_end_at - p_start_at not between interval '30 minutes' and interval '60 minutes' then",
+      'if p_slot_seats is null or p_slot_seats not between 1 and 15 then',
+      'if p_public_day_limit is null or p_public_day_limit not between 1 and 200 '
+        + 'or p_bot_day_limit is null or p_bot_day_limit not between 1 and 200 then',
+      'if p_max_moves is null or p_max_moves not between 0 and 10 then',
+      'if p_cutoff_sec is null or p_cutoff_sec not between 900 and 43200 then',
+      'if p_expiry_grace_sec is null or p_expiry_grace_sec not between 900 and 86400 then',
+    ]) {
+      expect(move(), text).toContain(text);
+    }
+    expect(create()).toContain("or p_end_at - p_start_at not between interval '30 minutes' and interval '60 minutes' then");
+    expect(functionBody('r1_meet_public_manage_read')).toContain('if p_max_moves is null or p_max_moves not between 0 and 10 then');
+    expect(cancel()).toContain('if p_withdraw_consent is null then');
+    expect(cancel()).toContain('if p_cutoff_sec is null or p_cutoff_sec not between 900 and 43200 then');
+  });
+
+  it('answers only its closed statuses and refusal codes, in order', () => {
+    const statuses = (text: string): string[] => runs([...text.matchAll(/'status', '([a-z_]+)'/g)].map((m) => m[1]!));
+    expect(statuses(move())).toEqual(['invalid_request', 'refused', 'moved']);
+    expect(statuses(cancel())).toEqual(['invalid_request', 'refused', 'already_cancelled', 'refused', 'cancelled']);
+    expect(statuses(reconsent())).toEqual(['invalid_request', 'refused', 'ok']);
+    expect(runs(refusalCodes(cancel()))).toEqual(['not_found', 'cutoff_passed', 'booking_dispatched']);
+    expect(runs(refusalCodes(reconsent()))).toEqual([
+      'not_found', 'booking_dispatched', 'not_found', 'consent_stale', 'consent_incomplete',
+    ]);
+    // Every code is a closed contract word of its RPC (contracts section 4.1 items 6-8).
+    const CONTRACT: Record<string, string[]> = {
+      [MOVE]: ['not_found', 'cutoff_passed', 'moves_exhausted', 'same_slot', 'slot_full', 'day_full', 'bot_attached',
+        'booking_dispatched', 'in_past', 'slot_too_far', 'version_conflict', 'round_not_live'],
+      [CANCEL]: ['not_found', 'cutoff_passed', 'booking_dispatched'],
+      [RECONSENT]: ['not_found', 'booking_dispatched', 'consent_stale', 'consent_incomplete'],
+    };
+    for (const [name, words] of Object.entries(CONTRACT)) {
+      for (const c of refusalCodes(functionBody(name)).filter((c) => !c.startsWith('v_'))) {
+        expect(words, `${name} ${c}`).toContain(c);
+      }
+    }
+    // No answer (a field name of invalid_request aside) carries a digest, the Meet URL or the consent.
+    for (const name of [MOVE, CANCEL, RECONSENT]) {
+      const answers = [...functionBody(name).matchAll(/return jsonb_build_object\(([^;]*)\);/g)].map((m) => m[1]!);
+      expect(answers.length, name).toBeGreaterThan(3);
+      for (const answer of answers.filter((a) => !a.includes("'invalid_request'"))) {
+        expect(answer, name).not.toMatch(/meet_url|digest|request_id|calendar|ip_prefix|user_agent|p_consent|ticket/);
+      }
+    }
+  });
+
+  it('move: the day locks (least, then greatest), then the booking, then the refusals in the plan order (R16)', () => {
+    const body = move();
+    inOrder(body, [
+      "select b.start_at into v_current_start from screening_v2.r1_meet_bookings b "
+        + "where b.id = p_booking_id and b.source = 'public_page' and b.manage_token_digest = p_digest;",
+      `if not found then ${REFUSED('not_found')} end if;`,
+      "v_old_day := (v_current_start at time zone 'Asia/Kolkata')::date;",
+      "v_new_day := (p_start_at at time zone 'Asia/Kolkata')::date;",
+      "perform pg_advisory_xact_lock(hashtextextended('r1_meet_public:day:' || to_char(least(v_old_day, v_new_day), 'YYYY-MM-DD'), 0));",
+      'if v_new_day <> v_old_day then',
+      "perform pg_advisory_xact_lock(hashtextextended('r1_meet_public:day:' || to_char(greatest(v_old_day, v_new_day), 'YYYY-MM-DD'), 0));",
+      "select * into v_booking from screening_v2.r1_meet_bookings b "
+        + "where b.id = p_booking_id and b.source = 'public_page' and b.manage_token_digest = p_digest for update;",
+      `or v_booking.status not in ${sqlList(LIVE)} or p_now >= v_booking.end_at then ${REFUSED('not_found')}`,
+      `if p_now >= v_booking.start_at - make_interval(secs => p_cutoff_sec) then ${REFUSED('cutoff_passed')}`,
+      `if v_booking.move_count >= p_max_moves then ${REFUSED('moves_exhausted')}`,
+      `if p_start_at = v_booking.start_at and p_end_at = v_booking.end_at then ${REFUSED('same_slot')}`,
+      `if v_booking.status in ${sqlList(R1_MEET_DISPATCHED_STATUSES)} then ${REFUSED('booking_dispatched')}`,
+      `if p_start_at <= p_now then ${REFUSED('in_past')}`,
+      `if p_end_at + make_interval(secs => p_expiry_grace_sec) > p_now + interval '14 days' then ${REFUSED('slot_too_far')}`,
+      `if screening_v2.r1_meet_public_slot_count(p_start_at, p_end_at, v_booking.id) >= p_slot_seats then ${REFUSED('slot_full')}`,
+      'v_counts := screening_v2.r1_meet_public_day_count(v_new_day, v_booking.id);',
+      "if (v_counts ->> 'public')::integer >= p_public_day_limit or (v_counts ->> 'total')::integer >= p_bot_day_limit "
+        + `then ${REFUSED('day_full')}`,
+      `if v_booking.version is distinct from p_expected_version then ${REFUSED('version_conflict')}`,
+      `if v_booking.recall_bot_id is not null then ${REFUSED('bot_attached')}`,
+      'v_res := screening_v2.r1_meet_reschedule_booking( v_booking.id, p_expected_version, p_start_at, p_end_at, '
+        + 'v_booking.meet_url, null, p_expiry_grace_sec, p_now);',
+    ]);
+    // The plan's refusal order (R16) up to the reschedule, then its mapping.
+    const before = body.slice(0, body.indexOf('screening_v2.r1_meet_reschedule_booking('));
+    expect(runs(refusalCodes(before))).toEqual([
+      'not_found', 'cutoff_passed', 'moves_exhausted', 'same_slot', 'booking_dispatched', 'in_past', 'slot_too_far',
+      'slot_full', 'day_full', 'version_conflict', 'bot_attached',
+    ]);
+    expect(runs(refusalCodes(body.slice(before.length)))).toEqual(['v_code', 'moves_exhausted', 'round_not_live', 'not_found']);
+    // Two advisory locks, both before the one row lock; the locks are on days only (no candidate lock).
+    expect(body.match(/pg_advisory_xact_lock\(/g)).toHaveLength(2);
+    expect(body.match(/\bfor update\b/g)).toHaveLength(1);
+    expect(body.lastIndexOf('pg_advisory_xact_lock(')).toBeLessThan(body.indexOf(' for update;'));
+    expect(body).not.toContain('r1_meet_public:candidate:');
+    // The day-lock key is the create's.
+    expect(create()).toContain("hashtextextended('r1_meet_public:day:' || to_char(v_day, 'YYYY-MM-DD'), 0)");
+  });
+
+  it('move: maps every answer of the unchanged 0142 reschedule, raising on the rest', () => {
+    expect(lastDefiner('r1_meet_reschedule_booking')).toBe('0142_r1_meet_bookings.sql');
+    expect(code0142).toContain(
+      'create or replace function screening_v2.r1_meet_reschedule_booking( p_booking_id uuid, p_expected_version integer, '
+      + 'p_start_at timestamptz, p_end_at timestamptz, p_meet_url text, p_ashby_updated_at timestamptz, '
+      + 'p_expiry_grace_sec integer default 7200, p_now timestamptz default now() )',
+    );
+    const body = move();
+    expect(body).toContain(
+      "if v_code in ('version_conflict', 'booking_dispatched', 'bot_attached', 'in_past', 'slot_too_far') then "
+      + "return jsonb_build_object('status', 'refused', 'code', v_code); end if;",
+    );
+    expect(body).toContain(`if v_code = 'version_exhausted' then ${REFUSED('moves_exhausted')} end if;`);
+    expect(body).toContain(`if v_code in ('round_not_live', 'no_round') then ${REFUSED('round_not_live')} end if;`);
+    expect(body).toContain(`if v_code in ('not_found', 'booking_terminal') then ${REFUSED('not_found')} end if;`);
+    expect(body).toContain(
+      "if v_code is distinct from 'ok' then raise exception "
+      + "'r1_meet_public_move_booking: unexpected answer from r1_meet_reschedule_booking' using errcode = 'P0001'; end if;",
+    );
+    // Mapped + raised = every answer the reschedule can give.
+    const answers = new Set([...body0142('r1_meet_reschedule_booking').matchAll(/'status', '([a-z_]+)'/g)].map((m) => m[1]!));
+    const mapped = new Set(['ok', 'version_conflict', 'booking_dispatched', 'bot_attached', 'in_past', 'slot_too_far',
+      'version_exhausted', 'round_not_live', 'no_round', 'not_found', 'booking_terminal']);
+    for (const a of mapped) expect(answers, a).toContain(a);
+    expect([...answers].filter((a) => !mapped.has(a)).sort()).toEqual(['invalid_request', 'not_allowed', 'stale_update']);
+  });
+
+  it('move: move_count + 1, then ensure_bot and calendar move keyed by the new count, then the contract answer', () => {
+    const body = move();
+    const update = 'update screening_v2.r1_meet_bookings set move_count = move_count + 1 where id = v_booking.id '
+      + 'returning * into v_booking;';
+    const inserts = [
+      "insert into screening_v2.job_queue (name, payload, dedup_key, max_attempts) values ('r1-meet', "
+        + "jsonb_build_object('kind', 'ensure_bot', 'booking_id', v_booking.id), "
+        + "'r1-meet:ensure-bot:' || v_booking.id::text, 10) on conflict do nothing;",
+      "insert into screening_v2.job_queue (name, payload, dedup_key, max_attempts) values ('r1-meet', "
+        + "jsonb_build_object('kind', 'calendar_sync', 'op', 'move', 'booking_id', v_booking.id), "
+        + "'r1-meet:calendar:' || v_booking.id::text || ':move:' || v_booking.move_count::text, 10) on conflict do nothing;",
+    ];
+    expect([...body.matchAll(/insert into screening_v2\.job_queue [^;]*;/g)].map((m) => m[0])).toEqual(inserts);
+    inOrder(body, ["if v_code is distinct from 'ok' then", update, ...inserts,
+      "return jsonb_build_object( 'status', 'moved', 'booking_id', v_booking.id, "
+        + "'start_at', v_booking.start_at, 'end_at', v_booking.end_at, "
+        + "'version', v_booking.version, 'key_attempt', v_booking.key_attempt, 'move_count', v_booking.move_count);"]);
+    expect(body.match(/\bupdate screening_v2\./g)).toHaveLength(1);
+    expect(body).not.toContain('updated_at');
+    // ensure_bot is the create's job (one live job per booking: a pending one absorbs the move's).
+    expect(create()).toContain(inserts[0]);
+  });
+
+  it('cancel: the booking first, then the round (one retry), then the consent, then the bot release; no round_cancelled job', () => {
+    const body = cancel();
+    const ticket = through(body0142('r1_meet_cancel_booking'), 'ticket_digest = case when ticket_claimed_at is null',
+      'updated_at = p_now');
+    const transition = "v_res := screening_v2.r1_transition_round(v_booking.round_id, 'cancel', v_round_version, null, null, p_now);";
+    inOrder(body, [
+      "select * into v_booking from screening_v2.r1_meet_bookings b "
+        + "where b.manage_token_digest = p_digest and b.source = 'public_page' for update;",
+      `if not found or p_now >= v_booking.end_at then ${REFUSED('not_found')} end if;`,
+      "if v_booking.status = 'cancelled' and v_booking.reason = 'candidate_cancelled' then "
+        + "return jsonb_build_object('status', 'already_cancelled'); end if;",
+      `if v_booking.status in ${sqlList(R1_MEET_TERMINAL_STATUSES)} then ${REFUSED('not_found')} end if;`,
+      `if p_now >= v_booking.start_at - make_interval(secs => p_cutoff_sec) then ${REFUSED('cutoff_passed')} end if;`,
+      `if v_booking.status in ${sqlList(R1_MEET_DISPATCHED_STATUSES)} then ${REFUSED('booking_dispatched')} end if;`,
+      'select r.status, r.version into v_round_status, v_round_version from screening_v2.interview_rounds r '
+        + 'where r.id = v_booking.round_id;',
+      `update screening_v2.r1_meet_bookings set status = 'cancelled', reason = 'candidate_cancelled', ${ticket} `
+        + 'where id = v_booking.id;',
+      "if v_round_status in ('invited', 'in_progress') then",
+      transition,
+      "if v_res ->> 'status' = 'version_conflict' then select r.version into v_round_version "
+        + 'from screening_v2.interview_rounds r where r.id = v_booking.round_id;',
+      transition,
+      "if v_res ->> 'status' is distinct from 'ok' and v_res ->> 'status' is distinct from 'round_terminal' then "
+        + "raise exception 'r1_meet_public_cancel_booking: the round could not be cancelled' using errcode = 'P0001';",
+      'if p_withdraw_consent and v_booking.round_id is not null then',
+      "v_res := screening_v2.r1_withdraw_consent(v_booking.round_id, jsonb_build_object('source', 'r1_public_booking'), "
+        + "p_now, 'withdrawn');",
+      "if v_res ->> 'status' is distinct from 'ok' then raise exception",
+      "if v_booking.recall_bot_id is not null then insert into screening_v2.job_queue (name, payload, dedup_key, max_attempts) "
+        + "values ('r1-meet', jsonb_build_object('kind', 'bot_release', 'recall_bot_id', v_booking.recall_bot_id, "
+        + "'booking_id', v_booking.id), 'r1-meet:bot-release:' || v_booking.recall_bot_id::text, 10) on conflict do nothing; "
+        + 'end if;',
+      "return jsonb_build_object('status', 'cancelled', 'booking_id', v_booking.id);",
+    ]);
+    expect(ticket).toContain('ticket_expires_at = case when ticket_claimed_at is null then null else ticket_expires_at end,');
+    expect(body.match(/\bupdate screening_v2\./g)).toHaveLength(1);
+    expect(body.match(/insert into screening_v2\.job_queue\b/g)).toHaveLength(1);
+    expect(body).not.toMatch(/round_cancelled|round-cancelled|pg_advisory|\binterview_round_consents\b/);
+    // The calls are to the unchanged browser primitives, with their argument order.
+    expect(lastDefiner('r1_transition_round')).toBe('0128_r1_twenty_minute_roleplay.sql');
+    expect(code0128).toContain(
+      'create or replace function screening_v2.r1_transition_round(p_round_id uuid,p_action text,p_expected_version integer,'
+      + 'p_link_token_digest text default null,p_expires_at timestamptz default null,p_now timestamptz default now())',
+    );
+    expect(lastDefiner('r1_withdraw_consent')).toBe('0120_r1_candidate_route_primitives.sql');
+    expect(migration('0120_r1_candidate_route_primitives.sql')).toContain(
+      "create or replace function screening_v2.r1_withdraw_consent( p_round_id uuid, p_proof jsonb default '{}'::jsonb, "
+      + "p_now timestamptz default now(), p_decision text default 'withdrawn' )",
+    );
+    expect(lc.match(/\br1_withdraw_consent\(/g)).toHaveLength(1);
+    // 0142's round_cancelled trigger only queues for a LIVE booking: the booking cancelled first adds nothing.
+    expect(body0142('enqueue_r1_meet_round_cancelled')).toContain(
+      "where b.round_id = new.id and b.status not in ('completed', 'cancelled', 'failed', 'drained') on conflict do nothing;",
+    );
+  });
+
+  it('cancel: the bot_release row is 0142\'s delete-trigger job and what jobs.ts writes and parses', () => {
+    expect(body0142('enqueue_r1_meet_bot_release')).toContain(
+      "values ('r1-meet', jsonb_build_object('kind', 'bot_release', 'recall_bot_id', old.recall_bot_id, 'booking_id', old.id), "
+      + "'r1-meet:bot-release:' || old.recall_bot_id::text, 10) on conflict do nothing;",
+    );
+    const bot = '7f000000-0000-4000-8000-003000000621';
+    const id = '7f000000-0000-4000-8000-004000000621';
+    const spec = r1MeetJobs.botRelease(bot, id);
+    expect(spec.payload).toEqual({ kind: 'bot_release', recall_bot_id: bot, booking_id: id });
+    expect(spec.dedupKey).toBe(`r1-meet:bot-release:${bot}`);
+    expect(spec.maxAttempts).toBe(10);
+    expect(R1_MEET_JOB_MAX_ATTEMPTS.bot_release).toBe(10);
+    expect(parseBotReleaseJob({ kind: 'bot_release', recall_bot_id: bot, booking_id: id }))
+      .toEqual({ kind: 'bot_release', recallBotId: bot, bookingId: id });
+  });
+
+  it('reconsent: the create\'s consent shape and checks on the round\'s live notice, supersede before the insert', () => {
+    const body = reconsent();
+    const shape = through(create(), "v_consent_ok := p_consent is not null and jsonb_typeof(p_consent) = 'object';",
+      "return jsonb_build_object('status', 'invalid_request', 'field', 'consent'); end if;");
+    expect(body).toContain(shape);
+    const insert = through(create(), 'insert into screening_v2.interview_round_consents', 'p_now);');
+    const supersede = through(code0142, 'update screening_v2.interview_round_consents set withdrawn_at = p_now,',
+      'where round_id = v_round.id and withdrawn_at is null;');
+    const live = "if not found or v_round.channel <> 'meet' or v_round.status not in ('invited', 'in_progress') "
+      + 'or v_round.expires_at <= p_now then';
+    expect(body0142('r1_meet_reschedule_booking')).toContain(`${live} return jsonb_build_object('status', 'round_not_live'`);
+    inOrder(body, [
+      shape,
+      "select * into v_booking from screening_v2.r1_meet_bookings b "
+        + "where b.manage_token_digest = p_digest and b.source = 'public_page' for update;",
+      `or v_booking.status not in ${sqlList(LIVE)} or p_now >= v_booking.end_at then ${REFUSED('not_found')}`,
+      `if v_booking.status in ${sqlList(R1_MEET_DISPATCHED_STATUSES)} then ${REFUSED('booking_dispatched')}`,
+      'select * into v_round from screening_v2.interview_rounds r where r.id = v_booking.round_id for update;',
+      `${live} ${REFUSED('not_found')}`,
+      'and t.locale = v_round.consent_locale;',
+      `if not found or jsonb_array_length(v_template.required_consents) = 0 then ${REFUSED('consent_stale')}`,
+      CONSENT_CHECK,
+      supersede,
+      'v_round_id := v_round.id;',
+      insert,
+      "return jsonb_build_object('status', 'ok');",
+    ]);
+    expect(body.split(CONSENT_CHECK)).toHaveLength(2);
+    expect(body.match(/insert into screening_v2\.interview_round_consents\b/g)).toHaveLength(1);
+    expect(body.match(/\bupdate screening_v2\./g)).toHaveLength(1);
+    expect(body.match(/\bfor update\b/g)).toHaveLength(2);
+    expect(body).not.toMatch(/job_queue|pg_advisory|update screening_v2\.(r1_meet_bookings|interview_rounds)\b/);
   });
 });
 
@@ -1420,6 +1755,84 @@ describe('migration 0143: wiring and the SQL suite', () => {
     const listed = [...mirror.matchAll(/'screening_v2\.(r1_meet_public_[a-z_]+)\(([^)]*)\)'/g)].map((m) => `${m[1]}(${m[2]})`);
     const declared = [...lc.matchAll(/create or replace function screening_v2\.(r1_meet_public_[a-z_]+)\(/g)].map((m) => m[1]!);
     expect(listed.map((s) => s.split('(')[0])).toEqual(declared);
-    for (const fn of T2_FUNCTIONS) expect(listed, fn.name).toContain(`${fn.name}(${fn.types})`);
+    for (const fn of [...T2_FUNCTIONS, ...T4_FUNCTIONS]) expect(listed, fn.name).toContain(`${fn.name}(${fn.types})`);
+    expect(listed).toHaveLength(13);
+  });
+
+  it('covers the T4 sections in order, after T3, through the move, cancel and re-consent helpers', () => {
+    let last = suite.indexOf('-- T3-H. ');
+    for (const section of ['-- T4-A. ', '-- T4-B. ', '-- T4-C. ']) {
+      expect(suite.split(section).length - 1, section).toBe(1);
+      expect(suite.indexOf(section), section).toBeGreaterThan(last);
+      last = suite.indexOf(section);
+    }
+    expect(suite.indexOf('-- T4-C. ')).toBeLessThan(suite.lastIndexOf('rollback;'));
+    // The helpers call each RPC with every argument, and every refusal is checked to write nothing.
+    expect(blockOf(suite, 'create function _r1_meet_public_tests.move(', '$$;'))
+      .toContain('return screening_v2.r1_meet_public_move_booking(');
+    expect(blockOf(suite, 'create function _r1_meet_public_tests.cancel(', '$$;'))
+      .toContain('return screening_v2.r1_meet_public_cancel_booking(');
+    expect(blockOf(suite, 'create function _r1_meet_public_tests.reconsent(', '$$;'))
+      .toContain("nullif(a -> 'consent', 'null'::jsonb)");
+    const expectRpc = blockOf(suite, 'create function _r1_meet_public_tests.expect_rpc(', '$$;');
+    expect(expectRpc).toContain("if p_outcome not in ('moved:', 'cancelled:', 'ok:') then");
+    expect(expectRpc).toContain('_r1_meet_public_tests.counts() = v_before');
+    for (const label of [
+      'T4-A a move to another IST day',
+      'T4-A ... the jobs: the create\'\'s three and calendar move:1 (the pending ensure_bot absorbed the move\'\'s)',
+      'T4-A ... queues calendar move:2 and, the first ensure_bot done, one new live ensure_bot',
+      'T4-A one seat and a slot overlapping only the booking\'\'s own',
+      'T4-A the day\'\'s own counts (the booking included) as the limits, one seat',
+      'T4-A every field wrong from ',
+      'T4-A at the slot end (the cutoff has passed too)',
+      'T4-A one second before start - cutoff with no moves left',
+      'T4-A no moves left and the same slot',
+      'T4-A a dispatched booking and the same slot',
+      'T4-A a dispatched booking and a slot in the past',
+      'T4-A one seat in a past slot a live booking holds',
+      'T4-A an expiry one second past now + 14 days, one seat, a live booking there',
+      'T4-A an expiry exactly at now + 14 days, one seat, the day\'\'s public limit 1',
+      'T4-A the bot limit 1 on a day with one live Ashby booking, a stale version too',
+      'T4-A a stale version and a bot attached',
+      'T4-A one seat in a slot a live booking holds, a bot attached',
+      'T4-A after set_bot replace, the new version: the S06 bot path moves',
+      'T4-A at bot generation 50 (the reschedule\'\'s version_exhausted)',
+      'T4-A the round cancelled by HR',
+      'T4-A execute r1_meet_public_move_booking',
+      'T4-B a pending booking, the consent kept',
+      'T4-B ... the round is cancelled through r1_transition_round and its 65-minute hold refunded',
+      'T4-B ... and no round_cancelled job (0142\'\'s trigger found no live booking on the round)',
+      'T4-B the same cancel again',
+      'T4-B after the cancel the candidate books the freed slot again: a new round',
+      'T4-B ... the unclaimed ticket is cleared; the bot id stays until its release is confirmed',
+      'T4-B ... which queues exactly the existing 0127 recording erase job',
+      'T4-B ... the jobs: the create\'\'s three, the calendar cancel, the tag removal and the bot release (0142 key)',
+      'T4-B ... the claimed ticket stays as evidence',
+      'T4-B a live Ashby booking holding the digest (CHECK lifted, rolled back): not_found, untouched',
+      'T4-B a dispatched booking at start - cutoff',
+      'T4-B a booking whose round already expired, withdrawing the consent',
+      'T4-B the round version moves during the cancel: one retry cancels it',
+      'T4-B a round whose hold month row is missing: the cancel raises',
+      'T4-B a live public booking with no round, withdrawing the consent',
+      'T4-B execute r1_meet_public_cancel_booking',
+      'T4-C a re-consent on the current notice',
+      'T4-C ... and inserts the candidate_web consent of the form, the nine proof fields exactly',
+      'T4-C under a newer release, the older notice',
+      'T4-C ... supersedes the old consent (no recording erase) and stores the newer notice\'\'s candidate_web consent',
+      'T4-C after the candidate withdrew',
+      'T4-C the newest release has no notice for the round\'\'s audience',
+      'T4-C a staff round whose staff notice requires more than the form granted: consent_incomplete',
+      'T4-C ... and stores the staff notice\'\'s required set and locale',
+      'T4-C a stale notice and no India tick: consent_stale first',
+      'T4-C a dispatched booking and a stale notice',
+      'T4-C a booking whose round HR cancelled',
+      'T4-C a consent of the wrong shape (',
+      'T4-C execute r1_meet_public_reconsent',
+    ]) {
+      expect(suite, label).toContain(label);
+    }
+    // The retry is proved with a test-only trigger that is dropped again.
+    expect(suite).toContain('create trigger t4_bump_round before update of status on screening_v2.r1_meet_bookings');
+    expect(suite).toContain('drop trigger t4_bump_round on screening_v2.r1_meet_bookings;');
   });
 });
