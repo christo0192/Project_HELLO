@@ -710,6 +710,428 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------------------------
+-- §15. r1_meet_create_round_from_public: the round, the candidate's consent and the booking.
+-- ---------------------------------------------------------------------------------------------
+-- S06 calls this after the Google event exists (the event id is the booking id without dashes).
+-- ONE transaction writes the R1 round (created through r1_send_round, or a reusable Meet round
+-- re-linked), the candidate_web consent of the form (attestation columns NULL, the India tick in
+-- the proof), the public booking (pending/eligible, no Ashby event, schedule or scheduler,
+-- calendar_state created) and three r1-meet jobs (ensure_bot, calendar_sync invite,
+-- ashby_booked_tag add). The first answer wins:
+--   1. invalid_request (+field: booking_id, request_id, candidate_id, application_id, meet_url,
+--      slot (30 to 60 minutes), created_by, consent (the closed p_consent shape), seats, day_limit,
+--      profile, grace, now). Nothing is read or written;
+--   2. replayed (+booking_id, start_at, end_at): this request id already made a booking for the
+--      same candidate and application (a double click, a retried submit). The same request id for
+--      another candidate or application is invalid_request request_id;
+--   3. invalid_request booking_id: the booking id is already taken;
+--   4. refused in_past: the slot has started;
+--   5. the candidate advisory lock, then the replay again (two tabs of one submit wait here and
+--      the second answers replayed), then the IST-day advisory lock of the slot start;
+--   6. refused slot_full (live bookings of both sources overlapping the slot >= p_slot_seats) or
+--      day_full (the IST day's public count >= p_public_day_limit, or its total >= p_bot_day_limit),
+--      counted under the day lock;
+--   7. refused <code>: the §12 predicates, exactly what the precheck answers;
+--   8. refused created_by_unknown | slot_too_far (round expiry = slot end + grace beyond now +
+--      14 days) | consent_template_unavailable | consent_stale (the form's notice is not the
+--      newest active en-IN release) | consent_incomplete (a required key not granted, or no India
+--      tick) | role_not_configured;
+--   9. the 0142 create steps 8a, 9 and 10, copied (no 0142 function is redeclared): a lapsed,
+--      unused Meet round is expired, the round is created through r1_send_round (an unusable link
+--      digest, then channel meet), or the candidate's reusable Meet round (after a cancel, a failed
+--      booking or HR's grant-retake) is re-linked with its consent re-checked against the newest
+--      notice of the ROUND's audience; their refusals answer refused <code>;
+--  10. booked (+result created | relinked, booking_id, round_id, candidate_id, start_at, end_at,
+--      version, key_attempt, round_expires_at).
+-- Refusals up to step 8 write nothing. A refusal of step 9 may leave what 0142 also leaves: the
+-- step-8a expiry of a lapsed round nothing can use (exactly what the sweep does) and the empty
+-- budget month row of r1_send_round. No call_sessions row, no audit row, no clock read (p_now
+-- only), no digest, Meet URL or request id in any answer.
+--
+-- Lock order: the candidate advisory lock, the IST-day advisory lock, then (inside
+-- r1_transition_round and r1_send_round) settings, the lapsed round's hold month, the lapsed round
+-- and the current month, then for a re-link the round's hold month and the round. No booking row
+-- is locked: the day lock serialises every public create and move of that day.
+create or replace function screening_v2.r1_meet_create_round_from_public(
+  p_booking_id uuid,
+  p_public_request_id uuid,
+  p_candidate_id uuid,
+  p_ashby_application_id text,
+  p_meet_url text,
+  p_start_at timestamptz,
+  p_end_at timestamptz,
+  p_created_by uuid,
+  p_consent jsonb,
+  p_slot_seats integer,
+  p_public_day_limit integer,
+  p_bot_day_limit integer,
+  p_objective_profile text default 'r1_dex_sales',
+  p_expiry_grace_sec integer default 7200,
+  p_now timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  c_uuid constant text := '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
+  v_candidate_id constant uuid := p_candidate_id;
+  v_consent_ok boolean;
+  v_replay screening_v2.r1_meet_bookings%rowtype;
+  v_day date;
+  v_counts jsonb;
+  v_refusal text;
+  v_expires timestamptz;
+  v_template screening_v2.interview_round_consent_templates%rowtype;
+  v_role_id uuid;
+  v_role_count integer;
+  v_lapsed_id uuid;
+  v_lapsed_version integer;
+  v_candidate_status text;
+  v_send jsonb;
+  v_code text;
+  v_live_id uuid;
+  v_hold_minutes numeric;
+  v_hold_month date;
+  v_uncounted boolean;
+  v_round screening_v2.interview_rounds%rowtype;
+  v_round_id uuid;
+  v_result text;
+  v_booking screening_v2.r1_meet_bookings%rowtype;
+begin
+  -- 1. Validation. Nothing is read or written.
+  if p_booking_id is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'booking_id');
+  end if;
+  if p_public_request_id is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'request_id');
+  end if;
+  if p_candidate_id is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'candidate_id');
+  end if;
+  if p_ashby_application_id is null or p_ashby_application_id !~* c_uuid then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'application_id');
+  end if;
+  if p_meet_url is null or p_meet_url !~ '^https://meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}$' then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'meet_url');
+  end if;
+  if p_start_at is null or p_end_at is null
+     or p_end_at - p_start_at not between interval '30 minutes' and interval '60 minutes' then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'slot');
+  end if;
+  if p_created_by is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'created_by');
+  end if;
+  -- The form's consent, a closed shape: an object of template_version (1..64 chars), consents
+  -- (1..8 unique keys), in_india (a JSON boolean) and the optional ip_prefix (1..64 chars) and
+  -- user_agent (1..256 chars). Checked in steps, so no function ever sees a value of the wrong type.
+  v_consent_ok := p_consent is not null and jsonb_typeof(p_consent) = 'object';
+  if v_consent_ok then
+    v_consent_ok := not exists (select 1 from jsonb_object_keys(p_consent) k(key)
+                                 where k.key not in ('template_version', 'consents', 'in_india',
+                                                     'ip_prefix', 'user_agent'))
+      and coalesce(jsonb_typeof(p_consent -> 'template_version') = 'string', false)
+      and coalesce(jsonb_typeof(p_consent -> 'consents') = 'array', false)
+      and coalesce(jsonb_typeof(p_consent -> 'in_india') = 'boolean', false)
+      and coalesce(jsonb_typeof(p_consent -> 'ip_prefix'), 'null') in ('null', 'string')
+      and coalesce(jsonb_typeof(p_consent -> 'user_agent'), 'null') in ('null', 'string');
+  end if;
+  if v_consent_ok then
+    v_consent_ok := char_length(p_consent ->> 'template_version') between 1 and 64
+      and jsonb_array_length(p_consent -> 'consents') between 1 and 8
+      and not exists (select 1 from jsonb_array_elements(p_consent -> 'consents') e(item)
+                       where jsonb_typeof(e.item) <> 'string')
+      and coalesce(char_length(p_consent ->> 'ip_prefix') between 1 and 64, true)
+      and coalesce(char_length(p_consent ->> 'user_agent') between 1 and 256, true);
+  end if;
+  if v_consent_ok then
+    v_consent_ok := not exists (select 1 from jsonb_array_elements_text(p_consent -> 'consents') e(item)
+                                 where e.item !~ '^[a-z][a-z0-9_]{0,63}$')
+      and (select count(distinct e.item) from jsonb_array_elements_text(p_consent -> 'consents') e(item))
+          = jsonb_array_length(p_consent -> 'consents');
+  end if;
+  if not v_consent_ok then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'consent');
+  end if;
+  if p_slot_seats is null or p_slot_seats not between 1 and 15 then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'seats');
+  end if;
+  if p_public_day_limit is null or p_public_day_limit not between 1 and 200
+     or p_bot_day_limit is null or p_bot_day_limit not between 1 and 200 then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'day_limit');
+  end if;
+  if p_objective_profile is null or p_objective_profile not in ('r1_dex_sales') then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'profile');
+  end if;
+  if p_expiry_grace_sec is null or p_expiry_grace_sec not between 900 and 86400 then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'grace');
+  end if;
+  if p_now is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'now');
+  end if;
+
+  -- 2. Replay: the request id already made a booking (nothing is written).
+  select * into v_replay
+    from screening_v2.r1_meet_bookings b
+   where b.public_request_id = p_public_request_id;
+  if found then
+    if v_replay.candidate_id = p_candidate_id
+       and v_replay.ashby_application_id = p_ashby_application_id then
+      return jsonb_build_object('status', 'replayed', 'booking_id', v_replay.id,
+                                'start_at', v_replay.start_at, 'end_at', v_replay.end_at);
+    end if;
+    return jsonb_build_object('status', 'invalid_request', 'field', 'request_id');
+  end if;
+  -- 3. The booking id is new.
+  if exists (select 1 from screening_v2.r1_meet_bookings b where b.id = p_booking_id) then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'booking_id');
+  end if;
+  -- 4. A slot that has started is never booked.
+  if p_start_at <= p_now then
+    return jsonb_build_object('status', 'refused', 'code', 'in_past');
+  end if;
+
+  -- 5. The candidate lock, the replay again under it, then the IST day lock.
+  perform pg_advisory_xact_lock(hashtextextended('r1_meet_public:candidate:' || p_candidate_id::text, 0));
+  select * into v_replay
+    from screening_v2.r1_meet_bookings b
+   where b.public_request_id = p_public_request_id;
+  if found then
+    if v_replay.candidate_id = p_candidate_id
+       and v_replay.ashby_application_id = p_ashby_application_id then
+      return jsonb_build_object('status', 'replayed', 'booking_id', v_replay.id,
+                                'start_at', v_replay.start_at, 'end_at', v_replay.end_at);
+    end if;
+    return jsonb_build_object('status', 'invalid_request', 'field', 'request_id');
+  end if;
+  v_day := (p_start_at at time zone 'Asia/Kolkata')::date;
+  perform pg_advisory_xact_lock(hashtextextended('r1_meet_public:day:' || to_char(v_day, 'YYYY-MM-DD'), 0));
+
+  -- 6. Capacity under the day lock.
+  if screening_v2.r1_meet_public_slot_count(p_start_at, p_end_at, null) >= p_slot_seats then
+    return jsonb_build_object('status', 'refused', 'code', 'slot_full');
+  end if;
+  v_counts := screening_v2.r1_meet_public_day_count(v_day, null);
+  if (v_counts ->> 'public')::integer >= p_public_day_limit
+     or (v_counts ->> 'total')::integer >= p_bot_day_limit then
+    return jsonb_build_object('status', 'refused', 'code', 'day_full');
+  end if;
+
+  -- 7. The refusal predicates the precheck answers (§12).
+  v_refusal := screening_v2.r1_meet_public_refusal(p_candidate_id, p_ashby_application_id, p_now);
+  if v_refusal is not null then
+    return jsonb_build_object('status', 'refused', 'code', v_refusal);
+  end if;
+
+  -- 8. The round creator, the bounded expiry, the form's consent and the role.
+  if not exists (select 1 from auth.users u where u.id = p_created_by) then
+    return jsonb_build_object('status', 'refused', 'code', 'created_by_unknown');
+  end if;
+  v_expires := p_end_at + make_interval(secs => p_expiry_grace_sec);
+  if v_expires > p_now + interval '14 days' then
+    return jsonb_build_object('status', 'refused', 'code', 'slot_too_far');
+  end if;
+  -- newest active notice (0142 step 7)
+  select t.* into v_template
+    from screening_v2.interview_round_consent_templates t
+   where t.is_active
+     and t.version = (select max(x.version) from screening_v2.interview_round_consent_templates x
+                       where x.is_active)
+     and t.locale = 'en-IN';
+  if not found or jsonb_array_length(v_template.required_consents) = 0 then
+    return jsonb_build_object('status', 'refused', 'code', 'consent_template_unavailable');
+  end if;
+  if p_consent ->> 'template_version' <> v_template.version then
+    return jsonb_build_object('status', 'refused', 'code', 'consent_stale');
+  end if;
+  if not (v_template.required_consents <@ (p_consent -> 'consents'))
+     or p_consent -> 'in_india' is distinct from 'true'::jsonb then
+    return jsonb_build_object('status', 'refused', 'code', 'consent_incomplete');
+  end if;
+  select count(*), (array_agg(r.id))[1] into v_role_count, v_role_id
+    from screening_v2.roles r
+   where r.interview_kind = 'sales_r1';
+  if v_role_count <> 1 then
+    return jsonb_build_object('status', 'refused', 'code', 'role_not_configured');
+  end if;
+
+  -- 9a. A lapsed Meet round that nothing can use any more is expired, as the sweep would do. The
+  -- booking being created is not one of its live bookings (0142 compares the Ashby event id, a
+  -- public booking has none: R01 1.3).
+  -- copied from r1_meet_create_round_from_ashby (0142) step 8a, is distinct from
+  select r.id, r.version into v_lapsed_id, v_lapsed_version
+    from screening_v2.interview_rounds r
+   where r.candidate_id = v_candidate_id and r.kind = 'sales_r1' and r.channel = 'meet'
+     and r.status = 'invited' and r.starts_used = 0 and r.expires_at <= p_now
+     and not exists (select 1 from screening_v2.call_sessions s
+                      where s.interview_round_id = r.id
+                        and s.status in ('created', 'waiting', 'in_progress'))
+     and not exists (select 1 from screening_v2.r1_meet_bookings o
+                      where o.round_id = r.id
+                        and o.status not in ('completed', 'cancelled', 'failed', 'drained')
+                        and o.id is distinct from p_booking_id)
+   limit 1;
+  if v_lapsed_id is not null then
+    perform screening_v2.r1_transition_round(v_lapsed_id, 'expire', v_lapsed_version, null, null, p_now);
+  end if;
+
+  -- 9b. The round, through r1_send_round. The digest's preimage is never stored or returned.
+  -- copied from r1_meet_create_round_from_ashby (0142) step 9
+  select c.status into v_candidate_status
+    from screening_v2.candidates c
+   where c.id = v_candidate_id;
+  v_send := screening_v2.r1_send_round(
+    v_candidate_id, v_role_id, p_created_by,
+    encode(sha256(convert_to('r1-meet-unusable:' || gen_random_uuid()::text || ':'
+                             || gen_random_uuid()::text, 'UTF8')), 'hex'),
+    v_candidate_status, v_expires, p_now);
+  v_code := v_send ->> 'status';
+  if v_code in ('disabled', 'paused', 'candidate_ineligible', 'role_not_configured',
+                'phone_engagement_active', 'phone_assessment_pending', 'capacity_exhausted') then
+    return jsonb_build_object('status', 'refused', 'code', v_code);
+  end if;
+  if v_code is distinct from 'ok' and v_code is distinct from 'round_active' then
+    raise exception 'r1_meet_create_round_from_public: unexpected answer from r1_send_round'
+      using errcode = 'P0001';
+  end if;
+  if v_code = 'ok' then
+    v_round_id := (v_send ->> 'id')::uuid;
+    -- Allowed by trg_interview_rounds_channel_locked: invited, unstarted, no consent yet.
+    update screening_v2.interview_rounds set channel = 'meet' where id = v_round_id;
+    v_result := 'created';
+  else
+    -- 9c. Re-link. r1_send_round already holds the settings row; take the live round's hold
+    -- month (exactly as the round transitions do) and then the round.
+    -- copied from r1_meet_create_round_from_ashby (0142) step 10
+    select r.id, r.held_minutes, r.hold_month, r.charged_attempt_number > r.attempts_counted
+      into v_live_id, v_hold_minutes, v_hold_month, v_uncounted
+      from screening_v2.interview_rounds r
+     where r.candidate_id = v_candidate_id and r.kind = 'sales_r1'
+       and r.status in ('invited', 'in_progress');
+    if v_live_id is null then
+      return jsonb_build_object('status', 'refused', 'code', 'already_booked');
+    end if;
+    if v_hold_minutes > 0 then
+      if v_hold_month is null then
+        return jsonb_build_object('status', 'refused', 'code', 'already_booked');
+      end if;
+      perform 1 from screening_v2.r1_budget_month where month_start = v_hold_month for update;
+    elsif v_uncounted and v_hold_month is not null then
+      perform 1 from screening_v2.r1_budget_month where month_start = v_hold_month for update;
+    end if;
+    select * into v_round from screening_v2.interview_rounds where id = v_live_id for update;
+    -- Reusable: a Meet round that is still live and unexpired (so its hold still counts and no
+    -- capacity re-check is needed), has starts and attempts left, no live session and no live
+    -- booking. A browser round is never taken over.
+    -- copied from r1_meet_create_round_from_ashby (0142) step 10 reuse
+    if v_round.id is null
+       or v_round.channel <> 'meet'
+       or v_round.status not in ('invited', 'in_progress')
+       or v_round.expires_at <= p_now
+       or v_round.starts_used >= 3
+       or v_round.attempts_counted >= v_round.attempts_allowed
+       or exists (select 1 from screening_v2.call_sessions s
+                   where s.interview_round_id = v_round.id
+                     and s.status in ('created', 'waiting', 'in_progress'))
+       or exists (select 1 from screening_v2.r1_meet_bookings b
+                   where b.round_id = v_round.id
+                     and b.status not in ('completed', 'cancelled', 'failed', 'drained')) then
+      return jsonb_build_object('status', 'refused', 'code', 'already_booked');
+    end if;
+    -- r1_send_round answered round_active before running its two phone checks, so they run here.
+    -- copied from r1_send_round (0128)
+    if exists (select 1 from screening_v2.phone_engagements e where e.candidate_id=p_candidate_id and e.state in ('pending_prereqs','eligible','scheduled','dialing','in_call','reconnecting','awaiting_retry')) then
+      return jsonb_build_object('status', 'refused', 'code', 'phone_engagement_active');
+    end if;
+    if exists (select 1 from screening_v2.call_sessions s join screening_v2.job_queue j on j.payload->>'session_id'=s.id::text where s.candidate_id=p_candidate_id and s.mode='live' and j.name='phone.assessment' and j.status in ('pending','active','delayed')) then
+      return jsonb_build_object('status', 'refused', 'code', 'phone_assessment_pending');
+    end if;
+    -- The notice for the ROUND's audience, and the form's consent against it.
+    -- newest active notice (0142 step 7)
+    select t.* into v_template
+      from screening_v2.interview_round_consent_templates t
+     where t.is_active
+       and t.version = (select max(x.version) from screening_v2.interview_round_consent_templates x
+                         where x.is_active)
+       and t.locale = v_round.consent_locale;
+    if not found or jsonb_array_length(v_template.required_consents) = 0 then
+      return jsonb_build_object('status', 'refused', 'code', 'consent_template_unavailable');
+    end if;
+    if p_consent ->> 'template_version' <> v_template.version then
+      return jsonb_build_object('status', 'refused', 'code', 'consent_stale');
+    end if;
+    if not (v_template.required_consents <@ (p_consent -> 'consents'))
+       or p_consent -> 'in_india' is distinct from 'true'::jsonb then
+      return jsonb_build_object('status', 'refused', 'code', 'consent_incomplete');
+    end if;
+    -- The hold stays in its original month (as a reissue does); only the expiry moves.
+    update screening_v2.interview_rounds
+       set expires_at = v_expires, version = version + 1, updated_at = p_now
+     where id = v_round.id;
+    -- The live consent is superseded, never edited in place (routes/r1-candidate.ts); the
+    -- recording erase trigger (0127) ignores `superseded`.
+    update screening_v2.interview_round_consents
+       set withdrawn_at = p_now,
+           proof = coalesce(proof, '{}'::jsonb)
+             || jsonb_build_object('decision', 'superseded', 'superseded_at', p_now)
+     where round_id = v_round.id and withdrawn_at is null;
+    v_round_id := v_round.id;
+    v_result := 'relinked';
+  end if;
+
+  -- 10. The candidate's own consent from the form: a normal candidate_web row (method and the
+  -- attestation columns keep their defaults: candidate_web, NULL), so admission and the API
+  -- consent read accept it unchanged. The stored keys are the notice's required set.
+  insert into screening_v2.interview_round_consents
+    (round_id, template_id, consents, proof, granted_at)
+  values (v_round_id, v_template.id, v_template.required_consents,
+          jsonb_build_object(
+            'decision', 'granted', 'captured_at', p_now,
+            'template_version', v_template.version, 'locale', v_template.locale,
+            'ip_prefix', p_consent ->> 'ip_prefix', 'user_agent', p_consent ->> 'user_agent',
+            'source', 'r1_public_booking', 'channel', 'meet',
+            'india_location_confirmed', true),
+          p_now);
+
+  -- The booking: public, no Ashby event, schedule or scheduler; the calendar event id is the
+  -- booking id without dashes (the event S06 created before this call).
+  insert into screening_v2.r1_meet_bookings
+    (id, source, ashby_interview_event_id, ashby_schedule_id, ashby_application_id,
+     ashby_interview_stage_id, ashby_interview_id, ashby_scheduled_by_user_id, ashby_updated_at,
+     candidate_id, round_id, objective_profile, status, reason, meet_url, start_at, end_at,
+     google_calendar_event_id, calendar_state, public_request_id, created_at, updated_at)
+  values (p_booking_id, 'public_page', null, null, p_ashby_application_id,
+          null, null, null, null,
+          p_candidate_id, v_round_id, p_objective_profile, 'pending', 'eligible', p_meet_url,
+          p_start_at, p_end_at,
+          replace(p_booking_id::text, '-', ''), 'created', p_public_request_id, p_now, p_now)
+  returning * into v_booking;
+
+  -- The bot, the calendar invite and the Ashby "Booked" tag (contracts section 5).
+  insert into screening_v2.job_queue (name, payload, dedup_key, max_attempts)
+  values ('r1-meet', jsonb_build_object('kind', 'ensure_bot', 'booking_id', v_booking.id),
+          'r1-meet:ensure-bot:' || v_booking.id::text, 10)
+  on conflict do nothing;
+  insert into screening_v2.job_queue (name, payload, dedup_key, max_attempts)
+  values ('r1-meet', jsonb_build_object('kind', 'calendar_sync', 'op', 'invite', 'booking_id', v_booking.id),
+          'r1-meet:calendar:' || v_booking.id::text || ':invite', 10)
+  on conflict do nothing;
+  insert into screening_v2.job_queue (name, payload, dedup_key, max_attempts)
+  values ('r1-meet', jsonb_build_object('kind', 'ashby_booked_tag', 'op', 'add', 'booking_id', v_booking.id),
+          'r1-meet:ashby-tag:' || v_booking.id::text || ':add', 10)
+  on conflict do nothing;
+
+  return jsonb_build_object(
+    'status', 'booked', 'result', v_result, 'booking_id', v_booking.id,
+    'round_id', v_booking.round_id, 'candidate_id', v_booking.candidate_id,
+    'start_at', v_booking.start_at, 'end_at', v_booking.end_at,
+    'version', v_booking.version, 'key_attempt', v_booking.key_attempt,
+    'round_expires_at', v_expires);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------------------------
 -- §16. r1_meet_public_set_manage_digest: stores (or rotates) the manage token digest.
 -- ---------------------------------------------------------------------------------------------
 -- S06 mints the manage token after the create and stores only its HMAC-SHA256 hex here; a new
@@ -1080,6 +1502,17 @@ grant execute on function screening_v2.r1_meet_public_precheck(uuid, text, times
 comment on function screening_v2.r1_meet_public_precheck(uuid, text, timestamptz) is
   'M035: read only. Whether the candidate may book a public R1 slot: eligible | refused (+code, '
   'the first of the shared refusal predicates) | invalid_request (+field). Service-role only.';
+
+revoke all on function screening_v2.r1_meet_create_round_from_public(uuid, uuid, uuid, text, text, timestamptz, timestamptz, uuid, jsonb, integer, integer, integer, text, integer, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.r1_meet_create_round_from_public(uuid, uuid, uuid, text, text, timestamptz, timestamptz, uuid, jsonb, integer, integer, integer, text, integer, timestamptz)
+  to service_role;
+comment on function screening_v2.r1_meet_create_round_from_public(uuid, uuid, uuid, text, text, timestamptz, timestamptz, uuid, jsonb, integer, integer, integer, text, integer, timestamptz) is
+  'M035: one transaction for a public booking: the R1 round (created through r1_send_round, or a '
+  'reusable Meet round re-linked), the candidate_web consent of the form (India tick in the proof, '
+  'no attestation), the public booking and its ensure_bot, calendar invite and Ashby tag jobs, '
+  'under the candidate and IST-day advisory locks. Answers booked (+result created or relinked) | '
+  'replayed | refused (+code) | invalid_request (+field). Service-role only.';
 
 revoke all on function screening_v2.r1_meet_public_set_manage_digest(uuid, text, timestamptz)
   from public, anon, authenticated;

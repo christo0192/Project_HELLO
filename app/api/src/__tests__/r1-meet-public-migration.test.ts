@@ -19,6 +19,7 @@ import {
   R1_MEET_TERMINAL_STATUSES,
   R1_MEET_UNDISPATCHED_STATUSES,
 } from '../lib/r1/meet/runtime-store.js';
+import { R1_MEET_JOB_MAX_ATTEMPTS, parseEnsureBotJob, r1MeetDedupKeys, r1MeetJobs } from '../lib/r1/meet/jobs.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const migrations = path.resolve(here, '../../../supabase/migrations');
@@ -110,7 +111,7 @@ describe('migration 0143: file and frame', () => {
   it('keeps its sections in order, each exactly once', () => {
     const markers = [
       '-- §1. ', '-- §2. ', '-- §3. ', '-- §4. ',
-      '-- §10. ', '-- §11. ', '-- §12. ', '-- §13. ', '-- §14. ', '-- §16. ', '-- §17. ',
+      '-- §10. ', '-- §11. ', '-- §12. ', '-- §13. ', '-- §14. ', '-- §15. ', '-- §16. ', '-- §17. ',
       '-- §21. ', '-- §22. ', '-- §23. ', '-- §90. ',
     ];
     let last = -1;
@@ -881,6 +882,322 @@ describe('migration 0143: T2 helpers and RPC bodies', () => {
   });
 });
 
+// ── T3: r1_meet_create_round_from_public ────────────────────────────────────────────────────────
+
+const CREATE = 'r1_meet_create_round_from_public';
+const CREATE_PARAMS = 'p_booking_id uuid, p_public_request_id uuid, p_candidate_id uuid, p_ashby_application_id text, '
+  + 'p_meet_url text, p_start_at timestamptz, p_end_at timestamptz, p_created_by uuid, p_consent jsonb, '
+  + 'p_slot_seats integer, p_public_day_limit integer, p_bot_day_limit integer, '
+  + "p_objective_profile text default 'r1_dex_sales', p_expiry_grace_sec integer default 7200, "
+  + 'p_now timestamptz default now()';
+const CREATE_TYPES = 'uuid, uuid, uuid, text, text, timestamptz, timestamptz, uuid, jsonb, integer, integer, integer, '
+  + 'text, integer, timestamptz';
+const REFUSED = (code: string): string => `return jsonb_build_object('status', 'refused', 'code', '${code}');`;
+/** The form's consent checked against the notice in v_template (step 8 for en-IN, again on a re-link). */
+const CONSENT_CHECK = "if p_consent ->> 'template_version' <> v_template.version then "
+  + `${REFUSED('consent_stale')} end if; `
+  + "if not (v_template.required_consents <@ (p_consent -> 'consents')) "
+  + "or p_consent -> 'in_india' is distinct from 'true'::jsonb then "
+  + `${REFUSED('consent_incomplete')} end if;`;
+
+describe('migration 0143: T3 r1_meet_create_round_from_public', () => {
+  // The body (from its `create or replace function` to the closing `$$;`), read without `expect`
+  // at collection time; the first test proves the declaration exists.
+  const createStart = code.indexOf(`create or replace function screening_v2.${CREATE}(`);
+  const body = createStart === -1 ? '' : code.slice(createStart, code.indexOf('$$;', createStart));
+
+  it('declares the create once with its contract signature, as a volatile security definer', () => {
+    expect(code).toContain(
+      `create or replace function screening_v2.${CREATE}( ${CREATE_PARAMS} ) returns jsonb `
+      + 'language plpgsql security definer set search_path = pg_catalog, screening_v2 as $$',
+    );
+    expect(lc.split(`create or replace function screening_v2.${CREATE}(`)).toHaveLength(2);
+    const sig = `screening_v2.${CREATE}(${CREATE_TYPES})`;
+    expect(code).toContain(`revoke all on function ${sig} from public, anon, authenticated;`);
+    expect(code).toContain(`grant execute on function ${sig} to service_role;`);
+    expect(code).toContain(`comment on function ${sig} is`);
+    expect(lc.split(`grant execute on function ${sig}`)).toHaveLength(2);
+    expect(lc).not.toMatch(new RegExp(`\\bgrant\\b[^;]*\\bon function screening_v2\\.${CREATE}\\([^;]*\\bto\\b[^;]*\\b(anon|authenticated|public)\\b`));
+  });
+
+  it('validates every field in the contract order, reading nothing, before the first lock', () => {
+    const lock = body.indexOf('pg_advisory_xact_lock(');
+    expect(lock).toBeGreaterThan(-1);
+    const fields = (text: string): string[] =>
+      [...text.matchAll(/'status', 'invalid_request', 'field', '([a-z_]+)'/g)].map((m) => m[1]!);
+    expect(fields(body.slice(0, lock))).toEqual([
+      'booking_id', 'request_id', 'candidate_id', 'application_id', 'meet_url', 'slot', 'created_by', 'consent',
+      'seats', 'day_limit', 'profile', 'grace', 'now',
+      // The replay (another candidate or application) and the taken booking id.
+      'request_id', 'booking_id',
+    ]);
+    // After the candidate lock: only the replay re-check.
+    expect(fields(body.slice(lock))).toEqual(['request_id']);
+    // Nothing of the schema is read before the last field check.
+    const statements = body.slice(body.indexOf(' begin ', body.indexOf('as $$')));
+    expect(statements.indexOf('screening_v2.')).toBeGreaterThan(statements.indexOf("'field', 'now'"));
+    expect(body).toContain("if p_meet_url is null or p_meet_url !~ '^https://meet\\.google\\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}$' then");
+    expect(code0142).toContain("if p_meet_url is null or p_meet_url !~ '^https://meet\\.google\\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}$' then");
+    expect(body).toContain(
+      "or p_end_at - p_start_at not between interval '30 minutes' and interval '60 minutes' then",
+    );
+    expect(body).toContain('if p_slot_seats is null or p_slot_seats not between 1 and 15 then');
+    expect(body).toContain('if p_public_day_limit is null or p_public_day_limit not between 1 and 200 '
+      + 'or p_bot_day_limit is null or p_bot_day_limit not between 1 and 200 then');
+    expect(body).toContain("if p_objective_profile is null or p_objective_profile not in ('r1_dex_sales') then");
+    expect(body).toContain('if p_expiry_grace_sec is null or p_expiry_grace_sec not between 900 and 86400 then');
+  });
+
+  it('closes the consent shape (plan R23), checked in steps', () => {
+    expect(body).toContain("v_consent_ok := p_consent is not null and jsonb_typeof(p_consent) = 'object';");
+    expect(body).toContain(
+      "where k.key not in ('template_version', 'consents', 'in_india', 'ip_prefix', 'user_agent'))",
+    );
+    for (const text of [
+      "coalesce(jsonb_typeof(p_consent -> 'template_version') = 'string', false)",
+      "coalesce(jsonb_typeof(p_consent -> 'consents') = 'array', false)",
+      "coalesce(jsonb_typeof(p_consent -> 'in_india') = 'boolean', false)",
+      "coalesce(jsonb_typeof(p_consent -> 'ip_prefix'), 'null') in ('null', 'string')",
+      "coalesce(jsonb_typeof(p_consent -> 'user_agent'), 'null') in ('null', 'string')",
+      "char_length(p_consent ->> 'template_version') between 1 and 64",
+      "jsonb_array_length(p_consent -> 'consents') between 1 and 8",
+      "coalesce(char_length(p_consent ->> 'ip_prefix') between 1 and 64, true)",
+      "coalesce(char_length(p_consent ->> 'user_agent') between 1 and 256, true)",
+      "where e.item !~ '^[a-z][a-z0-9_]{0,63}$')",
+      "(select count(distinct e.item) from jsonb_array_elements_text(p_consent -> 'consents') e(item)) = jsonb_array_length(p_consent -> 'consents')",
+    ]) {
+      expect(body, text).toContain(text);
+    }
+    // The type checks run before any function that needs the type (three separate steps).
+    expect(body.split('if v_consent_ok then')).toHaveLength(4);
+  });
+
+  it('runs its steps in the contract order (replay, locks, capacity, refusals, 0142 steps 8a, 9, 10, inserts)', () => {
+    const steps = [
+      'select * into v_replay from screening_v2.r1_meet_bookings b where b.public_request_id = p_public_request_id;',
+      'if exists (select 1 from screening_v2.r1_meet_bookings b where b.id = p_booking_id) then',
+      `if p_start_at <= p_now then ${REFUSED('in_past')}`,
+      "perform pg_advisory_xact_lock(hashtextextended('r1_meet_public:candidate:' || p_candidate_id::text, 0));",
+      'select * into v_replay from screening_v2.r1_meet_bookings b where b.public_request_id = p_public_request_id;',
+      "v_day := (p_start_at at time zone 'Asia/Kolkata')::date;",
+      "perform pg_advisory_xact_lock(hashtextextended('r1_meet_public:day:' || to_char(v_day, 'YYYY-MM-DD'), 0));",
+      `if screening_v2.r1_meet_public_slot_count(p_start_at, p_end_at, null) >= p_slot_seats then ${REFUSED('slot_full')}`,
+      'v_counts := screening_v2.r1_meet_public_day_count(v_day, null);',
+      "if (v_counts ->> 'public')::integer >= p_public_day_limit or (v_counts ->> 'total')::integer >= p_bot_day_limit "
+        + `then ${REFUSED('day_full')}`,
+      'v_refusal := screening_v2.r1_meet_public_refusal(p_candidate_id, p_ashby_application_id, p_now);',
+      "if v_refusal is not null then return jsonb_build_object('status', 'refused', 'code', v_refusal); end if;",
+      `if not exists (select 1 from auth.users u where u.id = p_created_by) then ${REFUSED('created_by_unknown')}`,
+      'v_expires := p_end_at + make_interval(secs => p_expiry_grace_sec);',
+      `if v_expires > p_now + interval '14 days' then ${REFUSED('slot_too_far')}`,
+      "and t.locale = 'en-IN';",
+      `if not found or jsonb_array_length(v_template.required_consents) = 0 then ${REFUSED('consent_template_unavailable')}`,
+      CONSENT_CHECK,
+      `if v_role_count <> 1 then ${REFUSED('role_not_configured')}`,
+      'and o.id is distinct from p_booking_id',
+      'v_send := screening_v2.r1_send_round(',
+      "update screening_v2.interview_rounds set channel = 'meet' where id = v_round_id; v_result := 'created';",
+      'select * into v_round from screening_v2.interview_rounds where id = v_live_id for update;',
+      'and t.locale = v_round.consent_locale;',
+      CONSENT_CHECK,
+      "v_round_id := v_round.id; v_result := 'relinked';",
+      'insert into screening_v2.interview_round_consents',
+      'insert into screening_v2.r1_meet_bookings',
+      "jsonb_build_object('kind', 'ensure_bot'",
+      "jsonb_build_object('kind', 'calendar_sync', 'op', 'invite'",
+      "jsonb_build_object('kind', 'ashby_booked_tag', 'op', 'add'",
+      "'status', 'booked'",
+    ];
+    let at = -1;
+    for (const step of steps) {
+      const i = body.indexOf(step, at + 1);
+      expect(i, step).toBeGreaterThan(at);
+      at = i;
+    }
+    expect(body.match(/pg_advisory_xact_lock\(/g)).toHaveLength(2);
+    expect(body.split('where b.public_request_id = p_public_request_id;')).toHaveLength(3);
+    // No booking row is locked: the day lock serialises the creates of a day.
+    expect(body).not.toMatch(/from screening_v2\.r1_meet_bookings[^;]*for update/);
+  });
+
+  it('answers replayed, refused, invalid_request or booked, with the refusal codes in order', () => {
+    expect(runs([...body.matchAll(/'status', '([a-z_]+)'/g)].map((m) => m[1]!))).toEqual([
+      'invalid_request', 'replayed', 'invalid_request', 'refused', 'replayed', 'invalid_request', 'refused', 'booked',
+    ]);
+    const codes = [...body.matchAll(/'status', 'refused', 'code', (?:'([a-z_]+)'|(v_[a-z_]+))\)/g)].map((m) => m[1] ?? m[2]!);
+    expect(runs(codes)).toEqual([
+      'in_past', 'slot_full', 'day_full', 'v_refusal', 'created_by_unknown', 'slot_too_far',
+      'consent_template_unavailable', 'consent_stale', 'consent_incomplete', 'role_not_configured',
+      // r1_send_round's own refusals (a race backstop behind §12), then the re-link's.
+      'v_code', 'already_booked', 'phone_engagement_active', 'phone_assessment_pending',
+      'consent_template_unavailable', 'consent_stale', 'consent_incomplete',
+    ]);
+    // Every refusal code is a closed contract word.
+    const contract = new Set([
+      'application_unknown', 'application_terminal', 'mapping_unavailable', 'dsar_hold', 'candidate_ineligible',
+      'already_booked', 'r1_completed', 'phone_engagement_active', 'phone_assessment_pending', 'role_not_configured',
+      'consent_template_unavailable', 'disabled', 'paused', 'capacity_exhausted', 'slot_full', 'day_full',
+      'consent_stale', 'consent_incomplete', 'in_past', 'slot_too_far', 'created_by_unknown',
+    ]);
+    for (const c of codes.filter((c) => !c.startsWith('v_'))) expect(contract.has(c), c).toBe(true);
+    expect(body).toContain(
+      "return jsonb_build_object('status', 'replayed', 'booking_id', v_replay.id, "
+      + "'start_at', v_replay.start_at, 'end_at', v_replay.end_at);",
+    );
+    expect(body).toContain(
+      'if v_replay.candidate_id = p_candidate_id and v_replay.ashby_application_id = p_ashby_application_id then',
+    );
+    expect(body).toContain(
+      "return jsonb_build_object( 'status', 'booked', 'result', v_result, 'booking_id', v_booking.id, "
+      + "'round_id', v_booking.round_id, 'candidate_id', v_booking.candidate_id, "
+      + "'start_at', v_booking.start_at, 'end_at', v_booking.end_at, "
+      + "'version', v_booking.version, 'key_attempt', v_booking.key_attempt, "
+      + "'round_expires_at', v_expires);",
+    );
+    // No answer (a field name of invalid_request aside) carries the Meet URL, a digest, the request
+    // id, the calendar event id or anything of the form's consent.
+    const answers = [...body.matchAll(/return jsonb_build_object\(([^;]*)\);/g)].map((m) => m[1]!);
+    expect(answers.length).toBeGreaterThan(20);
+    for (const answer of answers.filter((a) => !a.includes("'invalid_request'"))) {
+      expect(answer).not.toMatch(/meet_url|digest|request_id|calendar|ip_prefix|user_agent|p_consent/);
+    }
+  });
+
+  it('maps r1_send_round exactly as 0142 does, and raises on anything unexpected', () => {
+    const list0142 = /if v_code in \(([^)]*)\) then v_status := 'blocked'; v_reason := v_code;/.exec(code0142);
+    expect(list0142).not.toBeNull();
+    expect(body).toContain(`if v_code in (${list0142![1]}) then return jsonb_build_object('status', 'refused', 'code', v_code); end if;`);
+    expect(body).toContain(
+      "if v_code is distinct from 'ok' and v_code is distinct from 'round_active' then "
+      + "raise exception 'r1_meet_create_round_from_public: unexpected answer from r1_send_round' using errcode = 'P0001'; end if;",
+    );
+  });
+
+  it('copies 0142 step 8a with `o.id is distinct from p_booking_id` for the event conjunct (R01 1.3)', () => {
+    const source = through(code0142, 'select r.id, r.version into v_lapsed_id, v_lapsed_version', ' limit 1;');
+    const conjunct = ' and o.ashby_interview_event_id <> p_ashby_interview_event_id';
+    expect(source.split(conjunct)).toHaveLength(2);
+    const expire = "if v_lapsed_id is not null then perform screening_v2.r1_transition_round(v_lapsed_id, 'expire', "
+      + 'v_lapsed_version, null, null, p_now); end if;';
+    expect(code0142).toContain(`${source} ${expire}`);
+    const expected = `${source.replace(conjunct, ' and o.id is distinct from p_booking_id')} ${expire}`;
+    const copies = copiesAfter('-- copied from r1_meet_create_round_from_ashby (0142) step 8a, is distinct from');
+    expect(copies).toHaveLength(1);
+    expect(copies[0]!.startsWith(expected), copies[0]!.slice(0, 700)).toBe(true);
+    expect(body).toContain(expected);
+    // The alias keeps the copied text verbatim: the candidate is the parameter.
+    expect(body).toContain('v_candidate_id constant uuid := p_candidate_id;');
+  });
+
+  it('copies 0142 step 9: the round through r1_send_round with the unusable link digest, then channel meet', () => {
+    const DIGEST = "encode(sha256(convert_to('r1-meet-unusable:' || gen_random_uuid()::text || ':' "
+      + "|| gen_random_uuid()::text, 'UTF8')), 'hex')";
+    expect(code0142).toContain(DIGEST);
+    expect(body).toContain(DIGEST);
+    const source = through(code0142, 'select c.status into v_candidate_status', "v_code := v_send ->> 'status';");
+    expect(source).toContain(DIGEST);
+    const copies = copiesAfter('-- copied from r1_meet_create_round_from_ashby (0142) step 9');
+    expect(copies).toHaveLength(1);
+    expect(copies[0]!.startsWith(source), copies[0]!.slice(0, 600)).toBe(true);
+    expect(lc.match(/\br1_send_round\(/g)).toHaveLength(1);
+  });
+
+  it('copies 0142 step 10 (the hold month, the round lock, the reuse, the expiry and the supersede)', () => {
+    const source = through(code0142, 'select r.id, r.held_minutes, r.hold_month, r.charged_attempt_number > r.attempts_counted',
+      'select * into v_round from screening_v2.interview_rounds where id = v_live_id for update;');
+    expect(source.split('exit decide;')).toHaveLength(3);
+    const expected = source.replaceAll('exit decide;', REFUSED('already_booked'));
+    const copies = copiesAfter('-- copied from r1_meet_create_round_from_ashby (0142) step 10');
+    expect(copies).toHaveLength(1);
+    expect(copies[0]!.startsWith(expected), copies[0]!.slice(0, 900)).toBe(true);
+    // The reuse condition (pinned verbatim by the T2 test) refuses as already_booked.
+    const reuse = through(code0142, "if v_round.id is null or v_round.channel <> 'meet'", ' then exit decide;')
+      .slice(0, -' exit decide;'.length);
+    expect(body).toContain(`${reuse} ${REFUSED('already_booked')} end if;`);
+    // The re-link: the round's audience, the form re-checked, the expiry moved, the consent superseded.
+    const expiry = 'update screening_v2.interview_rounds set expires_at = v_expires, version = version + 1, '
+      + 'updated_at = p_now where id = v_round.id;';
+    const supersede = through(code0142, 'update screening_v2.interview_round_consents set withdrawn_at = p_now,',
+      'where round_id = v_round.id and withdrawn_at is null;');
+    for (const text of [expiry, supersede]) {
+      expect(code0142).toContain(text);
+      expect(body).toContain(text);
+    }
+    expect(body.split(CONSENT_CHECK)).toHaveLength(3);
+    expect(body.indexOf(CONSENT_CHECK, body.indexOf('and t.locale = v_round.consent_locale;'))).toBeLessThan(body.indexOf(expiry));
+    expect(body.indexOf(expiry)).toBeLessThan(body.indexOf(supersede));
+    expect(body.indexOf(supersede)).toBeLessThan(body.indexOf('insert into screening_v2.interview_round_consents'));
+  });
+
+  it('inserts the candidate_web consent: no attestation column, the required set, exactly the nine proof fields', () => {
+    const insert = through(body, 'insert into screening_v2.interview_round_consents', 'p_now);');
+    expect(insert.startsWith(
+      'insert into screening_v2.interview_round_consents (round_id, template_id, consents, proof, granted_at) '
+      + 'values (v_round_id, v_template.id, v_template.required_consents, jsonb_build_object(',
+    )).toBe(true);
+    expect(insert).not.toMatch(/\bmethod\b|attested|hr_attested/);
+    const proof = through(insert, 'jsonb_build_object(', 'true)');
+    const args = proof.slice('jsonb_build_object('.length, -1).trim().split(', ');
+    expect(args).toHaveLength(18);
+    expect(args.filter((_, i) => i % 2 === 0)).toEqual([
+      "'decision'", "'captured_at'", "'template_version'", "'locale'", "'ip_prefix'", "'user_agent'",
+      "'source'", "'channel'", "'india_location_confirmed'",
+    ]);
+    expect(proof).toBe(
+      "jsonb_build_object( 'decision', 'granted', 'captured_at', p_now, 'template_version', v_template.version, "
+      + "'locale', v_template.locale, 'ip_prefix', p_consent ->> 'ip_prefix', 'user_agent', p_consent ->> 'user_agent', "
+      + "'source', 'r1_public_booking', 'channel', 'meet', 'india_location_confirmed', true)",
+    );
+    expect(body.match(/insert into screening_v2\.interview_round_consents\b/g)).toHaveLength(1);
+  });
+
+  it('inserts the public booking: no Ashby event, schedule or scheduler, the event id pin, calendar created', () => {
+    expect(body).toContain(
+      'insert into screening_v2.r1_meet_bookings (id, source, ashby_interview_event_id, ashby_schedule_id, '
+      + 'ashby_application_id, ashby_interview_stage_id, ashby_interview_id, ashby_scheduled_by_user_id, ashby_updated_at, '
+      + 'candidate_id, round_id, objective_profile, status, reason, meet_url, start_at, end_at, '
+      + 'google_calendar_event_id, calendar_state, public_request_id, created_at, updated_at) '
+      + "values (p_booking_id, 'public_page', null, null, p_ashby_application_id, null, null, null, null, "
+      + "p_candidate_id, v_round_id, p_objective_profile, 'pending', 'eligible', p_meet_url, p_start_at, p_end_at, "
+      + "replace(p_booking_id::text, '-', ''), 'created', p_public_request_id, p_now, p_now) returning * into v_booking;",
+    );
+    expect(body.match(/insert into screening_v2\.r1_meet_bookings\b/g)).toHaveLength(1);
+    expect(body).not.toMatch(/\bupdate screening_v2\.r1_meet_bookings\b/);
+  });
+
+  it('queues exactly the ensure_bot, calendar invite and Ashby tag add jobs of contracts section 5', () => {
+    const inserts = [...body.matchAll(/insert into screening_v2\.job_queue [^;]*;/g)].map((m) => m[0]);
+    expect(inserts).toEqual([
+      "insert into screening_v2.job_queue (name, payload, dedup_key, max_attempts) values ('r1-meet', "
+        + "jsonb_build_object('kind', 'ensure_bot', 'booking_id', v_booking.id), "
+        + "'r1-meet:ensure-bot:' || v_booking.id::text, 10) on conflict do nothing;",
+      "insert into screening_v2.job_queue (name, payload, dedup_key, max_attempts) values ('r1-meet', "
+        + "jsonb_build_object('kind', 'calendar_sync', 'op', 'invite', 'booking_id', v_booking.id), "
+        + "'r1-meet:calendar:' || v_booking.id::text || ':invite', 10) on conflict do nothing;",
+      "insert into screening_v2.job_queue (name, payload, dedup_key, max_attempts) values ('r1-meet', "
+        + "jsonb_build_object('kind', 'ashby_booked_tag', 'op', 'add', 'booking_id', v_booking.id), "
+        + "'r1-meet:ashby-tag:' || v_booking.id::text || ':add', 10) on conflict do nothing;",
+    ]);
+    // The ensure_bot row is exactly what jobs.ts writes and parses (S06's maintenance re-drives it).
+    const id = '7f000000-0000-4000-8000-004000000500';
+    const spec = r1MeetJobs.ensureBot(id);
+    expect(spec.payload).toEqual({ kind: 'ensure_bot', booking_id: id });
+    expect(spec.dedupKey).toBe(`r1-meet:ensure-bot:${id}`);
+    expect(r1MeetDedupKeys.ensureBot(id.toUpperCase())).toBe(`r1-meet:ensure-bot:${id}`);
+    expect(spec.maxAttempts).toBe(10);
+    expect(R1_MEET_JOB_MAX_ATTEMPTS.ensure_bot).toBe(10);
+    expect(parseEnsureBotJob({ kind: 'ensure_bot', booking_id: id })).toEqual({ kind: 'ensure_bot', bookingId: id });
+  });
+
+  it('calls r1_transition_round only for the 8a expiry, and never reissues a link', () => {
+    expect([...lc.matchAll(/\br1_transition_round\(([^)]*)\)/g)].map((m) => m[1])).toEqual([
+      "v_lapsed_id, 'expire', v_lapsed_version, null, null, p_now",
+    ]);
+    expect(lc).not.toContain("'reissue'");
+    expect(body).not.toMatch(/\br1_withdraw_consent\(|\bcall_sessions\b[^;]*\binsert\b|insert into screening_v2\.call_sessions/);
+  });
+});
+
 describe('migration 0143: clock, handlers and redeclarations', () => {
   it('reads no machine clock inside a function body and swallows no error', () => {
     const bodies = [...lc.matchAll(/\$\$([\s\S]*?)\$\$/g)].map((m) => m[1]!);
@@ -1024,6 +1341,63 @@ describe('migration 0143: wiring and the SQL suite', () => {
     ]) {
       expect(suite, label).toContain(label);
     }
+  });
+
+  it('covers the T3 sections in order, after T2, through the create helper', () => {
+    let last = suite.indexOf('-- T2-H. ');
+    for (const section of ['-- T3-A. ', '-- T3-B. ', '-- T3-C. ', '-- T3-D. ', '-- T3-E. ', '-- T3-F. ', '-- T3-G. ', '-- T3-H. ']) {
+      expect(suite.split(section).length - 1, section).toBe(1);
+      expect(suite.indexOf(section), section).toBeGreaterThan(last);
+      last = suite.indexOf(section);
+    }
+    // The helper calls the RPC with every one of its 15 arguments.
+    const helper = blockOf(suite, 'create function _r1_meet_public_tests.create(', '$$;');
+    expect(helper).toContain('return screening_v2.r1_meet_create_round_from_public(');
+    expect(helper).toContain("nullif(a -> 'consent', 'null'::jsonb)");
+    expect(helper).toContain("(a ->> 'now')::timestamptz);");
+    for (const label of [
+      'T3-A a first eligible submit answers booked/created with exactly the contract fields',
+      "T3-A the consent is the candidate''s own: candidate_web, no attestation, our notice and its required set, the nine proof fields exactly",
+      'T3-A the booking queues exactly the ensure_bot, calendar invite and Ashby tag add jobs',
+      'T3-A admission passes the consent gate of a public Meet round',
+      'T3-A admission refuses the round once its consent is withdrawn: consent_missing',
+      'T3-B the same submit again answers replayed with the booking and its slot, exactly',
+      'T3-B the same request id for another candidate: invalid_request request_id',
+      'T3-B a booking id already taken, with a new request id: invalid_request booking_id',
+      'T3-C two seats and two live bookings in the slot',
+      'T3-C one seat and a slot that starts when the Ashby one ends',
+      'T3-C the total (with the completed Ashby booking) at the bot day limit',
+      'T3-C a slot at 00:00 IST on 2026-12-12 (18:30 UTC on 2026-12-11) is counted on IST 2026-12-12',
+      'T3-D a second submit of a booked candidate (new booking and request ids)',
+      'T3-D the newest release has no en-IN notice: consent_template_unavailable',
+      'T3-D precheck and create agree for candidate ',
+      'T3-E a consent with a field the shape does not name',
+      'T3-E a 257-character user_agent',
+      'T3-E an expiry one second past now + 14 days',
+      'T3-E no India tick',
+      'T3-E extra granted consents',
+      'T3-F after an Ashby cancel the public submit re-links the same round',
+      'T3-F ... the HR-attested consent is superseded, never erased',
+      'T3-F after a failed public booking a new submit re-links the same round',
+      "T3-F after HR''s grant-retake the public submit re-links the round",
+      'T3-F a re-link under a newer release the form did not show: consent_stale',
+      'T3-F a staff round whose staff notice requires more than the form granted: consent_incomplete',
+      'T3-F a reusable staff round with no staff notice',
+      'T3-G a lapsed, unused Meet round is expired and a new round created',
+      'T3-G a lapsed Meet round that still has a live booking',
+      'T3-H a 65-minute cap with a hold outstanding',
+      'T3-H the same cap with a reusable Meet round (a re-link takes no new hold)',
+      'T3-H the create is executable by service_role only',
+      'T3-H execute r1_meet_create_round_from_public',
+    ]) {
+      expect(suite, label).toContain(label);
+    }
+    // Every refusal of the expect() helper is checked to write nothing.
+    const expectHelper = blockOf(suite, 'create function _r1_meet_public_tests.expect(', '$$;');
+    expect(expectHelper).toContain("if p_outcome not like 'booked:%' then");
+    expect(expectHelper).toContain('_r1_meet_public_tests.counts() = v_before');
+    // The create is pinned as one overload by the catalog check.
+    expect(suite).toContain("x.proname = 'r1_meet_create_round_from_public'");
   });
 
   it('keeps the 0142 suite inserting valid Ashby rows (its full-row insert names the 0143 NOT NULL columns)', () => {

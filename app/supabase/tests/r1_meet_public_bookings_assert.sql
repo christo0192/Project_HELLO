@@ -35,6 +35,19 @@
 --   T2-G r1_meet_public_throttle_prune (§23).
 --   T2-H catalog posture of the T2 functions (definer RPCs, invoker helpers, volatility,
 --        search_path, EXECUTE).
+--   T3-A r1_meet_create_round_from_public (§15), the happy path: the round, the candidate_web
+--        consent, the booking, the three jobs, the exact answer, and admission accepting the round.
+--   T3-B replay by request id (same candidate, another candidate or application) and the taken
+--        booking id.
+--   T3-C slot and IST-day capacity under the day lock, at the limits.
+--   T3-D every precheck refusal reached through the create, nothing written.
+--   T3-E created_by_unknown, in_past, slot_too_far, consent_stale, consent_incomplete, every
+--        consent shape failure and every other field, nothing written.
+--   T3-F re-link: after an Ashby cancel, after a failed public booking, after HR's grant-retake,
+--        the consent checks of a re-link, and the round audience without a notice.
+--   T3-G the step-8a expiry of a lapsed Meet round, and a lapsed round that still has a booking.
+--   T3-H the settings refusals through the create, the re-link under a full cap, and the catalog
+--        posture of the create.
 --
 -- The clock is pinned: every time is written explicitly (p_now = 2026-12-01 04:00 UTC, 09:30 IST;
 -- the default slot is 2026-12-02 05:00-05:45 UTC, 10:30-11:15 IST); nothing asserts on now().
@@ -2381,6 +2394,891 @@ begin
          'screening_v2.r1_meet_public_set_calendar_state(uuid, text[], text, timestamptz)',
          'screening_v2.r1_meet_public_throttle_hit(text[], integer[], integer, timestamptz)',
          'screening_v2.r1_meet_public_throttle_prune(integer, integer, timestamptz)']) f));
+end;
+$$;
+
+-- =============================================================================================
+-- T3 fixtures. Fixture numbers 500-599 (and 5001-5999 for a second booking or request id of
+-- candidate n/10); p_now is 2026-12-01 04:00 UTC unless a call says otherwise. create(n) books
+-- candidate n's application n into its own default slot slot_of(n): one hour apart, twelve per IST
+-- day from 2026-12-03 09:00 IST, so no two default slots overlap and no IST day comes near the
+-- default limits (20). T3-C counts on its own days (IST 2026-12-11 and 2026-12-12).
+-- =============================================================================================
+
+-- The default slot start of create(n).
+create function _r1_meet_public_tests.slot_of(p_n integer) returns timestamptz
+language sql stable as $$
+  select '2026-12-03 03:30:00+00'::timestamptz
+         + make_interval(days => (p_n - 500) / 12, hours => (p_n - 500) % 12)
+$$;
+
+-- The consent the form sends by default: our notice, every required consent, the India tick, a
+-- TEST-NET-3 prefix and a fixture user agent.
+create function _r1_meet_public_tests.form_consent() returns jsonb
+language sql immutable as $$
+  select '{"template_version": "zz-meet-public-assert-current",
+           "consents": ["ai_interview", "video_audio_recording", "ai_evaluation", "data_processing"],
+           "in_india": true, "ip_prefix": "203.0.113.0/24", "user_agent": "meet public assert"}'::jsonb
+$$;
+
+-- Calls the create RPC as S06 would: defaults for candidate n, overridden by p_args (a JSON null
+-- is SQL NULL).
+create function _r1_meet_public_tests.create(p_n integer, p_args jsonb default '{}'::jsonb)
+returns jsonb language plpgsql as $$
+declare
+  a jsonb := jsonb_build_object(
+    'booking_id', _r1_meet_public_tests.id(40, p_n),
+    'request_id', _r1_meet_public_tests.id(41, p_n),
+    'candidate_id', _r1_meet_public_tests.id(10, p_n),
+    'application_id', _r1_meet_public_tests.id(22, p_n)::text,
+    'meet_url', 'https://meet.google.com/abc-defg-hij',
+    'start_at', _r1_meet_public_tests.slot_of(p_n),
+    'end_at', _r1_meet_public_tests.slot_of(p_n) + interval '45 minutes',
+    'created_by', _r1_meet_public_tests.id(1, 1),
+    'consent', _r1_meet_public_tests.form_consent(),
+    'seats', 2,
+    'public_limit', 20,
+    'bot_limit', 20,
+    'profile', 'r1_dex_sales',
+    'grace', 7200,
+    'now', '2026-12-01T04:00:00+00:00') || p_args;
+begin
+  return screening_v2.r1_meet_create_round_from_public(
+    (a ->> 'booking_id')::uuid, (a ->> 'request_id')::uuid, (a ->> 'candidate_id')::uuid,
+    a ->> 'application_id', a ->> 'meet_url', (a ->> 'start_at')::timestamptz,
+    (a ->> 'end_at')::timestamptz, (a ->> 'created_by')::uuid,
+    nullif(a -> 'consent', 'null'::jsonb),
+    (a ->> 'seats')::integer, (a ->> 'public_limit')::integer, (a ->> 'bot_limit')::integer,
+    a ->> 'profile', (a ->> 'grace')::integer, (a ->> 'now')::timestamptz);
+end;
+$$;
+
+-- An answer as one word: '<status>:<result, code or field>' ('replayed:' for a replay).
+create function _r1_meet_public_tests.outcome(p_res jsonb) returns text
+language sql immutable as $$
+  select coalesce(p_res ->> 'status', 'null') || ':'
+         || coalesce(p_res ->> 'result', p_res ->> 'code', p_res ->> 'field', '')
+$$;
+
+-- create(n, p_args) must answer p_outcome, and anything but booked must write nothing at all
+-- (bookings, rounds, consents, jobs, budget months, throttle rows).
+create function _r1_meet_public_tests.expect(p_label text, p_n integer, p_args jsonb, p_outcome text)
+returns jsonb language plpgsql as $$
+declare
+  v_before jsonb := _r1_meet_public_tests.counts();
+  v_res jsonb;
+begin
+  v_res := _r1_meet_public_tests.create(p_n, p_args);
+  perform _r1_meet_public_tests.assert(p_label || ' answers ' || p_outcome,
+    _r1_meet_public_tests.outcome(v_res) = p_outcome, v_res::text);
+  if p_outcome not like 'booked:%' then
+    perform _r1_meet_public_tests.assert(p_label || ' writes nothing',
+      _r1_meet_public_tests.counts() = v_before, v_res::text);
+  end if;
+  return v_res;
+end;
+$$;
+
+-- The minutes reserved in one budget month (0 when the month row does not exist).
+create function _r1_meet_public_tests.reserved(p_month date) returns numeric
+language sql stable as $$
+  select coalesce(sum(x.minutes_reserved), 0) from screening_v2.r1_budget_month x
+   where x.month_start = p_month
+$$;
+
+-- The three jobs a public create queues, in jobs_of order (ashby-tag, calendar, ensure-bot).
+create function _r1_meet_public_tests.create_jobs(p_booking uuid) returns jsonb
+language sql immutable as $$
+  select jsonb_build_array(
+    _r1_meet_public_tests.job(
+      jsonb_build_object('kind', 'ashby_booked_tag', 'op', 'add', 'booking_id', p_booking),
+      'r1-meet:ashby-tag:' || p_booking::text || ':add'),
+    _r1_meet_public_tests.job(
+      jsonb_build_object('kind', 'calendar_sync', 'op', 'invite', 'booking_id', p_booking),
+      'r1-meet:calendar:' || p_booking::text || ':invite'),
+    _r1_meet_public_tests.job(
+      jsonb_build_object('kind', 'ensure_bot', 'booking_id', p_booking),
+      'r1-meet:ensure-bot:' || p_booking::text))
+$$;
+
+-- The live consent of one round (NULL when there is none; the table allows at most one).
+create function _r1_meet_public_tests.live_consent(p_round uuid) returns uuid
+language sql stable as $$
+  select x.id from screening_v2.interview_round_consents x
+   where x.round_id = p_round and x.withdrawn_at is null
+$$;
+
+-- Whether consent row p_id is the candidate's own consent of the form: candidate_web, no
+-- attestation, live, on template p_template with exactly its required set, granted at p_now, and
+-- a proof of exactly the nine fields (the ip prefix and user agent as given, JSON null for NULL).
+create function _r1_meet_public_tests.form_consent_ok(p_id uuid, p_template uuid, p_now timestamptz,
+                                                      p_ip text default '203.0.113.0/24',
+                                                      p_ua text default 'meet public assert')
+returns boolean language sql stable as $$
+  select x.method = 'candidate_web' and x.attested_by_external_id is null and x.attested_at is null
+     and x.india_location_attested is null and x.withdrawn_at is null
+     and x.template_id = p_template and x.consents = t.required_consents and x.granted_at = p_now
+     and x.proof = jsonb_build_object(
+       'decision', 'granted', 'captured_at', p_now, 'template_version', t.version,
+       'locale', t.locale, 'ip_prefix', p_ip, 'user_agent', p_ua, 'source', 'r1_public_booking',
+       'channel', 'meet', 'india_location_confirmed', true)
+    from screening_v2.interview_round_consents x
+    join screening_v2.interview_round_consent_templates t on t.id = x.template_id
+   where x.id = p_id
+$$;
+
+-- =============================================================================================
+-- T3-A. r1_meet_create_round_from_public (§15): the happy path.
+-- =============================================================================================
+do $$
+declare
+  p_now constant timestamptz := '2026-12-01 04:00:00+00';
+  tpl constant uuid := _r1_meet_public_tests.id(3, 1);
+  bid constant uuid := _r1_meet_public_tests.id(40, 500);
+  s constant timestamptz := _r1_meet_public_tests.slot_of(500);
+  c uuid;
+  res jsonb;
+  adm jsonb;
+  b screening_v2.r1_meet_bookings%rowtype;
+  r screening_v2.interview_rounds%rowtype;
+  k uuid;
+  reserved_before numeric;
+begin
+  c := _r1_meet_public_tests.candidate(500);
+  reserved_before := _r1_meet_public_tests.reserved('2026-12-01');
+  res := _r1_meet_public_tests.create(500);
+  select * into b from screening_v2.r1_meet_bookings x where x.id = bid;
+  select * into r from screening_v2.interview_rounds x where x.id = b.round_id;
+  perform _r1_meet_public_tests.assert('T3-A a first eligible submit answers booked/created with exactly the contract fields',
+    res = jsonb_build_object('status', 'booked', 'result', 'created', 'booking_id', bid,
+                             'round_id', r.id, 'candidate_id', c, 'start_at', s,
+                             'end_at', s + interval '45 minutes', 'version', 0, 'key_attempt', 0,
+                             'round_expires_at', s + interval '45 minutes' + interval '7200 seconds'),
+    res::text);
+  perform _r1_meet_public_tests.assert(
+    'T3-A the booking is public, pending/eligible, with no Ashby event, schedule or scheduler',
+    b.source = 'public_page' and b.status = 'pending' and b.reason = 'eligible'
+    and b.ashby_interview_event_id is null and b.ashby_schedule_id is null
+    and b.ashby_scheduled_by_user_id is null and b.ashby_interview_stage_id is null
+    and b.ashby_interview_id is null and b.ashby_updated_at is null
+    and b.ashby_application_id = _r1_meet_public_tests.id(22, 500)::text
+    and b.candidate_id = c and b.round_id = r.id and b.objective_profile = 'r1_dex_sales'
+    and b.meet_url = 'https://meet.google.com/abc-defg-hij'
+    and b.start_at = s and b.end_at = s + interval '45 minutes'
+    and b.version = 0 and b.key_attempt = 0 and b.recall_bot_id is null
+    and b.ticket_digest is null and b.ticket_arms = 0 and b.session_id is null
+    and b.created_at = p_now and b.updated_at = p_now, to_jsonb(b)::text);
+  perform _r1_meet_public_tests.assert(
+    'T3-A the booking carries the event id pin, calendar created, its request id, no invite, no manage digest, no move',
+    b.google_calendar_event_id = replace(bid::text, '-', '') and b.calendar_state = 'created'
+    and b.invite_sent_at is null and b.public_request_id = _r1_meet_public_tests.id(41, 500)
+    and b.manage_token_digest is null and b.move_count = 0, to_jsonb(b)::text);
+  perform _r1_meet_public_tests.assert('T3-A the round is a Meet round created through r1_send_round',
+    r.channel = 'meet' and r.status = 'invited' and r.kind = 'sales_r1'
+    and r.role_id = _r1_meet_public_tests.id(2, 1) and r.candidate_id = c
+    and r.created_by = _r1_meet_public_tests.id(1, 1)
+    and r.candidate_status_at_send = (select x.status from screening_v2.candidates x where x.id = c)
+    and r.consent_locale = 'en-IN' and r.starts_used = 0 and r.attempts_counted = 0
+    and r.version = 1 and r.link_token_digest ~ '^[a-f0-9]{64}$', to_jsonb(r)::text);
+  perform _r1_meet_public_tests.assert(
+    'T3-A the round holds 65 minutes in the month of p_now and expires at slot end + 7200 s',
+    r.held_minutes = 65 and r.hold_month = '2026-12-01'
+    and _r1_meet_public_tests.reserved('2026-12-01') = reserved_before + 65
+    and r.expires_at = s + interval '45 minutes' + interval '7200 seconds',
+    format('held %s, month %s, reserved %s -> %s, expires %s', r.held_minutes, r.hold_month,
+           reserved_before, _r1_meet_public_tests.reserved('2026-12-01'), r.expires_at));
+  perform _r1_meet_public_tests.assert('T3-A the round has exactly one consent row, and it is live',
+    (select count(*) = 1 from screening_v2.interview_round_consents x where x.round_id = r.id)
+    and _r1_meet_public_tests.live_consent(r.id) is not null);
+  k := _r1_meet_public_tests.live_consent(r.id);
+  perform _r1_meet_public_tests.assert(
+    'T3-A the consent is the candidate''s own: candidate_web, no attestation, our notice and its required set, the nine proof fields exactly',
+    _r1_meet_public_tests.form_consent_ok(k, tpl, p_now),
+    (select to_jsonb(x)::text from screening_v2.interview_round_consents x where x.id = k));
+  perform _r1_meet_public_tests.assert(
+    'T3-A the booking queues exactly the ensure_bot, calendar invite and Ashby tag add jobs',
+    _r1_meet_public_tests.jobs_of(bid) = _r1_meet_public_tests.create_jobs(bid),
+    _r1_meet_public_tests.jobs_of(bid)::text);
+  perform _r1_meet_public_tests.assert('T3-A every job naming the booking is a pending r1-meet job',
+    (select count(*) = 3 and bool_and(x.name = 'r1-meet' and x.status = 'pending')
+       from screening_v2.job_queue x where x.payload ->> 'booking_id' = bid::text));
+  perform _r1_meet_public_tests.assert('T3-A creating the round created no call session',
+    not exists (select 1 from screening_v2.call_sessions x where x.interview_round_id = r.id));
+  perform _r1_meet_public_tests.assert(
+    'T3-A the answer carries no Meet URL, link digest, request id or calendar event id',
+    position('meet.google.com' in res::text) = 0 and position(r.link_token_digest in res::text) = 0
+    and position(_r1_meet_public_tests.id(41, 500)::text in res::text) = 0
+    and position(b.google_calendar_event_id in res::text) = 0, res::text);
+  perform _r1_meet_public_tests.assert('T3-A the precheck now answers already_booked',
+    _r1_meet_public_tests.pre(500) = 'already_booked', _r1_meet_public_tests.pre(500));
+
+  -- Admission accepts the candidate_web row unchanged. The answer must come from a check AFTER
+  -- the consent gate (earlier suites may leave live R1 sessions, so `ok` alone would be flaky),
+  -- and the same kind of round with its consent withdrawn must stop exactly at the gate.
+  perform _r1_meet_public_tests.candidate(501);
+  res := _r1_meet_public_tests.create(501);
+  adm := screening_v2.r1_admit_attempt((res ->> 'round_id')::uuid, _r1_meet_public_tests.digest('nonce-501'),
+                                       _r1_meet_public_tests.slot_of(501) + interval '1 minute');
+  perform _r1_meet_public_tests.assert('T3-A admission passes the consent gate of a public Meet round',
+    _r1_meet_public_tests.outcome(res) = 'booked:created'
+    and adm ->> 'status' in ('ok', 'r1_in_flight', 'round_live', 'cloud_capacity_exhausted',
+                             'capacity_exhausted'), adm::text);
+  perform _r1_meet_public_tests.candidate(502);
+  res := _r1_meet_public_tests.create(502);
+  adm := screening_v2.r1_withdraw_consent((res ->> 'round_id')::uuid, '{}'::jsonb, p_now);
+  perform _r1_meet_public_tests.assert('T3-A the candidate_web consent is withdrawn like any other',
+    _r1_meet_public_tests.outcome(res) = 'booked:created' and adm ->> 'status' = 'ok', adm::text);
+  adm := screening_v2.r1_admit_attempt((res ->> 'round_id')::uuid, _r1_meet_public_tests.digest('nonce-502'),
+                                       _r1_meet_public_tests.slot_of(502) + interval '1 minute');
+  perform _r1_meet_public_tests.assert(
+    'T3-A admission refuses the round once its consent is withdrawn: consent_missing',
+    adm ->> 'status' = 'consent_missing', adm::text);
+end;
+$$;
+
+-- =============================================================================================
+-- T3-B. Replay by request id, and the taken booking id.
+-- =============================================================================================
+do $$
+declare
+  s constant timestamptz := _r1_meet_public_tests.slot_of(503);
+  res jsonb;
+  v_before jsonb;
+begin
+  perform _r1_meet_public_tests.candidate(503);
+  perform _r1_meet_public_tests.candidate(504);
+  res := _r1_meet_public_tests.create(503);
+  perform _r1_meet_public_tests.assert('T3-B fixture: candidate 503 books its slot',
+    _r1_meet_public_tests.outcome(res) = 'booked:created', res::text);
+  v_before := _r1_meet_public_tests.counts();
+  res := _r1_meet_public_tests.create(503);
+  perform _r1_meet_public_tests.assert(
+    'T3-B the same submit again answers replayed with the booking and its slot, exactly',
+    res = jsonb_build_object('status', 'replayed', 'booking_id', _r1_meet_public_tests.id(40, 503),
+                             'start_at', s, 'end_at', s + interval '45 minutes'), res::text);
+  res := _r1_meet_public_tests.create(503, jsonb_build_object(
+    'booking_id', _r1_meet_public_tests.id(40, 5031), 'start_at', '2026-12-04T08:00:00+00:00',
+    'end_at', '2026-12-04T08:30:00+00:00', 'now', '2026-12-01T05:00:00+00:00'));
+  perform _r1_meet_public_tests.assert(
+    'T3-B the same request id with another booking id and slot answers the first booking and slot',
+    res = jsonb_build_object('status', 'replayed', 'booking_id', _r1_meet_public_tests.id(40, 503),
+                             'start_at', s, 'end_at', s + interval '45 minutes'), res::text);
+  res := _r1_meet_public_tests.create(503, jsonb_build_object('now', s + interval '10 minutes'));
+  perform _r1_meet_public_tests.assert(
+    'T3-B a replay after the slot started still answers replayed (the replay comes before in_past)',
+    _r1_meet_public_tests.outcome(res) = 'replayed:', res::text);
+  res := _r1_meet_public_tests.create(504, jsonb_build_object('request_id', _r1_meet_public_tests.id(41, 503)));
+  perform _r1_meet_public_tests.assert('T3-B the same request id for another candidate: invalid_request request_id',
+    res = '{"status": "invalid_request", "field": "request_id"}'::jsonb, res::text);
+  res := _r1_meet_public_tests.create(503, jsonb_build_object(
+    'application_id', _r1_meet_public_tests.id(22, 504)::text));
+  perform _r1_meet_public_tests.assert('T3-B the same request id for another application: invalid_request request_id',
+    res = '{"status": "invalid_request", "field": "request_id"}'::jsonb, res::text);
+  res := _r1_meet_public_tests.create(504, jsonb_build_object('booking_id', _r1_meet_public_tests.id(40, 503)));
+  perform _r1_meet_public_tests.assert(
+    'T3-B a booking id already taken, with a new request id: invalid_request booking_id',
+    res = '{"status": "invalid_request", "field": "booking_id"}'::jsonb, res::text);
+  perform _r1_meet_public_tests.assert('T3-B the replays and the refusals wrote nothing',
+    _r1_meet_public_tests.counts() = v_before);
+  perform _r1_meet_public_tests.expect('T3-B candidate 504 with its own ids', 504, '{}'::jsonb, 'booked:created');
+end;
+$$;
+
+-- =============================================================================================
+-- T3-C. Slot and IST-day capacity under the day lock, at the limits.
+-- =============================================================================================
+do $$
+declare
+  s1 constant timestamptz := '2026-12-11 05:00:00+00';
+  s2 constant timestamptz := '2026-12-11 07:00:00+00';
+  s3 constant timestamptz := '2026-12-11 09:00:00+00';
+  v_day jsonb;
+begin
+  -- One live public booking (blocked, no candidate) holds a seat of s1.
+  perform _r1_meet_public_tests.public_booking(505, _r1_meet_public_tests.blocked() || _r1_meet_public_tests.slot(s1));
+  perform _r1_meet_public_tests.candidate(506);
+  perform _r1_meet_public_tests.expect('T3-C one seat and one live public booking in the slot', 506,
+    jsonb_build_object('start_at', s1, 'end_at', s1 + interval '45 minutes', 'seats', 1), 'refused:slot_full');
+  perform _r1_meet_public_tests.expect('T3-C one seat and a partly overlapping live booking', 506,
+    jsonb_build_object('start_at', s1 + interval '30 minutes', 'end_at', s1 + interval '75 minutes', 'seats', 1),
+    'refused:slot_full');
+  perform _r1_meet_public_tests.expect('T3-C two seats and one live booking in the slot', 506,
+    jsonb_build_object('start_at', s1, 'end_at', s1 + interval '45 minutes', 'seats', 2), 'booked:created');
+  perform _r1_meet_public_tests.candidate(509);
+  perform _r1_meet_public_tests.expect('T3-C two seats and two live bookings in the slot', 509,
+    jsonb_build_object('start_at', s1, 'end_at', s1 + interval '45 minutes', 'seats', 2), 'refused:slot_full');
+
+  -- A live Ashby booking holds a seat too; a slot that only touches it is free.
+  perform _r1_meet_public_tests.ashby_booking(507, jsonb_build_object('status', 'blocked', 'reason', 'not_scheduled')
+                                                  || _r1_meet_public_tests.slot(s2));
+  perform _r1_meet_public_tests.candidate(508);
+  perform _r1_meet_public_tests.expect('T3-C one seat and one live Ashby booking in the slot', 508,
+    jsonb_build_object('start_at', s2, 'end_at', s2 + interval '45 minutes', 'seats', 1), 'refused:slot_full');
+  perform _r1_meet_public_tests.expect('T3-C one seat and a slot that starts when the Ashby one ends', 508,
+    jsonb_build_object('start_at', s2 + interval '45 minutes', 'end_at', s2 + interval '90 minutes', 'seats', 1),
+    'booked:created');
+
+  -- The IST day 2026-12-11: four live bookings, three of them public.
+  v_day := screening_v2.r1_meet_public_day_count('2026-12-11', null);
+  perform _r1_meet_public_tests.assert('T3-C fixture: IST 2026-12-11 counts total 4, public 3',
+    v_day = '{"total": 4, "public": 3}'::jsonb, v_day::text);
+  perform _r1_meet_public_tests.expect('T3-C the public count at the public day limit', 509,
+    jsonb_build_object('start_at', s3, 'end_at', s3 + interval '45 minutes', 'public_limit', 3), 'refused:day_full');
+  perform _r1_meet_public_tests.expect('T3-C the total at the bot day limit', 509,
+    jsonb_build_object('start_at', s3, 'end_at', s3 + interval '45 minutes', 'public_limit', 4, 'bot_limit', 4),
+    'refused:day_full');
+
+  -- An Ashby booking that used a bot counts toward the total; a failure that never had one does not.
+  perform _r1_meet_public_tests.candidate(510);
+  perform _r1_meet_public_tests.round(510, 'completed');
+  perform _r1_meet_public_tests.ashby_booking(510, jsonb_build_object(
+    'status', 'completed', 'reason', 'attempt_settled', 'candidate_id', _r1_meet_public_tests.id(10, 510),
+    'round_id', _r1_meet_public_tests.id(11, 510), 'recall_bot_id', _r1_meet_public_tests.id(30, 510))
+    || _r1_meet_public_tests.slot('2026-12-11 10:00:00+00'));
+  perform _r1_meet_public_tests.ashby_booking(511, jsonb_build_object('status', 'failed', 'reason', 'in_past')
+                                                  || _r1_meet_public_tests.slot('2026-12-11 11:00:00+00'));
+  v_day := screening_v2.r1_meet_public_day_count('2026-12-11', null);
+  perform _r1_meet_public_tests.assert(
+    'T3-C fixture: a completed Ashby booking with a bot counts, a failed/in_past one does not: total 5, public 3',
+    v_day = '{"total": 5, "public": 3}'::jsonb, v_day::text);
+  perform _r1_meet_public_tests.expect('T3-C the total (with the completed Ashby booking) at the bot day limit', 509,
+    jsonb_build_object('start_at', s3, 'end_at', s3 + interval '45 minutes', 'public_limit', 4, 'bot_limit', 5),
+    'refused:day_full');
+  perform _r1_meet_public_tests.expect('T3-C one under both day limits', 509,
+    jsonb_build_object('start_at', s3, 'end_at', s3 + interval '45 minutes', 'public_limit', 4, 'bot_limit', 6),
+    'booked:created');
+
+  -- Another IST day is counted on its own, by its IST date (00:00 IST is 18:30 UTC the day before).
+  perform _r1_meet_public_tests.candidate(512);
+  perform _r1_meet_public_tests.expect('T3-C IST 2026-12-12 with day limits of 1', 512,
+    jsonb_build_object('start_at', '2026-12-12 05:00:00+00', 'end_at', '2026-12-12 05:45:00+00',
+                       'public_limit', 1, 'bot_limit', 1), 'booked:created');
+  perform _r1_meet_public_tests.candidate(560);
+  perform _r1_meet_public_tests.expect(
+    'T3-C a slot at 00:00 IST on 2026-12-12 (18:30 UTC on 2026-12-11) is counted on IST 2026-12-12', 560,
+    jsonb_build_object('start_at', '2026-12-11 18:30:00+00', 'end_at', '2026-12-11 19:15:00+00',
+                       'public_limit', 2, 'bot_limit', 2), 'booked:created');
+end;
+$$;
+
+-- =============================================================================================
+-- T3-D. Every precheck refusal reached through the create, nothing written.
+-- =============================================================================================
+do $$
+declare
+  res jsonb;
+  v_before jsonb;
+  n integer;
+begin
+  -- Fixtures first (each refusal below is checked to write nothing).
+  perform _r1_meet_public_tests.candidate(513, false);
+  perform _r1_meet_public_tests.candidate(514);
+  update screening_v2.ashby_application_links set terminal_state = 'withdrawn'
+   where provider = 'ashby' and external_application_id = _r1_meet_public_tests.id(22, 514)::text;
+  perform _r1_meet_public_tests.candidate(515, true, 'paused');
+  perform _r1_meet_public_tests.candidate(516);
+  insert into screening_v2.data_subject_requests (candidate_id, request_type, requested_by)
+  values (_r1_meet_public_tests.id(10, 516), 'delete', _r1_meet_public_tests.id(1, 1));
+  perform _r1_meet_public_tests.candidate(517);
+  update screening_v2.candidates set decision_use_blocked_at = '2026-12-01 03:00:00+00'
+   where id = _r1_meet_public_tests.id(10, 517);
+  perform _r1_meet_public_tests.candidate(518);
+  perform _r1_meet_public_tests.round(518, 'invited', 'browser', '2026-12-10 00:00:00+00');
+  perform _r1_meet_public_tests.candidate(519);
+  perform _r1_meet_public_tests.round(519, 'completed');
+  perform _r1_meet_public_tests.candidate(520);
+  insert into screening_v2.phone_engagements (application_link_id, candidate_id, role_id, state)
+  select x.id, x.candidate_id, _r1_meet_public_tests.id(2, 1), 'pending_prereqs'
+    from screening_v2.ashby_application_links x
+   where x.provider = 'ashby' and x.external_application_id = _r1_meet_public_tests.id(22, 520)::text;
+  perform _r1_meet_public_tests.candidate(521);
+  insert into screening_v2.call_sessions (id, candidate_id, role_id, mode, provider, external_call_id, status)
+  values (_r1_meet_public_tests.id(12, 521), _r1_meet_public_tests.id(10, 521), _r1_meet_public_tests.id(2, 1),
+          'live', 'livekit', 'phone-' || _r1_meet_public_tests.id(12, 521)::text, 'created');
+  insert into screening_v2.job_queue (name, payload)
+  values ('phone.assessment', jsonb_build_object('session_id', _r1_meet_public_tests.id(12, 521)));
+  perform _r1_meet_public_tests.candidate(522);
+  perform _r1_meet_public_tests.candidate(523);
+  perform _r1_meet_public_tests.candidate(524, false);
+
+  perform _r1_meet_public_tests.expect('T3-D no Ashby link', 513, '{}'::jsonb, 'refused:application_unknown');
+  perform _r1_meet_public_tests.expect('T3-D a link bound to another candidate', 524,
+    jsonb_build_object('application_id', _r1_meet_public_tests.id(22, 500)::text), 'refused:application_unknown');
+  perform _r1_meet_public_tests.expect('T3-D a terminal link', 514, '{}'::jsonb, 'refused:application_terminal');
+  perform _r1_meet_public_tests.expect('T3-D a paused mapping', 515, '{}'::jsonb, 'refused:mapping_unavailable');
+  perform _r1_meet_public_tests.expect('T3-D a pending delete request', 516, '{}'::jsonb, 'refused:dsar_hold');
+  perform _r1_meet_public_tests.expect('T3-D a decision-use block', 517, '{}'::jsonb, 'refused:candidate_ineligible');
+  perform _r1_meet_public_tests.expect('T3-D a second submit of a booked candidate (new booking and request ids)', 500,
+    jsonb_build_object('booking_id', _r1_meet_public_tests.id(40, 5001), 'request_id', _r1_meet_public_tests.id(41, 5001)),
+    'refused:already_booked');
+  perform _r1_meet_public_tests.expect('T3-D a live browser round', 518, '{}'::jsonb, 'refused:already_booked');
+  perform _r1_meet_public_tests.expect('T3-D a completed R1 and no live round', 519, '{}'::jsonb, 'refused:r1_completed');
+  perform _r1_meet_public_tests.expect('T3-D a live phone engagement', 520, '{}'::jsonb, 'refused:phone_engagement_active');
+  perform _r1_meet_public_tests.expect('T3-D a pending phone assessment', 521, '{}'::jsonb, 'refused:phone_assessment_pending');
+  update screening_v2.roles set interview_kind = 'sales_r1' where id = _r1_meet_public_tests.id(2, 3);
+  perform _r1_meet_public_tests.expect('T3-D two sales_r1 roles', 522, '{}'::jsonb, 'refused:role_not_configured');
+  update screening_v2.roles set interview_kind = null where id = _r1_meet_public_tests.id(2, 3);
+  v_before := _r1_meet_public_tests.counts();
+  res := _r1_meet_public_tests.under_release('zzz-meet-public-assert-newer', 'en-GB', '["ai_interview"]'::jsonb,
+    'select _r1_meet_public_tests.create(523)');
+  perform _r1_meet_public_tests.assert('T3-D the newest release has no en-IN notice: consent_template_unavailable',
+    _r1_meet_public_tests.outcome(res) = 'refused:consent_template_unavailable'
+    and _r1_meet_public_tests.counts() = v_before, res::text);
+
+  -- One refusal set: the precheck answers exactly the code the create answers (522 is eligible
+  -- again now that the second role is gone, so it is not part of this loop).
+  for n in 513..521 loop
+    res := _r1_meet_public_tests.create(n);
+    perform _r1_meet_public_tests.assert('T3-D precheck and create agree for candidate ' || n::text,
+      res ->> 'status' = 'refused' and res ->> 'code' = _r1_meet_public_tests.pre(n),
+      res::text || ' vs ' || _r1_meet_public_tests.pre(n));
+  end loop;
+  res := screening_v2.r1_meet_public_precheck(_r1_meet_public_tests.id(10, 524),
+                                             _r1_meet_public_tests.id(22, 500)::text, '2026-12-01 04:00:00+00');
+  perform _r1_meet_public_tests.assert('T3-D precheck and create agree for a link bound to another candidate',
+    res ->> 'code' = 'application_unknown', res::text);
+end;
+$$;
+
+-- =============================================================================================
+-- T3-E. created_by_unknown, in_past, slot_too_far, the consent checks, the consent shape and
+-- every other field, nothing written.
+-- =============================================================================================
+do $$
+declare
+  p_now constant timestamptz := '2026-12-01 04:00:00+00';
+  tpl constant uuid := _r1_meet_public_tests.id(3, 1);
+  s constant timestamptz := _r1_meet_public_tests.slot_of(529);
+  base constant jsonb := _r1_meet_public_tests.form_consent();
+  stale constant jsonb := _r1_meet_public_tests.form_consent()
+                          || '{"template_version": "zz-meet-public-assert-older"}'::jsonb;
+  f record;
+  res jsonb;
+begin
+  perform _r1_meet_public_tests.candidate(529);
+  perform _r1_meet_public_tests.assert('T3-E fixture: id(1, 99) is not an auth user',
+    not exists (select 1 from auth.users x where x.id = _r1_meet_public_tests.id(1, 99)));
+  for f in
+    select * from (values
+      ('T3-E a NULL booking id', jsonb_build_object('booking_id', null), 'invalid_request:booking_id'),
+      ('T3-E a NULL booking id and a NULL now (booking_id first)',
+       jsonb_build_object('booking_id', null, 'now', null), 'invalid_request:booking_id'),
+      ('T3-E a NULL request id', jsonb_build_object('request_id', null), 'invalid_request:request_id'),
+      ('T3-E a NULL candidate id', jsonb_build_object('candidate_id', null), 'invalid_request:candidate_id'),
+      ('T3-E a NULL application id', jsonb_build_object('application_id', null), 'invalid_request:application_id'),
+      ('T3-E an application id that is not UUID-shaped', '{"application_id": "not-a-uuid"}'::jsonb,
+       'invalid_request:application_id'),
+      ('T3-E a NULL Meet URL', jsonb_build_object('meet_url', null), 'invalid_request:meet_url'),
+      ('T3-E a Meet URL that is not a Meet room', '{"meet_url": "https://meet.google.com/abc-defg-hi"}'::jsonb,
+       'invalid_request:meet_url'),
+      ('T3-E a NULL slot start', jsonb_build_object('start_at', null), 'invalid_request:slot'),
+      ('T3-E a NULL slot end', jsonb_build_object('end_at', null), 'invalid_request:slot'),
+      ('T3-E a 29-minute slot', jsonb_build_object('start_at', s, 'end_at', s + interval '29 minutes'),
+       'invalid_request:slot'),
+      ('T3-E a 61-minute slot', jsonb_build_object('start_at', s, 'end_at', s + interval '61 minutes'),
+       'invalid_request:slot'),
+      ('T3-E a slot that ends before it starts', jsonb_build_object('start_at', s, 'end_at', s - interval '45 minutes'),
+       'invalid_request:slot'),
+      ('T3-E a NULL round creator', jsonb_build_object('created_by', null), 'invalid_request:created_by'),
+      ('T3-E no consent', jsonb_build_object('consent', null), 'invalid_request:consent'),
+      ('T3-E a consent that is not an object', jsonb_build_object('consent', jsonb_build_array(base)),
+       'invalid_request:consent'),
+      ('T3-E a consent without in_india', jsonb_build_object('consent', base - 'in_india'), 'invalid_request:consent'),
+      ('T3-E in_india as a string', jsonb_build_object('consent', base || '{"in_india": "true"}'::jsonb),
+       'invalid_request:consent'),
+      ('T3-E a consent with a field the shape does not name',
+       jsonb_build_object('consent', base || '{"name": "meet public assert"}'::jsonb), 'invalid_request:consent'),
+      ('T3-E a consent without template_version', jsonb_build_object('consent', base - 'template_version'),
+       'invalid_request:consent'),
+      ('T3-E an empty template_version', jsonb_build_object('consent', base || '{"template_version": ""}'::jsonb),
+       'invalid_request:consent'),
+      ('T3-E a 65-character template_version',
+       jsonb_build_object('consent', base || jsonb_build_object('template_version', repeat('v', 65))),
+       'invalid_request:consent'),
+      ('T3-E a numeric template_version', jsonb_build_object('consent', base || '{"template_version": 7}'::jsonb),
+       'invalid_request:consent'),
+      ('T3-E a consent without its consents list', jsonb_build_object('consent', base - 'consents'),
+       'invalid_request:consent'),
+      ('T3-E consents that are not a list',
+       jsonb_build_object('consent', base || '{"consents": "ai_interview"}'::jsonb), 'invalid_request:consent'),
+      ('T3-E an empty consents list', jsonb_build_object('consent', base || '{"consents": []}'::jsonb),
+       'invalid_request:consent'),
+      ('T3-E nine consents',
+       jsonb_build_object('consent', base || '{"consents": ["c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9"]}'::jsonb),
+       'invalid_request:consent'),
+      ('T3-E a consent granted twice',
+       jsonb_build_object('consent', base || '{"consents": ["ai_interview", "ai_interview"]}'::jsonb),
+       'invalid_request:consent'),
+      ('T3-E a consent that is not a string', jsonb_build_object('consent', base || '{"consents": [1]}'::jsonb),
+       'invalid_request:consent'),
+      ('T3-E a consent outside the closed spelling',
+       jsonb_build_object('consent', base || '{"consents": ["AI_interview"]}'::jsonb), 'invalid_request:consent'),
+      ('T3-E an empty ip_prefix', jsonb_build_object('consent', base || '{"ip_prefix": ""}'::jsonb),
+       'invalid_request:consent'),
+      ('T3-E a 65-character ip_prefix',
+       jsonb_build_object('consent', base || jsonb_build_object('ip_prefix', repeat('2', 65))), 'invalid_request:consent'),
+      ('T3-E a numeric ip_prefix', jsonb_build_object('consent', base || '{"ip_prefix": 203}'::jsonb),
+       'invalid_request:consent'),
+      ('T3-E a 257-character user_agent',
+       jsonb_build_object('consent', base || jsonb_build_object('user_agent', repeat('u', 257))), 'invalid_request:consent'),
+      ('T3-E a numeric user_agent', jsonb_build_object('consent', base || '{"user_agent": 5}'::jsonb),
+       'invalid_request:consent'),
+      ('T3-E zero seats', '{"seats": 0}'::jsonb, 'invalid_request:seats'),
+      ('T3-E sixteen seats', '{"seats": 16}'::jsonb, 'invalid_request:seats'),
+      ('T3-E NULL seats', jsonb_build_object('seats', null), 'invalid_request:seats'),
+      ('T3-E a public day limit of 0', '{"public_limit": 0}'::jsonb, 'invalid_request:day_limit'),
+      ('T3-E a NULL public day limit', jsonb_build_object('public_limit', null), 'invalid_request:day_limit'),
+      ('T3-E a bot day limit of 201', '{"bot_limit": 201}'::jsonb, 'invalid_request:day_limit'),
+      ('T3-E another objective profile', '{"profile": "r1_other"}'::jsonb, 'invalid_request:profile'),
+      ('T3-E a NULL objective profile', jsonb_build_object('profile', null), 'invalid_request:profile'),
+      ('T3-E a grace of 899 s', '{"grace": 899}'::jsonb, 'invalid_request:grace'),
+      ('T3-E a grace of 86401 s', '{"grace": 86401}'::jsonb, 'invalid_request:grace'),
+      ('T3-E a NULL now', jsonb_build_object('now', null), 'invalid_request:now'),
+      -- The bounds that pass: a stale notice then stops each before anything is written.
+      ('T3-E a 30-minute slot passes the field checks',
+       jsonb_build_object('start_at', s, 'end_at', s + interval '30 minutes', 'consent', stale), 'refused:consent_stale'),
+      ('T3-E a 60-minute slot passes the field checks',
+       jsonb_build_object('start_at', s, 'end_at', s + interval '60 minutes', 'consent', stale), 'refused:consent_stale'),
+      ('T3-E a 64-character template_version passes the shape',
+       jsonb_build_object('consent', base || jsonb_build_object('template_version', repeat('v', 64))),
+       'refused:consent_stale'),
+      ('T3-E eight consents, a 64-character ip_prefix and a 256-character user_agent pass the shape',
+       jsonb_build_object('consent', stale || jsonb_build_object(
+         'consents', '["c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8"]'::jsonb,
+         'ip_prefix', repeat('2', 64), 'user_agent', repeat('u', 256))), 'refused:consent_stale'),
+      ('T3-E JSON null ip_prefix and user_agent pass the shape',
+       jsonb_build_object('consent', stale || '{"ip_prefix": null, "user_agent": null}'::jsonb), 'refused:consent_stale'),
+      -- The refusals after the field checks.
+      ('T3-E an unknown round creator', jsonb_build_object('created_by', _r1_meet_public_tests.id(1, 99)),
+       'refused:created_by_unknown'),
+      ('T3-E a slot that starts now', jsonb_build_object('start_at', p_now, 'end_at', p_now + interval '45 minutes'),
+       'refused:in_past'),
+      ('T3-E a slot that has started',
+       jsonb_build_object('start_at', p_now - interval '10 minutes', 'end_at', p_now + interval '35 minutes'),
+       'refused:in_past'),
+      ('T3-E an expiry one second past now + 14 days',
+       '{"start_at": "2026-12-15T01:15:01+00:00", "end_at": "2026-12-15T02:00:01+00:00"}'::jsonb, 'refused:slot_too_far'),
+      ('T3-E another notice version than the newest', jsonb_build_object('consent', stale), 'refused:consent_stale'),
+      ('T3-E a required consent not granted',
+       jsonb_build_object('consent', base || '{"consents": ["ai_interview", "video_audio_recording", "ai_evaluation"]}'::jsonb),
+       'refused:consent_incomplete'),
+      ('T3-E no India tick', jsonb_build_object('consent', base || '{"in_india": false}'::jsonb),
+       'refused:consent_incomplete')
+    ) v(label, args, outcome)
+  loop
+    perform _r1_meet_public_tests.expect(f.label, 529, f.args, f.outcome);
+  end loop;
+  perform _r1_meet_public_tests.assert('T3-E the candidate is still eligible after every refusal',
+    _r1_meet_public_tests.pre(529) = 'eligible', _r1_meet_public_tests.pre(529));
+
+  -- What passes: the expiry bound exactly, extra granted consents, no prefix or user agent.
+  perform _r1_meet_public_tests.candidate(530);
+  res := _r1_meet_public_tests.expect('T3-E an expiry of exactly now + 14 days', 530,
+    '{"start_at": "2026-12-15T01:15:00+00:00", "end_at": "2026-12-15T02:00:00+00:00"}'::jsonb, 'booked:created');
+  perform _r1_meet_public_tests.assert('T3-E ... and the round expires exactly at now + 14 days',
+    (res ->> 'round_expires_at')::timestamptz = p_now + interval '14 days', res::text);
+  perform _r1_meet_public_tests.candidate(531);
+  res := _r1_meet_public_tests.expect('T3-E extra granted consents', 531, jsonb_build_object('consent', base
+    || '{"consents": ["ai_interview", "video_audio_recording", "ai_evaluation", "data_processing", "marketing_updates"]}'::jsonb),
+    'booked:created');
+  perform _r1_meet_public_tests.assert('T3-E ... store exactly the notice''s required set',
+    _r1_meet_public_tests.form_consent_ok(_r1_meet_public_tests.live_consent((res ->> 'round_id')::uuid), tpl, p_now));
+  perform _r1_meet_public_tests.candidate(532);
+  res := _r1_meet_public_tests.expect('T3-E a consent without ip_prefix and user_agent', 532,
+    jsonb_build_object('consent', base - 'ip_prefix' - 'user_agent'), 'booked:created');
+  perform _r1_meet_public_tests.assert('T3-E ... stores both as JSON null in the nine proof fields',
+    _r1_meet_public_tests.form_consent_ok(_r1_meet_public_tests.live_consent((res ->> 'round_id')::uuid), tpl, p_now,
+                                          null, null));
+end;
+$$;
+
+-- =============================================================================================
+-- T3-F. Re-link: after an Ashby cancel, after a failed public booking, after HR's grant-retake;
+-- the consent checks of a re-link; the round audience without a notice.
+-- =============================================================================================
+do $$
+declare
+  p_now constant timestamptz := '2026-12-01 04:00:00+00';
+  t5 constant timestamptz := '2026-12-01 05:00:00+00';
+  tpl constant uuid := _r1_meet_public_tests.id(3, 1);
+  res jsonb;
+  r uuid;
+  ab uuid;
+  hr uuid;
+  k uuid;
+  b1 uuid;
+  r_before screening_v2.interview_rounds%rowtype;
+  r_after screening_v2.interview_rounds%rowtype;
+  reserved_before numeric;
+  stored jsonb;
+begin
+  -- (1) HR booked Dex in Ashby (0142: round + HR-attested consent), then cancelled the booking.
+  perform _r1_meet_public_tests.candidate(536);
+  res := screening_v2.r1_meet_create_round_from_ashby(
+    _r1_meet_public_tests.id(20, 536), _r1_meet_public_tests.id(21, 536)::text,
+    _r1_meet_public_tests.id(22, 536)::text, null, null, _r1_meet_public_tests.id(25, 1)::text,
+    '2026-11-30 09:00:00+00', '2026-11-30 09:00:05+00', 'https://meet.google.com/abc-defg-hij',
+    _r1_meet_public_tests.slot_of(536), _r1_meet_public_tests.slot_of(536) + interval '45 minutes',
+    _r1_meet_public_tests.id(1, 1), 'r1_dex_sales', 7200, p_now);
+  r := (res ->> 'round_id')::uuid;
+  ab := (res ->> 'booking_id')::uuid;
+  hr := _r1_meet_public_tests.live_consent(r);
+  perform _r1_meet_public_tests.assert('T3-F fixture: an Ashby booking with its round and HR-attested consent',
+    res ->> 'status' = 'created'
+    and (select x.method = 'hr_attested_ashby' from screening_v2.interview_round_consents x where x.id = hr), res::text);
+  res := screening_v2.r1_meet_cancel_booking(ab, 'cancelled', p_now);
+  perform _r1_meet_public_tests.assert('T3-F fixture: HR cancels the Ashby booking, and the candidate is eligible',
+    res ->> 'status' = 'ok' and _r1_meet_public_tests.pre(536) = 'eligible', res::text);
+  select * into r_before from screening_v2.interview_rounds x where x.id = r;
+  reserved_before := _r1_meet_public_tests.reserved('2026-12-01');
+  res := _r1_meet_public_tests.create(536, jsonb_build_object('now', t5));
+  select * into r_after from screening_v2.interview_rounds x where x.id = r;
+  perform _r1_meet_public_tests.assert('T3-F after an Ashby cancel the public submit re-links the same round',
+    _r1_meet_public_tests.outcome(res) = 'booked:relinked' and (res ->> 'round_id')::uuid = r, res::text);
+  perform _r1_meet_public_tests.assert(
+    'T3-F ... the round moves its expiry, version + 1, keeps its hold and its month counter',
+    r_after.expires_at = _r1_meet_public_tests.slot_of(536) + interval '45 minutes' + interval '7200 seconds'
+    and (res ->> 'round_expires_at')::timestamptz = r_after.expires_at
+    and r_after.version = r_before.version + 1 and r_after.updated_at = t5
+    and r_after.status = 'invited' and r_after.channel = 'meet'
+    and r_after.held_minutes = r_before.held_minutes and r_after.hold_month = r_before.hold_month
+    and _r1_meet_public_tests.reserved('2026-12-01') = reserved_before, to_jsonb(r_after)::text);
+  perform _r1_meet_public_tests.assert('T3-F ... the HR-attested consent is superseded, never erased',
+    (select x.withdrawn_at = t5 and x.proof ->> 'decision' = 'superseded'
+            and (x.proof ->> 'superseded_at')::timestamptz = t5 and x.method = 'hr_attested_ashby'
+       from screening_v2.interview_round_consents x where x.id = hr)
+    and not exists (select 1 from screening_v2.job_queue x
+                     where x.name = 'r1.recording.erase' and x.dedup_key = 'r1.recording.erase:' || hr::text));
+  k := _r1_meet_public_tests.live_consent(r);
+  perform _r1_meet_public_tests.assert('T3-F ... and the candidate_web consent of the form is the one live consent',
+    k is distinct from hr and _r1_meet_public_tests.form_consent_ok(k, tpl, t5));
+  perform _r1_meet_public_tests.assert('T3-F ... the new public booking queues its three jobs; the Ashby booking stays history',
+    _r1_meet_public_tests.jobs_of(_r1_meet_public_tests.id(40, 536))
+      = _r1_meet_public_tests.create_jobs(_r1_meet_public_tests.id(40, 536))
+    and (select x.status = 'cancelled' and x.round_id = r and x.source = 'ashby'
+           from screening_v2.r1_meet_bookings x where x.id = ab));
+
+  -- (2) A public booking whose bot could not be created (failed): a new submit re-links its round.
+  perform _r1_meet_public_tests.candidate(537);
+  res := _r1_meet_public_tests.create(537);
+  r := (res ->> 'round_id')::uuid;
+  b1 := (res ->> 'booking_id')::uuid;
+  k := _r1_meet_public_tests.live_consent(r);
+  res := screening_v2.r1_meet_transition_booking(b1, 'pending', 'failed', 'bot_create_failed', p_now);
+  perform _r1_meet_public_tests.assert('T3-F fixture: the public booking failed (bot_create_failed), the candidate is eligible',
+    res ->> 'status' = 'ok' and _r1_meet_public_tests.pre(537) = 'eligible', res::text);
+  res := _r1_meet_public_tests.create(537, jsonb_build_object(
+    'booking_id', _r1_meet_public_tests.id(40, 5371), 'request_id', _r1_meet_public_tests.id(41, 5371), 'now', t5));
+  perform _r1_meet_public_tests.assert('T3-F after a failed public booking a new submit re-links the same round',
+    _r1_meet_public_tests.outcome(res) = 'booked:relinked' and (res ->> 'round_id')::uuid = r
+    and (res ->> 'booking_id')::uuid = _r1_meet_public_tests.id(40, 5371), res::text);
+  perform _r1_meet_public_tests.assert('T3-F ... the first consent is superseded and the new one is live',
+    (select x.withdrawn_at = t5 and x.proof ->> 'decision' = 'superseded'
+       from screening_v2.interview_round_consents x where x.id = k)
+    and _r1_meet_public_tests.form_consent_ok(_r1_meet_public_tests.live_consent(r), tpl, t5));
+  perform _r1_meet_public_tests.assert('T3-F ... exactly one live booking of the candidate, the new one',
+    (select count(*) = 1 and bool_and(x.id = _r1_meet_public_tests.id(40, 5371))
+       from screening_v2.r1_meet_bookings x
+      where x.candidate_id = _r1_meet_public_tests.id(10, 537)
+        and x.status in ('pending', 'blocked', 'bot_scheduled', 'bot_joining', 'human_present', 'in_call')));
+
+  -- (3) HR's grant-retake: a completed Meet round with exactly one counted attempt goes back to
+  -- invited (r1_transition_round), and the public submit re-links it.
+  perform _r1_meet_public_tests.candidate(538);
+  r := _r1_meet_public_tests.round(538, 'completed', 'meet', '2026-12-01 03:00:00+00');
+  update screening_v2.interview_rounds set attempts_counted = 1, starts_used = 1 where id = r;
+  insert into screening_v2.call_sessions
+    (id, candidate_id, role_id, mode, provider, external_call_id, status, interview_round_id, owner_id)
+  values (_r1_meet_public_tests.id(12, 538), _r1_meet_public_tests.id(10, 538), _r1_meet_public_tests.id(2, 1),
+          'browser', 'livekit', 'screening-' || _r1_meet_public_tests.id(12, 538)::text, 'created', r,
+          _r1_meet_public_tests.id(1, 1));
+  -- The attempt's session ended (every session starts created, 0006); a counted attempt's session
+  -- need not be completed (0126).
+  update screening_v2.call_sessions set status = 'failed', terminal_reason = 'worker_crash'
+   where id = _r1_meet_public_tests.id(12, 538);
+  insert into screening_v2.interview_round_attempts
+    (session_id, round_id, attempt_number, persona_id, counted, nonce_digest)
+  values (_r1_meet_public_tests.id(12, 538), r, 1, 'p1_career_switcher', true,
+          _r1_meet_public_tests.digest('attempt-538'));
+  perform _r1_meet_public_tests.assert('T3-F fixture: a completed Meet R1 and no live round is r1_completed',
+    _r1_meet_public_tests.pre(538) = 'r1_completed', _r1_meet_public_tests.pre(538));
+  res := screening_v2.r1_transition_round(r, 'grant-retake',
+    (select x.version from screening_v2.interview_rounds x where x.id = r), null, '2026-12-08 00:00:00+00', p_now);
+  perform _r1_meet_public_tests.assert('T3-F HR grants the retake: the round is invited again and the candidate eligible',
+    res ->> 'status' = 'ok' and _r1_meet_public_tests.pre(538) = 'eligible'
+    and (select x.status = 'invited' and x.attempts_counted = 1 from screening_v2.interview_rounds x where x.id = r),
+    res::text);
+  res := _r1_meet_public_tests.create(538);
+  perform _r1_meet_public_tests.assert('T3-F after HR''s grant-retake the public submit re-links the round',
+    _r1_meet_public_tests.outcome(res) = 'booked:relinked' and (res ->> 'round_id')::uuid = r
+    and (select x.expires_at = _r1_meet_public_tests.slot_of(538) + interval '45 minutes' + interval '7200 seconds'
+                and x.attempts_counted = 1 and x.status = 'invited'
+           from screening_v2.interview_rounds x where x.id = r)
+    and _r1_meet_public_tests.form_consent_ok(_r1_meet_public_tests.live_consent(r), tpl, p_now), res::text);
+
+  -- (4) A re-link under a newer release: the form's older notice is stale; the newest one books.
+  perform _r1_meet_public_tests.candidate(539);
+  r := _r1_meet_public_tests.round(539);
+  res := _r1_meet_public_tests.under_release('zzz-meet-public-assert-newer', 'en-IN',
+    '["ai_interview", "video_audio_recording", "ai_evaluation", "data_processing"]'::jsonb,
+    'select _r1_meet_public_tests.create(539)');
+  perform _r1_meet_public_tests.assert('T3-F a re-link under a newer release the form did not show: consent_stale',
+    _r1_meet_public_tests.outcome(res) = 'refused:consent_stale', res::text);
+  res := _r1_meet_public_tests.under_release('zzz-meet-public-assert-newer', 'en-IN',
+    '["ai_interview", "video_audio_recording", "ai_evaluation", "data_processing"]'::jsonb,
+    format('select _r1_meet_public_tests.create(539, %L::jsonb)', jsonb_build_object('consent',
+      _r1_meet_public_tests.form_consent() || '{"template_version": "zzz-meet-public-assert-newer"}'::jsonb)));
+  perform _r1_meet_public_tests.assert('T3-F ... and with the newest notice it re-links (rolled back)',
+    _r1_meet_public_tests.outcome(res) = 'booked:relinked' and (res ->> 'round_id')::uuid = r, res::text);
+
+  -- (5) The round's audience decides the notice of a re-link: a staff round re-checks the form
+  -- against the staff notice of the newest release, which may require more than the en-IN one.
+  perform _r1_meet_public_tests.candidate(540);
+  r := _r1_meet_public_tests.round(540);
+  update screening_v2.interview_rounds set consent_locale = 'en-IN-x-staff' where id = r;
+  res := _r1_meet_public_tests.in_rollback(array[
+      'insert into screening_v2.interview_round_consent_templates (version, locale, title, body_md, required_consents, is_active) '
+      || 'values (''zzz-meet-public-assert-staff'', ''en-IN'', ''R1 Meet public assertion newer notice'', ''fixture'', '
+      || '''["ai_interview"]''::jsonb, true)',
+      'insert into screening_v2.interview_round_consent_templates (version, locale, title, body_md, required_consents, is_active) '
+      || 'values (''zzz-meet-public-assert-staff'', ''en-IN-x-staff'', ''R1 Meet public assertion staff notice'', ''fixture'', '
+      || '''["ai_interview", "staff_recording"]''::jsonb, true)'],
+    format('select _r1_meet_public_tests.create(540, %L::jsonb)', jsonb_build_object('consent',
+      _r1_meet_public_tests.form_consent()
+      || '{"template_version": "zzz-meet-public-assert-staff", "consents": ["ai_interview"]}'::jsonb)));
+  perform _r1_meet_public_tests.assert(
+    'T3-F a staff round whose staff notice requires more than the form granted: consent_incomplete',
+    _r1_meet_public_tests.outcome(res) = 'refused:consent_incomplete', res::text);
+  stored := _r1_meet_public_tests.in_rollback(array[
+      'insert into screening_v2.interview_round_consent_templates (version, locale, title, body_md, required_consents, is_active) '
+      || 'values (''zzz-meet-public-assert-staff'', ''en-IN'', ''R1 Meet public assertion newer notice'', ''fixture'', '
+      || '''["ai_interview"]''::jsonb, true)',
+      'insert into screening_v2.interview_round_consent_templates (version, locale, title, body_md, required_consents, is_active) '
+      || 'values (''zzz-meet-public-assert-staff'', ''en-IN-x-staff'', ''R1 Meet public assertion staff notice'', ''fixture'', '
+      || '''["ai_interview", "staff_recording"]''::jsonb, true)',
+      format('select _r1_meet_public_tests.assert(%L, _r1_meet_public_tests.outcome(_r1_meet_public_tests.create(540, %L::jsonb)) = %L)',
+             'T3-F ... granting the staff notice''s set re-links the staff round (rolled back)',
+             jsonb_build_object('consent', _r1_meet_public_tests.form_consent()
+               || '{"template_version": "zzz-meet-public-assert-staff", "consents": ["ai_interview", "staff_recording"]}'::jsonb),
+             'booked:relinked')],
+    format('select to_jsonb(x) from screening_v2.interview_round_consents x where x.round_id = %L and x.withdrawn_at is null', r));
+  perform _r1_meet_public_tests.assert('T3-F ... and stores the staff notice''s required set and locale',
+    stored -> 'consents' = '["ai_interview", "staff_recording"]'::jsonb
+    and stored -> 'proof' ->> 'locale' = 'en-IN-x-staff'
+    and stored -> 'proof' ->> 'template_version' = 'zzz-meet-public-assert-staff'
+    and stored ->> 'method' = 'candidate_web', coalesce(stored::text, 'null'));
+
+  -- (6) A reusable staff round and no staff notice in the newest release.
+  perform _r1_meet_public_tests.candidate(541);
+  r := _r1_meet_public_tests.round(541);
+  update screening_v2.interview_rounds set consent_locale = 'en-IN-x-staff' where id = r;
+  perform _r1_meet_public_tests.expect('T3-F a reusable staff round with no staff notice', 541, '{}'::jsonb,
+    'refused:consent_template_unavailable');
+end;
+$$;
+
+-- =============================================================================================
+-- T3-G. The step-8a expiry of a lapsed Meet round, and a lapsed round that still has a booking.
+-- =============================================================================================
+do $$
+declare
+  p_now constant timestamptz := '2026-12-01 04:00:00+00';
+  res jsonb;
+  r_old uuid;
+  b_old uuid;
+  old_version integer;
+  nov_before numeric;
+  dec_before numeric;
+begin
+  -- A public booking made on 2026-11-28 for 2026-11-29; its bot never joined (failed/in_past), so
+  -- its round lapsed unstarted and unused, still holding 65 minutes of November.
+  perform _r1_meet_public_tests.candidate(546);
+  res := _r1_meet_public_tests.create(546, '{"now": "2026-11-28T04:00:00+00:00",
+    "start_at": "2026-11-29T05:00:00+00:00", "end_at": "2026-11-29T05:45:00+00:00"}'::jsonb);
+  r_old := (res ->> 'round_id')::uuid;
+  b_old := (res ->> 'booking_id')::uuid;
+  perform _r1_meet_public_tests.assert('T3-G fixture: a November booking holds 65 minutes of November',
+    _r1_meet_public_tests.outcome(res) = 'booked:created'
+    and (select x.held_minutes = 65 and x.hold_month = '2026-11-01'
+           from screening_v2.interview_rounds x where x.id = r_old), res::text);
+  res := screening_v2.r1_meet_transition_booking(b_old, 'pending', 'failed', 'in_past', '2026-11-29 05:00:00+00');
+  perform _r1_meet_public_tests.assert('T3-G fixture: the booking failed and its round lapsed; the candidate is eligible',
+    res ->> 'status' = 'ok' and _r1_meet_public_tests.pre(546) = 'eligible', res::text);
+  select x.version into old_version from screening_v2.interview_rounds x where x.id = r_old;
+  nov_before := _r1_meet_public_tests.reserved('2026-11-01');
+  dec_before := _r1_meet_public_tests.reserved('2026-12-01');
+  res := _r1_meet_public_tests.create(546, jsonb_build_object(
+    'booking_id', _r1_meet_public_tests.id(40, 5461), 'request_id', _r1_meet_public_tests.id(41, 5461)));
+  perform _r1_meet_public_tests.assert('T3-G a lapsed, unused Meet round is expired and a new round created',
+    _r1_meet_public_tests.outcome(res) = 'booked:created' and (res ->> 'round_id')::uuid <> r_old, res::text);
+  perform _r1_meet_public_tests.assert(
+    'T3-G ... through r1_transition_round expire: status expired, version + 1, the November hold released',
+    (select x.status = 'expired' and x.held_minutes = 0 and x.version = old_version + 1 and x.updated_at = p_now
+       from screening_v2.interview_rounds x where x.id = r_old)
+    and _r1_meet_public_tests.reserved('2026-11-01') = nov_before - 65
+    and _r1_meet_public_tests.reserved('2026-12-01') = dec_before + 65,
+    format('november %s -> %s, december %s -> %s', nov_before, _r1_meet_public_tests.reserved('2026-11-01'),
+           dec_before, _r1_meet_public_tests.reserved('2026-12-01')));
+
+  -- A lapsed Meet round that still has a live booking is never expired: already_booked, no write.
+  perform _r1_meet_public_tests.candidate(547);
+  perform _r1_meet_public_tests.round(547, 'invited', 'meet', '2026-11-30 00:00:00+00');
+  perform _r1_meet_public_tests.public_booking(547);
+  perform _r1_meet_public_tests.expect('T3-G a lapsed Meet round that still has a live booking', 547,
+    jsonb_build_object('booking_id', _r1_meet_public_tests.id(40, 5471), 'request_id', _r1_meet_public_tests.id(41, 5471)),
+    'refused:already_booked');
+  perform _r1_meet_public_tests.assert('T3-G ... and its round stays invited',
+    (select x.status = 'invited' from screening_v2.interview_rounds x where x.id = _r1_meet_public_tests.id(11, 547)));
+end;
+$$;
+
+-- =============================================================================================
+-- T3-H. The settings refusals through the create (the §12 codes come before r1_send_round), the
+-- re-link under a full cap, and the catalog posture of the create.
+-- =============================================================================================
+do $$
+declare
+  sig constant text :=
+    'screening_v2.r1_meet_create_round_from_public(uuid, uuid, uuid, text, text, timestamptz, timestamptz, '
+    || 'uuid, jsonb, integer, integer, integer, text, integer, timestamptz)';
+  role_name text;
+begin
+  perform _r1_meet_public_tests.candidate(550);
+  perform _r1_meet_public_tests.candidate(551);
+  perform _r1_meet_public_tests.round(551);
+  update screening_v2.r1_settings set enabled = false, paused = true where singleton;
+  perform _r1_meet_public_tests.expect('T3-H R1 disabled (and paused)', 550, '{}'::jsonb, 'refused:disabled');
+  update screening_v2.r1_settings set enabled = true where singleton;
+  perform _r1_meet_public_tests.expect('T3-H R1 paused', 550, '{}'::jsonb, 'refused:paused');
+  update screening_v2.r1_settings set paused = false, monthly_cap_minutes = 65 where singleton;
+  perform _r1_meet_public_tests.assert('T3-H fixture: a 65-minute hold is outstanding',
+    exists (select 1 from screening_v2.interview_rounds x
+             where x.held_minutes > 0 and x.status in ('invited', 'in_progress')
+               and x.expires_at > '2026-12-01 04:00:00+00'));
+  perform _r1_meet_public_tests.expect('T3-H a 65-minute cap with a hold outstanding', 550, '{}'::jsonb,
+    'refused:capacity_exhausted');
+  perform _r1_meet_public_tests.expect('T3-H the same cap with a reusable Meet round (a re-link takes no new hold)', 551,
+    '{}'::jsonb, 'booked:relinked');
+  update screening_v2.r1_settings set monthly_cap_minutes = 100000 where singleton;
+  perform _r1_meet_public_tests.expect('T3-H the cap restored', 550, '{}'::jsonb, 'booked:created');
+
+  perform _r1_meet_public_tests.assert('T3-H the create is one security definer, volatile function returning jsonb',
+    (select x.prosecdef and x.provolatile = 'v'
+            and x.proconfig = array['search_path=pg_catalog, screening_v2']
+            and x.prorettype = 'jsonb'::regtype and x.pronargs = 15 and x.pronargdefaults = 3
+       from pg_proc x where x.oid = sig::regprocedure)
+    and (select count(*) = 1 from pg_proc x
+          where x.pronamespace = 'screening_v2'::regnamespace and x.proname = 'r1_meet_create_round_from_public'));
+  perform _r1_meet_public_tests.assert('T3-H the create is executable by service_role only',
+    has_function_privilege('service_role', sig, 'execute')
+    and not has_function_privilege('anon', sig, 'execute')
+    and not has_function_privilege('authenticated', sig, 'execute')
+    and not has_function_privilege('public', sig, 'execute'));
+  foreach role_name in array array['anon', 'authenticated'] loop
+    perform _r1_meet_public_tests.raises_as(role_name, 'T3-H execute r1_meet_create_round_from_public',
+      'select screening_v2.r1_meet_create_round_from_public(null, null, null, null, null, null, null, null, '
+      || 'null, null, null, null)', '42501');
+  end loop;
 end;
 $$;
 
