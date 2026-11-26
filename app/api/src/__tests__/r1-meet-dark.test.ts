@@ -217,6 +217,12 @@ const WIRED_IMPORTS: Readonly<Record<string, readonly string[]>> = {
     'app/api/src/integrations/google/token.js',
     'app/api/src/lib/r1/meet/config.js',
   ],
+  // M035 S03: the owner-run Google spike for Dex's meetings (local, never in CI or the API process).
+  'app/api/scripts/m035-google-spike.ts': [
+    'app/api/src/integrations/google/client.js',
+    'app/api/src/integrations/google/errors.js',
+    'app/api/src/lib/r1/meet/config.js',
+  ],
 };
 const AUTH_FILE = path.join(SRC, 'lib', 'auth.ts');
 const APP_FILE = path.join(SRC, 'app.ts');
@@ -286,6 +292,7 @@ describe('M034 S01: the Meet modules are dark libraries', () => {
     const wired = Object.keys(WIRED_IMPORTS).sort();
     expect(wired).toEqual([
       'app/api/scripts/m035-google-oauth-consent.ts',
+      'app/api/scripts/m035-google-spike.ts',
       'app/api/src/lib/r1/runtime.ts',
       'app/api/src/routes/ashby-webhook.ts',
       'app/api/src/routes/r1-candidate.ts',

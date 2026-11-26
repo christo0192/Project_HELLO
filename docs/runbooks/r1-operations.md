@@ -4413,3 +4413,231 @@ squash commit: no migration, no data, one blank env name.
   RichText `Summary` takes the `PlainText` value the Christy card already sends in production.
 - The Summary's line breaks read well on the Ashby card, and the `Detailed report` link opens the
   R1 review page after a staff sign-in.
+
+## R1 public booking: Dex's Google account and OAuth grant (M035 S03, dark)
+
+M035 gives TAs ONE public booking link for R1 with Dex over Google Meet: the candidate fills a form,
+picks a slot, and the API puts the interview on Dex's own Google calendar, with a Meet that anyone with
+the link can join (the guest bot is not host and Dex never joins). S03 adds the Google side of that:
+the Calendar and Meet client acting as Dex (`app/api/src/integrations/google/`), the public booking
+configuration (`lib/r1/meet/config.ts`), and two owner-run scripts: the one-time OAuth consent helper
+and the Google half of the live spike. Owner decision 2026-11-26: Dex is a normal, non-admin user of
+the EXISTING company Workspace, in its own organizational unit, and the API holds that user's own
+OAuth grant. No domain-wide delegation in the company Workspace: it could act as any employee.
+
+### What this PR adds (nothing runs)
+
+- **Dark.** `R1_MEET_PUBLIC_BOOKING_ENABLED` defaults off, and nothing in the API builds the Google
+  client yet: the booking routes (S06) and the calendar lane (S05) will build it only when the public
+  configuration reads `on`, which also needs `R1_ENABLED`, `R1_MEET_ENABLED` and
+  `R1_MEET_SERVICE_USER_ID`. `R1_MEET_GOOGLE_LOGIN_GROUP_ID` is NOT required: unset means the guest bot,
+  the default.
+- **Nothing reads the new variables at runtime** until S05/S06 ship. A bad value only makes the public
+  configuration `invalid`; it never changes what the Meet configuration answers, so it never stops bots
+  for existing bookings.
+- **Three new Fly secrets** on `project-hello-api` only: `R1_MEET_GOOGLE_OAUTH_CLIENT_SECRET`,
+  `R1_MEET_GOOGLE_OAUTH_REFRESH_TOKEN` and, for the alternative mode only, `R1_MEET_GOOGLE_SA_KEY_B64`.
+  Nobody pastes a value into a chat, a ticket, a PR, a test or a log; `.env.example` keeps `replace_me`.
+- **Two scripts** in `app/api/scripts/`, run by the owner on a laptop (never in CI, never by the
+  running service). The consent helper `m035-google-oauth-consent.ts` mints Dex's refresh token once;
+  the spike `m035-google-spike.ts` checks Dex's meetings against the real Google APIs (dry run by
+  default).
+
+### Google Cloud (owner, once)
+
+1. A Google Cloud project inside the company's Google Cloud organisation (the Workspace's own
+   organisation: an Internal consent screen needs it).
+2. APIs & Services, Library: enable **Google Calendar API** and **Google Meet REST API**.
+3. OAuth consent screen: user type **Internal** (an External app left in Testing issues refresh tokens
+   that die after 7 days), app name `Hello R1 booking`, a support email, and the scopes
+   `https://www.googleapis.com/auth/calendar.events.owned` and
+   `https://www.googleapis.com/auth/meetings.space.settings`. Add
+   `https://www.googleapis.com/auth/meetings.space.created` only if the spike forces
+   `R1_MEET_GOOGLE_MEET_MODE=space`.
+4. Credentials, Create OAuth client ID, application type **Desktop app**. A Desktop client takes the
+   loopback redirect (`http://127.0.0.1:<random port>`) the helper uses: there is no redirect URI to
+   register. Keep the client id and the client secret in the password manager; never paste them into
+   chat.
+
+### Dex's user and the Admin console (owner, once)
+
+- Dex is an ordinary user (for example `dex@<company domain>`) in its own organizational unit, never an
+  admin. `R1_MEET_GOOGLE_DEX_EMAIL` is that address; it must equal the Dex user in Ashby.
+- **API controls.** If the Workspace restricts third-party or internal apps (Admin console, Security,
+  Access and data control, API controls, App access control), add this OAuth client by its client id
+  and mark it **Trusted for the Dex organizational unit only**. Nothing else in the company changes.
+- **No domain-wide delegation** for this project in the company Workspace: never add its client under
+  "Manage Domain Wide Delegation". The `service_account` mode below is for a dedicated Dex Workspace only.
+- **Meet settings for the Dex unit** (Apps, Google Workspace, Google Meet, Meet safety settings; changes
+  take up to 24 h): access type **Open**; people who are not signed in to Google may join; the host does
+  not have to join first; the waiting room is **off**. The guest bot and candidates without a Google
+  account depend on all four.
+
+### Minting Dex's refresh token (owner, once per grant)
+
+Run it on a laptop whose default browser is signed in as Dex (a separate browser profile is easiest).
+The client id and the Dex email are not secret and can come from the shell; leave the client secret
+unset so the helper asks for it without echoing it (a value typed into `$env:` or `export` stays in the
+shell history).
+
+PowerShell, from `app/api` of a checkout:
+
+```powershell
+$env:R1_MEET_GOOGLE_OAUTH_CLIENT_ID = '<client id>.apps.googleusercontent.com'
+$env:R1_MEET_GOOGLE_DEX_EMAIL = 'dex@<company domain>'
+npx tsx scripts/m035-google-oauth-consent.ts --out="$env:USERPROFILE\Downloads\dex-google.env"
+```
+
+bash:
+
+```bash
+export R1_MEET_GOOGLE_OAUTH_CLIENT_ID='<client id>.apps.googleusercontent.com'
+export R1_MEET_GOOGLE_DEX_EMAIL='dex@<company domain>'
+npx tsx scripts/m035-google-oauth-consent.ts --out="$HOME/Downloads/dex-google.env"
+```
+
+- `--out` must be a NEW file whose folder exists and lies outside every git checkout; anything else is
+  refused (exit 2) before a prompt, a listener or a network call. Add `--space` only for space mode
+  (three scopes). `--no-open` prints the consent URL instead of opening the browser (the URL holds no
+  secret).
+- In the browser: sign in as Dex if asked, and allow both permissions. A consent page that offers
+  checkboxes must have every box ticked, or the helper answers `FAIL scope_missing <scope>`.
+- The helper prints only the file path, the import commands and the delete command, or one
+  `FAIL <word>` line. It never prints the token, the code, the client secret or an access token. The
+  file holds ONE line, `R1_MEET_GOOGLE_OAUTH_REFRESH_TOKEN=<token>`, mode 600 where the system has it.
+- `FAIL consent_access_denied`: the user pressed Cancel. `FAIL state_mismatch` or `FAIL consent_error`:
+  start again. `FAIL exchange_setup_forbidden`: a wrong client id or secret, or API controls block the
+  client. `FAIL no_refresh_token`: run it again (it always asks with `prompt=consent`). `FAIL timeout`:
+  nobody came back within 5 minutes (`--timeout-sec=30..900`).
+
+Next, in this order:
+
+1. Run the Google half of the live spike with this token (next section), from the same shell. To load
+   the token into the shell without echoing it:
+   PowerShell `Get-Content '<file>' | ForEach-Object { $n, $v = $_ -split '=', 2; Set-Item "env:$n" $v }`;
+   bash `set -a; . '<file>'; set +a`.
+2. In the deploy window, import the token into Fly from the file:
+   PowerShell `Get-Content -Raw '<file>' | fly secrets import -a project-hello-api`;
+   bash `fly secrets import -a project-hello-api < '<file>'`.
+3. Set the other values the way the M034 secrets are set (R1 over Google Meet, `### Secrets` above):
+   `fly secrets set R1_MEET_GOOGLE_OAUTH_CLIENT_ID=<client id> R1_MEET_GOOGLE_DEX_EMAIL=<dex email> -a project-hello-api`.
+   For the client secret, run `fly secrets import -a project-hello-api` with no file, type
+   `R1_MEET_GOOGLE_OAUTH_CLIENT_SECRET=<secret>` and end the input (Ctrl+Z then Enter in PowerShell,
+   Ctrl+D in bash), which keeps it out of the shell history.
+4. Delete the file: PowerShell `Remove-Item '<file>'`, bash `rm -f '<file>'`. Clear the shell:
+   PowerShell `Remove-Item env:R1_MEET_GOOGLE_*, env:M035_GOOGLE_SPIKE_LIVE -ErrorAction SilentlyContinue`;
+   bash `unset R1_MEET_GOOGLE_OAUTH_CLIENT_ID R1_MEET_GOOGLE_OAUTH_CLIENT_SECRET R1_MEET_GOOGLE_OAUTH_REFRESH_TOKEN R1_MEET_GOOGLE_DEX_EMAIL R1_MEET_GOOGLE_AUTH_MODE R1_MEET_GOOGLE_MEET_MODE M035_GOOGLE_SPIKE_LIVE`.
+
+Every `fly secrets` change restarts the API machines: do it in a quiet window with a live R1 count of 0,
+as for the M034 secrets. While `R1_MEET_PUBLIC_BOOKING_ENABLED` is off the values change nothing.
+
+### The Google half of the live spike (owner, local shell only)
+
+`app/api/scripts/m035-google-spike.ts` checks, with Dex's real grant, the Google items of the live spike
+(roadmap G): S2 (Dex's token may patch a Calendar-made Meet to OPEN), S3 (it stays OPEN with the
+company's Meet settings), S6 (moving an event keeps its Meet link) and the insert half of S7 (about 20
+inserts a day without `usageLimits`). It reads `R1_MEET_GOOGLE_AUTH_MODE`, `R1_MEET_GOOGLE_DEX_EMAIL`
+and the credentials of that mode from the shell, through the API's own reader; the public flag is not
+needed.
+
+1. **Dry run first**, with `M035_GOOGLE_SPIKE_LIVE` NOT set: `npx tsx scripts/m035-google-spike.ts`.
+   It prints `PASS config` and the `DRY <step>` list and sends nothing. `FAIL config unavailable` = a
+   value is missing, `replace_me` or malformed.
+2. **Live**, which needs BOTH the flag and the variable (either alone is refused with exit 2):
+   PowerShell `$env:M035_GOOGLE_SPIKE_LIVE = 'yes'`, bash `export M035_GOOGLE_SPIKE_LIVE=yes`, then
+   `npx tsx scripts/m035-google-spike.ts --live --patch-time` and, for S7,
+   `npx tsx scripts/m035-google-spike.ts --live --repeat=19` (19 more events, 1 s apart; at most 20).
+   Add `--space` only for space mode, with a grant minted with the helper's `--space`.
+3. Clear the variables afterwards (step 4 above).
+
+A live run creates ONE event about an hour ahead on Dex's primary calendar, titled
+`Hello R1 spike (delete me)`, with no guest and `sendUpdates=none` (nobody gets mail), and deletes it at
+the end, also after a failed step. If a run is interrupted (Ctrl+C), delete that event by hand in Dex's
+calendar. Space mode also leaves one unused Meet space, which expires on its own.
+
+Output is only `PASS|FAIL|SKIP|DRY <step> [<word>]` lines and one `RESULT:` line, never an id, a code,
+a link, an email or a token. Exit 0 = no FAIL, 1 = a FAIL, 2 = refused or not configured.
+
+| Line | Meaning and what to do |
+|---|---|
+| `FAIL config live_env_missing` / `live_flag_missing` | Only one of `--live` and `M035_GOOGLE_SPIKE_LIVE=yes` was given. |
+| `FAIL token auth_revoked` | The grant is dead: rotate (below). |
+| `FAIL token setup_forbidden` | A wrong client id or secret, API controls block the client, or the grant lacks a scope (space mode needs a grant minted with `--space`). |
+| `FAIL insert setup_forbidden` | The Calendar API is not enabled in the project, or the grant lacks `calendar.events.owned`. |
+| `FAIL organizer mismatch` | The grant is not Dex's: mint it again, signed in as Dex. |
+| `FAIL conference failure` / `timeout` | Calendar made no Meet: check that Meet is on for the Dex unit, then run again. |
+| `FAIL space_get setup_forbidden` | The Meet REST API is not enabled, or the grant lacks `meetings.space.settings`. |
+| `FAIL space_open setup_forbidden` or `FAIL space_readback not_open` | Spike S2/S3 failed. Check the Meet settings of the Dex unit (access type Open), wait up to 24 h and run again. If it still fails: mint with `--space`, set `R1_MEET_GOOGLE_MEET_MODE=space` and run with `--space`. |
+| `FAIL time_patch link_changed` | Spike S6 failed: moving an event changes its Meet. S05's move path must change before go-live; tell the team. |
+| `FAIL time_patch not_moved` | Google answered the move without applying it: run again; if it repeats, tell the team. |
+| `FAIL repeat quota` | Spike S7: the new-account Calendar limits bite. Wait a day, run again, and keep `R1_MEET_PUBLIC_DAILY_CAP` under what passed. |
+| `FAIL delete <word>` | The event may still be on Dex's calendar: delete it by hand. |
+| `FAIL <step> unavailable` / `timeout` / `quota` | Google was slow or busy: run again later. |
+| `SKIP <step> <word>` | Not run: `not_requested`, `calendar_mode`, `space_mode`, `no_conference`, `no_link`, `no_event`, `not_reached`, `after_failure`. |
+
+What this script cannot prove: that a signed-out browser and the guest bot join without knocking
+(S0a, S0b, S5) and how the invite mail looks (S4). Those need the booking page (S06) and a test bot.
+
+### Rotating after `auth_revoked` (alert `r1_meet_public_google_auth_failed`)
+
+Dex's refresh token dies when Dex's password is reset or the account is suspended, when Dex or an admin
+removes the app's access (Dex's Google Account, Security, third-party connections), when it goes
+unused for 6 months, when the account passes 100 live tokens for this client, or when an admin policy
+blocks the scopes (`admin_policy_enforced`). The API then fails closed: Google answers `invalid_grant`,
+the client reports `auth_revoked` (alert `r1_meet_public_google_auth_failed`), bookings answer
+"temporarily unavailable", existing events are not touched, and the token endpoint is not retried in a
+loop (one try a minute at most).
+
+1. Mint a new token with the helper (above), signed in as Dex.
+2. Run the spike dry, then live, with the new token from the local shell.
+3. Import it into Fly in a quiet window (restarts the API), delete the file, clear the shell.
+4. After a planned rotation, remove the old grant in Dex's Google Account (third-party connections).
+
+### The `service_account` alternative (a dedicated Dex Workspace only)
+
+Only when Dex lives in a Workspace of its own (the optional signed-in-bot upgrade, roadmap C), never in
+the company Workspace. Set `R1_MEET_GOOGLE_AUTH_MODE=service_account` and `R1_MEET_GOOGLE_SA_KEY_B64` =
+the base64 of the JSON key Google downloads for the service account (PowerShell
+`[Convert]::ToBase64String([IO.File]::ReadAllBytes('<key file>'))`, bash `base64 -w0 '<key file>'`),
+written as one `R1_MEET_GOOGLE_SA_KEY_B64=<value>` line into a file outside every checkout and imported
+with `fly secrets import` like the refresh token; then delete both files. In THAT Workspace's Admin
+console, authorise the service account's client id under domain-wide delegation with the same scopes.
+The `R1_MEET_GOOGLE_OAUTH_*` values are ignored in this mode, and `R1_MEET_GOOGLE_DEX_EMAIL` is the user
+it acts as. The spike works the same way.
+
+### Knobs (the 23 variables)
+
+All are API Fly secrets on `project-hello-api` (`fly secrets set NAME=value -a project-hello-api`, which
+restarts the API; `fly secrets unset NAME -a project-hello-api` returns to the default). Blank means the
+default. A value out of range makes the public configuration `invalid` (public booking off, the reason
+names the variable, never the value); nothing is clamped, and Meet for existing bookings is unaffected.
+
+| Variable | Default | Valid values and what it does |
+|---|---|---|
+| `R1_MEET_GOOGLE_AUTH_MODE` | `oauth_refresh` | `oauth_refresh` (Dex's own OAuth grant) or `service_account` (dedicated Dex Workspace only). |
+| `R1_MEET_GOOGLE_OAUTH_CLIENT_ID` | none | Required in `oauth_refresh`: the Desktop client id, ending `.apps.googleusercontent.com`, at most 200 characters. |
+| `R1_MEET_GOOGLE_OAUTH_CLIENT_SECRET` | none | SECRET. Required in `oauth_refresh`: 1..200 characters, no spaces. |
+| `R1_MEET_GOOGLE_OAUTH_REFRESH_TOKEN` | none | SECRET. Required in `oauth_refresh`: the consent helper's token, 1..512 characters, no spaces. |
+| `R1_MEET_GOOGLE_SA_KEY_B64` | none | SECRET. Required in `service_account` only: base64 of the service-account JSON key, at most 8 KB decoded. |
+| `R1_MEET_GOOGLE_DEX_EMAIL` | none | Required: the Dex user's address, at most 254 characters, stored lower-cased; every event's organizer must be it. |
+| `R1_MEET_GOOGLE_MEET_MODE` | `calendar` | `calendar` (the event's own Meet) or `space` (a Meet API space first; needs the third scope). |
+| `R1_MEET_PUBLIC_SLOT_MINUTES` | `45` | 30..60: the interview length. |
+| `R1_MEET_PUBLIC_SLOT_STEP_MINUTES` | `30` | 15, 30 or 60: the grid of slot starts. |
+| `R1_MEET_PUBLIC_HOURS_IST` | `09:00-20:30` | First and last START in IST: first at 09:00 or later, last not before it, both on the step grid, the last slot ending by 24:00. |
+| `R1_MEET_PUBLIC_DAYS` | `mon-sun` | Comma list of `mon`..`sun` and ascending ranges such as `mon-fri`. |
+| `R1_MEET_PUBLIC_CLOSED_DATES` | empty | Comma list of up to 100 IST dates `YYYY-MM-DD` with no slots. |
+| `R1_MEET_PUBLIC_MIN_NOTICE_MINUTES` | `60` | 30..1440: how soon a slot may start after booking. |
+| `R1_MEET_PUBLIC_HORIZON_DAYS` | `7` | 1..13: IST dates offered, today included. |
+| `R1_MEET_PUBLIC_SLOT_CAPACITY` | `2` | 1..15: public interviews per slot; the seats offered are the smaller of this and the live R1 concurrency minus the headroom. |
+| `R1_MEET_PUBLIC_BROWSER_HEADROOM` | `0` | 0..14: seats kept free for the browser R1 links HR sends (not scheduled, same worker pool). |
+| `R1_MEET_PUBLIC_DAILY_CAP` | `20` | 1..200: public bookings per IST day (the Meet bot cap `R1_MEET_DAILY_BOT_CAP` still applies). |
+| `R1_MEET_PUBLIC_MAX_MOVES` | `3` | 0..10: how often a candidate may move a booking. |
+| `R1_MEET_PUBLIC_MANAGE_CUTOFF_MINUTES` | `30` | 15..720: no move or cancel this close to the start. |
+| `R1_MEET_PUBLIC_REQUIRE_R1_STAGE` | `false` | `true` or `false`: `false` lets any Active application without an R1 book (owner decision). |
+| `R1_MEET_PUBLIC_CALENDAR_RETENTION_DAYS` | `30` | 1..365: Dex's copy of a past event is purged after this many days (`sendUpdates=none`). |
+| `R1_MEET_PUBLIC_PRESLOT_RECHECK` | `true` | `true` or `false`: about 2 h before the start, re-read the application in Ashby and cancel the booking if it is no longer Active (an Ashby error never cancels). |
+| `R1_MEET_PUBLIC_BOOKING_ENABLED` | off | Exactly `true` = on; unset, blank or `false` = off. Set it LAST. |
+
+`R1_MEET_PUBLIC_BOOKING_ENABLED=true` goes LAST: only after S06 has merged, the live spike has passed
+and the go-live gate (the Legal-approved consent notice) is met. Turning it off again stops new
+bookings at once (every public route answers `booking_disabled`); booked interviews still finish.
