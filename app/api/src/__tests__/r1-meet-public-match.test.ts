@@ -9,6 +9,7 @@
  * optional fraudStatus). Every id, name, email and number below is synthetic.
  */
 import { describe, expect, it } from 'vitest';
+import { ASHBY_CANDIDATE_SEARCH_LIMIT } from '../integrations/ashby/types.js';
 import {
   R1_PUBLIC_LOCAL_ROW_LIMIT,
   R1_PUBLIC_MATCH_REFUSALS,
@@ -421,6 +422,14 @@ describe('readR1PublicAshbySearch', () => {
   it('20 results are read', () => {
     const read = readR1PublicAshbySearch(page(Array.from({ length: 20 }, () => documentedCandidate()), false));
     expect(read.ok && read.hits.length).toBe(20);
+  });
+
+  it('the page bound is the limit the Ashby client sends (parity, T4)', () => {
+    expect(ASHBY_CANDIDATE_SEARCH_LIMIT).toBe(20);
+    const at = readR1PublicAshbySearch(page(Array.from({ length: ASHBY_CANDIDATE_SEARCH_LIMIT }, () => documentedCandidate()), false));
+    const over = readR1PublicAshbySearch(page(Array.from({ length: ASHBY_CANDIDATE_SEARCH_LIMIT + 1 }, () => documentedCandidate()), false));
+    expect(at.ok).toBe(true);
+    expect(over).toEqual({ ok: false, reason: 'ambiguous' });
   });
 });
 

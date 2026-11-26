@@ -62,6 +62,7 @@
  * {@link r1PublicMatchAlert} names.
  */
 
+import { ASHBY_CANDIDATE_SEARCH_LIMIT } from '../../../../integrations/ashby/types.js';
 import { normalizePublicEmail } from './normalize.js';
 
 /** Every reason a public booking form is refused (contracts 7.2 order). */
@@ -86,8 +87,6 @@ export const R1_PUBLIC_MAX_CHECK_LINKS = 5;
 /** A person with more Ashby applications than this is not decided automatically. */
 export const R1_PUBLIC_MAX_ASHBY_APPLICATIONS = 10;
 
-/** The `candidate.search` page size the client sends (the Ashby client's limit replaces this in T4). */
-const R1_PUBLIC_SEARCH_PAGE_LIMIT = 20;
 /** At most this many email entries on one Ashby candidate. */
 const MAX_HIT_EMAIL_ENTRIES = 20;
 /** At most this many application ids on one Ashby candidate. */
@@ -275,7 +274,7 @@ export function readR1PublicAshbySearch(page: { results: unknown; moreDataAvaila
   if (!envelope || !Array.isArray(envelope.results)) return Object.freeze({ ok: false as const, reason: 'malformed' as const });
   const more = envelope.moreDataAvailable;
   if (more !== undefined && typeof more !== 'boolean') return Object.freeze({ ok: false as const, reason: 'malformed' as const });
-  if (more === true || envelope.results.length > R1_PUBLIC_SEARCH_PAGE_LIMIT) {
+  if (more === true || envelope.results.length > ASHBY_CANDIDATE_SEARCH_LIMIT) {
     return Object.freeze({ ok: false as const, reason: 'ambiguous' as const });
   }
   const hits: R1PublicAshbyCandidateHit[] = [];
@@ -303,7 +302,7 @@ export function pickR1PublicAshbyCandidate(
 ): { kind: 'one'; hit: R1PublicAshbyCandidateHit } | { kind: 'not_found'; reason: R1PublicMatchRefusal } {
   const typed = typeof email === 'string' ? normalizePublicEmail(email) : null;
   if (typed === null) return refuse('no_match');
-  if (!Array.isArray(hits) || hits.length > R1_PUBLIC_SEARCH_PAGE_LIMIT) return refuse('ambiguous');
+  if (!Array.isArray(hits) || hits.length > ASHBY_CANDIDATE_SEARCH_LIMIT) return refuse('ambiguous');
   if (!hits.every(isHit)) return refuse('ambiguous');
 
   const exact = new Map<string, R1PublicAshbyCandidateHit>();

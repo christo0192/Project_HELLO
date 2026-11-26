@@ -9992,7 +9992,7 @@ components:
 
     AshbyAccessCheckResponse:
       type: object
-      description: M031 access check. Permission states, coarse codes, counts and stage types only — no id, name or title anywhere.
+      description: M031 access check. Permission states, coarse codes, counts and stage types only — no id, name or title anywhere. Candidates read also covers candidate.search (M035), probed once on a reserved example.invalid address whose results are never read.
       required: [ok, permissions, operations, mappings, samples, deadlineHit]
       properties:
         ok:
@@ -10010,7 +10010,7 @@ components:
           additionalProperties: false
         operations:
           type: object
-          required: [applicationInfo, applicationListHistory, applicationList, jobInterviewPlanInfo, interviewStageList]
+          required: [applicationInfo, applicationListHistory, applicationList, jobInterviewPlanInfo, interviewStageList, candidateSearch]
           properties:
             applicationInfo:
               $ref: '#/components/schemas/AshbyAccessOperation'
@@ -10021,6 +10021,8 @@ components:
             jobInterviewPlanInfo:
               $ref: '#/components/schemas/AshbyAccessOperation'
             interviewStageList:
+              $ref: '#/components/schemas/AshbyAccessOperation'
+            candidateSearch:
               $ref: '#/components/schemas/AshbyAccessOperation'
           additionalProperties: false
         mappings:

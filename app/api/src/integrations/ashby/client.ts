@@ -22,6 +22,7 @@ import { AshbyError, sanitizeCodes } from './errors.js';
 import {
   ASHBY_OPERATIONS,
   ASHBY_APPLICATION_STATUSES,
+  ASHBY_CANDIDATE_SEARCH_LIMIT,
   type AshbyOperation,
   type AshbyEnvelope,
   type AshbyResult,
@@ -186,6 +187,32 @@ function validateId(operation: string, field: string, value: unknown): string {
     }
   }
   void field;
+  return value;
+}
+
+/** Shortest (`a@b`) and longest (RFC 5321 path) address `candidate.search` is sent. */
+const MIN_SEARCH_EMAIL_LEN = 3;
+const MAX_SEARCH_EMAIL_LEN = 254;
+/** Whitespace, C0/C1 controls (DEL included) and Unicode format characters. */
+const SEARCH_EMAIL_FORBIDDEN_RE = /[\s\p{Cc}\p{Cf}]/u;
+
+/**
+ * Validate the address a `candidate.search` sends. Fail closed: a non-string,
+ * a length outside 3..254, anything other than exactly one `@` with text on
+ * both sides, or any whitespace, control or format character is refused
+ * before a transport call. The caller sends an already normalised address;
+ * this neither trims nor folds case. The error carries one fixed code and the
+ * operation name only, never the value or a fragment of it.
+ */
+function validateSearchEmail(value: unknown): string {
+  const refuse = (): never => {
+    throw new AshbyError('invalid_request', { code: 'invalid_email', operation: 'candidate.search' });
+  };
+  if (typeof value !== 'string') return refuse();
+  if (value.length < MIN_SEARCH_EMAIL_LEN || value.length > MAX_SEARCH_EMAIL_LEN) return refuse();
+  if (SEARCH_EMAIL_FORBIDDEN_RE.test(value)) return refuse();
+  const at = value.indexOf('@');
+  if (at <= 0 || at !== value.lastIndexOf('@') || at === value.length - 1) return refuse();
   return value;
 }
 
@@ -566,6 +593,25 @@ export class AshbyClient {
   ): Promise<AshbyResult<T>> {
     const id = validateId('candidate.info', 'candidateId', candidateId);
     return this.request<T>('candidate.info', { ...(extra ?? {}), id }, callTiming(options));
+  }
+
+  /**
+   * Candidates whose email matches (permission `candidatesRead`, M035). The
+   * body is exactly `{ email, limit: ASHBY_CANDIDATE_SEARCH_LIMIT }`: the
+   * endpoint is `additionalProperties: false` and takes only email, name and
+   * limit, so there is no `extra` passthrough and no name is ever sent. There
+   * is no phone search and no cursor. Whether Ashby matches the email exactly
+   * or partially, and whether it ignores case, is not verified against a
+   * tenant: the caller keeps only results whose own address equals the one it
+   * typed. The address is validated before anything is sent and never reaches
+   * the URL, a log record or an error. `options` is internal timing, never sent.
+   */
+  async candidateSearch<T = OpaqueRecord[]>(
+    email: string,
+    options: AshbyCallOptions = {},
+  ): Promise<AshbyResult<T>> {
+    const checked = validateSearchEmail(email);
+    return this.request<T>('candidate.search', { email: checked, limit: ASHBY_CANDIDATE_SEARCH_LIMIT }, callTiming(options));
   }
 
   /**

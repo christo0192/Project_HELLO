@@ -21,6 +21,9 @@
  *    stage id but no type, so each row is matched against the job plan read
  *    above. A row whose own status is not the one asked for is NOT used: an
  *    ignored filter must not pass an active application off as hired.
+ *  - last, once, and only when an enabled mapping exists: `candidate.search`
+ *    on {@link ACCESS_CHECK_SEARCH_PROBE_EMAIL}, a reserved address that can
+ *    match no one (Candidates read; M035). Its results are never read.
  *
  * WHAT NEVER LEAVES: no application, candidate, job, plan, stage or actor id,
  * no name, email or title — only states, coarse codes, counts, and stage
@@ -68,8 +71,15 @@ export const ACCESS_CHECK_READ_OPERATIONS = [
   'application.list',
   'jobInterviewPlan.info',
   'interviewStage.list',
+  'candidate.search',
 ] as const;
 export type AccessCheckOperation = (typeof ACCESS_CHECK_READ_OPERATIONS)[number];
+
+/**
+ * The address the `candidate.search` probe sends: on `example.invalid`, a name
+ * RFC 2606 reserves so it can never belong to a real person. Built at run time.
+ */
+export const ACCESS_CHECK_SEARCH_PROBE_EMAIL = ['access-check', 'example.invalid'].join('@');
 
 /** Fail closed unless the operation is an allowlisted READ in the registry. */
 export function assertAccessCheckReadOnly(operation: string): asserts operation is AccessCheckOperation {
@@ -164,6 +174,7 @@ export interface AccessCheckResult {
     applicationList: AccessOperationResult;
     jobInterviewPlanInfo: AccessOperationResult;
     interviewStageList: AccessOperationResult;
+    candidateSearch: AccessOperationResult;
   };
   mappings: {
     /** Enabled, live mappings read (bounded by the source). */
@@ -191,6 +202,7 @@ export interface AccessCheckReader {
   applicationList<T = OpaqueRecord[]>(params?: ApplicationListParams): Promise<{ results: T; moreDataAvailable: boolean }>;
   jobInterviewPlanInfo<T = OpaqueRecord>(jobId: string, extra?: OpaqueRecord, options?: AshbyCallOptions): Promise<{ results: T }>;
   interviewStageList<T = OpaqueRecord[]>(params: InterviewStageListParams): Promise<{ results: T }>;
+  candidateSearch<T = OpaqueRecord[]>(email: string, options?: AshbyCallOptions): Promise<{ results: T; moreDataAvailable: boolean }>;
 }
 
 /** What the check needs from HELLO's own tables. Opaque ids only, never returned. */
@@ -276,6 +288,7 @@ const OP_NAMES: Readonly<Record<OpKey, AccessCheckOperation>> = {
   applicationList: 'application.list',
   jobInterviewPlanInfo: 'jobInterviewPlan.info',
   interviewStageList: 'interviewStage.list',
+  candidateSearch: 'candidate.search',
 };
 
 interface Tally {
@@ -480,6 +493,14 @@ export async function runAccessCheck(
   const hired = await findByStatus('Hired');
   const archived = await findByStatus('Archived');
 
+  // 5. Candidates read, the candidate module: one search on a reserved address
+  // that matches no one. Last, so it never takes budget from the reads above;
+  // only with an enabled mapping, so "nothing to try" still calls nothing. The
+  // answer is a permission verdict only: its results are never read.
+  if (jobs.length > 0) {
+    await call('candidateSearch', () => reader.candidateSearch(ACCESS_CHECK_SEARCH_PROBE_EMAIL, timing));
+  }
+
   const op = (k: OpKey): AccessOperationResult => {
     const t = tallies[k];
     return { ...rollUp([{ tally: t }]), calls: t.ok + t.missingPermission + t.failed, ok: t.ok, missingPermission: t.missingPermission, failed: t.failed };
@@ -491,6 +512,7 @@ export async function runAccessCheck(
         { tally: tallies.applicationInfo },
         { tally: tallies.applicationListHistory },
         { tally: tallies.applicationList },
+        { tally: tallies.candidateSearch },
       ]),
       jobsRead: rollUp([{ tally: tallies.jobInterviewPlanInfo }]),
       interviewsRead: rollUp([{ tally: tallies.interviewStageList }]),
@@ -501,6 +523,7 @@ export async function runAccessCheck(
       applicationList: op('applicationList'),
       jobInterviewPlanInfo: op('jobInterviewPlanInfo'),
       interviewStageList: op('interviewStageList'),
+      candidateSearch: op('candidateSearch'),
     },
     mappings: {
       enabled: Math.max(0, Math.trunc(targets.enabledMappings) || 0),

@@ -81,7 +81,8 @@ export type AshbyOperation =
   | 'candidate.addTag'
   | 'candidate.removeTag'
   | 'interviewStage.list'
-  | 'interviewStage.info';
+  | 'interviewStage.info'
+  | 'candidate.search';
 
 export interface AshbyOperationSpec {
   /** Fixed request path appended to the allowlisted base origin. */
@@ -128,6 +129,12 @@ export const ASHBY_OPERATIONS: Readonly<Record<AshbyOperation, AshbyOperationSpe
   // and, later, the stage catalogue for stages outside a job's current plan.
   'interviewStage.list':               { path: '/interviewStage.list',               mutation: false },
   'interviewStage.info':               { path: '/interviewStage.info',               mutation: false },
+  // Candidate look-up by EMAIL (permission `candidatesRead`, M035). The body is
+  // exactly `{ email, limit }`: the endpoint takes only email, name and limit
+  // (`additionalProperties: false`), has no phone search and no cursor. Read by
+  // the M035 public booking matcher when a typed email matches no local
+  // candidate, and probed once by the Mission Control access check.
+  'candidate.search':                  { path: '/candidate.search',                  mutation: false },
 } as const;
 
 /**
@@ -137,6 +144,14 @@ export const ASHBY_OPERATIONS: Readonly<Record<AshbyOperation, AshbyOperationSpe
  */
 export const ASHBY_APPLICATION_STATUSES = ['Active', 'Hired', 'Archived', 'Lead'] as const;
 export type AshbyApplicationStatus = (typeof ASHBY_APPLICATION_STATUSES)[number];
+
+/**
+ * The `limit` every `candidate.search` sends. Ashby caps the results at the
+ * limit and has no cursor for this endpoint; `moreDataAvailable: true` means
+ * more people matched than were returned, so a caller that needs exactly one
+ * match treats that flag (or more results than the limit) as ambiguous.
+ */
+export const ASHBY_CANDIDATE_SEARCH_LIMIT = 20;
 
 // ── Narrow, extension-friendly request shapes ───────────────────────────────
 // Only fields we are confident about are named; everything else rides in
