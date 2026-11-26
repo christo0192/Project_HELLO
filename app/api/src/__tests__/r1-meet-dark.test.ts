@@ -13,6 +13,8 @@
  * assessment handler's `onResult`, which queues Dex's Ashby feedback for a Meet round and reads
  * nothing while Meet is off or the feedback form setting is blank (r1-meet-feedback-notify.test.ts,
  * r1-runtime.test.ts).
+ * M035 S03 adds the owner-run Google scripts under app/api/scripts (local, never in CI or the API
+ * process), each pinned in `WIRED_IMPORTS` with its exact targets rather than exempted by folder.
  *
  * What "dark" means here (S01 plan R21, R30, R31; S03 plan R16; S05 plan D-S05-18; D-M034-11):
  *  (a) no runtime file outside the four Meet folders (integrations/recall, integrations/google-meet,
@@ -208,6 +210,13 @@ const WIRED_IMPORTS: Readonly<Record<string, readonly string[]>> = {
   'app/api/src/routes/r1.ts': [
     'app/api/src/lib/r1/meet/attempt-ended.js',
   ],
+  // M035 S03: the owner-run OAuth consent helper (local, never in CI or the API process).
+  'app/api/scripts/m035-google-oauth-consent.ts': [
+    'app/api/src/integrations/google/errors.js',
+    'app/api/src/integrations/google/http.js',
+    'app/api/src/integrations/google/token.js',
+    'app/api/src/lib/r1/meet/config.js',
+  ],
 };
 const AUTH_FILE = path.join(SRC, 'lib', 'auth.ts');
 const APP_FILE = path.join(SRC, 'app.ts');
@@ -276,6 +285,7 @@ describe('M034 S01: the Meet modules are dark libraries', () => {
   it('(a) each wired importer imports EXACTLY its listed Meet modules (no stale or silent widening)', () => {
     const wired = Object.keys(WIRED_IMPORTS).sort();
     expect(wired).toEqual([
+      'app/api/scripts/m035-google-oauth-consent.ts',
       'app/api/src/lib/r1/runtime.ts',
       'app/api/src/routes/ashby-webhook.ts',
       'app/api/src/routes/r1-candidate.ts',

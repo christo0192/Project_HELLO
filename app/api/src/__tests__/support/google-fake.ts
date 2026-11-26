@@ -13,6 +13,12 @@
  *   `unauthorized_client`, Google's answer for an undelegated client or scope). No `scope` in the
  *   answer, like Google.
  * - `failNext` injects one canned response for the next call, served ahead of the simulation.
+ * - `grant_type=authorization_code` (T4, the owner's one-time consent helper): the code must be one
+ *   `issueAuthorizationCode` handed out and not yet redeemed (else 400 `invalid_grant`), the client id
+ *   and secret must match (else 401 `invalid_client`), `redirect_uri` must equal the one the code was
+ *   issued for (else 400 `redirect_uri_mismatch`) and base64url(sha256(`code_verifier`)) must equal its
+ *   PKCE challenge (else 400 `invalid_grant`). The answer carries an access token, the fake's refresh
+ *   token (unless the code was issued `withoutRefreshToken`) and `scope` = the code's scopes.
  *
  * T3 adds Dex's primary calendar and the Meet spaces. Every API call must carry
  * `authorization: Bearer <a token this fake issued and has not expired>` (else 401, like Google), so
@@ -43,7 +49,7 @@
  * Fixtures are built at run time from low-entropy parts (S03 plan R18). Never shipped:
  * `tsconfig.build.json` excludes `src/__tests__`.
  */
-import { verify, type KeyObject } from 'node:crypto';
+import { createHash, verify, type KeyObject } from 'node:crypto';
 import type {
   GoogleTransport,
   GoogleTransportRequest,
@@ -132,8 +138,25 @@ export interface FakeGoogleSpace {
   entryPointAccess: string;
 }
 
+/** What the consent page "granted" for one authorization code (T4). */
+export interface FakeGoogleAuthorizationCodeGrant {
+  /** The `redirect_uri` the consent request carried; the exchange must send the same one. */
+  redirectUri: string;
+  /** The PKCE S256 `code_challenge` the consent request carried. */
+  codeChallenge: string;
+  /** The scopes the user granted. Default: the fake's granted scopes. */
+  scopes?: readonly string[];
+  /** Answer the exchange without a `refresh_token`. */
+  withoutRefreshToken?: boolean;
+}
+
 export interface FakeGoogle {
   transport: GoogleTransport;
+  /**
+   * Hand out a one-use authorization code, as Google's consent page does on "Allow" (T4). The code
+   * is low entropy (`code-<n>-cccc...`), never a real-looking one.
+   */
+  issueAuthorizationCode(grant: FakeGoogleAuthorizationCodeGrant): string;
   calls: FakeGoogleCall[];
   /** Every access token issued, in order. */
   tokensIssued: string[];
@@ -265,6 +288,44 @@ export function createFakeGoogle(options: FakeGoogleOptions = {}): FakeGoogle {
       return oauthError(401, 'unauthorized_client', 'Client is unauthorized for the requested scopes.');
     }
     return { status: 200, body: { access_token: issue(requested), expires_in: expiresIn, token_type: 'Bearer' } };
+  };
+
+  // ── Authorization-code grant (T4, the consent helper) ─────────────────────
+
+  const authorizationCodes = new Map<string, FakeGoogleAuthorizationCodeGrant & { redeemed: boolean }>();
+  let codeCounter = 0;
+
+  const issueAuthorizationCode = (grant: FakeGoogleAuthorizationCodeGrant): string => {
+    codeCounter += 1;
+    const code = `code-${codeCounter}-${'c'.repeat(24)}`;
+    authorizationCodes.set(code, { ...grant, redeemed: false });
+    return code;
+  };
+
+  const authorizationCodeGrant = (form: Record<string, string>): { status: number; body: unknown } => {
+    if (form.client_id !== clientId || form.client_secret !== clientSecret) {
+      return oauthError(401, 'invalid_client', 'The OAuth client was not found.');
+    }
+    const grant = typeof form.code === 'string' ? authorizationCodes.get(form.code) : undefined;
+    if (grant === undefined || grant.redeemed) return oauthError(400, 'invalid_grant', 'Malformed auth code.');
+    if (form.redirect_uri !== grant.redirectUri) {
+      return oauthError(400, 'redirect_uri_mismatch', 'Bad Request');
+    }
+    const verifier = typeof form.code_verifier === 'string' ? form.code_verifier : '';
+    const challenge = createHash('sha256').update(verifier).digest('base64url');
+    if (verifier === '' || challenge !== grant.codeChallenge) {
+      return oauthError(400, 'invalid_grant', 'Invalid code verifier.');
+    }
+    grant.redeemed = true;
+    const scopes = grant.scopes ?? grantedScopes;
+    const answer: Record<string, unknown> = {
+      access_token: issue(scopes),
+      expires_in: expiresIn,
+      scope: scopes.join(' '),
+      token_type: 'Bearer',
+    };
+    if (grant.withoutRefreshToken !== true) answer.refresh_token = refreshToken;
+    return { status: 200, body: answer };
   };
 
   // ── Calendar (Dex's primary calendar) ─────────────────────────────────────
@@ -495,6 +556,7 @@ export function createFakeGoogle(options: FakeGoogleOptions = {}): FakeGoogle {
       const form = (body && typeof body === 'object' && !Array.isArray(body) ? body : {}) as Record<string, string>;
       if (form.grant_type === 'refresh_token') return refreshGrant(form);
       if (form.grant_type === GOOGLE_JWT_BEARER_GRANT_TYPE) return jwtBearerGrant(form);
+      if (form.grant_type === 'authorization_code') return authorizationCodeGrant(form);
       return oauthError(400, 'unsupported_grant_type', 'Invalid grant_type.');
     }
     const isCalendar = url.origin === calendarOrigin && url.pathname.startsWith(calendarEventsPath);
@@ -535,6 +597,7 @@ export function createFakeGoogle(options: FakeGoogleOptions = {}): FakeGoogle {
 
   return {
     transport,
+    issueAuthorizationCode,
     calls,
     tokensIssued,
     events,
