@@ -250,7 +250,13 @@ export async function runR1MeetScorecardFeedback(
     return deferOrThrow(meta, deps.now(), 'booking_not_settled', R1_MEET_FEEDBACK_DEFER.notSettled, 'r1_meet_feedback_booking_not_settled');
   }
   if (booking.status !== 'completed') return r1MeetIgnored('booking_not_completed');
-  if (booking.roundId === null || booking.sessionId === null || !UUID.test(booking.eventId)) {
+  // A public-page booking (M035) has no interview event: not posted yet (M035 S02 T3 posts it).
+  if (
+    booking.roundId === null
+    || booking.sessionId === null
+    || booking.source !== 'ashby'
+    || !UUID.test(booking.eventId)
+  ) {
     return r1MeetIgnored('booking_unbound');
   }
   const endMs = Date.parse(booking.endAt);

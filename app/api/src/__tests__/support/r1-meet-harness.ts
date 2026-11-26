@@ -92,6 +92,12 @@ export interface R1MeetHarness {
   alerts(): string[];
   /** A `pending` booking through the real create RPC: an application link, a staff user, a slot. */
   createBooking(options?: CreateBookingOptions): Promise<Extract<R1MeetCreateAnswer, { status: 'created' | 'relinked' }>>;
+  /**
+   * A `pending/eligible` public-page booking (M035, source `public_page`, no Ashby event, schedule or
+   * scheduler) bound to a fresh invited Meet round, its application linked to the round's candidate.
+   * Seeded directly: the public create RPC is not part of the fake (S06 adds it).
+   */
+  createPublicBooking(options?: CreatePublicBookingOptions): CreatedPublicBooking;
   /** A first run of a job (attempts 1, no deferral), or the meta you ask for. */
   meta(
     overrides?: Partial<Pick<R1MeetJobMeta, 'attempts' | 'maxAttempts' | 'deferCount' | 'deferredAt' | 'lastDeferReason' | 'lastError'>>,
@@ -105,6 +111,20 @@ export interface CreateBookingOptions {
   readonly startAt?: string;
   readonly endAt?: string;
   readonly meetUrl?: string;
+}
+
+export interface CreatePublicBookingOptions {
+  readonly applicationId?: string;
+  readonly startAt?: string;
+  readonly endAt?: string;
+  readonly meetUrl?: string;
+}
+
+export interface CreatedPublicBooking {
+  readonly bookingId: string;
+  readonly roundId: string;
+  readonly candidateId: string;
+  readonly applicationId: string;
 }
 
 export interface HarnessOptions {
@@ -264,6 +284,28 @@ export function createR1MeetHarness(options: HarnessOptions = {}): R1MeetHarness
         throw new Error(`harness: createBooking answered ${answer.status}`);
       }
       return answer;
+    },
+    createPublicBooking(opts: CreatePublicBookingOptions = {}): CreatedPublicBooking {
+      const applicationId = opts.applicationId ?? fixtureId();
+      const round = db.addRound({ channel: 'meet', status: 'invited' });
+      db.linkApplication(applicationId, round.candidate_id as string);
+      const startAt = opts.startAt ?? new Date(nowMs + 24 * 3600 * 1000).toISOString();
+      const endAt = opts.endAt ?? new Date(Date.parse(startAt) + 45 * 60 * 1000).toISOString();
+      const booking = db.seedPublicBooking({
+        round_id: round.id,
+        status: 'pending',
+        reason: 'eligible',
+        start_at: startAt,
+        end_at: endAt,
+        ashby_application_id: applicationId,
+        meet_url: opts.meetUrl ?? MEET_URL,
+      });
+      return Object.freeze({
+        bookingId: booking.id as string,
+        roundId: round.id as string,
+        candidateId: round.candidate_id as string,
+        applicationId,
+      });
     },
     meta(
       overrides: Partial<Pick<R1MeetJobMeta, 'attempts' | 'maxAttempts' | 'deferCount' | 'deferredAt' | 'lastDeferReason' | 'lastError'>> = {},

@@ -19,6 +19,13 @@
  * booking's slot compares with a job's slot as plain strings, and replaying the stored slot into the
  * create RPC never reads as a moved one.
  *
+ * TWO SOURCES (M035). A booking is `ashby` (HR scheduled it in Ashby with Dex) or `public_page` (the
+ * candidate booked it on the public R1 booking page). `R1MeetBooking` is a union on `source`: the three
+ * Ashby schedule ids (event, schedule, scheduler) are all set for `ashby` and all null for `public_page`,
+ * exactly 0143's `chk_r1_meet_bookings_source_ids`, and a row that mixes them fails `r1_meet_db_error`.
+ * The reads by an Ashby event or schedule id answer the Ashby member only. Readers narrow on `source`;
+ * nothing casts past the null.
+ *
  * COMPARE AND SET. State changes only through the RPCs (under the booking row lock, 0142); the one
  * direct write is the receipt, guarded by its own outcome. Two jobs of one booking may run at once.
  *
@@ -33,8 +40,10 @@ import { normalizeGoogleMeetUrl } from '../../../integrations/google-meet/url.js
 import type { supabase } from '../../supabase.js';
 import {
   R1_MEET_BOOKING_REASONS,
+  R1_MEET_BOOKING_SOURCES,
   R1_MEET_BOOKING_STATUSES,
   type R1MeetBookingReason,
+  type R1MeetBookingSource,
   type R1MeetBookingStatus,
 } from './bookings-read.js';
 import {
@@ -123,17 +132,17 @@ export const R1_MEET_BOOKING_COLUMNS =
   'id, ashby_interview_event_id, ashby_schedule_id, ashby_application_id, ashby_interview_stage_id, '
   + 'ashby_interview_id, ashby_scheduled_by_user_id, ashby_updated_at, round_id, objective_profile, status, '
   + 'reason, version, key_attempt, meet_url, start_at, end_at, recall_bot_id, ticket_not_before, '
-  + 'ticket_expires_at, ticket_claimed_at, ticket_arms, session_id, created_at, updated_at';
+  + 'ticket_expires_at, ticket_claimed_at, ticket_arms, session_id, created_at, updated_at, source';
 
-export interface R1MeetBooking {
+/**
+ * What every booking carries, whichever way it was booked. `applicationId` is always the matched Ashby
+ * application (a public booking keeps it too, so Dex's card lands on the right application).
+ */
+interface R1MeetBookingBase {
   readonly id: string;
-  readonly eventId: string;
-  readonly scheduleId: string;
   readonly applicationId: string;
   readonly interviewStageId: string | null;
   readonly interviewId: string | null;
-  /** The consent attester (D-M034-11). Confidential. */
-  readonly scheduledByUserId: string;
   readonly ashbyUpdatedAt: string | null;
   readonly roundId: string | null;
   readonly objectiveProfile: string;
@@ -155,6 +164,29 @@ export interface R1MeetBooking {
   readonly createdAt: string;
   readonly updatedAt: string;
 }
+
+/** A slot HR scheduled in Ashby with Dex (M034): the three Ashby schedule ids are always set. */
+export interface R1MeetAshbyBooking extends R1MeetBookingBase {
+  readonly source: 'ashby';
+  readonly eventId: string;
+  readonly scheduleId: string;
+  /** The consent attester (D-M034-11). Confidential. */
+  readonly scheduledByUserId: string;
+}
+
+/**
+ * A slot the candidate booked on the public R1 booking page (M035): there is no Ashby schedule, so the
+ * three schedule ids are always null (0143's `chk_r1_meet_bookings_source_ids`).
+ */
+export interface R1MeetPublicBooking extends R1MeetBookingBase {
+  readonly source: 'public_page';
+  readonly eventId: null;
+  readonly scheduleId: null;
+  readonly scheduledByUserId: null;
+}
+
+/** One booking as the runtime reads it: narrow on `source` before reading an Ashby schedule id. */
+export type R1MeetBooking = R1MeetAshbyBooking | R1MeetPublicBooking;
 
 /** `chk_call_sessions_status` (0006). Frozen. */
 export const R1_MEET_SESSION_STATUSES = Object.freeze([
@@ -509,11 +541,13 @@ export type R1MeetRpcName = keyof typeof R1_MEET_RPC_ANSWERS;
 
 export interface R1MeetStore {
   getBooking(id: string): Promise<R1MeetBooking | null>;
-  getBookingByEvent(eventId: string): Promise<R1MeetBooking | null>;
+  /** Only an Ashby booking has an event id (0143): any other row here fails `r1_meet_db_error`. */
+  getBookingByEvent(eventId: string): Promise<R1MeetAshbyBooking | null>;
   getBookingByBot(recallBotId: string): Promise<R1MeetBooking | null>;
   /** The booking most recently touched, should a restart ever have bound one session twice. */
   getBookingBySession(sessionId: string): Promise<R1MeetBooking | null>;
-  listLiveBySchedule(scheduleId: string): Promise<readonly R1MeetBooking[]>;
+  /** Only an Ashby booking has a schedule id (0143): any other row here fails `r1_meet_db_error`. */
+  listLiveBySchedule(scheduleId: string): Promise<readonly R1MeetAshbyBooking[]>;
   /** Terminal bookings whose bot is not confirmed released, longest owed first. */
   listOwedReleases(limit: number): Promise<readonly R1MeetBooking[]>;
   /** Live bookings whose slot ended before `endBefore`. */
@@ -644,6 +678,7 @@ class FieldReader {
 
   readonly status = (key: string): R1MeetBookingStatus => this.oneOf(key, R1_MEET_BOOKING_STATUSES);
   readonly reason = (key: string): R1MeetBookingReason => this.oneOf(key, R1_MEET_BOOKING_REASONS);
+  readonly source = (key: string): R1MeetBookingSource => this.oneOf(key, R1_MEET_BOOKING_SOURCES);
   readonly version = (key: string): number => this.int(key, 0, R1_MEET_MAX_VERSION);
   readonly keyAttempt = (key: string): number => this.int(key, 0, KEY_ATTEMPT_MAX);
   readonly ticketArms = (key: string): number => this.int(key, 0, R1_MEET_MAX_TICKET_ARMS);
@@ -659,14 +694,15 @@ function parseBooking(row: unknown): R1MeetBooking {
   const read = new FieldReader(row, R1_MEET_DB_ERROR);
   const meetUrl = read.text('meet_url');
   if (normalizeGoogleMeetUrl(meetUrl) !== meetUrl) read.fail();
-  return Object.freeze({
-    id: read.uuid('id'),
-    eventId: read.uuid('ashby_interview_event_id'),
-    scheduleId: read.verbatimUuid('ashby_schedule_id'),
-    applicationId: read.verbatimUuid('ashby_application_id'),
-    interviewStageId: read.orNull('ashby_interview_stage_id', read.verbatimUuid),
-    interviewId: read.orNull('ashby_interview_id', read.verbatimUuid),
-    scheduledByUserId: read.verbatimUuid('ashby_scheduled_by_user_id'),
+  const source = read.source('source');
+  const id = read.uuid('id');
+  const eventId = read.orNull('ashby_interview_event_id', read.uuid);
+  const scheduleId = read.orNull('ashby_schedule_id', read.verbatimUuid);
+  const applicationId = read.verbatimUuid('ashby_application_id');
+  const interviewStageId = read.orNull('ashby_interview_stage_id', read.verbatimUuid);
+  const interviewId = read.orNull('ashby_interview_id', read.verbatimUuid);
+  const scheduledByUserId = read.orNull('ashby_scheduled_by_user_id', read.verbatimUuid);
+  const rest = {
     ashbyUpdatedAt: read.orNull('ashby_updated_at', read.instant),
     roundId: read.orNull('round_id', read.uuid),
     objectiveProfile: read.text('objective_profile'),
@@ -685,7 +721,41 @@ function parseBooking(row: unknown): R1MeetBooking {
     sessionId: read.orNull('session_id', read.uuid),
     createdAt: read.instant('created_at'),
     updatedAt: read.instant('updated_at'),
+  };
+  // The three Ashby schedule ids follow the source exactly (0143's chk_r1_meet_bookings_source_ids):
+  // all set for an Ashby booking, all null for a public one. A mixed row is drift.
+  if (source === 'ashby') {
+    if (eventId === null || scheduleId === null || scheduledByUserId === null) return read.fail();
+    return Object.freeze({
+      id,
+      eventId,
+      scheduleId,
+      applicationId,
+      interviewStageId,
+      interviewId,
+      scheduledByUserId,
+      ...rest,
+      source,
+    });
+  }
+  if (eventId !== null || scheduleId !== null || scheduledByUserId !== null) return read.fail();
+  return Object.freeze({
+    id,
+    eventId,
+    scheduleId,
+    applicationId,
+    interviewStageId,
+    interviewId,
+    scheduledByUserId,
+    ...rest,
+    source,
   });
+}
+
+/** An Ashby booking, or `r1_meet_db_error` for any other: a read by an Ashby schedule id (0143). */
+function ashbyBooking(booking: R1MeetBooking): R1MeetAshbyBooking {
+  if (booking.source !== 'ashby') throw dbError();
+  return booking;
 }
 
 function parseParticipantRow(row: unknown): { receiptId: string | null; event: R1MeetParticipantEventRow } {
@@ -1004,6 +1074,15 @@ function bookingsOf(answer: DbAnswer): readonly R1MeetBooking[] {
   return Object.freeze(rowsOf(answer).map(parseBooking));
 }
 
+function ashbyBookingOf(answer: DbAnswer): R1MeetAshbyBooking | null {
+  const booking = bookingOf(answer);
+  return booking === null ? null : ashbyBooking(booking);
+}
+
+function ashbyBookingsOf(answer: DbAnswer): readonly R1MeetAshbyBooking[] {
+  return Object.freeze(rowsOf(answer).map((row) => ashbyBooking(parseBooking(row))));
+}
+
 /** The store over the service-role client. */
 export function createR1MeetStore(db: Db): R1MeetStore {
   const bookings = () => db.from('r1_meet_bookings').select(R1_MEET_BOOKING_COLUMNS);
@@ -1017,7 +1096,7 @@ export function createR1MeetStore(db: Db): R1MeetStore {
     },
 
     async getBookingByEvent(eventId: string) {
-      return bookingOf(await run(() => bookings().eq('ashby_interview_event_id', eventId).maybeSingle()));
+      return ashbyBookingOf(await run(() => bookings().eq('ashby_interview_event_id', eventId).maybeSingle()));
     },
 
     async getBookingByBot(recallBotId: string) {
@@ -1034,7 +1113,7 @@ export function createR1MeetStore(db: Db): R1MeetStore {
     },
 
     async listLiveBySchedule(scheduleId: string) {
-      return bookingsOf(
+      return ashbyBookingsOf(
         await run(() =>
           bookings()
             .eq('ashby_schedule_id', scheduleId)

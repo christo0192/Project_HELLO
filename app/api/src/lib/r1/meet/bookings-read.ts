@@ -55,6 +55,14 @@ export const R1_MEET_BOOKING_STATUSES = Object.freeze([
 ] as const);
 export type R1MeetBookingStatus = (typeof R1_MEET_BOOKING_STATUSES)[number];
 
+/**
+ * Where a booking came from, in the order of 0143's `chk_r1_meet_bookings_source` (M035): `ashby` is a
+ * slot HR scheduled in Ashby with Dex (M034), `public_page` one the candidate booked on the public R1
+ * booking page. Frozen.
+ */
+export const R1_MEET_BOOKING_SOURCES = Object.freeze(['ashby', 'public_page'] as const);
+export type R1MeetBookingSource = (typeof R1_MEET_BOOKING_SOURCES)[number];
+
 /** The booking reasons, in the order of 0142's `chk_r1_meet_bookings_reason`. Frozen. */
 export const R1_MEET_BOOKING_REASONS = Object.freeze([
   'dex_absent',

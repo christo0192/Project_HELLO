@@ -12,7 +12,9 @@
  *    `{ code: '23514' }` and rolls the whole call back; a unique index answers `23505`;
  *  - the first refusal wins, in the SQL's order;
  *  - the tables answer the store's reads (projection, count, JSON paths, compare-and-set update), the
- *    two triggers, the queue dedup, and `failNext`.
+ *    two triggers, the queue dedup, and `failNext`;
+ *  - (M035 S02) the `source` column of 0143 and its two CHECKs (`chk_r1_meet_bookings_source`,
+ *    `chk_r1_meet_bookings_source_ids`), and the public seed (`seedPublicBooking`, `createPublicBooking`).
  */
 
 import { readFileSync } from 'node:fs';
@@ -837,5 +839,88 @@ describe('the tables answer the store, and the test aids work', () => {
     await expect(h.db.store.getBooking(p.id)).rejects.toThrow('r1_meet_db_error');
     await expect(h.db.store.getBooking(p.id)).resolves.toMatchObject({ id: p.id, keyAttempt: 1 });
     expect(h.db.calls.filter((c) => c.kind === 'rpc').map((c) => c.name).slice(-2)).toEqual(['r1_meet_set_bot', 'r1_meet_set_bot']);
+  });
+});
+
+// ── 0143's source (M035 S02) ────────────────────────────────────────────────
+
+describe('the source of 0143 (M035 S02): the column, its two CHECKs and the public seed', () => {
+  it('every row the create RPC or seedBooking writes is an Ashby row', async () => {
+    const h = createR1MeetHarness();
+    const created = await h.createBooking();
+    expect(h.db.booking(created.bookingId)!.source).toBe('ashby');
+    const round = h.db.addRound();
+    expect(h.db.seedBooking({ round_id: round.id }).source).toBe('ashby');
+  });
+
+  it('an Ashby row without one of its three schedule ids, or a public row with one, is 23514 source_ids', () => {
+    const h = createR1MeetHarness();
+    const bad: Array<[string, () => Row]> = [
+      ['chk_r1_meet_bookings_source_ids', () => h.db.seedBooking({ status: 'failed', reason: 'in_past', ashby_schedule_id: null })],
+      ['chk_r1_meet_bookings_source_ids', () => h.db.seedBooking({ status: 'failed', reason: 'in_past', ashby_interview_event_id: null })],
+      ['chk_r1_meet_bookings_source_ids', () => h.db.seedBooking({ status: 'failed', reason: 'in_past', ashby_scheduled_by_user_id: null })],
+      ['chk_r1_meet_bookings_source_ids', () => h.db.seedPublicBooking({ status: 'failed', reason: 'in_past', ashby_interview_event_id: fixtureId() })],
+      ['chk_r1_meet_bookings_source_ids', () => h.db.seedPublicBooking({ status: 'failed', reason: 'in_past', ashby_schedule_id: fixtureId() })],
+      ['chk_r1_meet_bookings_source_ids', () => h.db.seedPublicBooking({ status: 'failed', reason: 'in_past', ashby_scheduled_by_user_id: SCHEDULER_ID })],
+      ['chk_r1_meet_bookings_source', () => h.db.seedBooking({ status: 'failed', reason: 'in_past', source: 'csv' })],
+      ['chk_r1_meet_bookings_source', () => h.db.seedBooking({ status: 'failed', reason: 'in_past', source: null })],
+      ['chk_r1_meet_bookings_source', () => h.db.seedPublicBooking({ status: 'failed', reason: 'in_past', source: 'PUBLIC_PAGE' })],
+      ['chk_r1_meet_bookings_ashby_application_id', () => h.db.seedPublicBooking({ status: 'failed', reason: 'in_past', ashby_application_id: null })],
+      ['chk_r1_meet_bookings_ashby_schedule_id', () => h.db.seedBooking({ status: 'failed', reason: 'in_past', ashby_schedule_id: 'x' })],
+      ['chk_r1_meet_bookings_ashby_scheduled_by_user_id', () => h.db.seedBooking({ status: 'failed', reason: 'in_past', ashby_scheduled_by_user_id: 'x' })],
+    ];
+    for (const [constraint, seed] of bad) {
+      expect(seed, constraint).toThrow(`23514 ${constraint}`);
+    }
+    expect(h.db.tables.r1_meet_bookings).toEqual([]);
+  });
+
+  it('a public seed stores the public shape and reads back through the store', async () => {
+    const h = createR1MeetHarness();
+    const pb = h.createPublicBooking();
+    const row = h.db.booking(pb.bookingId)!;
+    expect(row).toMatchObject({
+      source: 'public_page',
+      ashby_interview_event_id: null,
+      ashby_schedule_id: null,
+      ashby_scheduled_by_user_id: null,
+      ashby_interview_stage_id: null,
+      ashby_interview_id: null,
+      ashby_updated_at: null,
+      ashby_application_id: pb.applicationId,
+      round_id: pb.roundId,
+      candidate_id: pb.candidateId,
+      status: 'pending',
+      reason: 'eligible',
+      version: 0,
+      key_attempt: 0,
+      recall_bot_id: null,
+    });
+    expect(h.db.tables.ashby_application_links).toContainEqual({
+      provider: 'ashby',
+      external_application_id: pb.applicationId,
+      candidate_id: pb.candidateId,
+      terminal_state: null,
+    });
+    const booking = await h.db.store.getBooking(pb.bookingId);
+    expect(booking).toMatchObject({
+      id: pb.bookingId,
+      source: 'public_page',
+      eventId: null,
+      scheduleId: null,
+      scheduledByUserId: null,
+      applicationId: pb.applicationId,
+      roundId: pb.roundId,
+      status: 'pending',
+    });
+    // Two public rows: the event unique index ignores their NULL event ids.
+    const other = h.createPublicBooking();
+    expect(await h.db.store.getBooking(other.bookingId)).toMatchObject({ source: 'public_page', eventId: null });
+    // A public row projects to exactly the selected columns too.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const client = h.db.client as any;
+    const answer = (await client.from('r1_meet_bookings').select(R1_MEET_BOOKING_COLUMNS).eq('id', pb.bookingId).maybeSingle()) as FakeAnswer;
+    expect(Object.keys(answer.data as Row).sort()).toEqual(R1_MEET_BOOKING_COLUMNS.split(',').map((c) => c.trim()).sort());
+    expect((answer.data as Row).source).toBe('public_page');
   });
 });

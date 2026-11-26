@@ -8,6 +8,11 @@
  * only turns them into the exact `POST /api/v1/bot/` body and the Idempotency-Key, and refuses
  * anything malformed with a fixed reason, before any network call.
  *
+ * A booking the candidate made on the public R1 booking page (M035, source `public_page`) has no Ashby
+ * event: its body is built the same way, and its Idempotency-Key lives in its own space,
+ * `r1-meet-pb-<booking id>-v<version>-k<keyAttempt>` (`r1MeetPublicCreateBotIdempotencyKey`), next to
+ * the Ashby `r1-meet-<event id>-v<version>-k<keyAttempt>`. `r1MeetBookingIdempotencyKey` picks by source.
+ *
  * Pure: no environment, no I/O, no clock and no logging.
  *
  * The body (S01 plan section 4) asks Recall for as little as possible:
@@ -105,6 +110,8 @@ export type R1MeetCreateBotResult =
 const BOOKING_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** Ashby ids are UUIDs, delivered in either case (S01 plan R24). */
 const ASHBY_EVENT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** A public booking's own row id, accepted in either case and lower-cased into its key (M035). */
+const PUBLIC_BOOKING_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const LOGIN_GROUP_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const PRINTABLE_ASCII = /^[\x21-\x7e]+$/;
 const MAX_URL_LENGTH = 2048;
@@ -280,6 +287,7 @@ export function buildR1MeetCreateBotRequest(
  * The result always satisfies `RECALL_IDEMPOTENCY_KEY_RE` (at most 80 characters). Throws a
  * `TypeError` with a fixed message (never echoing the input) on a non-UUID event id, or on a version
  * or key attempt that is not a non-negative safe integer, checked in that order.
+ * A public-page booking has no Ashby event: its key is `r1MeetPublicCreateBotIdempotencyKey` (M035).
  */
 export function r1MeetCreateBotIdempotencyKey(ashbyEventId: string, version: number, keyAttempt: number): string {
   if (typeof ashbyEventId !== 'string' || !ASHBY_EVENT_ID_RE.test(ashbyEventId)) {
@@ -292,4 +300,64 @@ export function r1MeetCreateBotIdempotencyKey(ashbyEventId: string, version: num
     throw new TypeError('r1_meet_idempotency_invalid_key_attempt');
   }
   return `r1-meet-${ashbyEventId.toLowerCase()}-v${version}-k${keyAttempt}`;
+}
+
+/**
+ * The Idempotency-Key for creating the bot of one public-page booking (M035; there is no Ashby event):
+ * `r1-meet-pb-<booking id lower-cased>-v<version>-k<keyAttempt>`. `version` and `keyAttempt` change
+ * exactly as for an Ashby booking (see `r1MeetCreateBotIdempotencyKey`). The space is disjoint from the
+ * Ashby one: the ninth character of an Ashby key is a hex digit, of a public key the `p` of `pb-`.
+ *
+ * The result always satisfies `RECALL_IDEMPOTENCY_KEY_RE` (at most 83 characters). Throws a
+ * `TypeError` with a fixed message (never echoing the input) on a non-UUID booking id, or on a version
+ * or key attempt that is not a non-negative safe integer, checked in that order.
+ */
+export function r1MeetPublicCreateBotIdempotencyKey(bookingId: string, version: number, keyAttempt: number): string {
+  if (typeof bookingId !== 'string' || !PUBLIC_BOOKING_ID_RE.test(bookingId)) {
+    throw new TypeError('r1_meet_idempotency_invalid_booking_id');
+  }
+  if (typeof version !== 'number' || !Number.isSafeInteger(version) || version < 0) {
+    throw new TypeError('r1_meet_idempotency_invalid_version');
+  }
+  if (typeof keyAttempt !== 'number' || !Number.isSafeInteger(keyAttempt) || keyAttempt < 0) {
+    throw new TypeError('r1_meet_idempotency_invalid_key_attempt');
+  }
+  return `r1-meet-pb-${bookingId.toLowerCase()}-v${version}-k${keyAttempt}`;
+}
+
+/**
+ * What the key picker reads of a booking. Structural on purpose: this module stays pure and imports
+ * nothing from the runtime store, whose `R1MeetBooking` union satisfies it.
+ */
+export type R1MeetBotKeyBooking =
+  | {
+      readonly source: 'ashby';
+      readonly eventId: string;
+      readonly id: string;
+      readonly version: number;
+      readonly keyAttempt: number;
+    }
+  | {
+      readonly source: 'public_page';
+      readonly eventId: null;
+      readonly id: string;
+      readonly version: number;
+      readonly keyAttempt: number;
+    };
+
+/**
+ * The create Idempotency-Key of `booking`, by its source: an Ashby booking keys on its Ashby event id
+ * (`r1MeetCreateBotIdempotencyKey`, unchanged), a public-page booking on its own row id
+ * (`r1MeetPublicCreateBotIdempotencyKey`). Any other source throws
+ * `TypeError('r1_meet_idempotency_invalid_source')`; the two key functions throw their own fixed messages.
+ */
+export function r1MeetBookingIdempotencyKey(booking: R1MeetBotKeyBooking): string {
+  if (typeof booking !== 'object' || booking === null) throw new TypeError('r1_meet_idempotency_invalid_source');
+  if (booking.source === 'ashby') {
+    return r1MeetCreateBotIdempotencyKey(booking.eventId, booking.version, booking.keyAttempt);
+  }
+  if (booking.source === 'public_page') {
+    return r1MeetPublicCreateBotIdempotencyKey(booking.id, booking.version, booking.keyAttempt);
+  }
+  throw new TypeError('r1_meet_idempotency_invalid_source');
 }
