@@ -3,7 +3,8 @@
  * its booking, the human-present arm, the multi-human policy, the end of an attempt and the bridge
  * recovery check. Four job definitions: `recall_event`, `attempt_ended`, `bridge_check` and
  * `multi_human_check` (D-S06-22..29), plus pure functions: `decideBridgeCheck`, `countHumans`, and
- * (M035 S09) `r1MeetBotAlertFor` and `r1MeetPreCallVerdict` with the three frozen sub-code lists.
+ * (M035 S09) `r1MeetBotAlertFor` and `r1MeetPreCallVerdict` with the three frozen sub-code lists,
+ * `r1MeetBotInCallAtMs` and `r1MeetBotParticipantId` (the bot's own participant).
  *
  * WHICH BOOKING (D-S06-22). The event's `booking_id` (from the bot's metadata) first, else the booking
  * that holds the bot. The event acts only when that booking's CURRENT bot is the event's bot. A bot
@@ -26,8 +27,9 @@
  *                                  at once, before the status step (the meeting is not OPEN, or
  *                                  nobody admitted Dex: HR must fix it before more candidates are
  *                                  stranded); once per run, never on a re-run;
- *   in_call_recording, or a participant join that is not a bot
- *                                  a human is present (below);
+ *   in_call_recording, or a participant join that is not this bot's own participant
+ *                                  a human is present (below); the bot's own join, or a
+ *                                  marked join with no id, is ignored (`bot_participant`);
  *   call_ended, done, fatal        bot_scheduled | bot_joining -> failed/bot_fatal for `bot.fatal` or
  *                                  a FATAL sub-code (below). Otherwise the bot is read ONCE before
  *                                  the move (`r1MeetPreCallVerdict`): a `fatal` status, a fatal
@@ -58,7 +60,9 @@
  * otherwise one GET and whatever the bot's state allows (a leave). Then `set_bot('release')`. A run
  * that dies in between replays through the terminal branch, which finishes the owed release.
  *
- * HUMAN PRESENT (D-S06-25). The compare-and-set `-> human_present` elects ONE winner among the jobs
+ * HUMAN PRESENT (D-S06-25). The two signals are `bot.in_call_recording` and a participant join that is
+ * not this bot's own participant (below: a join the receiver marked `is_bot` goes down this path too
+ * unless it is the bot's own). The compare-and-set `-> human_present` elects ONE winner among the jobs
  * of the two signals (and their duplicates). The winner, or a RE-RUN of a job (a crash or a deferral
  * may have stopped it after the move or after the arm), arms when the ticket is unclaimed and either
  * was never armed or the booking has been untouched for 20 s (an arm a moment ago is someone's live
@@ -67,14 +71,28 @@
  * already shows its page); its bridge check is queued here, so a page that never claims is still
  * recovered. An unarmed one falls back to the normal arm.
  *
- * MULTIPLE HUMANS (D-S06-28, critic C4). Humans present = distinct participant ids with more joins
- * than leaves, not marked `is_bot`, counted from the durable `recall_event` rows of THIS bot (ids
- * only: no name is ever read). On Google Meet a rejoin is a NEW id, and HR may still be admitting
- * the candidate, so two humans only queue one `multi_human_check` 120 s later; if there are still
- * more than one then, policy `end` alerts `r1_meet_multiple_humans`, leaves at Recall FIRST, then
- * marks `failed/multiple_humans` and the release; policy `observe` (THE DEFAULT, PR #444 review
- * S06-R3) only logs, until the live spike settles whether Recall reports the bot's own join, whether
- * HR must stay to admit the candidate, and notetaker bots.
+ * MULTIPLE HUMANS (D-S06-28, critic C4; M035 S09 D-S09-6). Humans present = distinct participant ids
+ * with more joins than leaves, except null ids and the bot's OWN participant, counted from the durable
+ * `recall_event` rows of THIS bot (ids, the receiver's `is_bot` and times only: no name is ever read
+ * here). The receiver marks a join `is_bot` when Recall says so or when its display name is this
+ * bot's own (compared there in memory and dropped). A mark is EVIDENCE, never a verdict on its own: a
+ * candidate who happens to share the bot's name must stay visible. So the bot's own participant is
+ * the EARLIEST marked join with an id, and only when it is stamped at most 15 s
+ * (`R1_MEET_BOT_JOIN_SLACK_MS`) after the bot's first `in_call_*` status in Recall's history (one
+ * GET, made only when a marked join exists; no in-call status yet = no bound). Every other id counts,
+ * a later marked one included. UNVERIFIED until the live spike S0c: Recall documents neither whether
+ * the bot's own join is reported nor when. H1 (reported at the bot's entry): the rule finds it. H3
+ * (never reported): a lone name-alike joins after the bound and counts. H2 (reported only when
+ * recording starts, i.e. when someone else joins, later than 15 s): it counts as a person, so the
+ * multi-human check would see two on every call; it never arms early, because a person is in the
+ * call by then. A Recall failure of that GET defers `multi_human_check` and `attempt_ended` before
+ * any write; the human-present recount falls back to no bound (it only decides whether to queue a
+ * recount). On Google Meet a rejoin is a NEW id, and HR may still be admitting the candidate, so two
+ * humans only queue one `multi_human_check` 120 s later; if there are still more than one then,
+ * policy `end` alerts `r1_meet_multiple_humans`, leaves at Recall FIRST, then marks
+ * `failed/multiple_humans` and the release; policy `observe` (THE DEFAULT, PR #444 review S06-R3;
+ * unchanged by S09) only logs, until the live spike settles which hypothesis holds, whether HR must
+ * stay to admit the candidate, and notetaker bots.
  *
  * ATTEMPT ENDED (D-S06-29, PR #444 review S06-R1). Only when the booking still holds that session.
  * The attempt's settlement decides, never the bot: a COUNTED attempt leaves at Recall, then
@@ -171,6 +189,11 @@ export const R1_MEET_OWN_LEAVE_SUB_CODE = 'bot_received_leave_call';
 export const R1_MEET_REARM_UNTOUCHED_MS = 20 * SECOND_MS;
 /** Two humans are checked again this much later (a rejoin is a new id; HR may be admitting). */
 export const R1_MEET_MULTI_HUMAN_CHECK_DELAY_SEC = 120;
+/**
+ * The bot's own participant join is stamped at most this long after its first `in_call_*` status
+ * (M035 S09 D-S09-6; UNVERIFIED until the live spike S0c): a marked join later than that is a person.
+ */
+export const R1_MEET_BOT_JOIN_SLACK_MS = 15 * SECOND_MS;
 /** decideBridgeCheck: the page's own retries stop at 180 s, so an unclaimed ticket waits 200 s. */
 export const R1_MEET_BRIDGE_UNCLAIMED_SEC = 200;
 /** A claim with no session: the 202-then-resume handshake takes seconds, never 45. */
@@ -281,23 +304,88 @@ function unexpected(): never {
 // ── Pure: humans present, and the bridge check table ────────────────────────
 
 /**
- * Distinct participants with more joins than leaves (D-S06-28). An id that any row marks as a bot is
- * not counted, nor is a null id. A rejoin on Google Meet is a new id, so it counts once: the old id
- * left. The rows carry ids only; nothing here can read a name.
+ * Distinct participants with more joins than leaves (D-S06-28). A null id is not counted, nor is the
+ * bot's own participant (`botParticipantId`, from `r1MeetBotParticipantId`; M035 S09 D-S09-6). Every
+ * other id counts, one the receiver marked `is_bot` included: a mark alone is not a verdict. A rejoin
+ * on Google Meet is a new id, so it counts once: the old id left. The rows carry ids only; nothing
+ * here can read a name.
  */
 export function countHumans(
-  events: readonly Pick<R1MeetParticipantEventRow, 'type' | 'participantId' | 'isBot'>[],
+  events: readonly Pick<R1MeetParticipantEventRow, 'type' | 'participantId'>[],
+  botParticipantId: number | null = null,
 ): number {
-  const bots = new Set<number>();
-  for (const event of events) if (event.participantId !== null && event.isBot === true) bots.add(event.participantId);
   const net = new Map<number, number>();
   for (const event of events) {
-    if (event.participantId === null || bots.has(event.participantId)) continue;
+    if (event.participantId === null || event.participantId === botParticipantId) continue;
     net.set(event.participantId, (net.get(event.participantId) ?? 0) + (event.type === 'join' ? 1 : -1));
   }
   let humans = 0;
   for (const count of net.values()) if (count > 0) humans += 1;
   return humans;
+}
+
+// ── Pure: the bot's own participant (M035 S09 D-S09-6, UNVERIFIED) ──────────
+
+/** A parsed instant, or null when it is missing or unreadable. */
+function instantMs(value: string | null): number | null {
+  if (value === null) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * When the bot got into the call, from its Recall status history: the time of its OLDEST
+ * `in_call_not_recording` or `in_call_recording` change, or null when it has none yet (a bot still
+ * joining, waiting or refused). A change whose time cannot be read is skipped.
+ */
+export function r1MeetBotInCallAtMs(
+  changes: readonly Pick<RecallBotStatusChange, 'code' | 'createdAt'>[],
+): number | null {
+  let oldest: number | null = null;
+  for (const change of changes) {
+    if (!IN_CALL_CODES.has(change.code)) continue;
+    const ms = instantMs(change.createdAt);
+    if (ms !== null && (oldest === null || ms < oldest)) oldest = ms;
+  }
+  return oldest;
+}
+
+/**
+ * The id of the bot's OWN participant among its call's rows, or null (D-S09-6). Only a JOIN row the
+ * receiver marked (`isBot === true`) with a non-null id can be it, and only the EARLIEST of them
+ * (by `occurredAt`; a missing or unreadable time sorts last; a tie goes to the smallest id). It is the
+ * bot's own only when the bot is not known to be in the call yet (`botInCallAtMs` null) or when its
+ * time is known and at most `R1_MEET_BOT_JOIN_SLACK_MS` after `botInCallAtMs`. Otherwise null: the
+ * earliest marked join came after the bot was in, so it is a person (a candidate named like the bot),
+ * and no later marked join can be the bot's either. Never more than one id, so a name-alike who joins
+ * later always counts.
+ */
+export function r1MeetBotParticipantId(
+  events: readonly Pick<R1MeetParticipantEventRow, 'type' | 'participantId' | 'isBot' | 'occurredAt'>[],
+  botInCallAtMs: number | null,
+): number | null {
+  let first: { readonly id: number; readonly atMs: number | null } | null = null;
+  for (const event of events) {
+    if (event.type !== 'join' || event.isBot !== true || event.participantId === null) continue;
+    const candidate = { id: event.participantId, atMs: instantMs(event.occurredAt) };
+    if (first === null || r1MeetJoinsBefore(candidate, first)) first = candidate;
+  }
+  if (first === null) return null;
+  if (botInCallAtMs === null) return first.id;
+  return first.atMs !== null && first.atMs <= botInCallAtMs + R1_MEET_BOT_JOIN_SLACK_MS ? first.id : null;
+}
+
+/** The join order of `r1MeetBotParticipantId`: by time (unknown last), then by the smaller id. */
+function r1MeetJoinsBefore(
+  a: { readonly id: number; readonly atMs: number | null },
+  b: { readonly id: number; readonly atMs: number | null },
+): boolean {
+  if (a.atMs !== b.atMs) {
+    if (a.atMs === null) return false;
+    if (b.atMs === null) return true;
+    return a.atMs < b.atMs;
+  }
+  return a.id < b.id;
 }
 
 // ── Pure: a bot that was refused or never got in (M035 S09) ─────────────────
@@ -459,6 +547,55 @@ async function release(
   return { outcome };
 }
 
+/** The participant rows of a bot's call, and which of them is the bot's own (null: none). */
+interface CallParticipants {
+  readonly events: readonly R1MeetParticipantEventRow[];
+  readonly botParticipantId: number | null;
+}
+
+type BotParticipant = { readonly id: number | null };
+
+/**
+ * The bot's own participant id among `events` (D-S09-6). Recall is asked (ONE GET, for the time the
+ * bot got into the call) only when some join row is marked `is_bot` with an id: with none, nothing can
+ * be the bot's. A 404 (Recall no longer knows the bot) is no bound. Any other Recall failure is no
+ * bound with `'unbounded'` (a caller that only decides whether to queue a recount: never throws for
+ * Recall), else the job outcome of `r1MeetRecallFailure` (defer, or throw past the bound). A failure
+ * that is not Recall's is thrown as is.
+ */
+function botParticipantOf(
+  deps: R1MeetFlowDeps,
+  botId: string,
+  events: readonly R1MeetParticipantEventRow[],
+  onFailure: 'unbounded',
+): Promise<BotParticipant>;
+function botParticipantOf(
+  deps: R1MeetFlowDeps,
+  botId: string,
+  events: readonly R1MeetParticipantEventRow[],
+  onFailure: Meta,
+): Promise<BotParticipant | { readonly result: R1MeetJobResult }>;
+async function botParticipantOf(
+  deps: R1MeetFlowDeps,
+  botId: string,
+  events: readonly R1MeetParticipantEventRow[],
+  onFailure: 'unbounded' | Meta,
+): Promise<BotParticipant | { readonly result: R1MeetJobResult }> {
+  if (!events.some((event) => event.type === 'join' && event.isBot === true && event.participantId !== null)) {
+    return { id: null };
+  }
+  let botInCallAtMs: number | null = null;
+  try {
+    botInCallAtMs = r1MeetBotInCallAtMs((await deps.recall.getBot(botId)).statusChanges);
+  } catch (error) {
+    if (!isRecallError(error)) throw error;
+    if (error.category !== 'not_found' && onFailure !== 'unbounded') {
+      return { result: r1MeetRecallFailure(error, { meta: onFailure, nowMs: deps.now(), log: deps.log }) };
+    }
+  }
+  return { id: r1MeetBotParticipantId(events, botInCallAtMs) };
+}
+
 /**
  * Record a terminal booking's bot as released. Anything but `ok`/`duplicate` leaves it an owed release
  * for maintenance (`listOwedReleases`).
@@ -613,21 +750,39 @@ async function joining(deps: R1MeetFlowDeps, booking: R1MeetBooking): Promise<St
   return r1MeetProcessed('bot_joining');
 }
 
-/** Two or more humans: one check 120 s later (dedup per bot generation). */
-async function queueHumanCheck(deps: R1MeetFlowDeps, job: R1MeetRecallEventJob, booking: R1MeetBooking): Promise<void> {
-  const humans = countHumans(await deps.store.participantEvents(job.recallBotId));
+/**
+ * Two or more humans: one check 120 s later (dedup per bot generation). The bot's own participant is
+ * not one (D-S09-6): `known` when the caller already worked it out, else read here, with no bound on a
+ * Recall failure (this only decides whether to queue a recount; the check counts again, bounded).
+ */
+async function queueHumanCheck(
+  deps: R1MeetFlowDeps,
+  job: R1MeetRecallEventJob,
+  booking: R1MeetBooking,
+  known: CallParticipants | null,
+): Promise<void> {
+  let call = known;
+  if (call === null) {
+    const events = await deps.store.participantEvents(job.recallBotId);
+    call = { events, botParticipantId: (await botParticipantOf(deps, job.recallBotId, events, 'unbounded')).id };
+  }
+  const humans = countHumans(call.events, call.botParticipantId);
   if (humans <= 1) return;
   await deps.enqueue(r1MeetJobs.multiHumanCheck(booking.id, booking.version), {
     scheduledAt: toIso(deps.now() + R1_MEET_MULTI_HUMAN_CHECK_DELAY_SEC * SECOND_MS),
   });
 }
 
-/** D-S06-25 (see the header). */
+/**
+ * D-S06-25 (see the header). `known`: the call's participant rows and the bot's own id, when the
+ * caller (a marked join) already read them, so the recount needs no second read.
+ */
 async function humanPresent(
   deps: R1MeetFlowDeps,
   job: R1MeetRecallEventJob,
   booking: R1MeetBooking,
   meta: R1MeetJobMeta,
+  known: CallParticipants | null = null,
 ): Promise<Step> {
   let winner = false;
   if (booking.status === 'bot_scheduled' || booking.status === 'bot_joining') {
@@ -643,8 +798,9 @@ async function humanPresent(
     if (answer.status !== 'ok') return unexpected();
     winner = true;
   }
-  // Counted BEFORE the arm: a failed read throws before anything is armed, and the re-run arms.
-  if (job.eventType === 'participant_events.join') await queueHumanCheck(deps, job, booking);
+  // Counted BEFORE the arm: a failed database read throws before anything is armed, and the re-run
+  // arms. A Recall failure of the bot's in-call time only drops the bound (queueHumanCheck).
+  if (job.eventType === 'participant_events.join') await queueHumanCheck(deps, job, booking, known);
   // The page already claimed a ticket (in_call): the bridge check of that arm watches it.
   if (booking.status === 'in_call') return r1MeetIgnored('in_call');
 
@@ -748,6 +904,27 @@ async function ended(
   return r1MeetProcessed(`failed_${reason}`);
 }
 
+/**
+ * A participant join the receiver marked `is_bot` (D-S09-6): evidence, not a verdict. The bot's own
+ * participant, or a marked join with no id (nothing to count), is ignored; any other is a person (a
+ * candidate named like the bot) and goes down the normal human path. Recall first (one GET, for the
+ * bound), the database second: a Recall failure defers the job before any write.
+ */
+async function markedJoin(
+  deps: R1MeetFlowDeps,
+  job: R1MeetRecallEventJob,
+  booking: R1MeetBooking,
+  meta: R1MeetJobMeta,
+): Promise<Step> {
+  const participantId = job.participant?.id ?? null;
+  if (participantId === null) return r1MeetIgnored('bot_participant');
+  const events = await deps.store.participantEvents(job.recallBotId);
+  const own = await botParticipantOf(deps, job.recallBotId, events, meta);
+  if ('result' in own) return own.result;
+  if (own.id === participantId) return r1MeetIgnored('bot_participant');
+  return humanPresent(deps, job, booking, meta, { events, botParticipantId: own.id });
+}
+
 async function currentBotEvent(
   deps: R1MeetFlowDeps,
   job: R1MeetRecallEventJob,
@@ -772,7 +949,7 @@ async function currentBotEvent(
     case 'ended':
       return ended(deps, job, booking, meta);
     case 'bot_participant':
-      return r1MeetIgnored('bot_participant');
+      return markedJoin(deps, job, booking, meta);
     case 'participant_left':
       return r1MeetIgnored('participant_left');
   }
@@ -830,8 +1007,12 @@ async function recoverOrEnd(
   const round = booking.roundId === null ? 'closed' : await deps.store.roundStart(booking.roundId, nowMs);
   // Its counted attempts are all used (an earlier attempt counted): the round's result is settled.
   if (round === 'complete') return endCall(deps, booking, COMPLETE, meta, 'completed');
-  // Nobody left to interview: a new attempt would only spend one of the candidate's starts.
-  const humans = countHumans(await deps.store.participantEvents(booking.recallBotId!));
+  // Nobody left to interview: a new attempt would only spend one of the candidate's starts. The bot's
+  // own participant is not somebody (D-S09-6); a Recall failure of that read defers before any write.
+  const events = await deps.store.participantEvents(booking.recallBotId!);
+  const own = await botParticipantOf(deps, booking.recallBotId!, events, meta);
+  if ('result' in own) return own.result;
+  const humans = countHumans(events, own.id);
   if (humans === 0) return endCall(deps, booking, UNCOUNTED('no_show'), meta, 'failed_no_show');
   if (
     round === 'closed'
@@ -918,7 +1099,11 @@ export const r1MeetMultiHumanCheckDefinition: R1MeetJobDefinition<R1MeetMultiHum
     }
     if (!DISPATCHED.has(booking.status) || booking.recallBotId === null) return r1MeetIgnored('not_in_call');
     hotFor(deps, booking);
-    const humans = countHumans(await deps.store.participantEvents(booking.recallBotId));
+    // The bot's own participant is not a human (D-S09-6); a Recall failure of that read defers.
+    const events = await deps.store.participantEvents(booking.recallBotId);
+    const own = await botParticipantOf(deps, booking.recallBotId, events, meta);
+    if ('result' in own) return own.result;
+    const humans = countHumans(events, own.id);
     if (humans <= 1) return r1MeetIgnored('one_human');
     if (deps.config.multiHumanPolicy === 'observe') {
       deps.log.warn({ error_category: 'r1_meet_multi_human_observed' });

@@ -35,6 +35,16 @@
  *    bot is a bot failure too, a 503 defers before the move and a 404 keeps the event's reason;
  *  - a fresh `bot.in_waiting_room` of a live booking's bot alerts once, never on a re-run, never
  *    for a terminal booking, and the status mapping is unchanged.
+ *
+ * M035 S09 T4 (D-S09-6, UNVERIFIED until the live spike S0c), the bot's own participant:
+ *  - `r1MeetBotInCallAtMs` (the oldest `in_call_*` time) and `r1MeetBotParticipantId` (the EARLIEST
+ *    marked join with an id, and only within 15 s of that time, inclusive) as tables;
+ *  - `countHumans` excludes null ids and that one id only: every other id counts, marked or not;
+ *  - through the real client: the bot's own join never arms or counts (H1); a candidate's join is the
+ *    human signal with no recount; a later name-alike is a person (one recount; `end` ends the call,
+ *    `observe` only warns); a lone name-alike after the bot got in arms (H3); a marked join with no
+ *    id is ignored; a Recall failure of the bound defers a marked join, `attempt_ended` and the check
+ *    before any write, and only drops the bound at the human-present recount.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -43,6 +53,7 @@ import { armBridge } from '../lib/r1/meet/arm.js';
 import { ensureBot } from '../lib/r1/meet/bot-flow.js';
 import {
   R1_MEET_ADMISSION_SUB_CODES,
+  R1_MEET_BOT_JOIN_SLACK_MS,
   R1_MEET_EVENT_DEFINITIONS,
   R1_MEET_FATAL_SUB_CODES,
   R1_MEET_SIGN_IN_SUB_CODES,
@@ -50,6 +61,8 @@ import {
   decideBridgeCheck,
   r1MeetAttemptEndedDefinition,
   r1MeetBotAlertFor,
+  r1MeetBotInCallAtMs,
+  r1MeetBotParticipantId,
   r1MeetBridgeCheckDefinition,
   r1MeetMultiHumanCheckDefinition,
   r1MeetPreCallVerdict,
@@ -287,7 +300,7 @@ describe('the definitions', () => {
 
 // ── countHumans ─────────────────────────────────────────────────────────────
 
-describe('countHumans (D-S06-28)', () => {
+describe('countHumans (D-S06-28, M035 S09 D-S09-6)', () => {
   const join = (id: number | null, isBot: boolean | null = null) => ({ type: 'join' as const, participantId: id, isBot });
   const leave = (id: number | null, isBot: boolean | null = null) => ({ type: 'leave' as const, participantId: id, isBot });
 
@@ -302,14 +315,102 @@ describe('countHumans (D-S06-28)', () => {
 
   it('a rejoin (leave, then a NEW id) is one human', () => {
     expect(countHumans([join(2), leave(1), join(1)])).toBe(1);
+    expect(countHumans([join(2), leave(1), join(1)], 7)).toBe(1);
   });
 
-  it('ignores null ids and every id any row marks as a bot', () => {
+  it('ignores null ids, with or without a bot id', () => {
     expect(countHumans([join(null), join(null), join(1)])).toBe(1);
-    expect(countHumans([join(7, true), join(1)])).toBe(1);
-    // The leave is unmarked but the id was a bot's: still not a human.
-    expect(countHumans([join(7, true), leave(7), join(7), join(1)])).toBe(1);
-    expect(countHumans([join(1, false), join(2, false)])).toBe(2);
+    expect(countHumans([join(null, true), leave(null), join(1)], 7)).toBe(1);
+    expect(countHumans([join(null)], null)).toBe(0);
+  });
+
+  it('excludes the bot\'s own participant id and ONLY that one: every other id counts, marked or not', () => {
+    // A mark is evidence for r1MeetBotParticipantId, not a verdict here: only the named id is the bot.
+    expect(countHumans([join(7, true), join(1)], 7)).toBe(1);
+    expect(countHumans([join(7, true), join(1)])).toBe(2);
+    expect(countHumans([join(7, true), join(1)], null)).toBe(2);
+    // A second marked id (a candidate named like the bot) is a person.
+    expect(countHumans([join(7, true), join(8, true), join(1)], 7)).toBe(2);
+    // The bot's own leave and rejoin rows never count either, marked or not.
+    expect(countHumans([join(7, true), leave(7), join(7), join(1)], 7)).toBe(1);
+    // The bot alone; an id that is not in the rows changes nothing.
+    expect(countHumans([join(7, true)], 7)).toBe(0);
+    expect(countHumans([join(1), join(2)], 99)).toBe(2);
+    expect(countHumans([join(1, false), join(2, false)], 1)).toBe(1);
+  });
+});
+
+// ── The bot's own participant: the pure rule (M035 S09 D-S09-6) ────────────
+
+describe('r1MeetBotInCallAtMs (M035 S09 D-S09-6)', () => {
+  const T0 = Date.parse('2030-01-01T10:00:00.000Z');
+  const at = (code: string, when: number | string) => ({ code, createdAt: typeof when === 'string' ? when : iso(when) });
+
+  const cases: ReadonlyArray<readonly [label: string, changes: ReadonlyArray<{ code: string; createdAt: string }>, expected: number | null]> = [
+    ['no history', [], null],
+    ['ready, joining_call, in_waiting_room only: not in the call', [at('ready', T0), at('joining_call', T0 + SEC), at('in_waiting_room', T0 + 2 * SEC)], null],
+    ['refused at the door: not in the call', [at('joining_call', T0), at('fatal', T0 + SEC), at('done', T0 + 2 * SEC)], null],
+    ['in_call_not_recording', [at('ready', T0), at('joining_call', T0 + SEC), at('in_call_not_recording', T0 + 5 * SEC)], T0 + 5 * SEC],
+    ['in_call_recording alone', [at('ready', T0), at('in_call_recording', T0 + 9 * SEC)], T0 + 9 * SEC],
+    ['the oldest of either in-call code', [at('in_call_not_recording', T0 + 5 * SEC), at('in_call_recording', T0 + MIN)], T0 + 5 * SEC],
+    ['the oldest by time, whatever the array order', [at('in_call_recording', T0 + MIN), at('in_call_not_recording', T0 + 5 * SEC)], T0 + 5 * SEC],
+    ['a later end changes nothing', [at('in_call_not_recording', T0), at('call_ended', T0 + 10 * MIN), at('done', T0 + 11 * MIN)], T0],
+    ['an unreadable time is skipped', [at('in_call_not_recording', 'not a time'), at('in_call_recording', T0 + 30 * SEC)], T0 + 30 * SEC],
+    ['only unreadable in-call times: null', [at('in_call_not_recording', ''), at('in_call_recording', 'nope')], null],
+  ];
+
+  it.each(cases)('%s', (_label, changes, expected) => {
+    expect(r1MeetBotInCallAtMs(changes)).toBe(expected);
+  });
+});
+
+describe('r1MeetBotParticipantId (M035 S09 D-S09-6)', () => {
+  const T0 = Date.parse('2030-01-01T10:00:00.000Z');
+  type Row = { type: 'join' | 'leave'; participantId: number | null; isBot: boolean | null; occurredAt: string | null };
+  const time = (when: number | string | null): string | null => (when === null || typeof when === 'string' ? when : iso(when));
+  /** A join the receiver marked `is_bot`. */
+  const marked = (id: number | null, when: number | string | null): Row => ({ type: 'join', participantId: id, isBot: true, occurredAt: time(when) });
+  const person = (id: number | null, when: number | string | null, isBot: boolean | null = null): Row => ({
+    type: 'join',
+    participantId: id,
+    isBot,
+    occurredAt: time(when),
+  });
+  const markedLeave = (id: number, when: number): Row => ({ type: 'leave', participantId: id, isBot: true, occurredAt: time(when) });
+
+  it('the slack is 15 s', () => {
+    expect(R1_MEET_BOT_JOIN_SLACK_MS).toBe(15_000);
+  });
+
+  const cases: ReadonlyArray<readonly [label: string, rows: readonly Row[], botInCallAtMs: number | null, expected: number | null]> = [
+    ['no rows', [], T0, null],
+    ['no rows, no bound', [], null, null],
+    ['no marked join (unmarked, or Recall said false)', [person(1, T0), person(2, T0, false)], T0, null],
+    ['no marked join, no bound', [person(1, T0)], null, null],
+    ['the one marked join, at the in-call time', [marked(7, T0)], T0, 7],
+    ['the earliest marked join wins (rows newest first, as the store answers)', [marked(9, T0 + 5 * SEC), marked(8, T0 + 3 * SEC), person(1, T0 + SEC)], T0, 8],
+    ['equal times: the smallest id', [marked(9, T0), marked(4, T0), marked(6, T0)], T0, 4],
+    ['the bound is inclusive at +15 000 ms', [marked(7, T0 + 15_000)], T0, 7],
+    ['one ms past the bound: a person, not the bot', [marked(7, T0 + 15_001)], T0, null],
+    ['stamped before the in-call time: the bot', [marked(7, T0 - 30 * SEC)], T0, 7],
+    ['no bound (not in the call yet, or unknown): the earliest marked join, however late', [marked(9, T0 + 10 * MIN), marked(8, T0 + 5 * MIN)], null, 8],
+    ['a null time sorts last', [marked(3, null), marked(9, T0 + 2 * SEC)], T0, 9],
+    ['a null time sorts last with no bound too', [marked(3, null), marked(9, T0 + 2 * SEC)], null, 9],
+    ['only null times, with a bound: never the bot', [marked(3, null), marked(2, null)], T0, null],
+    ['only null times, no bound: the smallest id', [marked(5, null), marked(3, null)], null, 3],
+    ['an unreadable time sorts last, like null', [marked(3, 'not a time'), marked(9, T0 + 2 * SEC)], T0, 9],
+    ['an unreadable time alone, with a bound: never the bot', [marked(3, 'not a time')], T0, null],
+    ['a marked join with a null id is never chosen', [marked(null, T0 - SEC), marked(7, T0 + SEC)], T0, 7],
+    ['only marked joins with null ids: null', [marked(null, T0)], null, null],
+    ['a marked leave is never chosen', [markedLeave(5, T0 - SEC), marked(7, T0 + SEC)], T0, 7],
+    ['only a marked leave: null', [markedLeave(5, T0)], null, null],
+    ['the earliest marked join missed the bound: null, never the next one', [marked(8, T0 + MIN), marked(7, T0 + 20 * SEC)], T0, null],
+    ['the earliest missed the bound, a later one has no time: still null', [marked(7, T0 + 20 * SEC), marked(8, null)], T0, null],
+    ['a later name-alike never displaces the bot', [marked(8, T0 + 2 * MIN), person(1, T0 + MIN), marked(7, T0)], T0, 7],
+  ];
+
+  it.each(cases)('%s', (_label, rows, botInCallAtMs, expected) => {
+    expect(r1MeetBotParticipantId(rows, botInCallAtMs)).toBe(expected);
   });
 });
 
@@ -1360,6 +1461,258 @@ describe('multiple humans (D-S06-28)', () => {
     expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', recall_bot_id: b.botId });
     expect(await check(h, b, h.meta({ attempts: 2 }))).toEqual(done('processed', 'released_ended'));
     expect(h.db.booking(b.id)).toMatchObject({ recall_bot_id: null });
+  });
+});
+
+// ── The bot's own participant is never a human (M035 S09 D-S09-6) ──────────
+
+describe('the bot\'s own participant is never a human (M035 S09 D-S09-6, UNVERIFIED until S0c)', () => {
+  /** Participant ids: the bot's own join, the candidate, a candidate named like the bot. */
+  const BOT = 50;
+  const CANDIDATE = 1;
+  const NAME_ALIKE = 51;
+  /** A join the receiver marked `is_bot` (Recall said so, or the display name was the bot's own). */
+  const marked = (id: number | null): Delivery => ({ participantId: id, isBot: true });
+  const checkPayload = (b: Booked) => ({ kind: 'multi_human_check', booking_id: b.id, version: 0 });
+  const check = (h: R1MeetHarness, b: Booked, meta?: R1MeetJobMeta) =>
+    runJob(h, r1MeetMultiHumanCheckDefinition, checkPayload(b), meta ?? h.meta());
+
+  /** A `bot_joining` booking whose bot Recall reports in the call from now (T0). */
+  async function inCall(h: R1MeetHarness): Promise<Booked> {
+    const b = await booked(h, 'bot_joining');
+    h.recall.setStatus(b.botId, 'in_call_not_recording');
+    return b;
+  }
+
+  it('H1: the bot\'s own join (marked, at its in-call time) is ignored; the candidate\'s join arms, with no recount', async () => {
+    const h = world();
+    const b = await inCall(h);
+    expect(await deliver(h, b, 'participant_events.join', marked(BOT))).toEqual(done('ignored', 'bot_participant'));
+    // One GET for the bound; nothing moves, nothing is armed or shown.
+    expect(steps(h)).toEqual(['recall:get']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', reason: 'eligible', ticket_arms: 0 });
+    expect(outputMedia(h)).toHaveLength(0);
+
+    h.advance(60 * SEC);
+    reset(h);
+    expect(await deliver(h, b, 'participant_events.join', { participantId: CANDIDATE })).toEqual(done('processed', 'armed'));
+    // The recount reads the bound (the bot's row is marked), then the normal arm.
+    expect(steps(h)).toEqual([
+      'db:transition:human_present',
+      'recall:get',
+      'recall:get',
+      'db:arm_ticket',
+      'queue:bridge_check',
+      'recall:output_media',
+    ]);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', ticket_arms: 1 });
+    expect(outputMedia(h)).toHaveLength(1);
+    expect(h.db.jobs('multi_human_check')).toEqual([]);
+    expect(h.alerts()).toEqual([]);
+    expectNoPii(h, lastTicket(h), digestOf(lastTicket(h)));
+  });
+
+  it('the candidate already present, then the bot\'s own join 2 s after it got in: ignored, no recount', async () => {
+    const h = world();
+    const b = await inCall(h);
+    expect(await deliver(h, b, 'participant_events.join', { participantId: CANDIDATE })).toEqual(done('processed', 'armed'));
+    const ticket = lastTicket(h);
+    h.advance(2 * SEC);
+    reset(h);
+    expect(await deliver(h, b, 'participant_events.join', marked(BOT))).toEqual(done('ignored', 'bot_participant'));
+    expect(steps(h)).toEqual(['recall:get']);
+    expect(h.db.jobs('multi_human_check')).toEqual([]);
+    expect(outputMedia(h)).toHaveLength(0);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', ticket_arms: 1 });
+    expect(h.alerts()).toEqual([]);
+    expectNoPii(h, ticket, digestOf(ticket));
+  });
+
+  /** H1, then the candidate at +60 s, then a second marked join (a candidate named like the bot) at +120 s. */
+  async function nameAlikeCall(h: R1MeetHarness): Promise<Booked> {
+    const b = await inCall(h);
+    expect(await deliver(h, b, 'participant_events.join', marked(BOT))).toEqual(done('ignored', 'bot_participant'));
+    h.advance(60 * SEC);
+    expect(await deliver(h, b, 'participant_events.join', { participantId: CANDIDATE })).toEqual(done('processed', 'armed'));
+    expect(h.db.jobs('multi_human_check')).toEqual([]);
+    h.advance(60 * SEC);
+    reset(h);
+    // Not the bot's own: the earliest marked join (the bot's) already took that place.
+    expect(await deliver(h, b, 'participant_events.join', marked(NAME_ALIKE))).toEqual(done('ignored', 'already_present'));
+    expect(steps(h)).toEqual(['recall:get', 'queue:multi_human_check']);
+    expect(h.db.jobs('multi_human_check')).toEqual([
+      expect.objectContaining({ payload: checkPayload(b), scheduled_at: iso(h.now() + 120 * SEC) }),
+    ]);
+    expect(outputMedia(h)).toHaveLength(0);
+    return b;
+  }
+
+  it('a later name-alike is a person: ONE recount; at the check, policy end ends the call failed/multiple_humans', async () => {
+    const h = world();
+    const b = await nameAlikeCall(h);
+    expectNoPii(h);
+    h.advance(120 * SEC);
+    reset(h);
+    expect(await check(h, b)).toEqual(done('processed', 'multiple_humans'));
+    // The bound's GET, then the leave (its own GET first), then the mark.
+    expect(steps(h)).toEqual(['recall:get', 'recall:get', 'recall:leave', 'db:transition:failed', 'db:set_bot:release']);
+    expect(h.alerts()).toEqual(['r1_meet_multiple_humans']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'multiple_humans', recall_bot_id: null });
+    expectNoPii(h);
+  });
+
+  it('a later name-alike, policy observe (the default): only the warning, the call goes on', async () => {
+    const h = world({ config: { multiHumanPolicy: 'observe' } });
+    const b = await nameAlikeCall(h);
+    h.advance(120 * SEC);
+    reset(h);
+    expect(await check(h, b)).toEqual(done('ignored', 'observed'));
+    // The bound's GET logs its own info line; the flow itself only warns.
+    expect(h.logs.filter((line) => line.level !== 'info')).toEqual([
+      { level: 'warn', meta: { error_category: 'r1_meet_multi_human_observed' } },
+    ]);
+    expect(recallOps(h)).toEqual(['get']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', recall_bot_id: b.botId });
+    expectNoPii(h);
+  });
+
+  it('H3: no join row of the bot; a lone name-alike 120 s after the bot got in is the human signal and arms', async () => {
+    const h = world();
+    const b = await inCall(h);
+    h.advance(120 * SEC);
+    expect(await deliver(h, b, 'participant_events.join', marked(NAME_ALIKE))).toEqual(done('processed', 'armed'));
+    // The bound's GET first (Recall first), then the normal arm; the recount reuses the rows read.
+    expect(steps(h)).toEqual([
+      'recall:get',
+      'db:transition:human_present',
+      'recall:get',
+      'db:arm_ticket',
+      'queue:bridge_check',
+      'recall:output_media',
+    ]);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', ticket_arms: 1 });
+    expect(outputMedia(h)).toHaveLength(1);
+    expect(h.db.jobs('multi_human_check')).toEqual([]);
+    expectNoPii(h, lastTicket(h), digestOf(lastTicket(h)));
+  });
+
+  it('the same lone marked join before the bot is in the call (no bound): the bot\'s own, ignored', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    h.advance(120 * SEC);
+    expect(await deliver(h, b, 'participant_events.join', marked(NAME_ALIKE))).toEqual(done('ignored', 'bot_participant'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', ticket_arms: 0 });
+    // A real person is still seen through bot.in_call_recording.
+    expect(await deliver(h, b, 'bot.in_call_recording')).toEqual(done('processed', 'armed'));
+  });
+
+  it('a marked join with a null id: ignored, no Recall call, no arm', async () => {
+    const h = world();
+    const b = await inCall(h);
+    h.advance(120 * SEC);
+    expect(await deliver(h, b, 'participant_events.join', marked(null))).toEqual(done('ignored', 'bot_participant'));
+    expect(h.requests).toEqual([]);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', ticket_arms: 0 });
+    expect(h.db.jobs('multi_human_check')).toEqual([]);
+  });
+
+  it('Recall down at the bound of a marked join: deferred before any write; the re-run decides', async () => {
+    const h = world();
+    const b = await inCall(h);
+    h.advance(120 * SEC);
+    const payload = event(h, b, 'participant_events.join', marked(NAME_ALIKE));
+    h.intercept('get', { status: 503 });
+    expect(await run(h, payload)).toMatchObject({ outcome: 'defer', code: 'r1_meet_recall_unavailable' });
+    expect(steps(h)).toEqual(['recall:get']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', reason: 'eligible', ticket_arms: 0 });
+    expect(h.alerts()).toEqual([]);
+    // Past the deferral bound: thrown, still before any write.
+    h.intercept('get', 'network');
+    await expect(run(h, payload, h.meta({ deferCount: 30, deferredAt: iso(h.now()) }))).rejects.toThrow('r1_meet_recall_network');
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', ticket_arms: 0 });
+    // Recall answers: a mark 120 s after the bot got in is a person.
+    expect(await run(h, payload, h.meta({ deferCount: 1, deferredAt: iso(h.now()) }))).toEqual(done('processed', 'armed'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', ticket_arms: 1 });
+  });
+
+  it('Recall no longer knows the bot (404 at the bound): no bound, so the earliest marked join is the bot\'s', async () => {
+    const h = world();
+    const b = await inCall(h);
+    h.advance(120 * SEC);
+    h.intercept('get', { status: 404 });
+    expect(await deliver(h, b, 'participant_events.join', marked(NAME_ALIKE))).toEqual(done('ignored', 'bot_participant'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', ticket_arms: 0 });
+    expect(h.alerts()).toEqual([]);
+  });
+
+  it('Recall down at the recount of a candidate\'s join: no throw, the arm still happens, the count had no bound', async () => {
+    /** The bot in the call at T0, a marked join durable at T0+60 s (not run), the candidate at T0+60 s. */
+    const setUp = async (h: R1MeetHarness) => {
+      const b = await inCall(h);
+      h.advance(60 * SEC);
+      event(h, b, 'participant_events.join', marked(NAME_ALIKE));
+      return { b, candidate: event(h, b, 'participant_events.join', { participantId: CANDIDATE }) };
+    };
+    const h = world();
+    const { b, candidate } = await setUp(h);
+    h.intercept('get', { status: 503 });
+    expect(await run(h, candidate)).toEqual(done('processed', 'armed'));
+    expect(steps(h)).toEqual([
+      'db:transition:human_present',
+      'recall:get',
+      'recall:get',
+      'db:arm_ticket',
+      'queue:bridge_check',
+      'recall:output_media',
+    ]);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', ticket_arms: 1 });
+    // No bound: the earliest marked join counted as the bot's, so one human and no recount.
+    expect(h.db.jobs('multi_human_check')).toEqual([]);
+    expect(h.alerts()).toEqual([]);
+
+    // The same call with Recall up: the mark came 60 s after the bot got in, so two people, one recount.
+    const up = world();
+    const other = await setUp(up);
+    expect(await run(up, other.candidate)).toEqual(done('processed', 'armed'));
+    expect(up.db.jobs('multi_human_check')).toHaveLength(1);
+  });
+
+  it('attempt_ended: the bot\'s own join and a candidate who left: nobody to interview, failed/no_show (not a re-arm)', async () => {
+    const h = world();
+    // In the call from T0 (`in_call_recording`), an attempt bound, then failed and not counted.
+    const b = await booked(h, 'in_call_session', { sessionStatus: 'failed' });
+    h.db.addAttempt({ session_id: b.sessionId!, round_id: b.roundId, outcome: 'provider_error', counted: false });
+    event(h, b, 'participant_events.join', marked(BOT));
+    event(h, b, 'participant_events.join', { participantId: CANDIDATE });
+    event(h, b, 'participant_events.leave', { participantId: CANDIDATE });
+    const payload = { kind: 'attempt_ended', booking_id: b.id, session_id: b.sessionId };
+
+    // Recall down at the bound: deferred before any write.
+    h.intercept('get', { status: 503 });
+    expect(await runJob(h, r1MeetAttemptEndedDefinition, payload)).toMatchObject({ outcome: 'defer', code: 'r1_meet_recall_unavailable' });
+    expect(steps(h)).toEqual(['recall:get']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'in_call', recall_bot_id: b.botId, ticket_arms: 1 });
+
+    reset(h);
+    expect(await runJob(h, r1MeetAttemptEndedDefinition, payload, h.meta({ deferCount: 1, deferredAt: iso(h.now()) }))).toEqual(
+      done('processed', 'failed_no_show'),
+    );
+    expect(steps(h)).toEqual(['recall:get', 'recall:get', 'recall:leave', 'db:transition:failed', 'db:set_bot:release']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'no_show', recall_bot_id: null, ticket_arms: 1 });
+  });
+
+  it('multi_human_check: the bot\'s own join and one candidate is one human; Recall down there defers', async () => {
+    const h = world();
+    const b = await inCall(h);
+    expect(await deliver(h, b, 'participant_events.join', marked(BOT))).toEqual(done('ignored', 'bot_participant'));
+    expect(await deliver(h, b, 'participant_events.join', { participantId: CANDIDATE })).toEqual(done('processed', 'armed'));
+    reset(h);
+    expect(await check(h, b)).toEqual(done('ignored', 'one_human'));
+    expect(steps(h)).toEqual(['recall:get']);
+    h.intercept('get', { status: 503 });
+    expect(await check(h, b)).toMatchObject({ outcome: 'defer', code: 'r1_meet_recall_unavailable' });
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', recall_bot_id: b.botId });
+    expect(h.alerts()).toEqual([]);
   });
 });
 
