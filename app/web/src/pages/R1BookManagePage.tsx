@@ -18,6 +18,8 @@ import {
 } from '../lib/r1/r1-book-api';
 import {
   R1_BOOK_GRID_MIN_AGE_MS,
+  R1_BOOK_UNSTAMPED,
+  bookStamp,
   findBookSlot,
   firstOpenDay,
   formatBookSlot,
@@ -25,6 +27,7 @@ import {
   r1BookClock,
   validateConsentOnly,
   type BookConsentErrors,
+  type R1BookStamp,
 } from '../lib/r1/r1-book';
 import { captureManageToken } from '../lib/r1/r1-book-link';
 
@@ -52,8 +55,10 @@ import { captureManageToken } from '../lib/r1/r1-book-link';
  *     modal) with an unticked "also withdraw" box; `withdraw_consent` is exactly that box.
  *     `cancelled` and `already_cancelled` read the same.
  *   - Move (D-S07-M5, D-S07-M6, D-S07-M18). The picker never offers the booking's own time. Before
- *     a move the page reads again a grid older than 25 minutes and does not post a time that grid
- *     no longer offers; it never posts a grid younger than 3.5 s (one wait, never a loop).
+ *     a move the page reads again a grid older than 25 minutes (the larger age of its monotonic
+ *     and wall clocks: a phone's monotonic clock may pause in sleep) and does not post a time
+ *     that grid no longer offers; it never posts a grid younger than 3.5 s by the monotonic clock
+ *     (one wait, never a loop).
  *   - Errors are the closed words of `classifyBookFailure`: `not_found` reads as "no longer
  *     active", 503 `booking_disabled` as "online changes are not available", a refused move or
  *     cancel as "no longer possible". A change the server may have made (a dropped request, a
@@ -62,7 +67,8 @@ import { captureManageToken } from '../lib/r1/r1-book-link';
  *   - Nothing about the person is shown or kept: the server sends no name, email address or Meet
  *     link, and the page never stores anything, never writes the URL beyond the one strip and
  *     never logs. Every button is `type="button"`; there is no form to submit natively.
- *   - Copy: every string is a constant of r1-book-copy.ts.
+ *   - Copy: every string is a constant of r1-book-copy.ts, the tab title included (WCAG 2.4.2;
+ *     the previous title comes back when the page unmounts).
  */
 
 type ManageTemplate = Awaited<ReturnType<typeof r1BookApi.consentTemplate>>;
@@ -157,8 +163,8 @@ export function R1BookManagePage() {
   const slotsSeqRef = useRef(0);
   const viewRef = useRef<R1BookManageView | null>(null);
   const gridRef = useRef<R1BookGrid | null>(null);
-  /** `r1BookClock.now()` when the shown grid was received (D-S07-M5). */
-  const gridReceivedAtRef = useRef(0);
+  /** Both clocks when the shown grid was received (D-S07-M5). */
+  const gridReceivedAtRef = useRef<R1BookStamp>(R1_BOOK_UNSTAMPED);
   const busyRef = useRef(false);
   const summaryRef = useRef<HTMLDivElement>(null);
 
@@ -190,7 +196,7 @@ export function R1BookManagePage() {
 
   const receiveGrid = (next: R1BookGrid | null): void => {
     gridRef.current = next;
-    if (next) gridReceivedAtRef.current = r1BookClock.now();
+    if (next) gridReceivedAtRef.current = bookStamp();
     setGrid(next);
   };
 
@@ -296,6 +302,15 @@ export function R1BookManagePage() {
     };
   }, []);
 
+  // The tab names this page, not the recruiter tool (WCAG 2.4.2); leaving puts the old one back.
+  useEffect(() => {
+    const previous = document.title;
+    document.title = R1_BOOK_MANAGE_COPY.pageTitle;
+    return () => {
+      document.title = previous;
+    };
+  }, []);
+
   useEffect(() => {
     if (startedRef.current) return;
     startedRef.current = true;
@@ -374,7 +389,7 @@ export function R1BookManagePage() {
     setSlotNotice(null);
 
     // 1. A grid older than 25 minutes is read again first, then checked.
-    let decision = gridDecision(gridReceivedAtRef.current, r1BookClock.now());
+    let decision = gridDecision(gridReceivedAtRef.current, bookStamp());
     if (decision.action === 'reload') {
       let fresh: R1BookGrid;
       try {
@@ -393,7 +408,7 @@ export function R1BookManagePage() {
         showMoveSlotTaken(fresh);
         return;
       }
-      decision = gridDecision(gridReceivedAtRef.current, r1BookClock.now());
+      decision = gridDecision(gridReceivedAtRef.current, bookStamp());
     }
 
     // 2. Never a grid younger than 3.5 s: one wait for the remainder.

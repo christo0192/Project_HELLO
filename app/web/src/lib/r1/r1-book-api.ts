@@ -28,9 +28,9 @@
  *     fatal, so an additive server field is not an outage.
  *   - Closed error words, per route (D-S07-M3). `classifyBookFailure` tells apart only the
  *     `(status, word)` pairs a route declares in `R1_BOOK_CONTRACT`. Any other answer (a 429 from
- *     the `/api/r1` limiter, a 401 while the route is not deployed, an unknown word, a known word
- *     on the wrong status or route) reads as `unavailable`. Only 503 `booking_disabled` reads as
- *     "not open".
+ *     the `/api/r1` limiter, an unknown word, a known word on the wrong status or route) reads as
+ *     `unavailable`. 503 `booking_disabled` reads as "not open", and so does any 401: every
+ *     booking route is public, so a 401 only means the API does not serve it yet (before S06).
  *   - Uncertain outcomes (D-S07-M4). For the four POST actions a dropped request (status 0), a
  *     500, 502 or 504, or a malformed 2xx is `uncertain`: the server may have done it. For the
  *     two GETs these are `unavailable`.
@@ -419,7 +419,10 @@ export function parseManage(data: unknown): R1BookManageView {
     end_at: span.end_at,
     can_move: requireBoolean(body.can_move),
     can_cancel: requireBoolean(body.can_cancel),
-    moves_left: requireInteger(body.moves_left, 0, MAX_MOVES_LEFT),
+    // A display hint only. §4.1 #5 computes it as `max_moves - move_count` (both 0..10) without a
+    // floor, so a lowered R1_MEET_PUBLIC_MAX_MOVES can make it negative: read that as 0 rather
+    // than refuse the whole answer (and with it the cancel and the consent withdrawal).
+    moves_left: Math.max(0, requireInteger(body.moves_left, -MAX_MOVES_LEFT, MAX_MOVES_LEFT)),
     consent_current: requireBoolean(body.consent_current),
   };
 }
@@ -462,6 +465,9 @@ export function classifyBookFailure(route: R1BookRouteName, error: unknown): R1B
   const contract = R1_BOOK_CONTRACT[route];
   const unsure: R1BookFailure = contract.method === 'POST' ? 'uncertain' : 'unavailable';
   if (!(error instanceof ApiError)) return unsure;
+  // Every booking route is public (`security: []`): a 401 means the API does not serve it as a
+  // public route yet, so booking has not opened. Nothing was done; there is nothing to retry.
+  if (error.status === 401) return 'disabled';
   if (error.message === 'r1_malformed_response' || UNSURE_STATUSES.includes(error.status)) {
     return unsure;
   }

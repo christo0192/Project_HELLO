@@ -142,7 +142,11 @@ function deferred<T>(): Deferred<T> {
 // ── Helpers ─────────────────────────────────────────────────────────────────────────────────
 
 let nowSpy: MockInstance<() => number>;
+let wallSpy: MockInstance<() => number>;
 let sleepSpy: MockInstance<(ms: number) => Promise<void>>;
+
+/** The wall clock the tests start from (the monotonic clock starts at 100 000). */
+const WALL_MS = 1_700_000_000_000;
 
 function renderPage(strict = false) {
   window.history.replaceState(null, '', '/book');
@@ -202,6 +206,7 @@ beforeEach(() => {
   h.slots.mockResolvedValue(GRID);
   h.book.mockResolvedValue(BOOKED);
   nowSpy = vi.spyOn(r1BookClock, 'now').mockReturnValue(100_000);
+  wallSpy = vi.spyOn(r1BookClock, 'wallNow').mockReturnValue(WALL_MS);
   sleepSpy = vi.spyOn(r1BookClock, 'sleep').mockResolvedValue(undefined);
 });
 
@@ -262,9 +267,20 @@ describe('R1BookPage loading', () => {
   });
 
   it.each([
+    ['the notice', 'consentTemplate'],
+    ['the grid', 'slots'],
+  ] as const)('shows "not open yet" when %s answers 401 (the routes are not served yet), and never posts', async (_, route) => {
+    h[route].mockRejectedValue(new R1ApiError('unauthorized', 401));
+    renderPage();
+    expect(await findH1(R1_BOOK_COPY.states.notOpen.title)).toHaveFocus();
+    expect(screen.queryByRole('button')).toBeNull();
+    expect(screen.queryByText(R1_BOOK_COPY.states.unavailable.title)).toBeNull();
+    expect(h.book).not.toHaveBeenCalled();
+  });
+
+  it.each([
     ['temporarily_unavailable', unavailableError],
     ['a dropped request', networkError],
-    ['a 401 while the route is not deployed', () => new R1ApiError('unauthorized', 401)],
     ['a 429 from the limiter', () => new R1ApiError('rate_limited', 429)],
     ['a malformed answer', () => new ApiError('r1_malformed_response', 500)],
   ])('shows "temporarily unavailable" for %s, and "Try again" reads both again', async (_, error) => {
@@ -460,6 +476,70 @@ describe('R1BookPage booking', () => {
     expect(submissions()[0].website).toBe('filled by a bot');
   });
 
+  it('never puts a filled honeypot back when the form comes back, so an autofill cannot trap a person', async () => {
+    const user = setupUser();
+    h.book.mockRejectedValueOnce(new R1ApiError('not_found', 404));
+    await openAndFill(user);
+    // An identity autofill (or a password manager) filled the hidden field.
+    fireEvent.change(field('r1-book-website'), { target: { value: 'https://example.test' } });
+    await user.click(submitButton());
+    await findH1(R1_BOOK_COPY.states.notFound.title);
+    expect(submissions()[0].website).toBe('https://example.test');
+
+    await user.click(screen.getByRole('button', { name: R1_BOOK_COPY.states.notFound.action }));
+    await findForm();
+    expect(field('r1-book-website').value).toBe('');
+    await user.click(submitButton());
+    await findH1(R1_BOOK_COPY.states.booked.title);
+    expect(submissions()[1].website).toBe('');
+  });
+
+  it('asks password managers to leave the honeypot alone', async () => {
+    renderPage();
+    await findForm();
+    const trap = field('r1-book-website');
+    expect(trap).toHaveAttribute('data-1p-ignore', 'true');
+    expect(trap).toHaveAttribute('data-lpignore', 'true');
+    expect(trap).toHaveAttribute('data-bwignore', 'true');
+  });
+
+  it('keeps the typed details read-only while a booking is on its way, so they match what was sent', async () => {
+    const user = setupUser();
+    const pending = deferred<typeof BOOKED>();
+    h.book.mockReturnValueOnce(pending.promise);
+    await openAndFill(user);
+    await user.click(submitButton());
+    await waitFor(() => expect(h.book).toHaveBeenCalledTimes(1));
+    for (const input of [nameInput(), emailInput(), phoneInput()]) {
+      expect(input).toHaveAttribute('readonly');
+      expect(input).not.toBeDisabled();
+    }
+    await user.type(emailInput(), 'x');
+    fireEvent.change(nameInput(), { target: { value: 'Someone Else' } });
+    expect(emailInput().value).toBe(EMAIL);
+    expect(nameInput().value).toBe(NAME);
+    await act(async () => {
+      pending.resolve(BOOKED);
+    });
+    await findH1(R1_BOOK_COPY.states.booked.title);
+    expect(submissions()[0].email).toBe(EMAIL);
+  });
+
+  it('makes the typed details editable again once the answer is in', async () => {
+    const user = setupUser();
+    h.book.mockRejectedValueOnce(new R1ApiError('not_found', 404));
+    await openAndFill(user);
+    await user.click(submitButton());
+    await findH1(R1_BOOK_COPY.states.notFound.title);
+    await user.click(screen.getByRole('button', { name: R1_BOOK_COPY.states.notFound.action }));
+    await findForm();
+    for (const input of [nameInput(), emailInput(), phoneInput()]) {
+      expect(input).not.toHaveAttribute('readonly');
+    }
+    await user.type(emailInput(), 'x');
+    expect(emailInput().value).toBe(`${EMAIL}x`);
+  });
+
   it('ignores a second submit while the first is on its way', async () => {
     const user = setupUser();
     const pending = deferred<typeof BOOKED>();
@@ -484,6 +564,7 @@ describe('R1BookPage booking', () => {
 
 describe('R1BookPage request_id', () => {
   const retryTitle = R1_BOOK_COPY.states.retry.title;
+  const uncertainTitle = R1_BOOK_COPY.states.uncertain.title;
   const tryAgain = () => screen.getByRole('button', { name: R1_BOOK_COPY.states.retry.action });
 
   it('mints a new id after a definite refusal (503 temporarily_unavailable)', async () => {
@@ -492,6 +573,7 @@ describe('R1BookPage request_id', () => {
     await openAndFill(user);
     await user.click(submitButton());
     expect(await findH1(retryTitle)).toHaveFocus();
+    expect(screen.queryByText(uncertainTitle)).toBeNull();
     await user.click(tryAgain());
     await findH1(R1_BOOK_COPY.states.booked.title);
     const [first, second] = submissions();
@@ -500,12 +582,25 @@ describe('R1BookPage request_id', () => {
     expect(second.request_id).not.toBe(first.request_id);
   });
 
+  it('never says a booking failed when it may have gone through: a dropped request is "not confirmed"', async () => {
+    const user = setupUser();
+    h.book.mockRejectedValueOnce(networkError());
+    await openAndFill(user);
+    await user.click(submitButton());
+    expect(await findH1(uncertainTitle)).toHaveFocus();
+    expect(screen.getByText(R1_BOOK_COPY.states.uncertain.body)).toBeVisible();
+    expect(screen.queryByText(retryTitle)).toBeNull();
+    expect(screen.queryByText(R1_BOOK_COPY.states.retry.body)).toBeNull();
+    expect(tryAgain()).toBeEnabled();
+    expect(screen.getByRole('button', { name: R1_BOOK_COPY.states.uncertain.back })).toBeEnabled();
+  });
+
   it('reuses the id to retry the same details after a dropped request', async () => {
     const user = setupUser();
     h.book.mockRejectedValueOnce(networkError());
     await openAndFill(user);
     await user.click(submitButton());
-    await findH1(retryTitle);
+    await findH1(uncertainTitle);
     await user.click(tryAgain());
     await findH1(R1_BOOK_COPY.states.booked.title);
     const [first, second] = submissions();
@@ -518,8 +613,8 @@ describe('R1BookPage request_id', () => {
     h.book.mockRejectedValueOnce(networkError());
     await openAndFill(user);
     await user.click(submitButton());
-    await findH1(retryTitle);
-    await user.click(screen.getByRole('button', { name: R1_BOOK_COPY.states.retry.back }));
+    await findH1(uncertainTitle);
+    await user.click(screen.getByRole('button', { name: R1_BOOK_COPY.states.uncertain.back }));
     expect(await findForm()).toBeInTheDocument();
     expect(nameInput()).toHaveFocus();
     expect(nameInput().value).toBe(NAME);
@@ -537,7 +632,7 @@ describe('R1BookPage request_id', () => {
     h.book.mockImplementationOnce(async () => parseBooked({ status: 'ok' }));
     await openAndFill(user);
     await user.click(submitButton());
-    await findH1(retryTitle);
+    await findH1(uncertainTitle);
     await user.click(tryAgain());
     await findH1(R1_BOOK_COPY.states.booked.title);
     const [first, second] = submissions();
@@ -553,7 +648,7 @@ describe('R1BookPage request_id', () => {
     h.book.mockRejectedValueOnce(error());
     await openAndFill(user);
     await user.click(submitButton());
-    await findH1(retryTitle);
+    await findH1(uncertainTitle);
     await user.click(tryAgain());
     await findH1(R1_BOOK_COPY.states.booked.title);
     const [first, second] = submissions();
@@ -570,6 +665,57 @@ describe('R1BookPage request_id', () => {
     await findH1(R1_BOOK_COPY.states.booked.title);
     const [first, second] = submissions();
     expect(second.request_id).not.toBe(first.request_id);
+  });
+
+  // §6 order: the throttles (step 5) and the /api/r1 limiter answer BEFORE the replay check
+  // (step 6), so such an answer to a replay says nothing about the first attempt. Its id must
+  // survive, or the next retry could never reach the replay of a booking that was made.
+  it.each([
+    ['503 temporarily_unavailable', unavailableError],
+    ['a 429 from the limiter', () => new R1ApiError('rate_limited', 429)],
+    ['an unknown word', () => new R1ApiError('http_418', 418)],
+  ])('keeps the id of an unconfirmed booking when its retry is refused with %s', async (_, error) => {
+    const user = setupUser();
+    h.book.mockRejectedValueOnce(networkError()).mockRejectedValueOnce(error());
+    await openAndFill(user);
+    await user.click(submitButton());
+    await findH1(uncertainTitle);
+
+    await user.click(tryAgain());
+    await waitFor(() => expect(h.book).toHaveBeenCalledTimes(2));
+    // Still not confirmed: the first attempt may have booked.
+    const again = await screen.findByRole('button', { name: R1_BOOK_COPY.states.uncertain.action });
+    expect(screen.getByRole('heading', { level: 1, name: uncertainTitle })).toHaveFocus();
+    expect(screen.queryByText(retryTitle)).toBeNull();
+
+    await user.click(again);
+    await findH1(R1_BOOK_COPY.states.booked.title);
+    const [first, second, third] = submissions();
+    expect(second.request_id).toBe(first.request_id);
+    expect(third.request_id).toBe(first.request_id);
+    expect(third).toEqual(first);
+  });
+
+  it('keeps the id of an unconfirmed booking when the grid read before its retry fails', async () => {
+    const user = setupUser();
+    nowSpy.mockReturnValue(0);
+    h.book.mockRejectedValueOnce(networkError());
+    h.slots.mockResolvedValueOnce(GRID).mockRejectedValueOnce(unavailableError());
+    await openAndFill(user);
+    await user.click(submitButton());
+    await findH1(uncertainTitle);
+
+    nowSpy.mockReturnValue(26 * 60_000);
+    await user.click(tryAgain());
+    await waitFor(() => expect(h.slots).toHaveBeenCalledTimes(2));
+    const again = await screen.findByRole('button', { name: R1_BOOK_COPY.states.uncertain.action });
+    expect(screen.getByRole('heading', { level: 1, name: uncertainTitle })).toBeInTheDocument();
+    expect(h.book).toHaveBeenCalledTimes(1);
+
+    await user.click(again);
+    await findH1(R1_BOOK_COPY.states.booked.title);
+    const [first, second] = submissions();
+    expect(second.request_id).toBe(first.request_id);
   });
 });
 
@@ -593,6 +739,33 @@ describe('R1BookPage grid age', () => {
     // The new grid is brand new: one wait for its minimum age, then the booking.
     expect(sleepSpy).toHaveBeenCalledTimes(1);
     expect(sleepSpy).toHaveBeenCalledWith(3_500);
+  });
+
+  it('reads the grid again after the phone slept: the wall clock moved 40 minutes, the monotonic one did not', async () => {
+    const user = setupUser();
+    const fresh = makeGrid({ token: gridToken(1, 'h') });
+    h.slots.mockResolvedValueOnce(GRID).mockResolvedValueOnce(fresh);
+    await openAndFill(user);
+    // `performance.now()` may pause while a device sleeps; the server's 30-minute token limit
+    // runs on its wall clock, so the page must not trust the monotonic clock alone.
+    wallSpy.mockReturnValue(WALL_MS + 40 * 60_000);
+    await user.click(submitButton());
+    await findH1(R1_BOOK_COPY.states.booked.title);
+    expect(h.slots).toHaveBeenCalledTimes(2);
+    expect(h.slots.mock.invocationCallOrder[1]).toBeLessThan(h.book.mock.invocationCallOrder[0]);
+    expect(submissions()[0].grid_token).toBe(fresh.grid_token);
+  });
+
+  it('never makes a grid younger when the wall clock is set back', async () => {
+    const user = setupUser();
+    nowSpy.mockReturnValue(0);
+    await openAndFill(user);
+    nowSpy.mockReturnValue(1_000);
+    wallSpy.mockReturnValue(WALL_MS - 60 * 60_000);
+    await user.click(submitButton());
+    await findH1(R1_BOOK_COPY.states.booked.title);
+    expect(sleepSpy).toHaveBeenCalledWith(2_500);
+    expect(h.slots).toHaveBeenCalledTimes(1);
   });
 
   it('does not post when the reloaded grid no longer offers the chosen time', async () => {
@@ -620,9 +793,9 @@ describe('R1BookPage grid age', () => {
     h.book.mockRejectedValueOnce(networkError());
     await openAndFill(user);
     await user.click(submitButton());
-    await findH1(R1_BOOK_COPY.states.retry.title);
+    await findH1(R1_BOOK_COPY.states.uncertain.title);
     nowSpy.mockReturnValue(STALE_MS);
-    await user.click(screen.getByRole('button', { name: R1_BOOK_COPY.states.retry.action }));
+    await user.click(screen.getByRole('button', { name: R1_BOOK_COPY.states.uncertain.action }));
     await findH1(R1_BOOK_COPY.states.booked.title);
     expect(h.slots).toHaveBeenCalledTimes(2);
     expect(h.book).toHaveBeenCalledTimes(2);
@@ -846,7 +1019,7 @@ describe('R1BookPage privacy and access', () => {
       expect(time).toBeChecked();
 
       await user.tab();
-      expect(screen.getByRole('region', { name: 'Full notice' })).toHaveFocus();
+      expect(screen.getByRole('region', { name: R1_BOOK_COPY.form.noticeRegionLabel })).toHaveFocus();
       for (const type of TEMPLATE.required_consents) {
         await user.tab();
         expect(field(`r1-book-consent-${type}`)).toHaveFocus();
@@ -877,6 +1050,15 @@ describe('R1BookPage privacy and access', () => {
     view.unmount();
     expect(document.head.querySelector('meta[name="referrer"]')).toBeNull();
   });
+
+  it('names the browser tab after the page (WCAG 2.4.2), and puts the old title back on leaving', async () => {
+    document.title = 'HELLO — Talent Workspace & Mission Control';
+    const view = renderPage(true);
+    await findForm();
+    expect(document.title).toBe(R1_BOOK_COPY.pageTitle);
+    view.unmount();
+    expect(document.title).toBe('HELLO — Talent Workspace & Mission Control');
+  });
 });
 
 // ── 20: axe ────────────────────────────────────────────────────────────────────────────────
@@ -905,7 +1087,8 @@ describe('R1BookPage accessibility', () => {
       () => h.book.mockRejectedValue(new R1ApiError('already_booked', 409)),
       R1_BOOK_COPY.states.alreadyBooked.title,
     ],
-    ['retry', () => h.book.mockRejectedValue(networkError()), R1_BOOK_COPY.states.retry.title],
+    ['retry', () => h.book.mockRejectedValue(unavailableError()), R1_BOOK_COPY.states.retry.title],
+    ['not confirmed', () => h.book.mockRejectedValue(networkError()), R1_BOOK_COPY.states.uncertain.title],
   ])('passes axe on the %s card', async (_, arrange, title) => {
     const user = setupUser();
     arrange();

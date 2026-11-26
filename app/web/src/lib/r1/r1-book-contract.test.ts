@@ -414,7 +414,7 @@ function documentsPublic(operation: string[]): boolean {
 /**
  * The seven booking routes the web calls before the server documents them (M035 S06 serves them
  * behind R1_MEET_PUBLIC_BOOKING_ENABLED). The pages are dark without them: today the API answers
- * them 401, which the pages show as "temporarily unavailable".
+ * them 401, which the pages show as "not open yet".
  */
 const BOOK_PENDING: ReadonlySet<R1BookRouteName> = new Set<R1BookRouteName>([
   'consentTemplate',

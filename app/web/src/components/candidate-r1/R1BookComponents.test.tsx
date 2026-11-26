@@ -199,7 +199,7 @@ describe('R1BookNotice', () => {
     expect(
       screen.getByRole('heading', { level: 2, name: 'Notice and consent for your AI interview' }),
     ).toBeVisible();
-    const region = screen.getByRole('region', { name: 'Full notice' });
+    const region = screen.getByRole('region', { name: R1_BOOK_COPY.form.noticeRegionLabel });
     expect(region).toHaveAttribute('tabindex', '0');
     // The notice's own sections sit one level below its title.
     expect(within(region).getAllByRole('heading', { level: 3 }).map((node) => node.textContent)).toEqual([
@@ -219,7 +219,7 @@ describe('R1BookNotice', () => {
   it('drops a level when it sits inside a panel with its own heading', () => {
     render(<NoticeHarness headingLevel={3} />);
     expect(screen.getByRole('heading', { level: 3, name: TEMPLATE.title })).toBeVisible();
-    const region = screen.getByRole('region', { name: 'Full notice' });
+    const region = screen.getByRole('region', { name: R1_BOOK_COPY.form.noticeRegionLabel });
     expect(within(region).getAllByRole('heading', { level: 4 })).toHaveLength(2);
   });
 

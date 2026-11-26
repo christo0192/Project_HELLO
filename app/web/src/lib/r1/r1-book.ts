@@ -2,9 +2,10 @@
  * The pure booking rules of the public `/book` and `/book/manage` pages (M035 S07). No React, no
  * network: the pages call these, and the tests pin them.
  *
- *   - Grid age (D-S07-M5). The page keeps the monotonic time it RECEIVED the grid (`r1BookClock`).
- *     Before a book or move it reloads a grid older than 25 minutes (the server accepts a grid
- *     token for 30), and it never posts a grid younger than 3.5 s: it waits ONCE for the
+ *   - Grid age (D-S07-M5). The page keeps the time it RECEIVED the grid on both of its clocks
+ *     (`bookStamp`) and takes the larger age of the two (a monotonic clock may pause while a phone
+ *     sleeps). Before a book or move it reloads a grid older than 25 minutes (the server accepts
+ *     a grid token for 30), and it never posts a grid younger than 3.5 s: it waits ONCE for the
  *     remainder (the server answers `not_found` to a token younger than 3 s, and the browser's
  *     age of a grid is always below the server's). One sleep, never a loop.
  *   - `request_id` (D-S07-M7). A new UUID v4 for every submit attempt, EXCEPT the resubmit of an
@@ -27,29 +28,57 @@ export const R1_BOOK_GRID_MAX_AGE_MS = 25 * 60_000;
 export const R1_BOOK_GRID_MIN_AGE_MS = 3_500;
 
 /**
- * The page's clock: a monotonic `now` and a one-shot `sleep`. A mutable object so tests can
- * `vi.spyOn` it (and so the e2e frozen `Date` never matters: this reads `performance.now`).
+ * The page's clocks and its one-shot `sleep`. A mutable object so tests can `vi.spyOn` it.
+ *   - `now`: monotonic (`performance.now`), immune to a wall clock that is set back. But it may
+ *     PAUSE while the device sleeps (Chromium and WebKit on macOS and iOS, Android deep sleep).
+ *   - `wallNow`: the wall clock (`Date.now`), which keeps counting through sleep, as the server's
+ *     30-minute `grid_token` limit does. The e2e harness freezes it, which only reads as age 0.
  */
 export const r1BookClock = {
   now: (): number => performance.now(),
+  wallNow: (): number => Date.now(),
   sleep: (ms: number): Promise<void> =>
     new Promise<void>((resolve) => {
       window.setTimeout(resolve, ms);
     }),
 };
 
+/** One reading of both clocks (`r1BookClock`): when a grid was received, or now. */
+export interface R1BookStamp {
+  mono: number;
+  wall: number;
+}
+
+/** Read both clocks now. */
+export function bookStamp(): R1BookStamp {
+  return { mono: r1BookClock.now(), wall: r1BookClock.wallNow() };
+}
+
+/** A stamp for "no grid yet": any decision against it reloads. */
+export const R1_BOOK_UNSTAMPED: Readonly<R1BookStamp> = Object.freeze({
+  mono: Number.NaN,
+  wall: Number.NaN,
+});
+
 export type R1BookGridDecision = { action: 'reload' } | { action: 'send'; waitMs: number };
 
 /**
- * What to do with the grid received at `receivedAtMs` before posting at `nowMs`. A negative age
- * (a clock that went backwards) reads as 0; an unreadable one reloads.
+ * What to do with the grid received at `received` before posting at `now`. Each limit reads the
+ * clock that errs on its safe side:
+ *   - Too old: the LARGER age of the two clocks. The monotonic clock alone under-counts a phone
+ *     that slept (the page would post a token the server has already expired and tell the person
+ *     their time "was just taken"); the wall clock alone could be set back. A wall clock set
+ *     forward only costs one extra grid read.
+ *   - Too young: the monotonic age alone. It never runs ahead of real time, so a wall clock that
+ *     jumped forward can never skip the wait (a token younger than 3 s is a `not_found`).
+ * A negative age reads as 0; an unreadable one reloads.
  */
-export function gridDecision(receivedAtMs: number, nowMs: number): R1BookGridDecision {
-  const raw = nowMs - receivedAtMs;
-  if (!Number.isFinite(raw)) return { action: 'reload' };
-  const age = Math.max(0, raw);
-  if (age > R1_BOOK_GRID_MAX_AGE_MS) return { action: 'reload' };
-  return { action: 'send', waitMs: Math.max(0, R1_BOOK_GRID_MIN_AGE_MS - age) };
+export function gridDecision(received: R1BookStamp, now: R1BookStamp): R1BookGridDecision {
+  const monoAge = now.mono - received.mono;
+  const oldest = Math.max(monoAge, now.wall - received.wall);
+  if (!Number.isFinite(oldest)) return { action: 'reload' };
+  if (Math.max(0, oldest) > R1_BOOK_GRID_MAX_AGE_MS) return { action: 'reload' };
+  return { action: 'send', waitMs: Math.max(0, R1_BOOK_GRID_MIN_AGE_MS - Math.max(0, monoAge)) };
 }
 
 // ── request_id ────────────────────────────────────────────────────────────────────────────────

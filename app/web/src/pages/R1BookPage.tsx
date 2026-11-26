@@ -16,7 +16,9 @@ import {
 } from '../lib/r1/r1-book-api';
 import {
   R1_BOOK_GRID_MIN_AGE_MS,
+  R1_BOOK_UNSTAMPED,
   bookAttemptKey,
+  bookStamp,
   chooseRequestId,
   findBookSlot,
   firstOpenDay,
@@ -28,6 +30,7 @@ import {
   type BookAttemptMemo,
   type BookField,
   type BookFieldErrors,
+  type R1BookStamp,
 } from '../lib/r1/r1-book';
 
 /**
@@ -41,20 +44,30 @@ import {
  *     nothing else; a POST is sent only when a person submits. 503 `booking_disabled` from any
  *     call shows "Booking is not open yet"; every other refusal is told apart only as the closed
  *     words of `classifyBookFailure` (D-S07-M3, D-S07-M4).
- *   - Grid age (D-S07-M5). The page keeps the monotonic time it RECEIVED the grid
- *     (`r1BookClock`). Before a book it reloads a grid older than 25 minutes, then waits ONCE for
- *     the rest of 3.5 s if the grid is younger than that. One sleep, never a loop.
+ *   - Grid age (D-S07-M5). The page keeps the time it RECEIVED the grid on both clocks
+ *     (`bookStamp`). Before a book it reloads a grid older than 25 minutes by the larger of the two
+ *     ages (a phone's monotonic clock may pause in sleep), then waits ONCE for the rest of 3.5 s
+ *     by the monotonic age. One sleep, never a loop.
  *   - Slot check after a reload (D-S07-M6). When the reloaded grid no longer offers the chosen
  *     time, the page says so and does not post, EXCEPT for the retry of an uncertain attempt,
  *     which must be allowed to reach the server's replay by `request_id`.
  *   - `request_id` (D-S07-M7). A new UUID v4 per submit attempt; the same one only to retry the
- *     same attempt (same details, time, notice and trap) after an uncertain outcome.
+ *     same attempt (same details, time, notice and trap) after an uncertain outcome. An answer
+ *     that comes BEFORE the server's replay check (§6 steps 1-5: a throttle's 503, the limiter's
+ *     429, any other undeclared answer) says nothing about the first attempt, so a replay refused
+ *     that way stays uncertain and keeps its id; so does a replay whose grid read fails.
+ *   - Uncertain is not failed. An outcome the server may have acted on shows "We could not
+ *     confirm your booking" (the invite may be on its way), never "could not complete".
+ *   - Typed fields are read-only while a booking is on its way, so what the page shows after the
+ *     answer is what was sent.
  *   - Exactly what is sent (D-S07-M8). `slot_start` is the grid's `start_at` byte for byte;
  *     name, email and phone are trimmed only; the consents are the template's
  *     `required_consents` in template order with `in_india: true`; `website` is the honeypot's
  *     value (`''` for people); `grid_token` is the token of the grid that was shown.
  *   - Honeypot (D-S07-M9). An off-screen, aria-hidden text input named `website`, out of the Tab
- *     order. It is the only typed input with a `name`, and its value is read from the DOM.
+ *     order. It is the only typed input with a `name`, and its value is read from the DOM. It
+ *     always mounts empty (an autofill that filled it once must not trap the person on every
+ *     later submit) and asks password managers to leave it alone.
  *   - A native submit can never leak (D-S07-M10). `noValidate`, `method="post"`, and the
  *     handler's first statement is `preventDefault`; the typed fields have autocomplete tokens
  *     but no `name`, so nothing typed can ever reach a URL query.
@@ -70,7 +83,8 @@ import {
  *     address on the application.
  *   - Fully booked (D-S07-M20). `fully_booked`, or a grid with no `available` slot, shows the
  *     "All interview times are taken" card. The page never computes availability.
- *   - Copy (D-S07-M22). Every string is a constant of r1-book-copy.ts.
+ *   - Copy (D-S07-M22). Every string is a constant of r1-book-copy.ts, the tab title included
+ *     (WCAG 2.4.2; the previous title comes back when the page unmounts).
  */
 
 type BookTemplate = Awaited<ReturnType<typeof r1BookApi.consentTemplate>>;
@@ -100,7 +114,10 @@ type StageBody =
   | { name: 'form' }
   | { name: 'done'; kind: 'booked'; startAt: string; endAt: string }
   | { name: 'done'; kind: 'already_booked' | 'not_found' | 'not_open' }
-  | { name: 'retry' };
+  /** A definite refusal: nothing was booked. */
+  | { name: 'retry' }
+  /** The server may have booked: "Try again" replays the same attempt. */
+  | { name: 'uncertain' };
 
 /** `seq` keys each result card, so every new result mounts its own card and focuses its heading. */
 type Stage = StageBody & { seq: number };
@@ -139,7 +156,10 @@ export function R1BookPage() {
   const [grid, setGrid] = useState<R1BookGrid | null>(null);
   const [day, setDay] = useState<string | null>(null);
   const [values, setValues] = useState<BookValues>(EMPTY_VALUES);
-  /** The honeypot's value at the last submit: restored if the form mounts again, sent on a retry. */
+  /**
+   * The honeypot's value at the last submit, sent again only by the retry card's "Try again" (the
+   * same attempt). The field itself always mounts empty.
+   */
   const [trapValue, setTrapValue] = useState('');
   const [fieldErrors, setFieldErrors] = useState<BookFieldErrors>({});
   const [serverInvalid, setServerInvalid] = useState(false);
@@ -156,8 +176,8 @@ export function R1BookPage() {
   const loadSeqRef = useRef(0);
   const stageSeqRef = useRef(0);
   const focusSeqRef = useRef(0);
-  /** `r1BookClock.now()` when the shown grid was received (D-S07-M5). */
-  const gridReceivedAtRef = useRef(0);
+  /** Both clocks when the shown grid was received (D-S07-M5). */
+  const gridReceivedAtRef = useRef<R1BookStamp>(R1_BOOK_UNSTAMPED);
   const templateVersionRef = useRef<string | null>(null);
   /** The previous submit attempt (D-S07-M7). */
   const memoRef = useRef<BookAttemptMemo | null>(null);
@@ -191,7 +211,7 @@ export function R1BookPage() {
   };
 
   const receiveGrid = (next: R1BookGrid): void => {
-    gridReceivedAtRef.current = r1BookClock.now();
+    gridReceivedAtRef.current = bookStamp();
     setGrid(next);
   };
 
@@ -251,6 +271,15 @@ export function R1BookPage() {
     };
   }, []);
 
+  // The tab names this page, not the recruiter tool (WCAG 2.4.2); leaving puts the old one back.
+  useEffect(() => {
+    const previous = document.title;
+    document.title = R1_BOOK_COPY.pageTitle;
+    return () => {
+      document.title = previous;
+    };
+  }, []);
+
   useEffect(() => {
     if (startedRef.current) return;
     startedRef.current = true;
@@ -275,20 +304,33 @@ export function R1BookPage() {
     requestFocus(SLOT_FIRST_ID);
   };
 
-  /** What a refused or failed `POST /api/r1/book` leads to. */
+  /**
+   * What a refused or failed `POST /api/r1/book` leads to. `replay` is true when this attempt
+   * retried an uncertain one under its `request_id`.
+   */
   const onBookFailure = async (
     failure: R1BookFailure,
     attempt: { key: string; requestId: string },
+    replay: boolean,
   ): Promise<void> => {
     const definite: BookAttemptMemo = { ...attempt, uncertain: false };
     switch (failure) {
       case 'uncertain':
         memoRef.current = { ...attempt, uncertain: true };
         setLive('');
-        show({ name: 'retry' });
+        show({ name: 'uncertain' });
         return;
       case 'unavailable':
       case 'not_allowed':
+        // These answers come before the server's replay check (§6 steps 1-5: a throttle's 503,
+        // the limiter's 429, any undeclared answer), so for a replay they say nothing about the
+        // first attempt: it stays uncertain and keeps its id for the next "Try again".
+        if (replay) {
+          memoRef.current = { ...attempt, uncertain: true };
+          setLive('');
+          show({ name: 'uncertain' });
+          return;
+        }
         memoRef.current = definite;
         setLive('');
         show({ name: 'retry' });
@@ -402,21 +444,22 @@ export function R1BookPage() {
     try {
       // 1. A grid older than 25 minutes is read again first (D-S07-M5), then checked (D-S07-M6).
       let gridToSend = shownGrid;
-      let decision = gridDecision(gridReceivedAtRef.current, r1BookClock.now());
+      let decision = gridDecision(gridReceivedAtRef.current, bookStamp());
       if (decision.action === 'reload') {
         let fresh: R1BookGrid;
         try {
           fresh = await r1BookApi.slots();
         } catch (error) {
           if (!mountedRef.current) return;
-          // Nothing was posted. A replay keeps its memo, so its next retry still uses its id.
+          // Nothing was posted. A replay keeps its memo, so its next retry still uses its id, and
+          // its first attempt is still unconfirmed.
           if (!replay) memoRef.current = { key, requestId, uncertain: false };
           setLive('');
-          show(
-            classifyBookFailure('slots', error) === 'disabled'
-              ? { name: 'done', kind: 'not_open' }
-              : { name: 'retry' },
-          );
+          if (classifyBookFailure('slots', error) === 'disabled') {
+            show({ name: 'done', kind: 'not_open' });
+          } else {
+            show({ name: replay ? 'uncertain' : 'retry' });
+          }
           return;
         }
         if (!mountedRef.current) return;
@@ -428,7 +471,7 @@ export function R1BookPage() {
           showSlotTaken(fresh);
           return;
         }
-        decision = gridDecision(gridReceivedAtRef.current, r1BookClock.now());
+        decision = gridDecision(gridReceivedAtRef.current, bookStamp());
       }
 
       // 2. Never a grid younger than 3.5 s: one wait for the remainder.
@@ -457,7 +500,7 @@ export function R1BookPage() {
         });
       } catch (error) {
         if (!mountedRef.current) return;
-        await onBookFailure(classifyBookFailure('book', error), { key, requestId });
+        await onBookFailure(classifyBookFailure('book', error), { key, requestId }, replay);
         return;
       }
       if (!mountedRef.current) return;
@@ -483,6 +526,8 @@ export function R1BookPage() {
   };
 
   const setText = (field: 'name' | 'email' | 'phone', value: string): void => {
+    // Read-only while a booking is on its way: the form must keep showing what was sent.
+    if (submittingRef.current) return;
     setValues((current) => ({ ...current, [field]: value }));
   };
 
@@ -547,6 +592,7 @@ export function R1BookPage() {
                 type="text"
                 autoComplete="name"
                 value={values.name}
+                readOnly={submitting}
                 aria-invalid={nameError ? true : undefined}
                 aria-describedby={describedBy(nameError !== null && `${NAME_ID}-error`)}
                 onChange={(event) => setText('name', event.target.value)}
@@ -569,6 +615,7 @@ export function R1BookPage() {
                 autoComplete="email"
                 spellCheck={false}
                 value={values.email}
+                readOnly={submitting}
                 aria-invalid={emailError ? true : undefined}
                 aria-describedby={describedBy(
                   `${EMAIL_ID}-hint`,
@@ -597,6 +644,7 @@ export function R1BookPage() {
                 inputMode="tel"
                 autoComplete="tel"
                 value={values.phone}
+                readOnly={submitting}
                 aria-invalid={phoneError ? true : undefined}
                 aria-describedby={describedBy(
                   `${PHONE_ID}-hint`,
@@ -670,7 +718,10 @@ export function R1BookPage() {
               type="text"
               tabIndex={-1}
               autoComplete="off"
-              defaultValue={trapValue}
+              data-1p-ignore="true"
+              data-lpignore="true"
+              data-bwignore="true"
+              defaultValue=""
             />
           </div>
 
@@ -785,13 +836,13 @@ export function R1BookPage() {
         />
       )}
 
-      {stage.name === 'retry' && (
+      {(stage.name === 'retry' || stage.name === 'uncertain') && (
         <R1BookStatusCard
           key={cardKey}
-          id="r1-book-retry-title"
-          eyebrow={states.retry.eyebrow}
-          title={states.retry.title}
-          body={[states.retry.body]}
+          id={`r1-book-${stage.name}-title`}
+          eyebrow={states[stage.name].eyebrow}
+          title={states[stage.name].title}
+          body={[states[stage.name].body]}
         >
           <Button
             type="button"
@@ -799,10 +850,10 @@ export function R1BookPage() {
             loading={submitting}
             onClick={() => void submit('retry')}
           >
-            {states.retry.action}
+            {states[stage.name].action}
           </Button>
           <button type="button" className="r1-secondary-cta" disabled={submitting} onClick={backToForm}>
-            {states.retry.back}
+            {states[stage.name].back}
           </button>
         </R1BookStatusCard>
       )}

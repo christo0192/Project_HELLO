@@ -31,6 +31,7 @@ const ALL: Array<[string, string]> = [
 /** Proper nouns that keep their capitals inside a sentence. Longest first. */
 const PROPER_NOUNS = [
   "Interview Kickstart's",
+  'Interview Kickstart',
   'India Standard Time',
   'Google Meet',
   "Dex's",
@@ -179,6 +180,35 @@ describe('the public booking copy', () => {
     expect(R1_BOOK_MANAGE_COPY.inactive.title).toBe('This link is no longer active');
     expect(R1_BOOK_MANAGE_COPY.notAllowed.body).toMatch(/too close to the start/);
     expect(R1_BOOK_MANAGE_COPY.notAllowed.body).toMatch(/change limit has been reached/);
+  });
+
+  it('names each page in the browser tab, never with the recruiter tool name', () => {
+    expect(R1_BOOK_COPY.pageTitle).toBe('Book your interview with Dex · Interview Kickstart');
+    expect(R1_BOOK_MANAGE_COPY.pageTitle).toBe('Manage your interview with Dex · Interview Kickstart');
+    for (const title of [R1_BOOK_COPY.pageTitle, R1_BOOK_MANAGE_COPY.pageTitle]) {
+      expect(title).not.toMatch(/hello|talent workspace|mission control/i);
+    }
+  });
+
+  it('names the notice region from the copy, not from a component', () => {
+    expect(R1_BOOK_COPY.form.noticeRegionLabel).toBe('Full notice');
+  });
+
+  it('never says a booking failed when it may have gone through', () => {
+    const { uncertain, retry } = R1_BOOK_COPY.states;
+    // A dropped request or a gateway error: the server may have booked and sent the invite.
+    expect(uncertain.title).toBe('We could not confirm your booking');
+    expect(uncertain.body).toBe(
+      'Your interview may already be booked. Check for an invite from Dex at the email address on '
+        + 'your application before you try again.',
+    );
+    for (const [path, text] of strings(uncertain, 'uncertain')) {
+      expect(text, path).not.toMatch(/could not complete|failed|not booked/i);
+    }
+    expect(uncertain.action).toBe(retry.action);
+    expect(uncertain.back).toBe(retry.back);
+    // The definite refusal keeps its own card.
+    expect(retry.title).toBe('We could not complete your booking');
   });
 
   it('counts the moves left in words that read right for one and for more', () => {

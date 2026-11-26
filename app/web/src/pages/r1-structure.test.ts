@@ -474,6 +474,30 @@ describe('the public booking pages', () => {
     }
   });
 
+  it('takes every word a person sees or hears from r1-book-copy.ts, attributes included', () => {
+    // Copy rule (D-S07-M22): a wording review reads one file. A literal accessible name, title,
+    // placeholder or alt in a component would be announced by a screen reader yet missed there.
+    const UI_FILES = BOOK_FILES.filter((file) => file.endsWith('.tsx'));
+    expect(UI_FILES.length).toBeGreaterThan(0);
+    for (const file of UI_FILES) {
+      const literal = codeOf(file).match(
+        /\s(?:aria-label|aria-description|aria-roledescription|aria-valuetext|title|placeholder|alt)=["'][^"']*["']/g,
+      );
+      expect(literal, `${file} has a literal attribute string`).toBeNull();
+    }
+  });
+
+  it('names each page in the browser tab from its copy, and puts the old title back on leaving', () => {
+    for (const [file, constant] of [
+      [BOOK_PAGE, 'R1_BOOK_COPY.pageTitle'],
+      [MANAGE_PAGE, 'R1_BOOK_MANAGE_COPY.pageTitle'],
+    ] as const) {
+      const page = codeOf(file);
+      expect(page, file).toContain(`document.title = ${constant};`);
+      expect(page.split('document.title =').length - 1, `${file} sets the title once and restores it`).toBe(2);
+    }
+  });
+
   it('never touches the address bar, web storage or cookies', () => {
     const page = codeOf(BOOK_PAGE);
     expect(page).not.toMatch(/\bhistory\b/);

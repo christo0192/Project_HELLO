@@ -12,6 +12,7 @@ import type { R1BookGrid } from './r1-book-api';
 import {
   BOOK_REQUEST_ID_RE,
   bookAttemptKey,
+  bookStamp,
   chooseRequestId,
   findBookSlot,
   firstOpenDay,
@@ -26,6 +27,7 @@ import {
   validateConsentOnly,
   type BookAttemptInput,
   type BookFormValues,
+  type R1BookStamp,
 } from './r1-book';
 
 /**
@@ -64,18 +66,59 @@ describe('grid age', () => {
     expect(R1_BOOK_GRID_MIN_AGE_MS).toBe(3_500);
   });
 
+  /** Both clocks moved by the same amount: the usual case. */
+  const both = (ms: number): R1BookStamp => ({ mono: ms, wall: 1_700_000_000_000 + ms });
+
   it.each([
-    ['age 0', 10_000, 10_000, { action: 'send', waitMs: 3_500 }],
-    ['age 1 s', 10_000, 11_000, { action: 'send', waitMs: 2_500 }],
-    ['age 3.5 s', 10_000, 13_500, { action: 'send', waitMs: 0 }],
-    ['age 5 s', 10_000, 15_000, { action: 'send', waitMs: 0 }],
-    ['age 25 min', 10_000, 10_000 + 25 * 60_000, { action: 'send', waitMs: 0 }],
-    ['age 25 min + 1 ms', 10_000, 10_001 + 25 * 60_000, { action: 'reload' }],
-    ['age 2 h', 0, 2 * 60 * 60_000, { action: 'reload' }],
-    ['a negative age (read as 0)', 10_000, 9_000, { action: 'send', waitMs: 3_500 }],
-    ['an unreadable age', Number.NaN, 10_000, { action: 'reload' }],
-  ])('%s', (_name, receivedAt, now, expected) => {
-    expect(gridDecision(receivedAt, now)).toEqual(expected);
+    ['age 0', both(10_000), both(10_000), { action: 'send', waitMs: 3_500 }],
+    ['age 1 s', both(10_000), both(11_000), { action: 'send', waitMs: 2_500 }],
+    ['age 3.5 s', both(10_000), both(13_500), { action: 'send', waitMs: 0 }],
+    ['age 5 s', both(10_000), both(15_000), { action: 'send', waitMs: 0 }],
+    ['age 25 min', both(10_000), both(10_000 + 25 * 60_000), { action: 'send', waitMs: 0 }],
+    ['age 25 min + 1 ms', both(10_000), both(10_001 + 25 * 60_000), { action: 'reload' }],
+    ['age 2 h', both(0), both(2 * 60 * 60_000), { action: 'reload' }],
+    ['a negative age (read as 0)', both(10_000), both(9_000), { action: 'send', waitMs: 3_500 }],
+    ['an unreadable age', both(Number.NaN), both(10_000), { action: 'reload' }],
+    ['an unreadable wall clock', { mono: 10_000, wall: Number.NaN }, both(10_000), { action: 'reload' }],
+    // A phone that slept: the monotonic clock may pause while the device sleeps (Chromium and
+    // WebKit on macOS and iOS, Android deep sleep). The wall clock did not, so the grid is old.
+    [
+      'a device that slept 40 min (the monotonic clock moved 2 min)',
+      { mono: 10_000, wall: 1_700_000_000_000 },
+      { mono: 10_000 + 2 * 60_000, wall: 1_700_000_000_000 + 40 * 60_000 },
+      { action: 'reload' },
+    ],
+    // The minimum wait reads the monotonic clock alone: a wall clock that jumped forward must
+    // never skip it (a token younger than 3 s is a `not_found`).
+    [
+      'a wall clock that jumped 10 s ahead of a 1 s monotonic age (still waits 2.5 s)',
+      { mono: 10_000, wall: 1_700_000_000_000 },
+      { mono: 11_000, wall: 1_700_000_000_000 + 10_000 },
+      { action: 'send', waitMs: 2_500 },
+    ],
+    // A wall clock set back (or a frozen one, as in the e2e harness) never makes a grid younger
+    // than the monotonic clock says.
+    [
+      'a wall clock set back an hour',
+      { mono: 10_000, wall: 1_700_000_000_000 },
+      { mono: 16_000, wall: 1_700_000_000_000 - 60 * 60_000 },
+      { action: 'send', waitMs: 0 },
+    ],
+    [
+      'a frozen wall clock',
+      { mono: 10_000, wall: 1_700_000_000_000 },
+      { mono: 10_000 + 26 * 60_000, wall: 1_700_000_000_000 },
+      { action: 'reload' },
+    ],
+  ] as const)('%s', (_name, received, now, expected) => {
+    expect(gridDecision(received, now)).toEqual(expected);
+  });
+
+  it('stamps both clocks: the monotonic one and the wall clock', () => {
+    vi.spyOn(performance, 'now').mockReturnValue(1234.5);
+    vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_123);
+    expect(r1BookClock.wallNow()).toBe(1_700_000_000_123);
+    expect(bookStamp()).toEqual({ mono: 1234.5, wall: 1_700_000_000_123 });
   });
 
   it('reads the monotonic clock and sleeps once with a timer', async () => {

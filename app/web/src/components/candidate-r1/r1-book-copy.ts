@@ -44,6 +44,8 @@ const FIELD_ERRORS: Readonly<Record<BookFieldError, string>> = Object.freeze({
 
 /** `/book`: register and book a slot. */
 export const R1_BOOK_COPY = Object.freeze({
+  /** The browser tab (WCAG 2.4.2): never the recruiter tool's title. */
+  pageTitle: 'Book your interview with Dex · Interview Kickstart',
   form: Object.freeze({
     eyebrow: 'Interview booking',
     title: 'Book your interview with Dex',
@@ -65,6 +67,8 @@ export const R1_BOOK_COPY = Object.freeze({
     dayUnavailable: 'No times left',
     currentTime: 'Your current time',
     noTimesOnDay: 'There are no free times on this day. Please pick another day.',
+    /** The accessible name of the scrollable notice text. */
+    noticeRegionLabel: 'Full notice',
     purposesLegend: 'Please agree to each purpose separately',
     indiaLabel: 'I confirm I am located in India.',
     submit: 'Book my interview',
@@ -129,10 +133,25 @@ export const R1_BOOK_COPY = Object.freeze({
         + 'you used when you applied, or reply to the email from the hiring team.',
       action: 'Check my details',
     }),
+    /** A definite refusal: nothing was booked. */
     retry: card({
       eyebrow: 'Temporarily unavailable',
       title: 'We could not complete your booking',
       body: 'Please try again in a minute.',
+      action: 'Try again',
+      back: 'Back to my details',
+    }),
+    /**
+     * An outcome the server may have acted on (a dropped request, a gateway error, a malformed
+     * answer): the booking may be made and Dex's invite on its way, so never say it failed.
+     * "Try again" with the same details replays the first booking instead of making a second.
+     */
+    uncertain: card({
+      eyebrow: 'Interview booking',
+      title: 'We could not confirm your booking',
+      body:
+        'Your interview may already be booked. Check for an invite from Dex at the email address '
+        + 'on your application before you try again.',
       action: 'Try again',
       back: 'Back to my details',
     }),
@@ -141,6 +160,8 @@ export const R1_BOOK_COPY = Object.freeze({
 
 /** `/book/manage`: move, cancel or re-consent from the link in the invite. */
 export const R1_BOOK_MANAGE_COPY = Object.freeze({
+  /** The browser tab (WCAG 2.4.2): never the recruiter tool's title. */
+  pageTitle: 'Manage your interview with Dex · Interview Kickstart',
   loading: 'Loading your interview…',
   inactive: card({
     eyebrow: 'Manage your interview',

@@ -61,7 +61,12 @@ export function R1BookNotice({
     <div className="r1-book__section">
       <Title id={titleId}>{template.title}</Title>
 
-      <div className="r1-notice__body" role="region" aria-label="Full notice" tabIndex={0}>
+      <div
+        className="r1-notice__body"
+        role="region"
+        aria-label={R1_BOOK_COPY.form.noticeRegionLabel}
+        tabIndex={0}
+      >
         {blocks.map((block, index) => {
           if (block.kind === 'heading') return <BlockHeading key={index}>{block.text}</BlockHeading>;
           if (block.kind === 'list') {

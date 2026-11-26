@@ -142,7 +142,11 @@ const networkError = () => new ApiError('network_unreachable', 0);
 // ── Helpers ─────────────────────────────────────────────────────────────────────────────────
 
 let nowSpy: MockInstance<() => number>;
+let wallSpy: MockInstance<() => number>;
 let sleepSpy: MockInstance<(ms: number) => Promise<void>>;
+
+/** The wall clock the tests start from (the monotonic clock starts at 100 000). */
+const WALL_MS = 1_700_000_000_000;
 
 type User = ReturnType<typeof userEvent.setup>;
 
@@ -224,6 +228,7 @@ beforeEach(() => {
   h.cancel.mockResolvedValue('cancelled');
   h.consent.mockResolvedValue('consented');
   nowSpy = vi.spyOn(r1BookClock, 'now').mockReturnValue(100_000);
+  wallSpy = vi.spyOn(r1BookClock, 'wallNow').mockReturnValue(WALL_MS);
   sleepSpy = vi.spyOn(r1BookClock, 'sleep').mockResolvedValue(undefined);
 });
 
@@ -290,6 +295,14 @@ describe('R1BookManagePage token', () => {
 // ── 3: errors of the first read ────────────────────────────────────────────────────────────
 
 describe('R1BookManagePage first read', () => {
+  it('reads a 401 (the routes are not served yet) as "online changes are not available"', async () => {
+    h.manage.mockRejectedValue(new R1ApiError('unauthorized', 401));
+    openPage();
+    expect(await findH1(copy.disabled.title)).toHaveFocus();
+    expect(screen.queryByText(copy.unavailable.title)).toBeNull();
+    expect(screen.queryByRole('button')).toBeNull();
+  });
+
   it('shows loading while the booking is read', async () => {
     let resolve!: (value: R1BookManageView) => void;
     h.manage.mockReturnValue(
@@ -325,7 +338,6 @@ describe('R1BookManagePage first read', () => {
     ['a dropped request', networkError],
     ['a 404 with another word', () => new R1ApiError('http_404', 404)],
     ['a 429 from the limiter', () => new R1ApiError('rate_limited', 429)],
-    ['a 401 while the route is not deployed', () => new R1ApiError('unauthorized', 401)],
     ['a malformed answer', () => new ApiError('r1_malformed_response', 500)],
   ])('reads %s as unavailable, and "Try again" reads the booking again', async (_, error) => {
     const user = setupUser();
@@ -363,6 +375,25 @@ describe('R1BookManagePage view', () => {
     await findView();
     expect(screen.getByText(copy.view.movesLeft(1))).toBeVisible();
     expect(copy.view.movesLeft(1)).toContain('1 more time.');
+  });
+
+  it('still offers a cancel when the server counts the moves left below zero', async () => {
+    // Ops lowered R1_MEET_PUBLIC_MAX_MOVES under a booking that had already moved.
+    h.manage.mockResolvedValue(parseManage({
+      state: 'booked',
+      start_at: CURRENT_START,
+      end_at: CURRENT_END,
+      can_move: false,
+      can_cancel: true,
+      moves_left: -1,
+      consent_current: true,
+    }));
+    openPage();
+    expect(await findView()).toHaveFocus();
+    expect(screen.queryByText(copy.unavailable.title)).toBeNull();
+    expect(queryButton(copy.view.move)).toBeNull();
+    expect(document.getElementById('r1-manage-moves-left')).toBeNull();
+    expect(button(copy.view.cancel)).toBeVisible();
   });
 
   it('hides "Change the time" when the server does not allow a move', async () => {
@@ -461,6 +492,20 @@ describe('R1BookManagePage move', () => {
     await openMovePanel(user);
     h.slots.mockResolvedValue(fresh);
     nowSpy.mockReturnValue(100_000 + 26 * 60_000);
+    await user.click(screen.getByRole('radio', { name: TARGET_LABEL }));
+    await user.click(button(copy.movePanel.confirm));
+    await findH1(copy.moved.title);
+    expect(h.slots).toHaveBeenCalledTimes(2);
+    expect(h.slots.mock.invocationCallOrder[1]).toBeLessThan(h.move.mock.invocationCallOrder[0]);
+    expect(h.move.mock.calls[0]).toEqual([TOKEN, TARGET_START, fresh.grid_token]);
+  });
+
+  it('reads the grid again after the phone slept: the wall clock moved 40 minutes, the monotonic one did not', async () => {
+    const user = setupUser();
+    const fresh = makeGrid({ token: gridToken(1, 'h') });
+    await openMovePanel(user);
+    h.slots.mockResolvedValue(fresh);
+    wallSpy.mockReturnValue(WALL_MS + 40 * 60_000);
     await user.click(screen.getByRole('radio', { name: TARGET_LABEL }));
     await user.click(button(copy.movePanel.confirm));
     await findH1(copy.moved.title);
@@ -829,6 +874,22 @@ describe('R1BookManagePage privacy', () => {
     expect(meta).toHaveAttribute('content', 'no-referrer');
     view.unmount();
     expect(document.head.querySelector('meta[name="referrer"]')).toBeNull();
+  });
+
+  it('names the browser tab after the page (WCAG 2.4.2), and puts the old title back on leaving', async () => {
+    document.title = 'HELLO — Talent Workspace & Mission Control';
+    const view = openPage(`#m=${TOKEN}`, true);
+    await findView();
+    expect(document.title).toBe(copy.pageTitle);
+    view.unmount();
+    expect(document.title).toBe('HELLO — Talent Workspace & Mission Control');
+  });
+
+  it('names the tab even when the link is no longer active', async () => {
+    const view = openPage('');
+    await findH1(copy.inactive.title);
+    expect(document.title).toBe(copy.pageTitle);
+    view.unmount();
   });
 });
 

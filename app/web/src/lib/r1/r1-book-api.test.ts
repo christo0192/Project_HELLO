@@ -486,6 +486,19 @@ describe('parseManage', () => {
     expect(parseManage({ ...MANAGE, moves_left: 10 }).moves_left).toBe(10);
   });
 
+  // `moves_left` is shown only as a hint. Contracts §4.1 #5 does not promise it is non-negative:
+  // `max_moves - move_count` goes below 0 when ops lower R1_MEET_PUBLIC_MAX_MOVES (0..10) under a
+  // booking that already moved (move_count 0..10). That must not make the link unusable.
+  it.each([
+    [-1, 0],
+    [-10, 0],
+  ])('reads moves_left %d as %d, keeping the rest of the booking', (moves, shown) => {
+    const parsed = parseManage({ ...MANAGE, can_move: false, moves_left: moves });
+    expect(parsed.moves_left).toBe(shown);
+    expect(parsed.can_cancel).toBe(MANAGE.can_cancel);
+    expect(parsed.start_at).toBe(MANAGE.start_at);
+  });
+
   it.each(Object.keys(MANAGE))('fails closed without %s', (key) => {
     expectMalformed(() => parseManage(without(MANAGE, key)));
   });
@@ -502,7 +515,7 @@ describe('parseManage', () => {
       expectMalformed(() => parseManage({ ...MANAGE, [key]: 'true' }));
       expectMalformed(() => parseManage({ ...MANAGE, [key]: 1 }));
     }
-    for (const moves of [11, -1, 1.5, '2', null]) {
+    for (const moves of [11, -11, 1.5, -0.5, '2', '-1', null]) {
       expectMalformed(() => parseManage({ ...MANAGE, moves_left: moves }));
     }
     expectMalformed(() => parseManage({ ...MANAGE, start_at: '2026-09-16T09:00:00' }));
@@ -566,11 +579,27 @@ describe('classifyBookFailure', () => {
     expect(classifyBookFailure('book', new R1ApiError('cancel_not_allowed', 409))).toBe('unavailable');
   });
 
-  it('reads a rate limit, an auth refusal, an unknown word or a bare status as unavailable', () => {
+  // §6 makes all seven routes public (`security: []`), so a 401 means the API does not serve them
+  // as public routes yet (S06 not deployed): booking has not opened, whatever the word. Reading it
+  // as "temporarily unavailable" would invite a person to retry a page that cannot work yet.
+  it('reads a 401 on any booking route as not open, whatever its word', () => {
+    const refusals = [
+      new R1ApiError('unauthorized', 401),
+      new R1ApiError('http_401', 401),
+      new R1ApiError('not_found', 401),
+      new ApiError('authentication_error', 401),
+    ];
+    for (const name of NAMES) {
+      for (const error of refusals) {
+        expect(classifyBookFailure(name, error), `${name} ${error.message}`).toBe('disabled');
+      }
+    }
+  });
+
+  it('reads a rate limit, a 403, an unknown word or a bare status as unavailable', () => {
     const refusals = [
       new R1ApiError('rate_limited', 429),
       new R1ApiError('http_429', 429),
-      new R1ApiError('unauthorized', 401),
       new R1ApiError('forbidden', 403),
       new R1ApiError('http_404', 404),
       new R1ApiError('http_503', 503),
