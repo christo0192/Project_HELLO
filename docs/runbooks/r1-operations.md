@@ -3873,12 +3873,29 @@ here for the drain. The vendor is Recall.ai, region ap-northeast-1 (Tokyo).
   the call: while the round has a start left, the claim window is open, an arm is left and a person
   is still in the call, a fresh ticket is armed and posted (the next claim is a new attempt, as a
   browser candidate would restart). Otherwise the bot leaves and the booking is `failed/no_show`
-  (nobody left in the call) or `failed/bot_fatal` (Dex could not go on): HR books again. A move in
-  Ashby releases the bot and creates a new one (never a PATCH); a cancel, or Dex removed, releases it
-  and cancels the booking.
+  (nobody left in the call) or `failed/bot_fatal` (Dex could not go on): HR books again. Before
+  anyone is in the call, a bot that ends is `failed/no_show` only when it was in the call and nobody
+  came. A bot that never got into the call (no `in_call_*` status in its Recall history, read once
+  before the move), or one that Meet refused (held in the waiting room until the timeout, denied,
+  blocked, the meeting not started, a sign-in failure), is `failed/bot_fatal` with an alert: the
+  candidate was not the problem (M035 S09). A move in Ashby releases the bot and creates a new one
+  (never a PATCH); a cancel, or Dex removed, releases it and cancels the booking.
 - **The bot leaves on its own** (Recall `automatic_leave`, profile `r1_dex_sales`): waiting room
   600 s, nobody joined 900 s, everyone left 90 s (the worker's rejoin grace), in the call but not
   recording 900 s, recording 2700 s (45 minutes). These bound the bill of a bot nobody released.
+  Bot detection is explicit (M035 S09). Recall's name heuristic (`notetaker`, `recorder`,
+  `assistant`) is sent only because the field is required, and it activates after 7200 s, later
+  than any stay the timers above allow, so a candidate whose Meet name contains one of those words
+  never makes Dex leave (that Recall accepts 7200 s is a live-spike check). The no-speech heuristic
+  keeps Recall's defaults: from 1200 s (20 minutes) after recording starts, once nobody left in the
+  call has ever spoken or shared a screen, the bot leaves after 600 s; a candidate who speaks is
+  never taken for a bot. No `silence_detection` is sent (its default cannot fire before the
+  45-minute cap).
+- **The AI and recording notice in the Meet chat** (M035 S09): the bot posts and pins it when it
+  joins (`chat.on_bot_join`) and sends it again, to everyone, each time a person joins
+  (`chat.on_participant_join`), so a candidate who joins after the bot sees it even when the pin is
+  hidden (Meet hides a pinned message while continuous chat is on). It is at most 500 characters,
+  Meet's chat limit. Dex also says it aloud.
 - **Logs.** One info line per job, `error_category: r1_meet_job`, `error_type: <kind>:<code>`.
   Alerts are error lines with the closed categories of the alerts table below. Recall calls log
   `r1_meet_recall_ok` / `r1_meet_recall_failed` with the operation, category and HTTP status. No
@@ -3968,7 +3985,7 @@ value out of range makes Meet `invalid`; nothing is clamped.
 | `R1_MEET_ARM_AT_CREATE` | `false` | `true` puts the bridge page in the create body (armed right after the create) instead of posting it when a person joins (critic B2). If no ticket is armed at join time, the normal arm runs anyway. |
 | `R1_MEET_MULTI_HUMAN_POLICY` | `observe` | `observe`: more than one person in the call for 2 minutes is only a `r1_meet_multi_human_observed` warning. `end`: it ends the call (`failed/multiple_humans`). Keep `observe` until the live spike shows that Recall does not report the bot's own join and that HR need not stay to admit the candidate: either would make `end` cut every interview at 2 minutes. |
 | `R1_MEET_GOOGLE_LOGIN_GROUP_ID` | blank | The Recall Google Login Group of the signed-in bot; blank = a guest bot. |
-| `R1_MEET_BOT_NAME` | blank (`Dex`) | The name a guest bot shows; ignored for a signed-in bot. |
+| `R1_MEET_BOT_NAME` | blank (`Dex`) | The name a guest bot shows; ignored for a signed-in bot. It is also the name the own-participant rule recognises (M035 S09): a participant join whose display name equals it (case, width and spacing ignored, compared in memory, never stored) is marked as possibly the bot's own. With a signed-in bot, set it to exactly the Google account's display name, or the bot's own join is not recognised. The name is read when each event arrives: changing it while bots are scheduled leaves their joins unmarked (they then count as people: only an `observe` warning). |
 | `RECALL_BASE_URL` | `https://ap-northeast-1.recall.ai` | The Recall region. |
 
 ### Go-live order
@@ -4084,6 +4101,9 @@ and bill. Drain first, then turn the flag off.
 | `r1_meet_drain_failed` | A drain could not release a bot (`<op>:<category>`), a pass threw, or `passes_exhausted` | Check Recall; insert the drain job again |
 | `r1_meet_malformed_payload` / `r1_meet_unknown_kind` | A job this build cannot read (version skew during a deploy) | Finish the deploy; replay from the DLQ |
 | `r1_meet_job_failed` | A job's final attempt failed; its receipt is `failed` | Read the DLQ `error_message`, fix the cause, replay |
+| `r1_meet_bot_waiting_room` | Dex's bot reported `bot.in_waiting_room` (no `error_type`): the meeting is not OPEN, or nobody has admitted Dex. The booking stays live; the bot waits up to 600 s | Public bookings: fix the Dex unit's Meet settings at once, before more candidates are stranded (access Open, people who are not signed in may join, waiting room off, the host need not join first). Ashby bookings: someone in the meeting must admit Dex |
+| `r1_meet_bot_admission_blocked` | The bot never got in (`error_type` = the Recall sub-code: a waiting-room timeout, `bot_kicked_from_waiting_room`, `meeting_not_started`, `google_meet_bot_blocked`, `google_meet_knocking_disabled`, `google_meet_sign_in_missing_login_credentials`, `google_meet_organisation_restricted`); `failed/bot_fatal`, never a candidate no-show. Once per booking | Fix the Meet settings (as above; a meeting restricted to the organisation, or one that needs a signed-in user, also refuses a guest bot); HR re-books the candidate |
+| `r1_meet_bot_sign_in_failed` | Signed-in mode only (`R1_MEET_GOOGLE_LOGIN_GROUP_ID` set): the bot could not sign in to Google (`error_type` = the Recall sub-code); `failed/bot_fatal`. Once per booking | Check the Recall Google Login Group and its login, the Legacy SSO profile and certificate, and the concurrent sign-in count (30 per account); or unset the login group to go back to the guest bot. HR re-books |
 
 Warnings: `r1_meet_receipt_finish_failed`, `r1_meet_maintenance_had_errors` (`error_type` = the
 failed steps), `r1_meet_attempt_ended_enqueue_failed` (maintenance re-drives it),
@@ -4136,11 +4156,23 @@ that the bot's own join is not counted and HR leaves after admitting the candida
 - **B3.** Who admits the candidate: HR as the organizer, open access, or the signed-in bot as a
   guest.
 - **B10.** The latency Meet, Recall and the SFU add.
-- Whether Recall reports the bot's OWN join as a participant (it would count as a person: keep
-  `observe`), and whether notetaker bots on HR's calendars join (they count as people). The
-  recovery of an attempt that did not count also reads this count: with the bot's own join counted,
-  a candidate who left could be offered one more attempt in an empty call (the bot then leaves 90 s
-  after the last person, and the booking fails).
+- Whether Recall reports the bot's OWN join as a participant, and whether notetaker bots on HR's
+  calendars join (they count as people). The recovery of an attempt that did not count also reads
+  this count: with the bot's own join counted, a candidate who left could be offered one more
+  attempt in an empty call (the bot then leaves 90 s after the last person, and the booking fails).
+  Since M035 S09 the bot's own participant is the earliest join whose display name is the bot's own
+  (or that Recall marks as a bot), and only when it is stamped at most 15 s after the bot's first
+  `in_call_*` status; it is then never counted. **S0c** reads the `r1_meet_multi_human_observed`
+  lines (with the default `observe`) on one-candidate calls to learn which case holds and whether
+  the 15 s bound fits: H1, the join is reported when the bot enters (the rule finds it: no
+  warning); H3, it is never reported (no warning either; the bot's participant list in the Recall
+  dashboard tells H1 and H3 apart); H2, it is reported only when recording starts, later than
+  15 s after the bot's entry (a warning on every such call: widen the bound to the first
+  `in_call_recording`). It also checks that Meet shows the guest bot's name exactly as
+  `R1_MEET_BOT_NAME`.
+- **Late joiner and bot detection (M035 S09).** A candidate who joins after the bot sees the AI
+  and recording notice in the chat (pinned, or re-sent at the join); the first bot create is
+  accepted with `bot_detection.using_participant_names.activate_after` = 7200.
 
 ## R1 over Google Meet: Dex's scorecard as Ashby feedback (M034 S09, dark)
 
