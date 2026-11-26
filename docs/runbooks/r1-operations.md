@@ -4569,6 +4569,49 @@ squash commit: no migration, no data, one blank env name.
 - The Summary's line breaks read well on the Ashby card, and the `Detailed report` link opens the
   R1 review page after a staff sign-in.
 
+### Public-page bookings (M035 S02)
+
+A booking made on the public R1 booking page (`source` `public_page`, M035; none exists until S06 and
+`R1_MEET_PUBLIC_BOOKING_ENABLED`) has no Ashby schedule, so no interview event. Its card is posted
+as GENERAL feedback on the matched application: the same `applicationFeedback.submit` with the same
+form values and the Dex user, but no `interviewEventId` key (`submitGeneral` in `feedback-ashby.ts`;
+an Ashby-scheduled booking still uses the interview-event submit, which refuses a missing event id
+before the network). Every other check above is the same.
+
+- **The duplicate guard.** Ashby makes a NEW card on every general submit, so before EVERY submit of
+  a public booking (every run, not only a retry) the job reads `applicationFeedback.list` for the
+  application: pages of 100 from one hour before the slot start, at most 5 pages. A card by the Dex
+  user (submitter or credited user), submitted at or after the slot start (`start_at`), on the
+  configured form (case ignored) or with no form id, counts as already posted. Ashby-scheduled
+  bookings never call the list.
+- **`already_posted`.** The guard found the card: no submit, the receipt `processed`, one info line
+  `r1_meet_feedback_already_posted`, and the `r1_meet_job` line `scorecard_feedback:already_posted`.
+  This is how a submit whose answer was lost, a re-delivered job and a re-post end without a second
+  card.
+- **List failures never submit.** A 429 defers `feedback_list_rate_limited` (60 s); a 5xx, timeout,
+  network failure or a list the reader cannot read in full (not a list, an entry with no readable
+  user id, a Dex entry with a bad time or form id, a repeated or missing cursor, more than 5 pages)
+  defers `feedback_list_unavailable` (30 s). Past the deferral bound they throw
+  `r1_meet_feedback_list_rate_limited` / `r1_meet_feedback_list_unavailable` (then attempts and the
+  dead-letter queue). A permanent 4xx or `success:false` on the list alerts
+  `r1_meet_feedback_rejected` (`error_type` `<category>[:<Ashby code>]`, `http_status`) and ends
+  `feedback_list_rejected` with the receipt `failed`: fix the cause (403: the key's permissions), then
+  re-post.
+- **The key** also needs `candidatesRead` for `applicationFeedback.list` (already held for
+  `candidate.info`; check it passes this endpoint). The guard reads only four fields of each entry
+  (`submittedByUser.id`, `creditedToUser.id`, `submittedAt`, `feedbackFormDefinitionId`) and keeps
+  two of Dex's (the form id and the time) in memory; it never reads other interviewers' answers,
+  names or emails, and logs nothing of the list.
+- **Re-post.** The SQL above re-posts public cards too: each re-posted job runs the guard first, so a
+  card that did land before the job failed is found (`already_posted`) instead of posted again. Only
+  Dex's cards count: a card HR entered by hand under their own Ashby user does not stop the post.
+- **Live spike (roadmap S11).** A general submit (no `interviewEventId`) with `userId` = the Dex user
+  is accepted from this key and shows as Dex's card on the application; `applicationFeedback.list`
+  answers `results` entries with `submittedByUser.id`, `creditedToUser.id`, `submittedAt` (zoned ISO
+  8601) and `feedbackFormDefinitionId` as the public reference documents, and honours
+  `createdAfter` (epoch ms), `limit` and `cursor`. Until then these fields are UNVERIFIED: an
+  unreadable list only defers, it never posts.
+
 ## R1 public booking: Dex's Google account and OAuth grant (M035 S03, dark)
 
 M035 gives TAs ONE public booking link for R1 with Dex over Google Meet: the candidate fills a form,

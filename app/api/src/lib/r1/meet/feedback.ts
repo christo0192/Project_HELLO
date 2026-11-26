@@ -1,8 +1,10 @@
 /**
  * The `scorecard_feedback` job of the `r1-meet` runtime (M034 S09, dark; D-S09-1, D-S09-4, D-S09-5,
- * D-S09-10, D-S09-11, D-S09-13): post Dex's R1 scorecard of one Meet round to Ashby as the interview's
- * feedback (`applicationFeedback.submit` with the booking's `interviewEventId` and the Dex user), once
- * per booking and assessment.
+ * D-S09-10, D-S09-11, D-S09-13; M035 S02): post Dex's R1 scorecard of one Meet round to Ashby, once per
+ * booking and assessment. An Ashby-scheduled booking (`source` `ashby`) posts it as the interview's
+ * feedback (`applicationFeedback.submit` with the booking's `interviewEventId` and the Dex user); a
+ * public-page booking (`source` `public_page`, M035) has no Ashby schedule and so no interview event,
+ * and posts it as GENERAL feedback on the matched application (the same call without the event key).
  *
  * WHO QUEUES IT. The scorecard-ready trigger and the maintenance re-drive (S09 T4) through
  * `r1_meet_record_receipt`: ONE receipt per (booking, assessment), key
@@ -10,10 +12,18 @@
  * `receipt_id` and `source`). An operator's manual re-post (runbook) is the same payload without
  * `receipt_id`. The handler always finds the receipt by its KEY, so both kinds of job share it.
  *
- * ONCE (D-S09-1). Ours: a receipt already `processed` makes the job a no-op with ZERO Ashby calls, so a
- * re-delivered or replayed job never posts again. Ashby's: every submit names the interview event and
- * the Dex user, so Ashby UPDATES Dex's one submission for that event; a retry after an answer that was
- * lost can never create a second card.
+ * ONCE (D-S09-1). Ours, for both sources: a receipt already `processed` makes the job a no-op with
+ * ZERO Ashby calls, so a re-delivered or replayed job never posts again. Then per source:
+ *   ashby        every submit names the interview event and the Dex user, so Ashby UPDATES Dex's one
+ *                submission for that event; a retry after an answer that was lost can never create a
+ *                second card. These bookings never call `applicationFeedback.list`.
+ *   public_page  Ashby makes a NEW card on every general submit, so before EVERY submit (step 11a, on
+ *                every run, not only a retry) the job lists the application's feedback and looks for
+ *                a card by the Dex user, submitted at or after the slot start, on the configured form
+ *                (or with no form id: it cannot be proved to be another form). Found: no submit, the
+ *                receipt `processed`, `processed('already_posted')`. A list it cannot read never
+ *                submits. So a lost submit answer, a re-delivered job and a manual re-post all find
+ *                the card instead of posting a second one.
  *
  * THE STEPS, each stopping at its first refusal (closed codes; a refusal is `ignored(<code>)`, so the
  * dispatcher ends a trigger job's receipt `ignored`):
@@ -23,9 +33,11 @@
  *   3  already_submitted         the receipt is `processed`: nothing more, no Ashby call.
  *   4  booking_missing | defer booking_not_settled (a live status, 60 s, bounded, then throw
  *      `r1_meet_feedback_booking_not_settled`) | booking_not_completed (failed, cancelled, drained:
- *      a call that went wrong is never posted) | booking_unbound (no round or session) | stale (more
- *      than 7 days after the slot ended) | profile_unknown (an `objective_profile` this build has no
- *      profile for: the card's header names the profile's bot and interview kind, never a guess).
+ *      a call that went wrong is never posted) | booking_unbound (no round or session, or an `ashby`
+ *      booking whose interview event is not a UUID; a `public_page` booking has none by design) |
+ *      stale (more than 7 days after the slot ended) | profile_unknown (an `objective_profile` this
+ *      build has no profile for: the card's header names the profile's bot and interview kind, never
+ *      a guess).
  *   5  round_not_meet (missing or a browser round) | assessment_superseded (not the round's current).
  *   6  assessment_missing | assessment_not_booking_session (not the booking's attempt).
  *   7  decision_use_blocked (an open appeal) | consent_withdrawn (withdrawn or declined).
@@ -39,8 +51,19 @@
  *      bounded, then throw `r1_meet_feedback_form_unavailable`); a permanent 4xx alerts
  *      `form_unreadable`, receipt `failed`.
  *  11  the binding (`bindR1MeetFeedbackForm`): a refusal alerts with its reason, receipt `failed`.
- *  12  the submit: success settles the receipt `processed` (a failure of that write only warns; the
- *      dispatcher's own finish tries again) and answers `processed('submitted')`. A 429 defers
+ *  11a public_page only, on every run, immediately before the submit: the duplicate guard
+ *      (`listDexFeedback` over `applicationFeedback.list`, since the booking's `start_at`). A Dex card
+ *      on the configured form (case ignored) or with no form id: settle the receipt `processed` (a
+ *      failure of that write only warns), one info line `r1_meet_feedback_already_posted`, answer
+ *      `processed('already_posted')`, no submit. A 429 defers `feedback_list_rate_limited` (60 s) and a
+ *      5xx, timeout, network failure or an unreadable list defers `feedback_list_unavailable` (30 s),
+ *      both bounded, then throw `r1_meet_feedback_list_rate_limited` / `_unavailable`; a permanent 4xx,
+ *      `success:false` or a request the client refuses alerts `r1_meet_feedback_rejected` and is
+ *      terminal `feedback_list_rejected` (receipt `failed`, re-postable). A list failure NEVER submits.
+ *  12  the submit: `submit` (interview-event mode) for an `ashby` booking, `submitGeneral` (no event
+ *      key) for a `public_page` one; the request is otherwise the same. Success settles the receipt
+ *      `processed` (a failure of that write only warns; the dispatcher's own finish tries again) and
+ *      answers `processed('submitted')`. A 429 defers
  *      `ashby_rate_limited` (60 s) and a 5xx, timeout or network failure defers `ashby_unavailable`
  *      (30 s), both bounded, then throw `r1_meet_feedback_ashby_rate_limited` / `_unavailable`. A
  *      permanent 4xx or `success:false` alerts `r1_meet_feedback_rejected` and is terminal
@@ -59,7 +82,11 @@
 
 import type { ProbeFeedbackForm } from '../../../integrations/ashby/probe.js';
 import type { R1MeetFeedbackConfig } from './config.js';
-import { classifyR1MeetAshbyFailure, type R1MeetAshbyFeedbackPort } from './feedback-ashby.js';
+import {
+  classifyR1MeetAshbyFailure,
+  type R1MeetAshbyFeedbackPort,
+  type R1MeetDexFeedbackCard,
+} from './feedback-ashby.js';
 import {
   R1_MEET_FEEDBACK_LIMITS,
   bindR1MeetFeedbackForm,
@@ -102,6 +129,9 @@ export const R1_MEET_FEEDBACK_ALERTS = Object.freeze({
 /** The warning of a card held back because Ashby's own switches are off (a rollback, not a fault). */
 export const R1_MEET_FEEDBACK_ASHBY_INACTIVE_LOG = 'r1_meet_feedback_ashby_inactive';
 
+/** The info line of a public-page card the list guard found already in Ashby (M035 S02; contracts §8). */
+export const R1_MEET_FEEDBACK_ALREADY_POSTED_LOG = 'r1_meet_feedback_already_posted';
+
 /** The deferrals of this job, in seconds. Frozen. */
 export const R1_MEET_FEEDBACK_DEFER = Object.freeze({
   notSettled: 60,
@@ -135,9 +165,10 @@ const UNWIRED = 'r1_meet_feedback_unwired';
 
 /**
  * The outcomes a run can only reach BEFORE any submit, as the queue keeps them: the job's own waits
- * (steps 4 and 10) and the codes thrown when those waits pass the bound; the dispatcher's
- * `r1_meet_inactive` deferral (no handler ran; a literal here, because `dispatcher.ts` imports this
- * module); and the throws that cannot follow a submit that may have landed: `r1_meet_db_error` (the
+ * (steps 4, 10 and the public-page list guard 11a, which always runs before that run's submit) and
+ * the codes thrown when those waits pass the bound; the dispatcher's `r1_meet_inactive` deferral
+ * (no handler ran; a literal here, because `dispatcher.ts` imports this module); and the throws
+ * that cannot follow a submit that may have landed: `r1_meet_db_error` (the
  * settle after a success only warns, and the terminal settle follows a refusal, which posts nothing),
  * `r1_meet_feedback_unwired`, `r1_meet_unknown_kind`, `r1_meet_malformed_payload`. NOT here, because
  * they may follow a submit that landed: the submit's own waits and throws (`ashby_rate_limited`,
@@ -146,9 +177,13 @@ const UNWIRED = 'r1_meet_feedback_unwired';
 const PRE_SUBMIT_OUTCOMES: ReadonlySet<string> = new Set([
   'booking_not_settled',
   'form_unavailable',
+  'feedback_list_rate_limited',
+  'feedback_list_unavailable',
   'r1_meet_inactive',
   'r1_meet_feedback_booking_not_settled',
   'r1_meet_feedback_form_unavailable',
+  'r1_meet_feedback_list_rate_limited',
+  'r1_meet_feedback_list_unavailable',
   R1_MEET_DB_ERROR,
   UNWIRED,
   R1_MEET_UNKNOWN_KIND,
@@ -191,6 +226,11 @@ export function r1MeetFeedbackSubmitMayHaveRun(
 
 const SUBMITTED_LOG = 'r1_meet_feedback_submitted';
 const SETTLE_FAILED_LOG = 'r1_meet_feedback_receipt_settle_failed';
+
+/** Two UUIDs name the same form whatever their case (as `feedback-form.ts` compares them). */
+function sameUuid(a: unknown, b: unknown): boolean {
+  return typeof a === 'string' && typeof b === 'string' && UUID.test(a) && a.toLowerCase() === b.toLowerCase();
+}
 
 /** A transient wait within the job's deferral bound; past it, the closed code is thrown (retries, DLQ). */
 function deferOrThrow(meta: R1MeetJobMeta, nowMs: number, code: string, seconds: number, thrown: string): R1MeetJobResult {
@@ -250,12 +290,11 @@ export async function runR1MeetScorecardFeedback(
     return deferOrThrow(meta, deps.now(), 'booking_not_settled', R1_MEET_FEEDBACK_DEFER.notSettled, 'r1_meet_feedback_booking_not_settled');
   }
   if (booking.status !== 'completed') return r1MeetIgnored('booking_not_completed');
-  // A public-page booking (M035) has no interview event: not posted yet (M035 S02 T3 posts it).
+  // An Ashby booking names its interview event; a public-page booking (M035) has none by design.
   if (
     booking.roundId === null
     || booking.sessionId === null
-    || booking.source !== 'ashby'
-    || !UUID.test(booking.eventId)
+    || (booking.source === 'ashby' && !UUID.test(booking.eventId))
   ) {
     return r1MeetIgnored('booking_unbound');
   }
@@ -318,16 +357,58 @@ export async function runR1MeetScorecardFeedback(
   });
   if (!binding.ok) return terminal(receipt, R1_MEET_FEEDBACK_ALERTS.formInvalid, binding.reason, binding.reason);
 
-  // 12. Submit (or update) Dex's one card for this interview event.
+  /** The card is in Ashby: end the receipt `processed`; a failure of that write only warns. */
+  const settleProcessed = async (): Promise<void> => {
+    if (receipt === null) return;
+    try {
+      await store.settleReceipt(receipt.id, 'processed', nowIso());
+    } catch {
+      // The card is in Ashby: never fail (and re-post) for this write. The dispatcher's finish of a
+      // trigger job tries the same compare-and-set again.
+      deps.log.warn({ error_category: SETTLE_FAILED_LOG });
+    }
+  };
+
+  // 11a. A public-page booking: Ashby makes a new card on every general submit, so look first.
+  if (booking.source === 'public_page') {
+    let cards: readonly R1MeetDexFeedbackCard[];
+    try {
+      cards = await ashby.listDexFeedback(booking.applicationId, { dexUserId: feedback.dexUserId, since: booking.startAt });
+    } catch (error) {
+      const failure = classifyR1MeetAshbyFailure(error);
+      if (failure === null) throw error;
+      switch (failure.kind) {
+        case 'rate_limited':
+          return deferOrThrow(meta, deps.now(), 'feedback_list_rate_limited', R1_MEET_FEEDBACK_DEFER.rateLimited, 'r1_meet_feedback_list_rate_limited');
+        case 'unavailable':
+          return deferOrThrow(meta, deps.now(), 'feedback_list_unavailable', R1_MEET_FEEDBACK_DEFER.unavailable, 'r1_meet_feedback_list_unavailable');
+        case 'rejected':
+        case 'request_invalid':
+          return terminal(receipt, R1_MEET_FEEDBACK_ALERTS.rejected, failure.detail, 'feedback_list_rejected', failure.httpStatus);
+        default:
+          throw error;
+      }
+    }
+    const formId = config.formDefinitionId;
+    if (cards.some((card) => card.formDefinitionId === null || sameUuid(card.formDefinitionId, formId))) {
+      await settleProcessed();
+      deps.log.info({ error_category: R1_MEET_FEEDBACK_ALREADY_POSTED_LOG });
+      return r1MeetProcessed('already_posted');
+    }
+  }
+
+  // 12. Submit: an update of Dex's one card for this interview event (ashby), or the general card of a
+  // public-page booking (no event key; step 11a found none of Dex's).
   const request = r1MeetFeedbackRequest({
     applicationId: booking.applicationId,
     formDefinitionId: config.formDefinitionId,
-    interviewEventId: booking.eventId,
+    interviewEventId: booking.source === 'ashby' ? booking.eventId : null,
     dexUserId: feedback.dexUserId,
     fieldSubmissions: binding.fieldSubmissions,
   });
   try {
-    await ashby.submit(request);
+    if (booking.source === 'ashby') await ashby.submit(request);
+    else await ashby.submitGeneral(request);
   } catch (error) {
     const failure = classifyR1MeetAshbyFailure(error);
     if (failure === null) throw error;
@@ -351,15 +432,7 @@ export async function runR1MeetScorecardFeedback(
     }
   }
 
-  if (receipt !== null) {
-    try {
-      await store.settleReceipt(receipt.id, 'processed', nowIso());
-    } catch {
-      // The card is in Ashby: never fail (and re-post) for this write. The dispatcher's finish of a
-      // trigger job tries the same compare-and-set again.
-      deps.log.warn({ error_category: SETTLE_FAILED_LOG });
-    }
-  }
+  await settleProcessed();
   deps.log.info({
     error_category: SUBMITTED_LOG,
     error_type: `metrics_${binding.metricsBound}_unbound_${binding.metricsUnbound}`,

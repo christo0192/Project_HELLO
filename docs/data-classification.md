@@ -714,7 +714,11 @@ application and the phone-screen card; nothing goes to any other party.
 - **What is kept.** Ashby's answer is discarded: it is not stored and not logged. The outcome is
   the receipt row above. Log lines hold closed codes, counts and an HTTP status only. S09 deletes
   nothing in Ashby: a card already posted is part of the candidate's Ashby record, and a DSAR
-  erasure in this system does not remove it there.
+  erasure in this system does not remove it there. For a public-page booking (M035 S02, general
+  feedback with no interview event id) the duplicate guard reads that application's
+  `applicationFeedback.list` into memory only for the one job run, copies two fields of Dex's own
+  cards (the form id and the submitted time), never reads or keeps other interviewers' answers,
+  names or emails, and stores and logs nothing of the list.
 
 ### R1 Meet public bookings (0143, M035)
 
