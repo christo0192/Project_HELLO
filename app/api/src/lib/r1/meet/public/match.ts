@@ -11,22 +11,36 @@
  *   1. no rows -> search_ashby (no phone identity);
  *   2. E = candidates matched by email (`email`, `both`), P = by phone (`phone`, `both`); both
  *      non-empty and disjoint -> conflicting_identity (the email names one person, the phone another);
- *   3. chosen = E and P intersected when both are non-empty, else the side that matched;
- *   4. kept = links of the chosen candidates that have an application, are not terminal, sit on an
- *      enabled non-archived mapping, and whose candidate has no DSAR hold and no decision block (a
- *      hold or block on any row of a candidate excludes all its rows), deduplicated by application id
- *      (two rows of one application that disagree on the person -> ambiguous);
- *   5. nothing kept: no email-matched candidate -> search_ashby, carrying the Ashby candidate ids of
+ *   3. a DSAR hold or a decision block on ANY matched row -> no_bookable_application. Never a search
+ *      of Ashby and never a pick around it: the held person could otherwise be imported again as a
+ *      new shell from another of their Ashby applications (an erasure or restriction bypassed);
+ *   4. chosen = E and P intersected when both are non-empty, else the side that matched;
+ *   5. kept = links of the chosen candidates that have an application, are not terminal and sit on
+ *      an enabled non-archived mapping, deduplicated by application id (two rows of one application
+ *      that disagree on the person -> ambiguous);
+ *   6. nothing kept: no email-matched candidate -> search_ashby, carrying the Ashby candidate ids of
  *      the phone-matched rows; an email-matched candidate -> no_bookable_application (Ashby is
  *      searched only when the typed email matches nobody here);
- *   6. more than 5 kept -> ambiguous;
- *   7. more than one kept and they are not all one known Ashby candidate -> ambiguous;
- *   8. check, with the application ids sorted (S06 reads each in Ashby).
+ *   7. more than 5 kept -> ambiguous;
+ *   8. more than one kept and they are not all one known Ashby candidate -> ambiguous;
+ *   9. check, with the application ids sorted, the one Ashby candidate id they share (null for a
+ *      single link with none) and `emailMatched` (false when the decision rests on the phone alone).
+ *
+ * After `check`, S06 reads that Ashby candidate (`candidate.info`) and:
+ *   - scopeR1PublicCheck(check, hit) widens the decision to EVERY application of the person (the
+ *     same set the search path decides over), so "exactly one Active application" never depends on
+ *     which applications we happened to import; a kept id Ashby does not list -> ambiguous;
+ *   - when `emailMatched` is false, confirmR1PublicTypedEmail(email, hits, id) checks the typed email
+ *     against a `candidate.search`: an exact hit that is another Ashby person -> conflicting_identity
+ *     (the form names two people); no exact hit, or the same person -> go on.
  *
  * readR1PublicAshbyCandidate / readR1PublicAshbySearch read Ashby `Candidate` JSON (a `candidate.info`
  * result or a `candidate.search` entry) into a bounded hit, failing closed: `doNotContact` is false
- * only when Ashby says exactly `false`; an unreadable entry makes the whole page malformed (S06
- * answers 503); more data beyond the page means an exact match may be past it -> ambiguous.
+ * only when Ashby says exactly `false`; more data beyond the page means an exact match may be past it
+ * -> ambiguous. An entry that is not an object makes the page malformed (S06 answers 503). An object
+ * entry that fails the strict read makes the page malformed when no typed email is given; with the
+ * typed email it is skipped when none of its addresses is that email (it could never be picked), and
+ * it makes the page ambiguous when one is, or when its addresses cannot be scanned.
  *
  * pickR1PublicAshbyCandidate(email, hits, o?):
  *   1. the typed email does not normalise -> no_match;
@@ -93,6 +107,8 @@ const MAX_HIT_EMAIL_ENTRIES = 20;
 const MAX_HIT_APPLICATION_IDS = 100;
 /** A fraud status longer than this is cut (it then matches no known value and refuses). */
 const MAX_FRAUD_STATUS_LEN = 64;
+/** At most this many addresses are scanned on an unreadable search entry; more -> ambiguous. */
+const MAX_LOOSE_EMAIL_SCAN = 1000;
 /** What a hit serialises to, in place of its contents. */
 const HIT_JSON_MARKER = '[r1-public-ashby-candidate]';
 
@@ -145,7 +161,7 @@ export interface R1PublicLocalRow {
 }
 
 export type R1PublicLocalDecision =
-  | { kind: 'check'; applicationIds: readonly string[] }
+  | { kind: 'check'; applicationIds: readonly string[]; ashbyCandidateId: string | null; emailMatched: boolean }
   | { kind: 'search_ashby'; phoneAshbyCandidateIds: readonly string[] | null }
   | { kind: 'not_found'; reason: R1PublicMatchRefusal };
 
@@ -176,16 +192,14 @@ export function decideR1PublicLocal(rows: readonly R1PublicLocalRow[]): R1Public
   }
   const both = [...byEmail].filter((id) => byPhone.has(id));
   if (byEmail.size > 0 && byPhone.size > 0 && both.length === 0) return refuse('conflicting_identity');
+  // A hold or block on anyone the form matched refuses the form: no search, no import around it.
+  if (rows.some((row) => row.dsarHold || row.decisionBlocked)) return refuse('no_bookable_application');
   const chosen = byEmail.size > 0 && byPhone.size > 0 ? new Set(both) : byEmail.size > 0 ? byEmail : byPhone;
 
-  // A hold or block anywhere on a candidate excludes every row of that candidate.
-  const excluded = new Set(
-    rows.filter((row) => row.dsarHold || row.decisionBlocked).map((row) => key(row.candidateId)),
-  );
   const kept = new Map<string, R1PublicLocalRow>();
   for (const row of rows) {
     const candidate = key(row.candidateId);
-    if (!chosen.has(candidate) || excluded.has(candidate)) continue;
+    if (!chosen.has(candidate)) continue;
     if (row.applicationId === null || row.linkTerminal || !row.mappingEnabled) continue;
     const previous = kept.get(key(row.applicationId));
     if (previous === undefined) {
@@ -214,9 +228,12 @@ export function decideR1PublicLocal(rows: readonly R1PublicLocalRow[]): R1Public
     if (links.some((row) => row.ashbyCandidateId === null)) return refuse('ambiguous');
     if (new Set(links.map((row) => key(row.ashbyCandidateId as string))).size > 1) return refuse('ambiguous');
   }
+  const ashbyIds = distinctSorted(links.flatMap((row) => (row.ashbyCandidateId === null ? [] : [row.ashbyCandidateId])));
   return Object.freeze({
     kind: 'check' as const,
     applicationIds: Object.freeze(links.map((row) => row.applicationId as string).sort()),
+    ashbyCandidateId: ashbyIds[0] ?? null,
+    emailMatched: byEmail.size > 0,
   });
 }
 
@@ -266,8 +283,29 @@ export function readR1PublicAshbyCandidate(raw: unknown): R1PublicAshbyCandidate
   return Object.freeze(hit);
 }
 
-/** Read one `candidate.search` page (`results` and `moreDataAvailable` of the response). */
-export function readR1PublicAshbySearch(page: { results: unknown; moreDataAvailable?: boolean }):
+/**
+ * Whether an entry the strict reader refused could be the typed person: true when one of its
+ * addresses normalises to `typed`, and also when its addresses cannot be scanned (fail closed).
+ */
+function mayCarryEmail(entry: Record<string, unknown>, typed: string): boolean {
+  const listed = entry.emailAddresses;
+  if (listed !== undefined && listed !== null && !Array.isArray(listed)) return true;
+  const items: unknown[] = [entry.primaryEmailAddress, ...((listed as unknown[] | null | undefined) ?? [])];
+  if (items.length > MAX_LOOSE_EMAIL_SCAN) return true;
+  return items.some((item) => {
+    const value = itemValue(item);
+    return value !== null && normalizePublicEmail(value) === typed;
+  });
+}
+
+/**
+ * Read one `candidate.search` page (`results` and `moreDataAvailable` of the response). S06 passes
+ * the typed email (`o.email`), so an unreadable entry that is not that person does not fail the page.
+ */
+export function readR1PublicAshbySearch(
+  page: { results: unknown; moreDataAvailable?: boolean },
+  o?: { email?: string | null },
+):
   | { ok: true; hits: readonly R1PublicAshbyCandidateHit[] }
   | { ok: false; reason: 'ambiguous' | 'malformed' } {
   const envelope = asObject(page);
@@ -277,12 +315,21 @@ export function readR1PublicAshbySearch(page: { results: unknown; moreDataAvaila
   if (more === true || envelope.results.length > ASHBY_CANDIDATE_SEARCH_LIMIT) {
     return Object.freeze({ ok: false as const, reason: 'ambiguous' as const });
   }
+  const typed = typeof o?.email === 'string' ? normalizePublicEmail(o.email) : null;
   const hits: R1PublicAshbyCandidateHit[] = [];
+  let unreadable = false;
   for (const entry of envelope.results as unknown[]) {
     const hit = readR1PublicAshbyCandidate(entry);
-    if (hit === null) return Object.freeze({ ok: false as const, reason: 'malformed' as const });
-    hits.push(hit);
+    if (hit !== null) {
+      hits.push(hit);
+      continue;
+    }
+    const object = asObject(entry);
+    if (object === undefined || typed === null) return Object.freeze({ ok: false as const, reason: 'malformed' as const });
+    // Unreadable, but maybe the person: never pick around it.
+    if (mayCarryEmail(object, typed)) unreadable = true;
   }
+  if (unreadable) return Object.freeze({ ok: false as const, reason: 'ambiguous' as const });
   return Object.freeze({ ok: true as const, hits: Object.freeze(hits) });
 }
 
@@ -325,6 +372,47 @@ export function pickR1PublicAshbyCandidate(
     if (!known) return refuse('conflicting_identity');
   }
   return Object.freeze({ kind: 'one' as const, hit });
+}
+
+/**
+ * Widen a `check` to every application of the person: the ids S06 reads in Ashby and decides over
+ * with `decideR1PublicApplications`, the same set the search path uses. `hit` is the person's
+ * `candidate.info` (read by `check.ashbyCandidateId`, or for a single link with none, by the
+ * `candidate.id` of its `application.info`). A different person, a kept id Ashby does not list, or
+ * more than 10 applications -> ambiguous.
+ */
+export function scopeR1PublicCheck(
+  check: { applicationIds: readonly string[]; ashbyCandidateId: string | null },
+  hit: R1PublicAshbyCandidateHit,
+): { kind: 'read'; applicationIds: readonly string[] } | { kind: 'not_found'; reason: R1PublicMatchRefusal } {
+  const local = asObject(check)?.applicationIds;
+  const expected = asObject(check)?.ashbyCandidateId;
+  if (!Array.isArray(local) || local.length === 0 || local.length > R1_PUBLIC_MAX_CHECK_LINKS) return refuse('ambiguous');
+  if (!local.every(isAshbyId) || !(expected === null || isAshbyId(expected))) return refuse('ambiguous');
+  if (!isHit(hit) || !isAshbyId(hit.id) || !hit.applicationIds.every(isAshbyId)) return refuse('ambiguous');
+  if (expected !== null && key(expected) !== key(hit.id)) return refuse('ambiguous');
+  const all = distinctSorted(hit.applicationIds);
+  if (all.length > R1_PUBLIC_MAX_ASHBY_APPLICATIONS) return refuse('ambiguous');
+  const listed = new Set(all.map(key));
+  if (!local.every((id) => listed.has(key(id)))) return refuse('ambiguous');
+  return Object.freeze({ kind: 'read' as const, applicationIds: all });
+}
+
+/**
+ * A `check` that rests on the phone alone (`emailMatched` false): does the typed email name ANOTHER
+ * Ashby person? `hits` is the read `candidate.search` page for the typed email; `ashbyCandidateId`
+ * the person the phone matched. An exact hit that is someone else -> conflicting_identity; several
+ * exact hits -> ambiguous; no exact hit (the email is new to Ashby) or the same person -> ok.
+ */
+export function confirmR1PublicTypedEmail(
+  email: string,
+  hits: readonly R1PublicAshbyCandidateHit[],
+  ashbyCandidateId: string,
+): { ok: true } | { ok: false; reason: R1PublicMatchRefusal } {
+  if (!isAshbyId(ashbyCandidateId)) return Object.freeze({ ok: false as const, reason: 'ambiguous' as const });
+  const picked = pickR1PublicAshbyCandidate(email, hits, { phoneAshbyCandidateIds: [ashbyCandidateId] });
+  if (picked.kind === 'one' || picked.reason === 'no_match') return Object.freeze({ ok: true as const });
+  return Object.freeze({ ok: false as const, reason: picked.reason });
 }
 
 // ── Applications ────────────────────────────────────────────────────────────────────────────────

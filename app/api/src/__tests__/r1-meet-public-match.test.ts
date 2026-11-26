@@ -15,6 +15,7 @@ import {
   R1_PUBLIC_MATCH_REFUSALS,
   R1_PUBLIC_MAX_ASHBY_APPLICATIONS,
   R1_PUBLIC_MAX_CHECK_LINKS,
+  confirmR1PublicTypedEmail,
   decideR1PublicApplications,
   decideR1PublicCandidateFlags,
   decideR1PublicLocal,
@@ -23,6 +24,7 @@ import {
   readR1PublicAshbyCandidate,
   readR1PublicAshbySearch,
   resolveR1PublicOnFileEmail,
+  scopeR1PublicCheck,
   type R1PublicApplicationFacts,
   type R1PublicAshbyCandidateHit,
   type R1PublicLocalDecision,
@@ -116,7 +118,8 @@ function documentedCandidate(over: Record<string, unknown> = {}): Record<string,
 }
 
 const notFound = (reason: R1PublicMatchRefusal) => ({ kind: 'not_found', reason });
-const check = (...applicationIds: string[]) => ({ kind: 'check', applicationIds });
+const check = (applicationIds: string[], ashbyCandidateId: string | null = ASHBY1, emailMatched = true) =>
+  ({ kind: 'check', applicationIds, ashbyCandidateId, emailMatched });
 const search = (phoneAshbyCandidateIds: string[] | null) => ({ kind: 'search_ashby', phoneAshbyCandidateIds });
 
 function expectNoPii(value: unknown): void {
@@ -157,15 +160,15 @@ describe('decideR1PublicLocal', () => {
 
   it.each<[string, readonly R1PublicLocalRow[], unknown]>([
     ['zero rows: search Ashby, no phone identity', [], search(null)],
-    ['one bookable email row', [row()], check(APP1)],
-    ['email-only, two links of one person', [row({ applicationId: APP2 }), row()], check(APP1, APP2)],
-    ['phone-only bookable row (no email row)', [row({ matchedBy: 'phone' })], check(APP1)],
-    ['both on one row', [row({ matchedBy: 'both' })], check(APP1)],
-    ['both agreeing across an email row and a phone row', [row({ matchedBy: 'email' }), row({ matchedBy: 'phone' })], check(APP1)],
+    ['one bookable email row', [row()], check([APP1])],
+    ['email-only, two links of one person', [row({ applicationId: APP2 }), row()], check([APP1, APP2])],
+    ['phone-only bookable row (no email row): emailMatched false', [row({ matchedBy: 'phone' })], check([APP1], ASHBY1, false)],
+    ['both on one row', [row({ matchedBy: 'both' })], check([APP1])],
+    ['both agreeing across an email row and a phone row', [row({ matchedBy: 'email' }), row({ matchedBy: 'phone' })], check([APP1])],
     [
       'both agreeing: the intersection excludes an extra email-only candidate',
       [row({ matchedBy: 'both' }), row({ candidateId: C2, matchedBy: 'email', applicationId: APP2, ashbyCandidateId: ASHBY2 })],
-      check(APP1),
+      check([APP1]),
     ],
     [
       'both conflicting: email names one candidate, phone another',
@@ -180,19 +183,19 @@ describe('decideR1PublicLocal', () => {
     [
       'two candidates on one email, one Ashby person: check both links',
       [row(), row({ candidateId: C2, applicationId: APP2 })],
-      check(APP1, APP2),
+      check([APP1, APP2]),
     ],
     [
       'two candidates on one email, one Ashby person whose id differs only in case',
       [row(), row({ candidateId: C2, applicationId: APP2, ashbyCandidateId: ASHBY1.toUpperCase() })],
-      check(APP1, APP2),
+      check([APP1, APP2]),
     ],
     [
       'two candidates on one email, different Ashby people: ambiguous',
       [row(), row({ candidateId: C2, applicationId: APP2, ashbyCandidateId: ASHBY2 })],
       notFound('ambiguous'),
     ],
-    ['one kept link with no Ashby candidate id', [row({ ashbyCandidateId: null })], check(APP1)],
+    ['one kept link with no Ashby candidate id', [row({ ashbyCandidateId: null })], check([APP1], null)],
     [
       'a kept link with no Ashby candidate id beside another: ambiguous',
       [row({ ashbyCandidateId: null }), row({ applicationId: APP2 })],
@@ -219,8 +222,41 @@ describe('decideR1PublicLocal', () => {
     ],
     ['phone-only: terminal link -> search with its Ashby id', [row({ matchedBy: 'phone', linkTerminal: true })], search([ASHBY1])],
     ['phone-only: disabled mapping -> search with its Ashby id', [row({ matchedBy: 'phone', mappingEnabled: false })], search([ASHBY1])],
-    ['phone-only: DSAR hold -> search with its Ashby id', [row({ matchedBy: 'phone', dsarHold: true })], search([ASHBY1])],
-    ['phone-only: decision-blocked -> search with its Ashby id', [row({ matchedBy: 'phone', decisionBlocked: true })], search([ASHBY1])],
+    ['phone-only: DSAR hold refuses, never a search (review F2)', [row({ matchedBy: 'phone', dsarHold: true })], notFound('no_bookable_application')],
+    ['phone-only: decision-blocked refuses, never a search (review F2)', [row({ matchedBy: 'phone', decisionBlocked: true })], notFound('no_bookable_application')],
+    [
+      'phone-only: a held candidate with no link refuses, never a search (review F2)',
+      [row({ matchedBy: 'phone', applicationId: null, ashbyCandidateId: null, linkTerminal: true, mappingEnabled: false, dsarHold: true })],
+      notFound('no_bookable_application'),
+    ],
+    [
+      'phone-only: a hold on one of two phone candidates refuses the form (review F2)',
+      [
+        row({ matchedBy: 'phone' }),
+        row({ candidateId: C2, matchedBy: 'phone', applicationId: APP2, ashbyCandidateId: ASHBY2, linkTerminal: true, dsarHold: true }),
+      ],
+      notFound('no_bookable_application'),
+    ],
+    [
+      'both agreeing: a hold on the extra email-only candidate refuses the form (review F2)',
+      [row({ matchedBy: 'both' }), row({ candidateId: C2, matchedBy: 'email', applicationId: APP2, dsarHold: true })],
+      notFound('no_bookable_application'),
+    ],
+    [
+      'two candidates on one email of one Ashby person, one decision-blocked: refused, not booked around it (review F2)',
+      [row(), row({ candidateId: C2, applicationId: APP2, decisionBlocked: true })],
+      notFound('no_bookable_application'),
+    ],
+    [
+      'conflicting_identity outranks a hold',
+      [row(), row({ candidateId: C2, matchedBy: 'phone', applicationId: APP2, ashbyCandidateId: ASHBY2, dsarHold: true })],
+      notFound('conflicting_identity'),
+    ],
+    [
+      'more than 20 rows outranks a hold (ambiguous)',
+      [...twentyOneRows.slice(0, 20), row({ applicationId: app(99), dsarHold: true })],
+      notFound('ambiguous'),
+    ],
     [
       'phone-only: no link -> search with no phone identity',
       [row({ matchedBy: 'phone', applicationId: null, ashbyCandidateId: null, linkTerminal: true, mappingEnabled: false })],
@@ -235,19 +271,19 @@ describe('decideR1PublicLocal', () => {
       ],
       search([ASHBY1, ASHBY2]),
     ],
-    ['five kept links: check all five', sixLinks.slice(0, 5), check(app(1), app(2), app(3), app(4), app(5))],
+    ['five kept links: check all five', sixLinks.slice(0, 5), check([app(1), app(2), app(3), app(4), app(5)])],
     ['six kept links: ambiguous', sixLinks, notFound('ambiguous')],
-    ['twenty rows (one bookable): check', twentyRows, check(APP1)],
+    ['twenty rows (one bookable): check', twentyRows, check([APP1])],
     ['twenty-one rows: ambiguous', twentyOneRows, notFound('ambiguous')],
     [
       'ids sorted and deduplicated',
       [row({ applicationId: APP3 }), row(), row({ matchedBy: 'both' })],
-      check(APP1, APP3),
+      check([APP1, APP3]),
     ],
     [
       'an application id that differs only in case is one link (first spelling kept)',
       [row(), row({ applicationId: APP1.toUpperCase() })],
-      check(APP1),
+      check([APP1]),
     ],
     [
       'two rows of one application that disagree on the person: ambiguous',
@@ -280,9 +316,25 @@ describe('decideR1PublicLocal', () => {
     expect(decideR1PublicLocal(rows as readonly R1PublicLocalRow[])).toEqual(notFound('ambiguous'));
   });
 
+  it('the review F2 path end to end: a phone-only held person is never searched, so never imported', () => {
+    // Person A is held locally; A's Ashby email differs from the local one, and A has a second Ashby
+    // application, Active, unlinked, on an enabled mapping. Before the fix the decision was
+    // search_ashby([A]), the pick confirmed A, and the applications decision answered import.
+    const decision = decideR1PublicLocal([row({ matchedBy: 'phone', linkTerminal: true, dsarHold: true })]);
+    expect(decision).toEqual(notFound('no_bookable_application'));
+  });
+
+  it('check carries the one Ashby candidate id its links share (the first spelling) and emailMatched', () => {
+    const shared = decideR1PublicLocal([row({ ashbyCandidateId: ASHBY1.toUpperCase() }), row({ candidateId: C2, applicationId: APP2 })]);
+    expect(shared).toEqual(check([APP1, APP2], ASHBY1.toUpperCase()));
+    expect(decideR1PublicLocal([row({ matchedBy: 'phone' })])).toMatchObject({ emailMatched: false });
+    expect(decideR1PublicLocal([row({ matchedBy: 'both' })])).toMatchObject({ emailMatched: true });
+    expect(decideR1PublicLocal([row({ matchedBy: 'email' })])).toMatchObject({ emailMatched: true });
+  });
+
   it('does not mutate its input', () => {
     const rows = Object.freeze([row({ applicationId: APP2 }), row()].map((r) => Object.freeze(r)));
-    expect(decideR1PublicLocal(rows)).toEqual(check(APP1, APP2));
+    expect(decideR1PublicLocal(rows)).toEqual(check([APP1, APP2]));
   });
 
   it('the decision kinds are exactly check, search_ashby and not_found', () => {
@@ -424,6 +476,59 @@ describe('readR1PublicAshbySearch', () => {
     expect(read.ok && read.hits.length).toBe(20);
   });
 
+  describe('with the typed email (review F5)', () => {
+    const others = (n: number) => Array.from({ length: n }, (_, i) => contact(`p${i}@example.com`, 'Other', false));
+    /** Unreadable (21 addresses), and none of them is the typed one. */
+    const unrelated = documentedCandidate({ id: ASHBY2, primaryEmailAddress: contact(OTHER_EMAIL), emailAddresses: others(21) });
+
+    it.each<[string, unknown[], unknown]>([
+      ['an unreadable entry that is not the person is skipped', [documentedCandidate(), unrelated], 'ASHBY1'],
+      [
+        'an unreadable entry with 101 applications that is not the person is skipped',
+        [documentedCandidate(), documentedCandidate({ id: ASHBY2, primaryEmailAddress: contact(OTHER_EMAIL), emailAddresses: [], applicationIds: Array.from({ length: 101 }, (_, i) => app(i + 1)) })],
+        'ASHBY1',
+      ],
+      ['only unrelated unreadable entries: no hits', [unrelated], { ok: true, hits: [] }],
+      ['an unreadable entry that carries the typed email (bad id) -> ambiguous', [documentedCandidate({ id: 'cand_1' })], { ok: false, reason: 'ambiguous' }],
+      [
+        'an unreadable entry that carries it in another case, in its list -> ambiguous',
+        [documentedCandidate(), documentedCandidate({ id: ASHBY2, primaryEmailAddress: null, emailAddresses: [...others(20), contact(EMAIL.toUpperCase())] })],
+        { ok: false, reason: 'ambiguous' },
+      ],
+      ['an unreadable entry whose address list is not a list -> ambiguous', [documentedCandidate({ id: 'cand_1', primaryEmailAddress: null, emailAddresses: OTHER_EMAIL })], { ok: false, reason: 'ambiguous' }],
+      [
+        'an unreadable entry with more than 1000 addresses -> ambiguous',
+        [documentedCandidate({ id: ASHBY2, primaryEmailAddress: contact(OTHER_EMAIL), emailAddresses: others(1000) })],
+        { ok: false, reason: 'ambiguous' },
+      ],
+      ['an entry that is not an object is still malformed', [documentedCandidate(), 'candidate'], { ok: false, reason: 'malformed' }],
+      ['a null entry is still malformed', [null], { ok: false, reason: 'malformed' }],
+    ])('%s', (_name, results, expected) => {
+      const read = readR1PublicAshbySearch(page(results, false), { email: ' Test.Person@Example.com ' });
+      if (expected === 'ASHBY1') {
+        expect(read.ok && read.hits.map((h) => h.id)).toEqual([ASHBY1]);
+        expectNoPii(read);
+      } else {
+        expect(read).toEqual(expected);
+      }
+      expect(Object.isFrozen(read)).toBe(true);
+    });
+
+    it('without a usable typed email an unreadable entry still fails the page (malformed)', () => {
+      for (const o of [undefined, {}, { email: null }, { email: 'not-an-email' }]) {
+        expect(readR1PublicAshbySearch(page([documentedCandidate(), unrelated], false), o)).toEqual({ ok: false, reason: 'malformed' });
+      }
+    });
+
+    it('a skipped entry never changes the pick: the one exact person is picked', () => {
+      const read = readR1PublicAshbySearch(page([unrelated, documentedCandidate()], false), { email: EMAIL });
+      expect(read.ok).toBe(true);
+      if (!read.ok) return;
+      const picked = pickR1PublicAshbyCandidate(EMAIL, read.hits);
+      expect(picked.kind === 'one' && picked.hit.id).toBe(ASHBY1);
+    });
+  });
+
   it('the page bound is the limit the Ashby client sends (parity, T4)', () => {
     expect(ASHBY_CANDIDATE_SEARCH_LIMIT).toBe(20);
     const at = readR1PublicAshbySearch(page(Array.from({ length: ASHBY_CANDIDATE_SEARCH_LIMIT }, () => documentedCandidate()), false));
@@ -485,6 +590,86 @@ describe('pickR1PublicAshbyCandidate', () => {
     if (!read.ok) return;
     const picked = pickR1PublicAshbyCandidate('Test.Person@Example.com', read.hits);
     expect(picked.kind === 'one' && picked.hit.id).toBe(ASHBY1);
+  });
+});
+
+// ── scopeR1PublicCheck (review F3) ──────────────────────────────────────────────────────────────
+describe('scopeR1PublicCheck', () => {
+  const read = (...applicationIds: string[]) => ({ kind: 'read', applicationIds });
+  const local = (applicationIds: string[], ashbyCandidateId: string | null = ASHBY1) => ({ applicationIds, ashbyCandidateId });
+
+  it.each<[string, { applicationIds: readonly string[]; ashbyCandidateId: string | null }, R1PublicAshbyCandidateHit, unknown]>([
+    ['widens one local link to every application of the person, sorted', local([APP1]), hit({ applicationIds: [APP3, APP1, APP2] }), read(APP1, APP2, APP3)],
+    ['the same set when everything is imported', local([APP1, APP2]), hit({ applicationIds: [APP2, APP1] }), read(APP1, APP2)],
+    ['the person id differs only in case', local([APP1], ASHBY1.toUpperCase()), hit(), read(APP1)],
+    ['a local id that differs only in case from Ashby\'s', local([APP1.toUpperCase()]), hit(), read(APP1)],
+    ['no Ashby id on the single link: the hit S06 resolved is taken', local([APP1], null), hit({ id: ASHBY2 }), read(APP1)],
+    ['another Ashby person than the links name -> ambiguous', local([APP1]), hit({ id: ASHBY2 }), notFound('ambiguous')],
+    ['a local link Ashby does not list -> ambiguous', local([APP1, APP3]), hit({ applicationIds: [APP1, APP2] }), notFound('ambiguous')],
+    ['ten applications', local([APP1]), hit({ applicationIds: Array.from({ length: 10 }, (_, i) => app(i + 1)) }), 'read'],
+    ['eleven applications -> ambiguous', local([APP1]), hit({ applicationIds: Array.from({ length: 11 }, (_, i) => app(i + 1)) }), notFound('ambiguous')],
+    ['no local ids -> ambiguous', local([]), hit(), notFound('ambiguous')],
+    ['six local ids -> ambiguous', local([1, 2, 3, 4, 5, 6].map(app)), hit({ applicationIds: [1, 2, 3, 4, 5, 6].map(app) }), notFound('ambiguous')],
+    ['a malformed local id -> ambiguous', local(['app 1']), hit(), notFound('ambiguous')],
+    ['a malformed hit -> ambiguous', local([APP1]), { ...hit(), applicationIds: APP1 } as unknown as R1PublicAshbyCandidateHit, notFound('ambiguous')],
+    ['a missing ashbyCandidateId key -> ambiguous', { applicationIds: [APP1] } as unknown as ReturnType<typeof local>, hit(), notFound('ambiguous')],
+  ])('%s', (_name, checked, h, expected) => {
+    const scoped = scopeR1PublicCheck(checked, h);
+    if (expected === 'read') expect(scoped.kind).toBe('read');
+    else expect(scoped).toEqual(expected);
+    expect(Object.isFrozen(scoped)).toBe(true);
+    if (scoped.kind === 'read') expect(Object.isFrozen(scoped.applicationIds)).toBe(true);
+    expectNoPii(scoped);
+  });
+
+  it('the review F3 case: one imported and one not-imported Active application is ambiguous on the check path too', () => {
+    // Ashby person X: APP1 imported (Active, mapping enabled), APP2 not imported (Active, mapping enabled).
+    const decision = decideR1PublicLocal([row()]);
+    expect(decision).toEqual(check([APP1]));
+    if (decision.kind !== 'check') return;
+    const scoped = scopeR1PublicCheck(decision, hit({ applicationIds: [APP1, APP2] }));
+    expect(scoped).toEqual(read(APP1, APP2));
+    if (scoped.kind !== 'read') return;
+    const byId: Record<string, R1PublicApplicationFacts> = {
+      [APP1]: facts(),
+      [APP2]: facts({ applicationId: APP2, link: null }),
+    };
+    const facts2 = scoped.applicationIds.map((id) => byId[id]!);
+    expect(decideR1PublicApplications(facts2, { requireR1Stage: false })).toEqual(notFound('ambiguous'));
+    // The same person found through the search path decides the same way.
+    expect(decideR1PublicApplications([byId[APP2]!, byId[APP1]!], { requireR1Stage: false })).toEqual(notFound('ambiguous'));
+  });
+});
+
+// ── confirmR1PublicTypedEmail (review F6) ───────────────────────────────────────────────────────
+describe('confirmR1PublicTypedEmail', () => {
+  const ok = { ok: true };
+  const no = (reason: R1PublicMatchRefusal) => ({ ok: false, reason });
+
+  it.each<[string, string, readonly R1PublicAshbyCandidateHit[], string, unknown]>([
+    ['the typed email is new to Ashby: the phone match stands', EMAIL, [], ASHBY1, ok],
+    ['only partial hits: the phone match stands', 'test@example.com', [hit({ emails: [EMAIL] })], ASHBY1, ok],
+    ['the typed email is the same person', EMAIL, [hit()], ASHBY1, ok],
+    ['the same person, the id in another case', EMAIL, [hit()], ASHBY1.toUpperCase(), ok],
+    ['the typed email is ANOTHER Ashby person -> conflicting_identity', EMAIL, [hit({ id: ASHBY2 })], ASHBY1, no('conflicting_identity')],
+    ['two exact people -> ambiguous', EMAIL, [hit(), hit({ id: ASHBY2 })], ASHBY1, no('ambiguous')],
+    ['an unusable typed email: the phone match stands', 'not-an-email', [hit({ id: ASHBY2 })], ASHBY1, ok],
+    ['a phone person id that is not an id -> ambiguous', EMAIL, [hit()], 'ashby 1', no('ambiguous')],
+    ['malformed hits -> ambiguous', EMAIL, 'hits' as unknown as R1PublicAshbyCandidateHit[], ASHBY1, no('ambiguous')],
+  ])('%s', (_name, email, hits, id, expected) => {
+    const confirmed = confirmR1PublicTypedEmail(email, hits, id);
+    expect(confirmed).toEqual(expected);
+    expect(Object.isFrozen(confirmed)).toBe(true);
+  });
+
+  it('the review F6 case: the email names Ashby person B, the phone local A: refused', () => {
+    const decision = decideR1PublicLocal([row({ matchedBy: 'phone' })]);
+    expect(decision).toEqual(check([APP1], ASHBY1, false));
+    if (decision.kind !== 'check') return;
+    const page = readR1PublicAshbySearch({ results: [documentedCandidate({ id: ASHBY2 })], moreDataAvailable: false }, { email: EMAIL });
+    expect(page.ok).toBe(true);
+    if (!page.ok) return;
+    expect(confirmR1PublicTypedEmail(EMAIL, page.hits, decision.ashbyCandidateId!)).toEqual(no('conflicting_identity'));
   });
 });
 
