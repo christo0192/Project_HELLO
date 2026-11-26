@@ -56,8 +56,14 @@ export const R1_MEET_BOOKING_REASONS = [
   'multiple_humans',
   'attempt_settled',
   'flag_off',
+  'candidate_cancelled',
+  'invite_undeliverable',
 ] as const;
 export type R1MeetBookingReason = (typeof R1_MEET_BOOKING_REASONS)[number];
+
+/** Where a booking came from, in the API's order: HR in Ashby, or the candidate on the public booking page. */
+export const R1_MEET_BOOKING_SOURCES = ['ashby', 'public_page'] as const;
+export type R1MeetBookingSource = (typeof R1_MEET_BOOKING_SOURCES)[number];
 
 /** One booking. `status` and `reason` stay plain text: a newer API may know more than this page. */
 export interface R1MeetBooking {
@@ -72,6 +78,11 @@ export interface R1MeetBooking {
   updated_at: string;
   /** The meeting bot's generation, and not a revision of the row: a status change leaves it as it was. */
   version: number;
+  /**
+   * Where the booking came from (M035): required, and only one of the two values. Unlike `status` and
+   * `reason` this is not plain text, so a value this page does not know refuses the page.
+   */
+  source: R1MeetBookingSource;
 }
 
 export interface R1MeetBookingsBody {
