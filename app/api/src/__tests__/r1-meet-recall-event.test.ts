@@ -4,7 +4,9 @@
  * A verified Recall body becomes the `recall_event` job (contract §2, exact keys and order), or is
  * `ignored_event` (no Meet meaning on that endpoint) or `malformed_event`. The builder is pure, never
  * throws, freezes its result, lower-cases ids, canonicalises times, and never reads a participant's
- * name, email, platform or extra data. Fake data only: fixed fake UUIDs, `Example` names,
+ * email, platform or extra data. M035 S09 T2: a JOIN's display name is read once, compared in memory
+ * with the bot's own display name (`r1MeetSameDisplayName`) and dropped; only `is_bot: true` is kept.
+ * Fake data only: fixed fake UUIDs, `Example` names, the bot's own fixture name `Dex`,
  * `example.invalid` emails.
  */
 import { describe, expect, it } from 'vitest';
@@ -19,8 +21,10 @@ import {
   R1_MEET_RECALL_SUBPATHS,
   buildR1MeetRecallEventJob,
   r1MeetRecallEventsFor,
+  r1MeetSameDisplayName,
   type R1MeetRecallEndpoint,
   type R1MeetRecallEventJob,
+  type R1MeetRecallEventOptions,
 } from '../lib/r1/meet/recall-event.js';
 
 const BOT_ID = '7f000000-0000-4000-8000-000000000001';
@@ -429,27 +433,107 @@ describe('buildR1MeetRecallEventJob: PII and freezing', () => {
     }
   });
 
-  it('reads only id, is_host and is_bot from the participant, and none of the other artifacts', () => {
+  it.each<[string, R1MeetRecallEventOptions]>([
+    ['Dex', {}],
+    ['Dex (AI Interviewer)', { botNameOverride: 'Dex (AI Interviewer)' }],
+  ])('a join named like the bot (%s) is marked, and the serialized job holds no trace of the name', (name, options) => {
+    const job = buildR1MeetRecallEventJob(
+      participantBody('participant_events.join', participantFields({ name })),
+      'realtime',
+      options,
+    );
+    expect(okPayload(job).participant).toStrictEqual({ id: 100, is_host: false, is_bot: true });
+    const text = JSON.stringify(job);
+    expect(text.toLowerCase()).not.toContain('dex');
+    expect(text.toLowerCase()).not.toContain('interviewer');
+    expect(text).not.toContain('"name"');
+    for (const banned of [PARTICIPANT_EMAIL, PARTICIPANT_PLATFORM, EXTRA_MARKER, 'extra_data', 'platform']) {
+      expect(text, banned).not.toContain(banned);
+    }
+  });
+
+  /** A participant object (and its body) whose property reads are recorded. */
+  function trackedParticipantBody(event: string, fields: Json, bot: Json = {}) {
     const participantReads: PropertyKey[] = [];
     const dataReads: PropertyKey[] = [];
-    const participant = new Proxy(participantFields({ is_bot: false }), {
+    const participant = new Proxy(fields, {
       get(target, key, receiver) {
         participantReads.push(key);
         return Reflect.get(target, key, receiver);
       },
     });
-    const body = participantBody('participant_events.leave', participant);
+    const body = participantBody(event, participant, {}, bot);
     body.data = new Proxy(body.data as Json, {
       get(target, key, receiver) {
         dataReads.push(key);
         return Reflect.get(target, key, receiver);
       },
     });
-    const payload = okPayload(buildR1MeetRecallEventJob(body, 'realtime'));
+    const stringReads = () => participantReads.filter((key): key is string => typeof key === 'string');
+    return { body, participantReads, dataReads, stringReads };
+  }
+
+  it.each<[string, string, boolean]>([
+    ['another name', PARTICIPANT_NAME, false],
+    ["the bot's own name", 'Dex', true],
+  ])('a JOIN with %s reads exactly id, is_host, is_bot and the name (once), and none of the other artifacts', (_label, name, marked) => {
+    const t = trackedParticipantBody('participant_events.join', participantFields({ name, is_bot: false }));
+    const payload = okPayload(buildR1MeetRecallEventJob(t.body, 'realtime'));
+    expect(payload.participant).toStrictEqual({ id: 100, is_host: false, is_bot: marked });
+    for (const key of ['email', 'platform', 'extra_data']) expect(t.participantReads, key).not.toContain(key);
+    expect(new Set(t.stringReads())).toEqual(new Set(['id', 'is_host', 'is_bot', 'name']));
+    expect(t.stringReads().filter((key) => key === 'name')).toHaveLength(1);
+    for (const key of ['realtime_endpoint', 'recording', 'participant_events']) expect(t.dataReads, key).not.toContain(key);
+  });
+
+  it('a LEAVE reads only id, is_host and is_bot (never the name), and none of the other artifacts', () => {
+    const t = trackedParticipantBody('participant_events.leave', participantFields({ name: 'Dex', is_bot: false }));
+    const payload = okPayload(buildR1MeetRecallEventJob(t.body, 'realtime', { botNameOverride: 'Dex' }));
     expect(payload.participant).toStrictEqual({ id: 100, is_host: false, is_bot: false });
-    for (const key of ['name', 'email', 'platform', 'extra_data']) expect(participantReads, key).not.toContain(key);
-    expect(new Set(participantReads.filter((key) => typeof key === 'string'))).toEqual(new Set(['id', 'is_host', 'is_bot']));
-    for (const key of ['realtime_endpoint', 'recording', 'participant_events']) expect(dataReads, key).not.toContain(key);
+    for (const key of ['name', 'email', 'platform', 'extra_data']) expect(t.participantReads, key).not.toContain(key);
+    expect(new Set(t.stringReads())).toEqual(new Set(['id', 'is_host', 'is_bot']));
+    for (const key of ['realtime_endpoint', 'recording', 'participant_events']) expect(t.dataReads, key).not.toContain(key);
+  });
+
+  it('a JOIN with no known own name (unknown profile, no override) never reads the name', () => {
+    const t = trackedParticipantBody(
+      'participant_events.join',
+      participantFields({ name: 'Dex' }),
+      { metadata: { booking_id: BOOKING_ID, profile: 'not_a_profile' } },
+    );
+    const payload = okPayload(buildR1MeetRecallEventJob(t.body, 'realtime'));
+    expect(payload.participant).toStrictEqual({ id: 100, is_host: false, is_bot: null });
+    expect(new Set(t.stringReads())).toEqual(new Set(['id', 'is_host', 'is_bot']));
+  });
+
+  it('a name getter is read at most once, even when it would answer differently the second time', () => {
+    let nameReads = 0;
+    const fields = participantFields();
+    Object.defineProperty(fields, 'name', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        nameReads += 1;
+        return nameReads === 1 ? 'Dex' : PARTICIPANT_NAME;
+      },
+    });
+    const payload = okPayload(buildR1MeetRecallEventJob(participantBody('participant_events.join', fields), 'realtime'));
+    expect(payload.participant).toStrictEqual({ id: 100, is_host: false, is_bot: true });
+    expect(nameReads).toBe(1);
+  });
+
+  it('a throwing name getter on a join is malformed_event, never a throw', () => {
+    const fields = participantFields();
+    Object.defineProperty(fields, 'name', {
+      enumerable: true,
+      get() {
+        throw new Error('trap');
+      },
+    });
+    expect(buildR1MeetRecallEventJob(participantBody('participant_events.join', fields), 'realtime')).toStrictEqual({
+      ok: false,
+      reason: 'malformed_event',
+    });
   });
 
   it('the result, its payload and the participant are frozen', () => {
@@ -466,5 +550,164 @@ describe('buildR1MeetRecallEventJob: PII and freezing', () => {
     const before = JSON.stringify(body);
     buildR1MeetRecallEventJob(body, 'realtime');
     expect(JSON.stringify(body)).toBe(before);
+  });
+});
+
+// ── The bot's own display name (M035 S09 T2, D-S09-6) ────────────────────────
+
+describe("buildR1MeetRecallEventJob: a join that carries the bot's own display name", () => {
+  /** The participant of a join (or `event`) named `name`, with `fields` merged in. */
+  function joinParticipant(
+    name: unknown,
+    options?: R1MeetRecallEventOptions,
+    fields: Json = {},
+    bot: Json = {},
+    event = 'participant_events.join',
+  ) {
+    const raw = participantFields({ name, ...fields });
+    if (name === undefined) delete raw.name;
+    return okPayload(buildR1MeetRecallEventJob(participantBody(event, raw, {}, bot), 'realtime', options)).participant;
+  }
+
+  // The default profile (`r1_dex_sales`) shows `Dex`.
+  it.each<[string, string]>([
+    ['Dex', 'Dex'],
+    ['surrounding spaces', ' dex '],
+    ['upper case', 'DEX'],
+    ['full-width letters (NFKC)', 'Ｄｅｘ'],
+    ['a trailing no-break space', 'Dex '],
+    ['a tab and a newline around it', '\tDex\n'],
+  ])("the profile's own name with %s is marked is_bot true", (_label, name) => {
+    expect(joinParticipant(name)).toStrictEqual({ id: 100, is_host: false, is_bot: true });
+  });
+
+  it.each<[string, unknown]>([
+    ['Dex2', 'Dex2'],
+    ['Dexter', 'Dexter'],
+    ['D ex', 'D ex'],
+    ['an empty name', ''],
+    ['a blank name', '   '],
+    ['a 300-character name that folds to the bot name', 'Dex' + ' '.repeat(297)],
+    ['a zero-width space inside', 'De​x'],
+    ['null', null],
+    ['a number', 42],
+    ['an array', ['Dex']],
+    ['an object', { first: 'Dex' }],
+    ['missing', undefined],
+    ['another person', PARTICIPANT_NAME],
+  ])('a join named %s is not marked (is_bot stays null)', (_label, name) => {
+    expect(joinParticipant(name)).toStrictEqual({ id: 100, is_host: false, is_bot: null });
+  });
+
+  it("Recall's own booleans: true is kept for any name; false becomes true only for the bot's own name", () => {
+    expect(joinParticipant(PARTICIPANT_NAME, {}, { is_bot: true })).toStrictEqual({ id: 100, is_host: false, is_bot: true });
+    expect(joinParticipant(PARTICIPANT_NAME, {}, { is_bot: false })).toStrictEqual({ id: 100, is_host: false, is_bot: false });
+    expect(joinParticipant('Dexter', {}, { is_bot: false })).toStrictEqual({ id: 100, is_host: false, is_bot: false });
+    expect(joinParticipant('Dex', {}, { is_bot: false })).toStrictEqual({ id: 100, is_host: false, is_bot: true });
+    expect(joinParticipant('Dex', {}, { is_bot: 'no' })).toStrictEqual({ id: 100, is_host: false, is_bot: true });
+    expect(joinParticipant('Dex', {}, { is_host: true, id: 7 })).toStrictEqual({ id: 7, is_host: true, is_bot: true });
+  });
+
+  it('the override (R1_MEET_BOT_NAME) replaces the profile name: only that name marks', () => {
+    const options = { botNameOverride: 'Dex (AI Interviewer)' };
+    expect(joinParticipant('Dex (AI Interviewer)', options)!.is_bot).toBe(true);
+    expect(joinParticipant('  dex  (ai interviewer) ', options)!.is_bot).toBe(true);
+    expect(joinParticipant('Dex', options)!.is_bot).toBeNull();
+    expect(joinParticipant('Dex (AI)', options)!.is_bot).toBeNull();
+  });
+
+  it('a null, empty or over-long override falls back to the profile name', () => {
+    for (const botNameOverride of [null, undefined, '', 'D'.repeat(101)]) {
+      const options = { botNameOverride };
+      expect(joinParticipant('Dex', options)!.is_bot, String(botNameOverride).slice(0, 8)).toBe(true);
+      expect(joinParticipant('D'.repeat(101), options)!.is_bot, String(botNameOverride).slice(0, 8)).toBeNull();
+    }
+    // A 100-character override is used.
+    const hundred = 'D'.repeat(100);
+    expect(joinParticipant(hundred, { botNameOverride: hundred })!.is_bot).toBe(true);
+    expect(joinParticipant('Dex', { botNameOverride: hundred })!.is_bot).toBeNull();
+  });
+
+  it('with an unknown or missing profile and no override, nothing is ever marked by name', () => {
+    for (const metadata of [
+      { booking_id: BOOKING_ID, profile: 'not_a_profile' },
+      { booking_id: BOOKING_ID },
+      { booking_id: BOOKING_ID, profile: 'toString' },
+      null,
+    ]) {
+      expect(joinParticipant('Dex', {}, {}, { metadata })!.is_bot, JSON.stringify(metadata)).toBeNull();
+    }
+    // The override still works without a profile.
+    const unknown = { metadata: { booking_id: BOOKING_ID, profile: 'not_a_profile' } };
+    expect(joinParticipant('Dex', { botNameOverride: 'Dex' }, {}, unknown)!.is_bot).toBe(true);
+  });
+
+  it("a LEAVE named like the bot is never marked by name (Recall's boolean only)", () => {
+    expect(joinParticipant('Dex', {}, {}, {}, 'participant_events.leave')).toStrictEqual({ id: 100, is_host: false, is_bot: null });
+    expect(joinParticipant('Dex', { botNameOverride: 'Dex' }, {}, {}, 'participant_events.leave')!.is_bot).toBeNull();
+    expect(joinParticipant('Dex', {}, { is_bot: false }, {}, 'participant_events.leave')!.is_bot).toBe(false);
+    expect(joinParticipant('Dex', {}, { is_bot: true }, {}, 'participant_events.leave')!.is_bot).toBe(true);
+  });
+
+  it('status events are untouched by the options (participant stays null)', () => {
+    const job = buildR1MeetRecallEventJob(statusBody('bot.in_call_recording'), 'status', { botNameOverride: 'Dex' });
+    expect(okPayload(job).participant).toBeNull();
+  });
+
+  it('the payload keeps its exact keys and order, and the participant its three keys, when marked', () => {
+    const job = buildR1MeetRecallEventJob(participantBody('participant_events.join', participantFields({ name: 'Dex' })), 'realtime');
+    expect(Object.keys(okPayload(job))).toEqual(PAYLOAD_KEYS);
+    expect(Object.keys(okPayload(job).participant!)).toEqual(['id', 'is_host', 'is_bot']);
+    expect(Object.isFrozen(okPayload(job).participant)).toBe(true);
+  });
+});
+
+describe('r1MeetSameDisplayName', () => {
+  it.each<[string, string]>([
+    ['Dex', 'Dex'],
+    [' dex ', 'Dex'],
+    ['DEX', 'dex'],
+    ['Ｄｅｘ', 'Dex'],
+    ['Dex ', 'Dex'],
+    ['Dex　', 'Dex'],
+    ['Dex  (AI   Interviewer)', 'Dex (AI Interviewer)'],
+    ['dex\t(ai interviewer)\n', ' Dex (AI Interviewer) '],
+    ['Dex' + ' '.repeat(253), 'Dex'],
+  ])('%j is the same display name as %j', (name, own) => {
+    expect(r1MeetSameDisplayName(name, own)).toBe(true);
+  });
+
+  it.each<[string, unknown, string]>([
+    ['Dex2', 'Dex2', 'Dex'],
+    ['Dexter', 'Dexter', 'Dex'],
+    ['D ex', 'D ex', 'Dex'],
+    ['a zero-width space inside', 'De​x', 'Dex'],
+    ['an empty name', '', 'Dex'],
+    ['a blank name', '  ', 'Dex'],
+    ['257 characters', 'Dex' + ' '.repeat(254), 'Dex'],
+    ['null', null, 'Dex'],
+    ['undefined', undefined, 'Dex'],
+    ['a number', 42, 'Dex'],
+    ['a boolean', true, 'Dex'],
+    ['an array', ['Dex'], 'Dex'],
+    ['an object that stringifies to the name', { toString: () => 'Dex' }, 'Dex'],
+    ['an empty own name', '', ''],
+    ['a blank own name', ' ', '   '],
+    ['an own name over 256 characters', 'Dex' + ' '.repeat(254), 'Dex' + ' '.repeat(254)],
+    ['a lone surrogate', '\ud800', 'Dex'],
+  ])('%s is not the same display name', (_label, name, own) => {
+    expect(r1MeetSameDisplayName(name, own)).toBe(false);
+  });
+
+  it('never throws, even for a non-string own name or a throwing toString', () => {
+    const hostile = {
+      toString() {
+        throw new Error('trap');
+      },
+    };
+    expect(r1MeetSameDisplayName('Dex', null as unknown as string)).toBe(false);
+    expect(r1MeetSameDisplayName('Dex', 42 as unknown as string)).toBe(false);
+    expect(r1MeetSameDisplayName(hostile, 'Dex')).toBe(false);
+    expect(r1MeetSameDisplayName('Dex', hostile as unknown as string)).toBe(false);
   });
 });

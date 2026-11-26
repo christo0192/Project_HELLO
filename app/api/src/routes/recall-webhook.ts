@@ -51,7 +51,10 @@
  *
  * SECURITY: the raw body, the signatures, the secret, the webhook id and every participant field
  * are never logged, persisted or returned. The job payload carries ids and times only (contract
- * §2); responses carry only a fixed status or error code.
+ * §2); responses carry only a fixed status or error code. A participant join's display name is
+ * compared in memory with the bot's own (`R1_MEET_BOT_NAME`, else the profile's name; M035 S09) by
+ * `buildR1MeetRecallEventJob`, and only the resulting `is_bot` boolean is kept: the name itself is
+ * never logged, persisted or returned.
  */
 
 import express, { Router, type NextFunction, type Request, type Response } from 'express';
@@ -225,7 +228,7 @@ export function createRecallWebhookRouter(deps: RecallWebhookRouterDeps = {}): R
           return;
         }
 
-        const job = buildR1MeetRecallEventJob(parsed, endpoint);
+        const job = buildR1MeetRecallEventJob(parsed, endpoint, { botNameOverride: meet.botNameOverride });
         if (!job.ok) {
           if (job.reason === 'ignored_event') respond(res, 200, 'ignored');
           else respond(res, 400, 'malformed_event');
