@@ -835,6 +835,20 @@ fi
 log '0142: PASS — R1 Meet assertions ran against the complete migration chain in supabase-check.'
 
 # =====================================================================
+# 0143 R1 public Meet bookings (M035 S01) — source and the nullable
+# Ashby ids, the public columns, the reasons, the throttle table and the
+# terminal / purge triggers on the complete chain, in one rolled-back
+# transaction.
+# =====================================================================
+log '0143: R1 public Meet booking, throttle, trigger and privilege assertions...'
+env SUPABASE_DB_CONTAINER="$SUPABASE_DB_CONTAINER" bash scripts/test-r1-meet-public.sh 2>&1 | tee -a "$RESULTS_FILE"
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+  log 'ERROR: 0143 R1 public Meet assertions FAILED.'
+  exit 1
+fi
+log '0143: PASS — R1 public Meet assertions ran against the complete migration chain in supabase-check.'
+
+# =====================================================================
 # TST-15 rollback rehearsal — clean reset / roll-forward / restore
 # (Phase 6 lane L4). No reverse SQL exists or is invented; this proves the
 # sanctioned recovery path: the committed migration set can always be

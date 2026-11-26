@@ -224,6 +224,10 @@ language sql as $$
     'ticket_claimed_at', null,
     'ticket_arms', 0,
     'session_id', null,
+    -- 0143 (M035 S01) added two NOT NULL columns with defaults; jsonb_populate_record leaves a
+    -- missing key NULL rather than the default, so this Ashby row spells their Ashby values out.
+    'source', 'ashby',
+    'move_count', 0,
     'created_at', '2026-12-01T04:00:00+00:00',
     'updated_at', '2026-12-01T04:00:00+00:00')
 $$;

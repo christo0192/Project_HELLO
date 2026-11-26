@@ -78,7 +78,7 @@ function functionBody(name: string = FUNCTION): string {
 }
 
 describe('0138 shape', () => {
-  it('is the only 0138 migration, and only the later M031 migrations and the M034 0142 follow it', () => {
+  it('is the only 0138 migration, and only the later M031 migrations and the M034/M035 R1 Meet migrations follow it', () => {
     const files = readdirSync(migrations).filter((f) => f.endsWith('.sql')).sort();
     expect(files.filter((f) => f.startsWith('0138_'))).toEqual([FILE]);
     // 0139_ashby_progress_worker.sql (M031 S3) adds functions over these tables and nothing else;
@@ -86,11 +86,13 @@ describe('0138 shape', () => {
     // 0141_ashby_progress_nudge.sql (M031 S4, the webhook nudge, one function over the progress table)
     // follows that. All by exact name, in that order.
     // 0142_r1_meet_bookings.sql (M034 S02, R1 Meet bookings) touches none of these tables.
+    // 0143_r1_meet_public_bookings.sql (M035 S01, public R1 Meet bookings) touches none of these tables.
     expect(files.slice(files.indexOf(FILE) + 1)).toEqual([
       '0139_ashby_progress_worker.sql',
       '0140_ashby_business_impact.sql',
       '0141_ashby_progress_nudge.sql',
       '0142_r1_meet_bookings.sql',
+      '0143_r1_meet_public_bookings.sql',
     ]);
   });
 
