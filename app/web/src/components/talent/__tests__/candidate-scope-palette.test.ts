@@ -49,6 +49,7 @@ const CANDIDATE_FACING = [
   'src/pages/R1JoinPage.tsx',
   'src/pages/R1MeetBridgePage.tsx',
   'src/pages/R1BookPage.tsx',
+  'src/pages/R1BookManagePage.tsx',
   ...sourcesUnder('src/components/candidate-r1'),
   ...sourcesUnder('src/components/candidate-join'),
   ...sourcesUnder('src/lib/r1'),

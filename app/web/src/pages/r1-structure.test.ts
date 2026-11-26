@@ -40,6 +40,7 @@ const R1_FILES = [
   'src/pages/R1JoinPage.tsx',
   'src/pages/R1MeetBridgePage.tsx',
   'src/pages/R1BookPage.tsx',
+  'src/pages/R1BookManagePage.tsx',
 ].filter((file) => /\.(ts|tsx)$/.test(file) && !/\.test\.(ts|tsx)$/.test(file));
 
 const R1_TSX = R1_FILES.filter((file) => file.endsWith('.tsx'));
@@ -428,8 +429,10 @@ describe('the public booking pages', () => {
     'src/components/candidate-r1/R1BookSlotPicker.tsx',
     'src/components/candidate-r1/R1BookErrorSummary.tsx',
     'src/pages/R1BookPage.tsx',
+    'src/pages/R1BookManagePage.tsx',
   ];
   const BOOK_PAGE = 'src/pages/R1BookPage.tsx';
+  const MANAGE_PAGE = 'src/pages/R1BookManagePage.tsx';
   const codeOf = (file: string): string =>
     read(file).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
 
@@ -505,5 +508,54 @@ describe('the public booking pages', () => {
     expect(page).toContain('autoComplete="name"');
     expect(page).toContain('autoComplete="email"');
     expect(page).toContain('autoComplete="tel"');
+  });
+
+  // `/book/manage#m=<token>`: the link in Dex's invite. The token is a bearer secret for one
+  // booking, so the page must read it from the fragment only, strip it at once and never keep it
+  // anywhere but memory.
+  it('routes /book/manage as its own public, lazy page before the recruiter routes', () => {
+    const app = read('src/App.tsx');
+    expect(app).toMatch(
+      /lazyPage\(\(\) => import\('\.\/pages\/R1BookManagePage'\), 'R1BookManagePage'\)/,
+    );
+    expect(app).not.toMatch(/import \{[^}]*\bR1BookManagePage\b[^}]*\} from/);
+    expect(app).toMatch(
+      /<Route\s+path="\/book\/manage"\s+element=\{\s*<Suspense fallback=\{<LoadingPanel \/>\}>\s*<R1BookManagePage \/>\s*<\/Suspense>\s*\}\s*\/>/,
+    );
+    expect(app.split('path="/book/manage"').length - 1, 'routed once').toBe(1);
+    expect(app.indexOf('path="/book/manage"')).toBeGreaterThan(app.indexOf('path="/book"'));
+    expect(app.indexOf('path="/book/manage"')).toBeLessThan(app.indexOf('<ProtectedRoute />'));
+  });
+
+  it('calls the booking read, the grid, the notice and the three changes, and no other route', () => {
+    const page = codeOf(MANAGE_PAGE);
+    const calls = [...new Set([...page.matchAll(/\br1BookApi\.(\w+)/g)].map((match) => match[1]))];
+    expect(calls.sort()).toEqual(['cancel', 'consent', 'consentTemplate', 'manage', 'move', 'slots']);
+    expect(page, 'the manage page uses the candidate client').not.toMatch(/\br1Api\b/);
+    expect(page).toContain("from '../lib/r1/r1-book-api'");
+    expect(page).not.toMatch(/from '\.\.\/lib\/r1\/r1-api'/);
+  });
+
+  it('reads its token only with captureManageToken, keeps it in a ref and never writes the URL', () => {
+    const page = codeOf(MANAGE_PAGE);
+    expect(page.split('captureManageToken(').length - 1, 'captured once').toBe(1);
+    expect(page).toContain("from '../lib/r1/r1-book-link'");
+    expect(page).toMatch(/const tokenRef = useRef<string \| null>\(null\);/);
+    expect(page, 'a token held in state').not.toMatch(/const \[\s*\w*token\w*\s*,/i);
+    expect(page).not.toMatch(/\bhistory\b/);
+    expect(page).not.toMatch(/\blocation\b/);
+    expect(page).not.toMatch(/\b(?:pushState|replaceState)\b/);
+    expect(page).not.toMatch(/\b(?:sessionStorage|localStorage|indexedDB)\b|document\.cookie/);
+  });
+
+  it('declares a no-referrer policy and has no control a native submit could send', () => {
+    const page = read(MANAGE_PAGE);
+    expect(page).toMatch(/<meta name="referrer" content="no-referrer" \/>/);
+    expect(page, 'the manage page has no form').not.toMatch(/<form\b/);
+    const buttons = page.match(/<[Bb]utton\b/g) ?? [];
+    expect(buttons.length).toBeGreaterThan(0);
+    expect(page, 'every button says type="button" first').not.toMatch(/<[Bb]utton\b(?!\s+type="button")/);
+    const named = [...page.matchAll(/\sname=["{]([^"}]*)/g)].map((match) => match[1]);
+    expect(named).toEqual(['referrer']);
   });
 });

@@ -65,6 +65,8 @@ const R1JoinPage = lazyPage(() => import('./pages/R1JoinPage'), 'R1JoinPage');
 const R1MeetBridgePage = lazyPage(() => import('./pages/R1MeetBridgePage'), 'R1MeetBridgePage');
 // The public Dex booking page (M035): LiveKit-free, lazy so it stays out of the recruiter chunk.
 const R1BookPage = lazyPage(() => import('./pages/R1BookPage'), 'R1BookPage');
+// Its manage page (M035): move, cancel or re-consent from the link in the invite; same reasons.
+const R1BookManagePage = lazyPage(() => import('./pages/R1BookManagePage'), 'R1BookManagePage');
 const ScreeningPage = lazyPage(() => import('./pages/ScreeningPage'), 'ScreeningPage');
 const CandidateDetailPage = lazyPage(
   () => import('./pages/CandidateDetailPage'),
@@ -169,6 +171,14 @@ export default function App() {
           element={
             <Suspense fallback={<LoadingPanel />}>
               <R1BookPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/book/manage"
+          element={
+            <Suspense fallback={<LoadingPanel />}>
+              <R1BookManagePage />
             </Suspense>
           }
         />
