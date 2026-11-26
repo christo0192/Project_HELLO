@@ -17,15 +17,23 @@
  *    `join_at` is at least `RECALL_SCHEDULED_BOT_MIN_LEAD_MS` away (a scheduled bot, which never gets
  *    507) or not (an ad-hoc bot, which may get 507 and is retried by the durable queue);
  *  - the `web_4_core` Google Meet variant and the profile's automatic-leave timers;
+ *  - explicit bot detection from the profile (M035 S09): the participant-name heuristic activates
+ *    only after the longest stay the other timers allow, so a candidate whose Meet name contains
+ *    "assistant", "recorder" or "notetaker" never makes the bot leave; the no-speech heuristic keeps
+ *    Recall's default timers. `silence_detection` is not sent (its default cannot fire before the
+ *    in-call-recording cap);
  *  - a minimal recording config: no transcript, no video, no meeting metadata; only participant
  *    join/leave events, pushed to our real-time webhook and kept for the profile's retention hours.
  *    It is the server-side "a human is in the call" signal;
  *  - the profile's disclosure (Dex is an AI interviewer and the call is recorded), posted to
- *    everyone in the chat and pinned. It is a notice only: consent was attested by HR when they
- *    scheduled the Dex interview in Ashby (consent mode `hr_attested_ashby`);
+ *    everyone in the chat and pinned when the bot joins, and re-sent to everyone (host included)
+ *    each time a participant joins, so a candidate who joins after the bot sees it even when the
+ *    Workspace's continuous chat hides the pin (M035 S09). It is a notice only: consent was attested
+ *    by HR when they scheduled the Dex interview in Ashby (consent mode `hr_attested_ashby`);
  *  - `output_media` (our bridge page as the bot's camera) only when a page URL is given, and only
  *    ever of kind `webpage`; without it the caller can arm the camera mid-call instead;
- *  - `google_meet` (signed-in bot) only when a login group is configured;
+ *  - `google_meet` (signed-in bot) only when a login group is configured; the default guest bot
+ *    sends none;
  *  - `metadata` = our booking row id and the profile id only: no name, email or other personal data.
  */
 
@@ -203,6 +211,7 @@ export function buildR1MeetCreateBotRequest(
   if (!isBotName(botName)) return { ok: false, reason: 'invalid_bot_name' };
 
   const leave = profile.automaticLeave;
+  const detection = leave.botDetection;
   const body: RecallCreateBotRequest = {
     meeting_url: meetingUrl,
     bot_name: botName,
@@ -217,6 +226,17 @@ export function buildR1MeetCreateBotRequest(
       everyone_left_timeout: { timeout: leave.everyoneLeftTimeoutSec },
       in_call_not_recording_timeout: leave.inCallNotRecordingTimeoutSec,
       in_call_recording_timeout: leave.inCallRecordingTimeoutSec,
+      bot_detection: {
+        using_participant_events: {
+          timeout: detection.participantEvents.timeoutSec,
+          activate_after: detection.participantEvents.activateAfterSec,
+        },
+        using_participant_names: {
+          matches: [...detection.participantNames.matches],
+          timeout: detection.participantNames.timeoutSec,
+          activate_after: detection.participantNames.activateAfterSec,
+        },
+      },
     },
     recording_config: {
       transcript: null,
@@ -229,7 +249,10 @@ export function buildR1MeetCreateBotRequest(
         { type: 'webhook', url: settings.realtimeWebhookUrl, events: [...R1_MEET_REALTIME_EVENTS] },
       ],
     },
-    chat: { on_bot_join: { send_to: 'everyone', message: profile.disclosureChatMessage, pin: true } },
+    chat: {
+      on_bot_join: { send_to: 'everyone', message: profile.disclosureChatMessage, pin: true },
+      on_participant_join: { message: profile.disclosureChatMessage, exclude_host: false },
+    },
     ...(loginGroupId !== null ? { google_meet: { google_login_group_id: loginGroupId.toLowerCase() } } : {}),
     metadata: { booking_id: booking.bookingId, profile: profile.id },
   };

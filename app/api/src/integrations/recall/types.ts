@@ -7,7 +7,8 @@
  * plan R8): the client re-checks it at run time, because a cast can defeat a type.
  *
  * Field names and enums follow Recall's Create Bot OpenAPI (BotRequest, AutomaticLeaveRequest,
- * BotRecordingConfigRequest, ChatOnBotJoinRequest, OutputMediaWebpageRequest, GoogleMeetRequest).
+ * AutomaticLeaveBotDetectionRequest, BotRecordingConfigRequest, ChatRequest, ChatOnBotJoinRequest,
+ * ChatOnParticipantJoinRequest, OutputMediaWebpageRequest, GoogleMeetRequest).
  */
 
 /** Every REST operation the client performs; the name used in logs and errors. */
@@ -31,12 +32,30 @@ export interface RecallOutputMediaRequest {
   };
 }
 
+/**
+ * Recall `AutomaticLeaveBotDetectionRequest`: when the bot leaves because every other participant
+ * looks like a bot. `activate_after` counts seconds from recording start. Recall's limits: every
+ * `timeout` >= 10, every `activate_after` >= 1, each `matches` item at least one character; the
+ * three fields of `using_participant_names` are all required when that block is sent.
+ */
+export interface RecallBotDetectionRequest {
+  /** No audio or screenshare activity for the whole call. */
+  readonly using_participant_events?: { readonly timeout?: number; readonly activate_after?: number };
+  /** A participant whose name contains any of `matches` (case-insensitive). */
+  readonly using_participant_names?: {
+    readonly matches: readonly string[];
+    readonly timeout: number;
+    readonly activate_after: number;
+  };
+}
+
 export interface RecallAutomaticLeaveRequest {
   readonly waiting_room_timeout?: number;
   readonly noone_joined_timeout?: number;
   readonly everyone_left_timeout?: { readonly timeout: number; readonly activate_after?: number | null };
   readonly in_call_not_recording_timeout?: number;
   readonly in_call_recording_timeout?: number;
+  readonly bot_detection?: RecallBotDetectionRequest;
 }
 
 /** The realtime events R1 asks for: whether a human is in the call. */
@@ -68,6 +87,21 @@ export interface RecallChatOnBotJoinRequest {
   readonly pin?: boolean;
 }
 
+/**
+ * Recall `ChatOnParticipantJoinRequest`: the message is sent every time a participant joins, and
+ * every participant sees it. Both fields are required by Recall.
+ */
+export interface RecallChatOnParticipantJoinRequest {
+  readonly message: string;
+  readonly exclude_host: boolean;
+}
+
+/** Recall `ChatRequest`. */
+export interface RecallChatRequest {
+  readonly on_bot_join?: RecallChatOnBotJoinRequest;
+  readonly on_participant_join?: RecallChatOnParticipantJoinRequest;
+}
+
 /** `POST /api/v1/bot/` body. Only `meeting_url` is required by Recall. */
 export interface RecallCreateBotRequest {
   /** Must already be the canonical `https://meet.google.com/<code>` (normalizeGoogleMeetUrl). */
@@ -79,7 +113,7 @@ export interface RecallCreateBotRequest {
   readonly output_media?: RecallOutputMediaRequest;
   readonly automatic_leave?: RecallAutomaticLeaveRequest;
   readonly recording_config?: RecallRecordingConfigRequest | null;
-  readonly chat?: { readonly on_bot_join: RecallChatOnBotJoinRequest };
+  readonly chat?: RecallChatRequest;
   readonly google_meet?: { readonly google_login_group_id: string };
   readonly metadata?: Readonly<Record<string, string>>;
 }

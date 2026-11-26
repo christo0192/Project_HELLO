@@ -2,7 +2,8 @@
  * The R1-over-Meet objective-profile registry: frozen, fail-closed lookups, and timers that agree
  * with the R1 worker. The worker's own files are read here (as `r1-personas-sync.test.ts` does), so
  * a change to the worker's rejoin grace, maximum residency or no-show wait fails this build until
- * the bot's automatic-leave timers are re-aligned.
+ * the bot's automatic-leave timers are re-aligned. M035 S09 T1: the explicit bot-detection timers
+ * (the name heuristic can never fire during a stay) and the Meet chat limit on the disclosure.
  */
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -11,6 +12,7 @@ import { describe, expect, it } from 'vitest';
 import {
   R1_MEET_CONSENT_MODES,
   R1_MEET_DEFAULT_PROFILE_ID,
+  R1_MEET_MEET_CHAT_MAX_CHARS,
   R1_MEET_PROFILES,
   R1_MEET_PROFILE_IDS,
   getR1MeetProfile,
@@ -78,6 +80,10 @@ describe('R1 Meet profile registry', () => {
         everyoneLeftTimeoutSec: 90,
         inCallNotRecordingTimeoutSec: 900,
         inCallRecordingTimeoutSec: 2700,
+        botDetection: {
+          participantNames: { matches: ['notetaker', 'recorder', 'assistant'], activateAfterSec: 7200, timeoutSec: 600 },
+          participantEvents: { activateAfterSec: 1200, timeoutSec: 600 },
+        },
       },
       disclosureChatMessage: DISCLOSURE,
       participantMetadataRetentionHours: 1,
@@ -108,6 +114,11 @@ describe('R1 Meet profile registry', () => {
     for (const profile of profiles) {
       expect(Object.isFrozen(profile), profile.id).toBe(true);
       expect(Object.isFrozen(profile.automaticLeave), profile.id).toBe(true);
+      const detection = profile.automaticLeave.botDetection;
+      expect(Object.isFrozen(detection), profile.id).toBe(true);
+      expect(Object.isFrozen(detection.participantNames), profile.id).toBe(true);
+      expect(Object.isFrozen(detection.participantNames.matches), profile.id).toBe(true);
+      expect(Object.isFrozen(detection.participantEvents), profile.id).toBe(true);
     }
     const profile = getR1MeetProfile('r1_dex_sales')!;
     expect(() => {
@@ -116,6 +127,27 @@ describe('R1 Meet profile registry', () => {
     expect(() => {
       (profile.automaticLeave as { everyoneLeftTimeoutSec: number }).everyoneLeftTimeoutSec = 2;
     }).toThrow(TypeError);
+    const detection = profile.automaticLeave.botDetection;
+    expect(() => {
+      (detection as { participantNames: unknown }).participantNames = null;
+    }).toThrow(TypeError);
+    expect(() => {
+      (detection.participantNames as { activateAfterSec: number }).activateAfterSec = 120;
+    }).toThrow(TypeError);
+    expect(() => {
+      (detection.participantNames.matches as string[]).push('interviewer');
+    }).toThrow(TypeError);
+    expect(() => {
+      (detection.participantNames.matches as string[])[0] = 'candidate';
+    }).toThrow(TypeError);
+    expect(() => {
+      (detection.participantEvents as { timeoutSec: number }).timeoutSec = 10;
+    }).toThrow(TypeError);
+    expect(detection.participantNames).toStrictEqual({
+      matches: ['notetaker', 'recorder', 'assistant'],
+      activateAfterSec: 7200,
+      timeoutSec: 600,
+    });
     expect(() => {
       (R1_MEET_PROFILES as Record<string, unknown>).r1_other = profile;
     }).toThrow(TypeError);
@@ -207,6 +239,30 @@ describe('every profile agrees with the database and the R1 worker', () => {
     expect(leave.everyoneLeftTimeoutSec).toBeGreaterThanOrEqual(1);
   });
 
+  it.each(profiles)('$id never leaves because a candidate is named like a bot (the name heuristic is inert)', (profile) => {
+    const leave = profile.automaticLeave;
+    // The longest the bot may stay: the not-recording window, then the recorded-call cap. The name
+    // heuristic only activates after that (counted from recording start, so this is conservative).
+    expect(leave.botDetection.participantNames.activateAfterSec).toBeGreaterThan(
+      leave.inCallNotRecordingTimeoutSec + leave.inCallRecordingTimeoutSec,
+    );
+  });
+
+  it.each(profiles)('$id respects the Recall bot-detection limits', (profile) => {
+    const { participantNames, participantEvents } = profile.automaticLeave.botDetection;
+    for (const heuristic of [participantNames, participantEvents]) {
+      expect(Number.isSafeInteger(heuristic.timeoutSec)).toBe(true);
+      expect(heuristic.timeoutSec).toBeGreaterThanOrEqual(10);
+      expect(Number.isSafeInteger(heuristic.activateAfterSec)).toBe(true);
+      expect(heuristic.activateAfterSec).toBeGreaterThanOrEqual(1);
+    }
+    expect(participantNames.matches.length).toBeGreaterThan(0);
+    for (const match of participantNames.matches) {
+      expect(typeof match).toBe('string');
+      expect(match.length).toBeGreaterThanOrEqual(1);
+    }
+  });
+
   it.each(profiles)('$id has sane scheduling and retention values', (profile) => {
     expect(Number.isSafeInteger(profile.botJoinLeadSec)).toBe(true);
     expect(profile.botJoinLeadSec).toBeGreaterThan(0);
@@ -228,7 +284,9 @@ describe('every profile agrees with the database and the R1 worker', () => {
   it.each(profiles)('$id discloses that the interviewer is an AI, by name, and that the call is recorded', (profile) => {
     const message = profile.disclosureChatMessage;
     expect(message.trim().length).toBeGreaterThan(0);
-    expect(message.length).toBeLessThanOrEqual(4096);
+    // Google Meet's chat limit (Recall's own maximum is 4096): the notice is never cut short.
+    expect(R1_MEET_MEET_CHAT_MAX_CHARS).toBe(500);
+    expect(message.length).toBeLessThanOrEqual(R1_MEET_MEET_CHAT_MAX_CHARS);
     expect(message).toMatch(/\bAI\b/);
     expect(message).toMatch(/\brecorded\b/);
     expect(message).toContain(profile.botDisplayName);
