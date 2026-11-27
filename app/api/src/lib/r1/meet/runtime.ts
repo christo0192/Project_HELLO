@@ -42,6 +42,12 @@
  * `ashby_key_missing`), and a null is NOT remembered, so a key set later is picked up by the next job.
  * A built port is kept. The Ashby client it holds makes one attempt per call (the queue retries).
  *
+ * THE DEX R1 BOOKED TAG (M035 S11): the lane's flow ports carry `ashbyTag`, the ports of the
+ * `ashby_booked_tag` job: the booked-tag store over the same client, Ashby's own switches (read per
+ * job, the same two as the scorecard), and the Ashby tag port, built on the first job that needs it
+ * from the existing Ashby runtime config (same `ASHBY_API_KEY`, no new secret): null while no usable
+ * key exists (not remembered), kept once built; its client makes one attempt per call.
+ *
  * MULTI-MACHINE (D-S06-35): correctness comes from the leases, the RPCs' compare-and-sets and the dedup
  * keys; the hot window and the bucket memory are per process and only shape cadence.
  *
@@ -54,6 +60,9 @@ import { createRecallClient } from '../../../integrations/recall/client.js';
 import type { Queue } from '../../queue/index.js';
 import { createQueueRunner, type QueueRunnerEvent, type QueueRunnerHandle } from '../../queue/runner.js';
 import type { supabase } from '../../supabase.js';
+import type { R1MeetAshbyTagDeps } from './ashby-booked-tag.js';
+import { createR1MeetAshbyTagPort, type R1MeetAshbyTagPort } from './ashby-booked-tag-ashby.js';
+import { createR1MeetBookedTagStore } from './ashby-booked-tag-store.js';
 import {
   getR1MeetFeedbackConfig,
   r1MeetActive,
@@ -123,6 +132,11 @@ export interface R1MeetLaneDeps {
    * enabled Meet config, the feedback form setting and the Ashby runtime config (see the header).
    */
   readonly feedback?: R1MeetFeedbackDeps;
+  /**
+   * Test seam (M035 S11): the ports of the "Dex R1: Booked" tag job. Production builds them from the
+   * same client and the Ashby runtime config (`createR1MeetAshbyTagPorts`, see the header).
+   */
+  readonly ashbyTag?: R1MeetAshbyTagDeps;
 }
 
 export interface R1MeetLaneTick {
@@ -150,6 +164,19 @@ export interface R1MeetLane {
 }
 
 /**
+ * Ashby's own write switches, read on every call: the integration master switch with a usable webhook
+ * secret AND `ASHBY_RUNTIME_ENABLED`, the switches every other Ashby write honours (see the header). A
+ * switch that cannot be read is off. Shared by Dex's scorecard and the booked tag.
+ */
+function ashbyWritesActive(): boolean {
+  try {
+    return isAshbyWebhookActive(loadAshbyConfig()) && loadAshbyRuntimeConfig().runtimeEnabled;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The production ports of Dex's scorecard feedback (M034 S09, see the header). Ashby's switches are
  * read per job (a switch that cannot be read is off). The Ashby port is built lazily from
  * `loadAshbyRuntimeConfig()`: null while no usable key is configured (not remembered, so a key set
@@ -164,13 +191,7 @@ export function createR1MeetFeedbackPorts(
   return Object.freeze({
     config: () => getR1MeetFeedbackConfig(),
     store: createR1MeetFeedbackStore(client),
-    ashbyActive: (): boolean => {
-      try {
-        return isAshbyWebhookActive(loadAshbyConfig()) && loadAshbyRuntimeConfig().runtimeEnabled;
-      } catch {
-        return false;
-      }
-    },
+    ashbyActive: ashbyWritesActive,
     ashby: (): R1MeetAshbyFeedbackPort | null => {
       if (port !== null) return port;
       const ashby = loadAshbyRuntimeConfig();
@@ -185,6 +206,33 @@ export function createR1MeetFeedbackPorts(
     },
     dexUserId: meet.ashby.dexUserId,
     bridgePageUrl: meet.bridgePageUrl,
+  });
+}
+
+/**
+ * The production ports of the "Dex R1: Booked" tag job (M035 S11, see the header): the booked-tag
+ * store over the same client (building it queries nothing), Ashby's own switches read per job, and
+ * the Ashby tag port built lazily from `loadAshbyRuntimeConfig()`: null while no usable key is
+ * configured or the client refuses it (not remembered, so a key set later counts at the next job),
+ * kept once built.
+ */
+export function createR1MeetAshbyTagPorts(client: Db, log: R1MeetLog): R1MeetAshbyTagDeps {
+  let port: R1MeetAshbyTagPort | null = null;
+  return Object.freeze({
+    store: createR1MeetBookedTagStore(client),
+    ashbyActive: ashbyWritesActive,
+    ashby: (): R1MeetAshbyTagPort | null => {
+      if (port !== null) return port;
+      const ashby = loadAshbyRuntimeConfig();
+      if (!ashby.apiKeyConfigured) return null;
+      try {
+        port = createR1MeetAshbyTagPort({ apiKey: ashby.apiKey, log });
+      } catch {
+        // The client refused the key: as unusable as none (the job alerts `ashby_key_missing`).
+        return null;
+      }
+      return port;
+    },
   });
 }
 
@@ -240,6 +288,8 @@ export function createR1MeetLane(deps: R1MeetLaneDeps): R1MeetLane | null {
       },
       // M034 S09: Dex's scorecard to Ashby (the `scorecard_feedback` job and the maintenance re-drive).
       feedback: deps.feedback ?? createR1MeetFeedbackPorts(deps.client, meet, log),
+      // M035 S11: the "Dex R1: Booked" tag of public bookings (the `ashby_booked_tag` job).
+      ashbyTag: deps.ashbyTag ?? createR1MeetAshbyTagPorts(deps.client, log),
     }));
 
   const dispatcher = createR1MeetDispatcher({

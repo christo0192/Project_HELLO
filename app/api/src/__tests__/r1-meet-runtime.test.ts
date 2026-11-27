@@ -20,7 +20,11 @@
  *  - M034 S09: the lane's flow ports carry `feedback` (the seam is honoured; production builds the
  *    form setting, the store, the Dex user, the bridge page and a LAZY Ashby port: no usable
  *    `ASHBY_API_KEY` = null and no client built, a null is not remembered, a built port is kept), and
- *    the maintenance job re-drives a lost feedback trigger only while the form setting is set.
+ *    the maintenance job re-drives a lost feedback trigger only while the form setting is set;
+ *  - M035 S11: the lane's flow ports carry `ashbyTag` (the seam is honoured; production builds the
+ *    booked-tag store, Ashby's own switches read per call and a LAZY tag port: no usable
+ *    `ASHBY_API_KEY` = null and no client built, a null is not remembered, a built port is kept), and
+ *    an `ashby_booked_tag` job through the production lane reaches its wired definition.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -28,14 +32,17 @@ import { createRecallClient, type RecallTransport } from '../integrations/recall
 import { Queue } from '../lib/queue/index.js';
 import { MemoryAdapter } from '../lib/queue/memory-adapter.js';
 import { notifyR1MeetAttemptEnded } from '../lib/r1/meet/attempt-ended.js';
+import type { R1MeetAshbyTagDeps } from '../lib/r1/meet/ashby-booked-tag.js';
+import { createR1MeetAshbyTagPort } from '../lib/r1/meet/ashby-booked-tag-ashby.js';
 import { getR1MeetConfig, getR1MeetDrainConfig, type R1MeetConfig, type R1MeetDrainConfig } from '../lib/r1/meet/config.js';
 import { R1_MEET_DEFINITIONS } from '../lib/r1/meet/dispatcher.js';
 import { createR1MeetAshbyFeedbackPort } from '../lib/r1/meet/feedback-ashby.js';
 import type { R1MeetFeedbackDeps } from '../lib/r1/meet/feedback.js';
-import { R1_MEET_QUEUE, r1MeetProcessed } from '../lib/r1/meet/jobs.js';
+import { R1_MEET_QUEUE, r1MeetJobs, r1MeetProcessed } from '../lib/r1/meet/jobs.js';
 import type { R1MeetFlowDeps, R1MeetJobDefinition } from '../lib/r1/meet/recall-actions.js';
 import {
   R1_MEET_LANE,
+  createR1MeetAshbyTagPorts,
   createR1MeetFeedbackPorts,
   createR1MeetLane,
   createR1MeetSweepTick,
@@ -65,6 +72,11 @@ import {
 vi.mock('../lib/r1/meet/feedback-ashby.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/r1/meet/feedback-ashby.js')>();
   return { ...actual, createR1MeetAshbyFeedbackPort: vi.fn(actual.createR1MeetAshbyFeedbackPort) };
+});
+// M035 S11: the same pass-through spy on the "Dex R1: Booked" tag port factory.
+vi.mock('../lib/r1/meet/ashby-booked-tag-ashby.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../lib/r1/meet/ashby-booked-tag-ashby.js')>();
+  return { ...actual, createR1MeetAshbyTagPort: vi.fn(actual.createR1MeetAshbyTagPort) };
 });
 
 const SECOND = 1000;
@@ -598,46 +610,51 @@ describe('the drain backstop inside the full runtime (R1 on, Meet flag off, a ke
   });
 });
 
+/** An Ashby key long enough to count, built at run time (never a key-shaped literal). */
+const usableKey = (): string => 'k'.repeat(24);
+const quiet = { info: () => {}, warn: () => {}, error: () => {} };
+
+/**
+ * The flow ports a job of the lane receives (one probe job, run through the real dispatcher). The
+ * optional seams are passed to the lane only when given (M034 S09 `feedback`, M035 S11 `ashbyTag`).
+ */
+async function flowDepsOf(w: World, feedback?: R1MeetFeedbackDeps, ashbyTag?: R1MeetAshbyTagDeps): Promise<R1MeetFlowDeps> {
+  const seen: R1MeetFlowDeps[] = [];
+  const probe: R1MeetJobDefinition<{ kind: 'probe' }> = {
+    kind: 'probe',
+    parse: (payload) => ((payload as { kind?: unknown } | null)?.kind === 'probe' ? { kind: 'probe' } : null),
+    run: async (deps) => {
+      seen.push(deps);
+      return r1MeetProcessed('probe');
+    },
+  };
+  const lane = createR1MeetLane({
+    r1Config: () => R1_ON,
+    meetConfig: () => MEET_ON,
+    client: w.db.client,
+    queue: w.queue,
+    owner: 'probe',
+    now: () => w.clock.ms,
+    definitions: [probe as R1MeetJobDefinition],
+    log: quiet,
+    ...(feedback === undefined ? {} : { feedback }),
+    ...(ashbyTag === undefined ? {} : { ashbyTag }),
+  })!;
+  await w.queue.enqueue(R1_MEET_QUEUE, { kind: 'probe' });
+  await lane.tick();
+  await settle(lane);
+  await lane.stop();
+  expect(seen).toHaveLength(1);
+  return seen[0]!;
+}
+
 describe('M034 S09: the feedback ports of the lane', () => {
   const FORM_ID = '7f000000-0000-4000-8000-00000000f0b1';
   const factory = vi.mocked(createR1MeetAshbyFeedbackPort);
-  /** An Ashby key long enough to count, built at run time (never a key-shaped literal). */
-  const usableKey = (): string => 'k'.repeat(24);
-  const quiet = { info: () => {}, warn: () => {}, error: () => {} };
 
   beforeEach(() => {
     factory.mockClear();
   });
-
-  /** The flow ports a job of the lane receives (one probe job, run through the real dispatcher). */
-  async function flowDepsOf(w: World, feedback?: R1MeetFeedbackDeps): Promise<R1MeetFlowDeps> {
-    const seen: R1MeetFlowDeps[] = [];
-    const probe: R1MeetJobDefinition<{ kind: 'probe' }> = {
-      kind: 'probe',
-      parse: (payload) => ((payload as { kind?: unknown } | null)?.kind === 'probe' ? { kind: 'probe' } : null),
-      run: async (deps) => {
-        seen.push(deps);
-        return r1MeetProcessed('probe');
-      },
-    };
-    const lane = createR1MeetLane({
-      r1Config: () => R1_ON,
-      meetConfig: () => MEET_ON,
-      client: w.db.client,
-      queue: w.queue,
-      owner: 'probe',
-      now: () => w.clock.ms,
-      definitions: [probe as R1MeetJobDefinition],
-      log: quiet,
-      ...(feedback === undefined ? {} : { feedback }),
-    })!;
-    await w.queue.enqueue(R1_MEET_QUEUE, { kind: 'probe' });
-    await lane.tick();
-    await settle(lane);
-    await lane.stop();
-    expect(seen).toHaveLength(1);
-    return seen[0]!;
-  }
 
   it('the seam is honoured: a job sees exactly the feedback ports it was given', async () => {
     const w = world();
@@ -799,5 +816,145 @@ describe('M034 S09: the feedback ports of the lane', () => {
     for (const id of [lost.bookingId, lost.assessmentId]) expect(logs).not.toContain(id);
     // No Ashby port was needed to queue it.
     expect(factory).not.toHaveBeenCalled();
+  });
+});
+
+describe('M035 S11: the tag ports of the lane', () => {
+  const tagFactory = vi.mocked(createR1MeetAshbyTagPort);
+
+  beforeEach(() => {
+    tagFactory.mockClear();
+  });
+
+  it('the seam is honoured: a job sees exactly the tag ports it was given', async () => {
+    const w = world();
+    const given: R1MeetAshbyTagDeps = Object.freeze({
+      store: {} as R1MeetAshbyTagDeps['store'],
+      ashbyActive: () => false,
+      ashby: () => null,
+    });
+    expect((await flowDepsOf(w, undefined, given)).ashbyTag).toBe(given);
+    expect(tagFactory).not.toHaveBeenCalled();
+  });
+
+  it('production ports: the booked-tag store; no ASHBY_API_KEY = null and NO client built; building them reads nothing', async () => {
+    vi.stubEnv('ASHBY_API_KEY', '');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const w = world();
+    const deps = await flowDepsOf(w);
+    const ashbyTag = deps.ashbyTag!;
+    expect(ashbyTag).toBeDefined();
+    expect(Object.isFrozen(ashbyTag)).toBe(true);
+    expect(Object.keys(ashbyTag).sort()).toEqual(['ashby', 'ashbyActive', 'store']);
+    for (const read of ['booking', 'applicationLink', 'candidateApplications', 'newestPublicBooking'] as const) {
+      expect(typeof ashbyTag.store[read]).toBe('function');
+    }
+    // The scorecard's group is still built next to it, unchanged.
+    expect(deps.feedback).toBeDefined();
+
+    expect(ashbyTag.ashby()).toBeNull();
+    vi.stubEnv('ASHBY_API_KEY', 'replace_me');
+    expect(ashbyTag.ashby()).toBeNull();
+    expect(tagFactory).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(w.db.calls).toEqual([]);
+  });
+
+  it("production ports: Ashby's own switches, read per call, the same two as Dex's scorecard", async () => {
+    // A webhook secret long enough to count, built at run time (never a secret-shaped literal).
+    const secret = 's'.repeat(24);
+    vi.stubEnv('ASHBY_INTEGRATION_ENABLED', 'true');
+    vi.stubEnv('ASHBY_WEBHOOK_SECRET', secret);
+    vi.stubEnv('ASHBY_RUNTIME_ENABLED', 'true');
+    vi.stubEnv('ASHBY_API_KEY', '');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const w = world();
+    const deps = await flowDepsOf(w);
+    const ashbyTag = deps.ashbyTag!;
+    const feedback = deps.feedback!;
+    /** Both groups answer the same at every step (one shared reading of the switches). */
+    const both = (): [boolean, boolean] => [ashbyTag.ashbyActive(), feedback.ashbyActive()];
+    // On: both switches, whatever the key (the key is the job's next question).
+    expect(both()).toEqual([true, true]);
+    // The documented "stop all Ashby writes" rollback, each step on its own (ashby-runtime-activation.md §6).
+    vi.stubEnv('ASHBY_RUNTIME_ENABLED', 'false');
+    expect(both()).toEqual([false, false]);
+    vi.stubEnv('ASHBY_RUNTIME_ENABLED', 'true');
+    vi.stubEnv('ASHBY_INTEGRATION_ENABLED', 'false');
+    expect(both()).toEqual([false, false]);
+    vi.stubEnv('ASHBY_INTEGRATION_ENABLED', 'true');
+    vi.stubEnv('ASHBY_WEBHOOK_SECRET', 'replace_me');
+    expect(both()).toEqual([false, false]);
+    vi.stubEnv('ASHBY_WEBHOOK_SECRET', secret);
+    vi.stubEnv('ASHBY_RUNTIME_ENABLED', '');
+    expect(both()).toEqual([false, false]);
+    vi.stubEnv('ASHBY_RUNTIME_ENABLED', 'true');
+    expect(both()).toEqual([true, true]);
+    expect(tagFactory).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(w.db.calls).toEqual([]);
+  });
+
+  it('a null is not remembered (a key set later counts), and a built port is kept', async () => {
+    vi.stubEnv('ASHBY_API_KEY', '');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const w = world();
+    const ashbyTag = (await flowDepsOf(w)).ashbyTag!;
+    expect(ashbyTag.ashby()).toBeNull();
+    vi.stubEnv('ASHBY_API_KEY', usableKey());
+    const port = ashbyTag.ashby();
+    expect(port).not.toBeNull();
+    expect(Object.isFrozen(port)).toBe(true);
+    expect(typeof port!.client.candidateInfo).toBe('function');
+    expect(typeof port!.resolver.resolve).toBe('function');
+    expect(ashbyTag.ashby()).toBe(port);
+    // Kept even when the key goes away afterwards (the built client holds it).
+    vi.stubEnv('ASHBY_API_KEY', '');
+    expect(ashbyTag.ashby()).toBe(port);
+    expect(tagFactory).toHaveBeenCalledTimes(1);
+    expect(tagFactory.mock.calls[0]![0]).toMatchObject({ apiKey: usableKey() });
+    // Production passes no transport, sleep or clock: the real network, at the first call only.
+    expect(Object.keys(tagFactory.mock.calls[0]![0]).sort()).toEqual(['apiKey', 'log']);
+    // Building the port calls nothing and reads nothing.
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(w.db.calls).toEqual([]);
+  });
+
+  it('a key the client refuses is as unusable as none, and the next call tries again', () => {
+    vi.stubEnv('ASHBY_API_KEY', usableKey());
+    const db = createR1MeetFakeDb();
+    const ashbyTag = createR1MeetAshbyTagPorts(db.client, quiet);
+    tagFactory.mockImplementationOnce(() => {
+      throw new Error('refused');
+    });
+    expect(ashbyTag.ashby()).toBeNull();
+    expect(ashbyTag.ashby()).not.toBeNull();
+    expect(tagFactory).toHaveBeenCalledTimes(2);
+    expect(db.calls).toEqual([]);
+  });
+
+  it('the production lane runs an ashby_booked_tag job on its wired definition: a missing booking ends ignored, one booking read, no Ashby call', async () => {
+    vi.stubEnv('ASHBY_API_KEY', '');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const w = world();
+    const lane = w.runtime!.meetLane!;
+    const bookingId = fixtureId();
+    const spec = r1MeetJobs.ashbyBookedTag('add', bookingId);
+    const job = await w.queue.enqueue(R1_MEET_QUEUE, spec.payload, { dedupKey: spec.dedupKey, maxAttempts: spec.maxAttempts });
+    await lane.tick();
+    await settle(lane);
+    await w.runtime!.stop();
+
+    expect((await w.queue.getById(job.id))!.status).toBe('completed');
+    expect(w.runtime!.snapshot().meetJobEvents.completed).toBe(1);
+    const logs = written.join('\n');
+    expect(logs).toContain('"error_type":"ashby_booked_tag:booking_missing"');
+    expect(logs).not.toContain('r1_meet_ashby_tag_unwired');
+    expect(logs.toLowerCase()).not.toContain(bookingId.toLowerCase());
+    // One narrow read of the booking, nothing else: no link read, no Ashby port, no request.
+    expect(w.db.calls).toEqual([{ kind: 'from', name: 'r1_meet_bookings' }]);
+    expect(tagFactory).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(w.requests).toEqual([]);
   });
 });
