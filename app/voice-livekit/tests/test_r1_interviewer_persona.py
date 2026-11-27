@@ -20,6 +20,7 @@ import os
 import re
 import string
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import r1_guard
@@ -658,3 +659,91 @@ class TestSessionVoiceMismatch(unittest.TestCase):
                 events = [(line.get("error_type"), line.get("error_category")) for line in lines]
                 if fallback:
                     self.assertIn(("r1_tts_profile", "v3"), events)
+
+
+_REPO = Path(__file__).resolve().parents[3]
+
+
+def _repo_text(rel):
+    return (_REPO / rel).read_text(encoding="utf-8").replace("\r\n", "\n")
+
+
+def _section(doc, heading):
+    start = doc.index(heading)
+    end = doc.find("\n### ", start + len(heading))
+    return doc[start:] if end < 0 else doc[start:end]
+
+
+def _flat(text):
+    return " ".join(text.split())
+
+
+class TestMeetRollbackRunbook(unittest.TestCase):
+    """The persona flags are the voice worker's only: the runbook must say what they leave as Lexy.
+
+    The API's Meet chat disclosure and Ashby feedback card header, and the staff web labels, are code
+    with no persona switch, and R1_MEET_BOT_NAME renames only a guest bot's tile. These tests read
+    the API and web sources that make the runbook's claims true, so changing that code fails here
+    until the runbook says the new truth.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.doc = _repo_text("docs/runbooks/r1-operations.md")
+        cls.section = _section(cls.doc, "### The interviewer: Lexy (owner 2026-11-27)")
+        cls.flat = _flat(cls.section)
+        profiles = _repo_text("app/api/src/lib/r1/meet/profiles.ts")
+        cls.bot_name = re.search(r"botDisplayName: '([^']+)'", profiles).group(1)
+        cls.disclosure = re.search(r"disclosureChatMessage: '([^']+)'", profiles).group(1)
+
+    def test_the_api_names_are_code_and_ignore_the_bot_name_override(self):
+        self.assertEqual(self.bot_name, "Lexy")
+        recall_bot = _repo_text("app/api/src/lib/r1/meet/recall-bot.ts")
+        self.assertIn("settings.botNameOverride ?? profile.botDisplayName", recall_bot)
+        self.assertIn("message: profile.disclosureChatMessage", recall_bot)
+        self.assertEqual(recall_bot.count("botNameOverride ??"), 1)
+        form = _repo_text("app/api/src/lib/r1/meet/feedback-form.ts")
+        self.assertIn("boundedText(profile.botDisplayName", form)
+        self.assertIn("(AI interviewer): ", form)
+        self.assertNotIn("botNameOverride", form)
+        self.assertNotIn("botNameOverride", _repo_text("app/api/src/lib/r1/meet/feedback.ts"))
+        for rel in ("app/api/src/lib/r1/meet/profiles.ts", "app/api/src/lib/r1/meet/recall-bot.ts",
+                    "app/api/src/lib/r1/meet/feedback-form.ts"):
+            self.assertNotIn("R1_INTERVIEWER_", _repo_text(rel), rel)
+
+    def test_the_runbook_says_a_voice_rollback_leaves_meet_and_the_web_as_lexy(self):
+        self.assertNotIn("R1_MEET_BOT_NAME=Dex", self.doc)
+        self.assertIn("Both rollbacks change the voice worker only", self.flat)
+        self.assertIn(f'("{self.disclosure}")', self.flat)
+        self.assertIn(f'("{self.bot_name} (AI interviewer): ...")', self.flat)
+        self.assertIn("`app/api/src/lib/r1/meet/profiles.ts`", self.flat)
+        self.assertIn("A full rollback on Meet needs an API and web code change", self.flat)
+        self.assertIn("`R1_MEET_BOT_NAME` changes none of these. It renames only a guest bot's name tile",
+                      self.flat)
+        web = {
+            "app/web/src/lib/r1-review.ts": "'Lexy (AI interviewer)'",
+            "app/web/src/lib/r1-meet-bookings.ts": "label: 'Lexy scheduled'",
+        }
+        for rel, literal in web.items():
+            self.assertIn(literal, _repo_text(rel), rel)
+        for label in ('"Lexy (AI interviewer)"', '"Lexy scheduled"', '"Lexy joining"'):
+            self.assertIn(label, self.flat)
+        rows = [line for line in self.doc.splitlines()
+                if line.startswith(("| `R1_INTERVIEWER_LEXY` |", "| `R1_INTERVIEWER_DEX` |"))]
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertIn("Voice worker only", row)
+
+    def test_the_bot_workspace_user_is_renamed_with_the_ashby_user(self):
+        self.assertIn('the Ashby user becomes "Lexy (AI Interviewer)"', self.flat)
+        self.assertIn("the bot's Google Workspace user (the account a signed-in bot joins as) gets the "
+                      "display name Lexy and a matching photo", self.flat)
+        self.assertIn("Change only the name and photo, not the email", self.flat)
+        self.assertIn("never by its name", self.flat)
+        recall = _flat(_section(self.doc, "### Recall setup (owner, once)"))
+        self.assertIn("one NON-admin user: the bot, whose display name is Lexy", recall)
+        self.assertIn("A signed-in bot shows the Google account's name and photo, not `R1_MEET_BOT_NAME`",
+                      recall)
+        go_live = _flat(_section(self.doc, "### Go-live order"))
+        self.assertIn("the bot Workspace (its user's display name and photo are Lexy's: a signed-in bot "
+                      "shows them, and `R1_MEET_BOT_NAME` only names a guest bot)", go_live)

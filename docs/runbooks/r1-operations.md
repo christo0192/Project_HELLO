@@ -1777,8 +1777,8 @@ Switches (optional; timing of reads is noted for the M033 switches):
 | `R1_LINE_CACHE` | on | `off` speaks every scripted line live, as before PR-4c |
 | `R1_SYNTH_PER_MIN` | 5 | Background Sarvam syntheses started per minute (1-30); raise only after the Sarvam tier is confirmed (D13) |
 | `R1_TTS_PROFILE` | v4 | R1's voices, both at once (read once per session): `v4` is Bulbul v4 Flash (the interviewer Lexy `roopa_en_conversational`, Dex `deven_en_conversation` with `R1_INTERVIEWER_LEXY=0`, or Christy `simran_en_customer` with `R1_INTERVIEWER_DEX=0`; the learner `zarina_en_conversation`), `v3` is the old voice (`SARVAM_TTS_MODEL` / `SARVAM_TTS_VOICE`) for both; any other value is v3. A Fly **secret** only. **Rollback: `fly secrets set R1_TTS_PROFILE=v3 R1_INTERVIEWER_DEX=0 -a project-hello-voice`** in a zero-live window. See "Voices: Bulbul v4 Flash" below |
-| `R1_INTERVIEWER_DEX` | 1 | The interviewer is not Christy: Dex (male) in spoken lines, prompts and the default interviewer voice `deven_en_conversation`, or Lexy while `R1_INTERVIEWER_LEXY` is on; 0 = Christy and `simran_en_customer` exactly as before, whatever `R1_INTERVIEWER_LEXY` says. Rollback to Christy: `fly secrets set R1_INTERVIEWER_DEX=0 -a project-hello-voice` in a zero-live window |
-| `R1_INTERVIEWER_LEXY` | 1 | Owner 2026-11-27, only with `R1_INTERVIEWER_DEX`: Lexy (female, she/her) in spoken lines, prompts and the default interviewer voice `roopa_en_conversational` (bulbul:v4-flash; the learner keeps `zarina_en_conversation`); the name and the voice switch together. 0 = Dex exactly as before (content revision 54's texts, `deven_en_conversation`). Rollback to Dex: `fly secrets set R1_INTERVIEWER_LEXY=0 -a project-hello-voice` in a zero-live window |
+| `R1_INTERVIEWER_DEX` | 1 | The interviewer is not Christy: Dex (male) in spoken lines, prompts and the default interviewer voice `deven_en_conversation`, or Lexy while `R1_INTERVIEWER_LEXY` is on; 0 = Christy and `simran_en_customer` exactly as before, whatever `R1_INTERVIEWER_LEXY` says. Rollback to Christy: `fly secrets set R1_INTERVIEWER_DEX=0 -a project-hello-voice` in a zero-live window. Voice worker only, like the Dex rollback |
+| `R1_INTERVIEWER_LEXY` | 1 | Owner 2026-11-27, only with `R1_INTERVIEWER_DEX`: Lexy (female, she/her) in spoken lines, prompts and the default interviewer voice `roopa_en_conversational` (bulbul:v4-flash; the learner keeps `zarina_en_conversation`); the name and the voice switch together. 0 = Dex exactly as before (content revision 54's texts, `deven_en_conversation`). Rollback to Dex: `fly secrets set R1_INTERVIEWER_LEXY=0 -a project-hello-voice` in a zero-live window. Voice worker only: the Meet chat disclosure, the Ashby feedback card and the staff web still say Lexy (see "The interviewer: Lexy") |
 | `R1_TTS_INTERVIEWER_VOICE` / `R1_TTS_LEARNER_VOICE` | empty | v4 only: swap one voice for another id in `r1_tts.V4_SPEAKERS`; anything else is ignored with `r1_tts_setting_rejected`. Fly secrets only |
 | `R1_STT_MODEL` | empty (`saaras:v4`) | R1's STT model: `saaras:v4` (default) or `saaras:v3` (the rollback); anything else falls back to `SARVAM_STT_MODEL` with `r1_stt_setting_rejected` |
 
@@ -3398,11 +3398,30 @@ fly secrets set R1_INTERVIEWER_DEX=0 -a project-hello-voice    # Christy, simran
 ```
 
 Undo with `fly secrets unset R1_INTERVIEWER_LEXY -a project-hello-voice` (or
-`R1_INTERVIEWER_DEX`). Confirm with the session's `r1_interviewer_persona` line. A Meet bot shows
-the API's profile name (`Lexy`, or `R1_MEET_BOT_NAME`): set `R1_MEET_BOT_NAME=Dex` on the API with
-a Dex rollback while Meet is live. The Ashby user is renamed to "Lexy (AI Interviewer)" by the
-owner; the Meet code matches that user by its id (`R1_MEET_ASHBY_DEX_USER_ID`), never by name,
-so the rename needs no secret change.
+`R1_INTERVIEWER_DEX`). Confirm with the session's `r1_interviewer_persona` line.
+
+**Both rollbacks change the voice worker only.** The API and the staff web have no persona
+switch, so with `R1_INTERVIEWER_LEXY=0` (or `R1_INTERVIEWER_DEX=0`) they still say Lexy:
+- on Google Meet, the pinned chat disclosure ("Lexy is an AI interviewer from Interview
+  Kickstart. This call is recorded.") and the header of the Ashby feedback card ("Lexy (AI
+  interviewer): ..."), both fixed in code (`app/api/src/lib/r1/meet/profiles.ts`);
+- on the staff pages, the transcript speaker label "Lexy (AI interviewer)", the Meet bookings
+  statuses ("Lexy scheduled", "Lexy joining"), the review briefing and the retake copy.
+
+`R1_MEET_BOT_NAME` changes none of these. It renames only a guest bot's name tile, and a
+signed-in bot (the recommended setup) shows its Google Workspace user's name and photo instead.
+So while Meet is live, a voice rollback leaves the voice saying it is Dex (or Christy) next to a
+chat notice and an Ashby card that say Lexy. A full rollback on Meet needs an API and web code
+change. Meet is dark (`R1_MEET_ENABLED` unset), so nothing is affected until it goes live. The
+Christy rollback had the same gap before Lexy (Meet said Dex).
+
+**Renames the owner makes** (neither needs a secret change):
+- the Ashby user becomes "Lexy (AI Interviewer)". The Meet code matches that user by its id
+  (`R1_MEET_ASHBY_DEX_USER_ID`), never by its name;
+- the bot's Google Workspace user (the account a signed-in bot joins as) gets the display name
+  Lexy and a matching photo, otherwise a signed-in bot joins the Meet labelled Dex while it speaks
+  as Lexy. Change only the name and photo, not the email: the Ashby user and the Recall Google
+  Login are tied to that email.
 
 ### Saaras v4 STT (R1 default since 2026-10-30)
 
@@ -4029,7 +4048,8 @@ delivery sent while dark is lost. The Ashby API key stays with the owner.
 - **Account and region.** The Recall workspace is in ap-northeast-1; `RECALL_BASE_URL` defaults to
   `https://ap-northeast-1.recall.ai`. A key from another region does not work there.
 - **The bot's Google account.** A dedicated paid Google Workspace (Starter is enough) on its own
-  primary domain, separate from the company domains, with one NON-admin user: the bot. In that
+  primary domain, separate from the company domains, with one NON-admin user: the bot, whose
+  display name is Lexy (with a matching photo; a signed-in bot shows them in the call). In that
   user's Google Calendar settings, set "Add invitations to my calendar" to "Only if the sender is
   known". Nothing reads this calendar (no Calendar sync, no Recall Calendar V2): Ashby's webhooks are
   the only source of bookings.
@@ -4100,7 +4120,9 @@ Preconditions, each with an owner:
 Then, in order:
 1. Every M034 PR merged and deployed dark; `R1_MEET_ENABLED` unset. The read-only queries below
    return nothing.
-2. Owner: the Lexy Ashby user, the bot Workspace, the Recall login group (sections above).
+2. Owner: the Lexy Ashby user, the bot Workspace (its user's display name and photo are Lexy's:
+   a signed-in bot shows them, and `R1_MEET_BOT_NAME` only names a guest bot), the Recall login
+   group (sections above).
 3. Owner: the secrets and the knobs (at least `R1_MEET_SERVICE_USER_ID`), still with the flag off.
 4. The voice worker's Meet channel, `R1_MEET_VOICE_ENABLED=true` on `project-hello-voice` (S08), in
    a zero-live window.
