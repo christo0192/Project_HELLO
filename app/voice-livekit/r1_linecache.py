@@ -33,9 +33,10 @@ learner for L-PICKUP and L-SIL-RP1).  The voices come from the session's TTS
 read of the environment, so a cached line and a live line always agree.  Under v3 both roles
 are ``r1_tts_kwargs()`` and every key is byte-identical to the single-voice cache's (no version
 bump); under v4 the keys differ by model and speaker, so a learner clip and an interviewer
-clip of the same text never collide, and neither do a Christy clip and a Dex clip (their text
-and their speaker both differ).  One synthesizer is built per DISTINCT voice (one under v3,
-two REST ``sarvam.TTS`` under v4) and one request bucket paces them all.
+clip of the same text never collide, and neither do a Christy, a Dex and a Lexy clip (their
+text and their speaker both differ, so a persona switch re-warms its lines by itself).  One
+synthesizer is built per DISTINCT voice (one under v3, two REST ``sarvam.TTS`` under v4) and one
+request bucket paces them all.
 
 This module logs nothing: ``on_event`` is the single reporting seam and ``r1_session`` turns
 each event into one ``r1`` log line.

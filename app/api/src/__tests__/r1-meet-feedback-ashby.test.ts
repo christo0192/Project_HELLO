@@ -167,7 +167,7 @@ function cardRequest(form: ProbeFeedbackForm) {
 }
 
 const EXPECTED_SUMMARY = [
-  'Dex (AI interviewer): R1 sales role-play over Google Meet. Verdict: Borderline. Weighted 2.65/4 across 4 of 5 metrics; 1 not scored (listed below).',
+  'Lexy (AI interviewer): R1 sales role-play over Google Meet. Verdict: Borderline. Weighted 2.65/4 across 4 of 5 metrics; 1 not scored (listed below).',
   'Negotiation & discount discipline — NOT SCORED (insufficient evidence): Rationale 3.',
   'Probing & discovery — 3/4: Rationale 0.',
   'Objection handling — 3/4: Rationale 1.',
@@ -433,7 +433,7 @@ describe('r1MeetAshbyClientLogger', () => {
       API_KEY, authHeader, authHeader.replace(/^Basic /, ''), 'Basic', 'authorization',
       FORM_ID, ROUND_ID, APPLICATION_ID, EVENT_ID, DEX_USER_ID, 'sfi-1',
       'summary_path', 'report_path', 'metric_path', 'overall_recommendation', 'hello.example.test',
-      'Rationale', 'Dex (AI interviewer)', '/',
+      'Rationale', 'Lexy (AI interviewer)', '/',
     ];
     expect(authHeader.startsWith('Basic ')).toBe(true);
     for (const needle of forbidden) expect(text, needle).not.toContain(needle);

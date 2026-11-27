@@ -6,8 +6,9 @@ that remains the rollback path.
 
 Stack: Sarvam STT (`saaras:v3`, en-IN) + Sarvam TTS (`bulbul:v3`, speaker `simran`)
 + DeepSeek/OpenAI-compatible LLM. Turn handling uses LiveKit Agents defaults. R1 alone
-speaks Bulbul v4 Flash (`bulbul:v4-flash`: Dex `deven_en_conversation`, the learner
-`zarina_en_conversation`), switched back to the line above by the secret `R1_TTS_PROFILE=v3`
+speaks Bulbul v4 Flash (`bulbul:v4-flash`: the interviewer Lexy `roopa_en_conversational`, or
+Dex `deven_en_conversation` with `R1_INTERVIEWER_LEXY=0`; the learner `zarina_en_conversation`),
+switched back to the line above by the secret `R1_TTS_PROFILE=v3`
 (`docs/runbooks/r1-operations.md`, "Voices: Bulbul v4 Flash"); its Saaras v4 STT trial
 (`R1_STT_MODEL`, `tools/r1_stt_ab.py`) stays off in production.
 

@@ -506,8 +506,8 @@ the dashboard figure to re-stamp its baseline.
 
 ### Deploying 0142 (M034 S02, Meet bookings, dark)
 
-0142 is the database half of R1 over Google Meet (HR schedules the interview in Ashby with Dex
-as an interviewer; Dex joins that Meet). It adds `r1_meet_bookings`, `r1_meet_receipts`,
+0142 is the database half of R1 over Google Meet (HR schedules the interview in Ashby with Lexy
+as an interviewer; Lexy joins that Meet). It adds `r1_meet_bookings`, `r1_meet_receipts`,
 `interview_rounds.channel`, four HR-attestation columns on `interview_round_consents`, eleven
 service-role RPCs and four trigger functions. Data classification:
 `docs/data-classification.md`, "R1 Meet bookings (0142, M034)".
@@ -540,9 +540,9 @@ service-role RPCs and four trigger functions. Data classification:
   Meet round fail admission with `consent_missing`, exactly like browser rounds that consented to
   the older notice. Nothing re-attests automatically: the stored attester attested the OLD
   notice, and writing the new version under their name would record an attestation that never
-  happened. Recovery, per booking, is a new HR act in Ashby: HR cancels the Dex interview (or
-  removes Dex from it), so the runtime cancels the booking and removes its bot, and then
-  schedules a new Dex interview. The new event re-links the candidate's reusable Meet round and
+  happened. Recovery, per booking, is a new HR act in Ashby: HR cancels the Lexy interview (or
+  removes Lexy from it), so the runtime cancels the booking and removes its bot, and then
+  schedules a new Lexy interview. The new event re-links the candidate's reusable Meet round and
   attests under the new template, naming the HR user who scheduled it. A new event while the old
   booking is still live is refused as `blocked/round_active`, so the cancel comes first. Release a
   template only when no Meet booking is live (the consent release is the last M034 PR, at
@@ -716,14 +716,14 @@ classified in `docs/data-classification.md`, "Job payloads" and the paragraph af
   deploy S06, then turn the flag on, then create the Recall dashboard endpoint (the status path,
   the nine `bot.*` events), then add the two schedule actions to the Ashby webhook.
 - **The forwarding table (Ashby, flag on).** D is the set of events in the delivery whose
-  interviewers include Dex (`R1_MEET_ASHBY_DEX_USER_ID`).
-  - D not empty: one `event` job per Dex event, carrying the S01 decision (`eligible`,
+  interviewers include Lexy (`R1_MEET_ASHBY_DEX_USER_ID`).
+  - D not empty: one `event` job per Lexy event, carrying the S01 decision (`eligible`,
     `cancelled`, `in_past`, `not_scheduled`, `no_attester` or `no_meet_link`).
   - D empty, Create: no job, 200 `r1_meet_no_dex_event` (a new schedule has no booking).
   - D empty, Update with status `Cancelled`: one `schedule` job, decision `cancelled`.
   - D empty, any other Update: one `schedule` job, decision `dex_absent`, always (HR may have
-    removed Dex, or deleted the Dex event, and S06 must cancel the bot). There is no "long past"
-    exception: an Update lists only the events still in the schedule, so a deleted future Dex event
+    removed Lexy, or deleted the Lexy event, and S06 must cancel the bot). There is no "long past"
+    exception: an Update lists only the events still in the schedule, so a deleted future Lexy event
     in a schedule whose other events are past is visible only through this job.
   - A `schedule` job carries no application, stage or scheduler id (it may concern a human-only
     interview): only the schedule id, the decision, `ashby_updated_at`, `received_at` and the two
@@ -769,7 +769,7 @@ classified in `docs/data-classification.md`, "Job payloads" and the paragraph af
      on every request, so the change takes effect with no deploy.
   3. Receipts and jobs already written stay in the queue; S06 handles them only while the flag is
      on. Ashby schedule changes made while the flag was off are not replayed, so before turning it
-     back on, review the Dex interviews scheduled or cancelled in that window in Ashby.
+     back on, review the Lexy interviews scheduled or cancelled in that window in Ashby.
 
   Before S06 ships no bot can exist, so the flag can be turned off at any time.
 
@@ -1776,8 +1776,9 @@ Switches (optional; timing of reads is noted for the M033 switches):
 | `R1_TTS_FLUSH_MIN_CHARS` | 60 | Early-flush length cap; `0` turns the early-flush `tts_node` off |
 | `R1_LINE_CACHE` | on | `off` speaks every scripted line live, as before PR-4c |
 | `R1_SYNTH_PER_MIN` | 5 | Background Sarvam syntheses started per minute (1-30); raise only after the Sarvam tier is confirmed (D13) |
-| `R1_TTS_PROFILE` | v4 | R1's voices, both at once (read once per session): `v4` is Bulbul v4 Flash (the interviewer Dex `deven_en_conversation`, or Christy `simran_en_customer` with `R1_INTERVIEWER_DEX=0`, the learner `zarina_en_conversation`), `v3` is the old voice (`SARVAM_TTS_MODEL` / `SARVAM_TTS_VOICE`) for both; any other value is v3. A Fly **secret** only. **Rollback: `fly secrets set R1_TTS_PROFILE=v3 R1_INTERVIEWER_DEX=0 -a project-hello-voice`** in a zero-live window. See "Voices: Bulbul v4 Flash" below |
-| `R1_INTERVIEWER_DEX` | 1 | Dex (male) in spoken lines, prompts and the default interviewer voice `deven_en_conversation`; 0 = Christy and `simran_en_customer` exactly as before. Rollback: `fly secrets set R1_INTERVIEWER_DEX=0 -a project-hello-voice` in a zero-live window |
+| `R1_TTS_PROFILE` | v4 | R1's voices, both at once (read once per session): `v4` is Bulbul v4 Flash (the interviewer Lexy `roopa_en_conversational`, Dex `deven_en_conversation` with `R1_INTERVIEWER_LEXY=0`, or Christy `simran_en_customer` with `R1_INTERVIEWER_DEX=0`; the learner `zarina_en_conversation`), `v3` is the old voice (`SARVAM_TTS_MODEL` / `SARVAM_TTS_VOICE`) for both; any other value is v3. A Fly **secret** only. **Rollback: `fly secrets set R1_TTS_PROFILE=v3 R1_INTERVIEWER_DEX=0 -a project-hello-voice`** in a zero-live window. See "Voices: Bulbul v4 Flash" below |
+| `R1_INTERVIEWER_DEX` | 1 | The interviewer is not Christy: Dex (male) in spoken lines, prompts and the default interviewer voice `deven_en_conversation`, or Lexy while `R1_INTERVIEWER_LEXY` is on; 0 = Christy and `simran_en_customer` exactly as before, whatever `R1_INTERVIEWER_LEXY` says. Rollback to Christy: `fly secrets set R1_INTERVIEWER_DEX=0 -a project-hello-voice` in a zero-live window |
+| `R1_INTERVIEWER_LEXY` | 1 | Owner 2026-11-27, only with `R1_INTERVIEWER_DEX`: Lexy (female, she/her) in spoken lines, prompts and the default interviewer voice `roopa_en_conversational` (bulbul:v4-flash; the learner keeps `zarina_en_conversation`); the name and the voice switch together. 0 = Dex exactly as before (content revision 54's texts, `deven_en_conversation`). Rollback to Dex: `fly secrets set R1_INTERVIEWER_LEXY=0 -a project-hello-voice` in a zero-live window |
 | `R1_TTS_INTERVIEWER_VOICE` / `R1_TTS_LEARNER_VOICE` | empty | v4 only: swap one voice for another id in `r1_tts.V4_SPEAKERS`; anything else is ignored with `r1_tts_setting_rejected`. Fly secrets only |
 | `R1_STT_MODEL` | empty (`saaras:v4`) | R1's STT model: `saaras:v4` (default) or `saaras:v3` (the rollback); anything else falls back to `SARVAM_STT_MODEL` with `r1_stt_setting_rejected` |
 
@@ -3290,11 +3291,13 @@ R1 (and only R1: the browser screener and the phone lane are untouched) speaks w
 
 | Role | Sarvam persona | Speaker id |
 |---|---|---|
-| Christy, the interviewer (opening, icebreaker, transition, asides, wrap-up, close) | "Simran - A confident and low female voice - Customer support" | `simran_en_customer` |
+| Lexy, the interviewer since 2026-11-27 (opening, icebreaker, transition, asides, wrap-up, close) | Roopa, female, conversational | `roopa_en_conversational` |
+| Dex, the interviewer with `R1_INTERVIEWER_LEXY=0` | Deven, male, conversational | `deven_en_conversation` |
+| Christy, the interviewer with `R1_INTERVIEWER_DEX=0` | "Simran - A confident and low female voice - Customer support" | `simran_en_customer` |
 | The role-play learner (Priya, Pooja, ...: every role-play reply, L-PICKUP, L-SIL-RP1, the learner filler, L-TIME-CUE) | "Zarina - A deep, full and flowing female voice - Conversational" | `zarina_en_conversation` |
 
-Both ids were confirmed on Sarvam's Voices page and in the live server's own speaker list on
-2026-10-29, and both synthesised live on the pinned plugin (livekit-plugins-sarvam 1.6.4) over the
+The learner's voice is the same whoever the interviewer is. The Simran and Zarina ids were
+confirmed on Sarvam's Voices page and in the live server's own speaker list on 2026-10-29, and both synthesised live on the pinned plugin (livekit-plugins-sarvam 1.6.4) over the
 two routes R1 uses: the WebSocket stream for live speech, REST for the line cache. No SDK upgrade.
 
 **How it works.** `R1_TTS_PROFILE` (default `v4`) picks a whole voice set, once per session
@@ -3320,9 +3323,11 @@ exactly today's construction, and both roles speak `SARVAM_TTS_VOICE` (`simran`)
   could not be built; THIS session runs on v3), `r1_tts_voice_unbound` (once per session: a speech
   R1 could not identify fell back to the phase rule; after an SDK bump this means the speech-handle
   seam moved, and the interviewer's lines in role-play would come out in the learner's voice);
-* `r1_interviewer_voice_mismatch` (Dex is on but the session speaks a female or legacy voice:
-  `legacy_voice` = v3 profile or v4 build fallback, `voice_not_male` = an interviewer override
-  that is not a male id).
+* `r1_interviewer_voice_mismatch` (the interviewer's name and voice disagree: `legacy_voice` =
+  Lexy or Dex on the v3 profile or the v4 build fallback, `voice_not_female` = Lexy with an
+  interviewer override that is not a female id (`r1_tts.V4_FEMALE_SPEAKERS`),
+  `voice_not_male` = Dex with one that is not a male id). Never logged for Christy.
+* `r1_interviewer_persona` once per session: `lexy`, `dex` or `christy`.
 
 **Rollback (no redeploy).** In a zero-live window (a secret change restarts running machines and
 cuts a live interview, as for `R1_RECORDING`):
@@ -3331,19 +3336,22 @@ cuts a live interview, as for `R1_RECORDING`):
 fly secrets set R1_TTS_PROFILE=v3 R1_INTERVIEWER_DEX=0 -a project-hello-voice
 ```
 
-The v3 Simran voice is female, so turn Dex off with the v3 rollback. Fly restarts the running
-machines with the values, and stopped pool machines take them at their next start. Confirm the
-first new session logs `r1_tts_profile` `v3` and no `r1_interviewer_voice_mismatch`. Undo (back
-to v4 and Dex) with `fly secrets unset R1_TTS_PROFILE R1_INTERVIEWER_DEX -a project-hello-voice`.
+The v3 Simran voice is Christy's, so turn Lexy and Dex off with the v3 rollback
+(`R1_INTERVIEWER_DEX=0` turns both off). Fly restarts the running machines with the values, and
+stopped pool machines take them at their next start. Confirm the first new session logs
+`r1_tts_profile` `v3`, `r1_interviewer_persona` `christy` and no
+`r1_interviewer_voice_mismatch`. Undo (back to v4 and Lexy) with
+`fly secrets unset R1_TTS_PROFILE R1_INTERVIEWER_DEX -a project-hello-voice`.
 An unknown value (a typo such as `V 3`) is v3 too, logged `profile_unknown`: the known-good voice
 wins.
 
 **Swap one voice** (v4 only): `fly secrets set R1_TTS_LEARNER_VOICE=<id> -a project-hello-voice`
 (or `R1_TTS_INTERVIEWER_VOICE`). The id must be in `r1_tts.V4_SPEAKERS`, the English ids the live
 server listed for bulbul:v4-flash; anything else keeps the default and logs
-`learner_voice_rejected`. With Dex on, the interviewer id must also be in
-`r1_tts.V4_MALE_SPEAKERS`: a female id is still used, but logs `r1_interviewer_voice_mismatch`
-`voice_not_male`. Adding an id is a code change on purpose: the plugin does not validate
+`learner_voice_rejected`. With Lexy on (the default), the interviewer id must also be in
+`r1_tts.V4_FEMALE_SPEAKERS`: any other id is still used, but logs
+`r1_interviewer_voice_mismatch` `voice_not_female`; with Dex (`R1_INTERVIEWER_LEXY=0`) it must
+be in `r1_tts.V4_MALE_SPEAKERS` (`voice_not_male`). Adding an id is a code change on purpose: the plugin does not validate
 v4 ids, and a wrong one is dead air on every line (an in-band 400, retried three times).
 
 **Pre-deploy check.** `fly secrets list -a project-hello-voice` (names only) must show no leftover
@@ -3367,6 +3375,34 @@ matters ("nine thousand dollars"); Hindi must be written in Devanagari, never ro
 the plugin raises as status **500** (retryable), not 402: R1's 402 abort does not fire for TTS over
 the socket, the SDK retries, then the 3-failure abort ends the interview. Check the Sarvam credits
 (the Sarvam dashboard) before anything else when TTS fails across sessions.
+
+### The interviewer: Lexy (owner 2026-11-27)
+
+The R1 interviewer is **Lexy** (she/her), voiced by `roopa_en_conversational` on
+`bulbul:v4-flash`; the role-play learner keeps `zarina_en_conversation`. Her name is in every
+scripted line that names the interviewer (`r1_script.LEXY_LINES`, content revision 55: the
+Christy texts with the name swapped and nothing else, so the Google Meet lines and the spoken
+-SP lines follow too), in the interviewer prompts, the end-intent and turn-reader prompts
+(reader label `r1-reader-v4+...`) and the agent instructions. Detectors also hear Lexy, Lexi and
+Lexie whatever the flags say (and still hear Dex and Christy). The line cache keys on the text
+and the speaker, so every machine re-warms its interviewer lines once by itself after the deploy.
+Stored transcript speaker ids (`christy`), reason codes (`dex_absent`), the Meet profile id
+(`r1_dex_sales`) and `R1_MEET_ASHBY_DEX_USER_ID` keep their names: they are identifiers, not
+copy. The phone screener and the Ashby `Christy:` verdict tags are unchanged.
+
+Rollbacks, each in a zero-live window (the name and the voice always switch together):
+
+```
+fly secrets set R1_INTERVIEWER_LEXY=0 -a project-hello-voice   # Dex, deven_en_conversation
+fly secrets set R1_INTERVIEWER_DEX=0 -a project-hello-voice    # Christy, simran_en_customer
+```
+
+Undo with `fly secrets unset R1_INTERVIEWER_LEXY -a project-hello-voice` (or
+`R1_INTERVIEWER_DEX`). Confirm with the session's `r1_interviewer_persona` line. A Meet bot shows
+the API's profile name (`Lexy`, or `R1_MEET_BOT_NAME`): set `R1_MEET_BOT_NAME=Dex` on the API with
+a Dex rollback while Meet is live. The Ashby user is renamed to "Lexy (AI Interviewer)" by the
+owner; the Meet code matches that user by its id (`R1_MEET_ASHBY_DEX_USER_ID`), never by name,
+so the rename needs no secret change.
 
 ### Saaras v4 STT (R1 default since 2026-10-30)
 
@@ -3928,19 +3964,19 @@ here for the drain. The vendor is Recall.ai, region ap-northeast-1 (Tokyo).
   `web_4_core`, Idempotency-Key `r1-meet-<event>-v<version>-k<key_attempt>`) -> `bot_scheduled`
   -> `bot_joining` -> a person joins (`human_present`): a fresh bridge ticket is armed and the
   bridge page is posted as the bot's camera (`output_media`) -> the page claims the ticket
-  (`in_call`) and Dex runs the interview -> the worker reports the attempt outcome -> `leave_call`
+  (`in_call`) and Lexy runs the interview -> the worker reports the attempt outcome -> `leave_call`
   -> `completed/attempt_settled`. An attempt that does NOT count (a provider error, a forced
   shutdown, a bridge that never got in, a session that lapsed before the worker joined) does not end
   the call: while the round has a start left, the claim window is open, an arm is left and a person
   is still in the call, a fresh ticket is armed and posted (the next claim is a new attempt, as a
   browser candidate would restart). Otherwise the bot leaves and the booking is `failed/no_show`
-  (nobody left in the call) or `failed/bot_fatal` (Dex could not go on): HR books again. Before
+  (nobody left in the call) or `failed/bot_fatal` (Lexy could not go on): HR books again. Before
   anyone is in the call, a bot that ends is `failed/no_show` only when it was in the call and nobody
   came. A bot that never got into the call (no `in_call_*` status in its Recall history, read once
   before the move), or one that Meet refused (held in the waiting room until the timeout, denied,
   blocked, the meeting not started, a sign-in failure), is `failed/bot_fatal` with an alert: the
   candidate was not the problem (M035 S09). A move in Ashby releases the bot and creates a new one
-  (never a PATCH); a cancel, or Dex removed, releases it and cancels the booking.
+  (never a PATCH); a cancel, or Lexy removed, releases it and cancels the booking.
 - **The bot leaves on its own** (Recall `automatic_leave`, profile `r1_dex_sales`): waiting room
   600 s, nobody joined 900 s, everyone left 90 s (the worker's rejoin grace), in the call but not
   recording 900 s, recording 2700 s (45 minutes). These bound the bill of a bot nobody released.
@@ -3962,21 +3998,21 @@ here for the drain. The vendor is Recall.ai, region ap-northeast-1 (Tokyo).
   `r1_meet_recall_ok` / `r1_meet_recall_failed` with the operation, category and HTTP status. No
   line ever holds an id, a name, an email, a Meet URL, a ticket or a digest.
 
-### The Dex Ashby user (owner, once)
+### The Lexy Ashby user (owner, once)
 
-1. Create the Ashby user **"Dex (AI Interviewer)"** with the email of the bot's Google account
-   (below), so that Ashby invites that account whenever Dex is an interviewer.
-2. Add Dex as an interviewer on the R1 interview of the stage HR schedules R1 in. HR schedules the
-   R1 interview in Ashby with Dex as the interviewer; Ashby creates the Google Meet and invites the
+1. Create the Ashby user **"Lexy (AI Interviewer)"** with the email of the bot's Google account
+   (below), so that Ashby invites that account whenever Lexy is an interviewer.
+2. Add Lexy as an interviewer on the R1 interview of the stage HR schedules R1 in. HR schedules the
+   R1 interview in Ashby with Lexy as the interviewer; Ashby creates the Google Meet and invites the
    candidate and the bot account. Scheduling it is the HR-attested consent and India-location
    attestation (D-M034-11): the attestation names the Ashby user who scheduled it.
-3. Copy Dex's Ashby user id (Ashby `user.search` with the bot account's email, or the admin user
+3. Copy Lexy's Ashby user id (Ashby `user.search` with the bot account's email, or the admin user
    page) into `R1_MEET_ASHBY_DEX_USER_ID` (see Secrets). Only events with this user among the
    interviewers get a bot.
 4. Tell HR: book the slot at most 14 days ahead (a later slot waits as `blocked/slot_too_far` and
    is picked up by itself); admit the candidate, then leave the call within 2 minutes (with the
    policy `end`, two people in the call for 2 minutes end it as `failed/multiple_humans`; the
-   default `observe` only logs it); bring no notetaker bot. Dex starts when the first person joins,
+   default `observe` only logs it); bring no notetaker bot. Lexy starts when the first person joins,
    so HR should not wait in the call ahead of the candidate.
 
 ### The Ashby webhook (owner, LAST step of the go-live)
@@ -4046,7 +4082,7 @@ value out of range makes Meet `invalid`; nothing is clamped.
 | `R1_MEET_ARM_AT_CREATE` | `false` | `true` puts the bridge page in the create body (armed right after the create) instead of posting it when a person joins (critic B2). If no ticket is armed at join time, the normal arm runs anyway. |
 | `R1_MEET_MULTI_HUMAN_POLICY` | `observe` | `observe`: more than one person in the call for 2 minutes is only a `r1_meet_multi_human_observed` warning. `end`: it ends the call (`failed/multiple_humans`). Keep `observe` until the live spike shows that Recall does not report the bot's own join and that HR need not stay to admit the candidate: either would make `end` cut every interview at 2 minutes. |
 | `R1_MEET_GOOGLE_LOGIN_GROUP_ID` | blank | The Recall Google Login Group of the signed-in bot; blank = a guest bot. |
-| `R1_MEET_BOT_NAME` | blank (`Dex`) | The name a guest bot shows; ignored for a signed-in bot. It is also the name the own-participant rule recognises (M035 S09): a participant join whose display name equals it (case, width and spacing ignored, compared in memory, never stored) is marked as possibly the bot's own. With a signed-in bot, set it to exactly the Google account's display name, or the bot's own join is not recognised. The name is read when each event arrives: changing it while bots are scheduled leaves their joins unmarked (they then count as people: only an `observe` warning). |
+| `R1_MEET_BOT_NAME` | blank (`Lexy`) | The name a guest bot shows; ignored for a signed-in bot. It is also the name the own-participant rule recognises (M035 S09): a participant join whose display name equals it (case, width and spacing ignored, compared in memory, never stored) is marked as possibly the bot's own. With a signed-in bot, set it to exactly the Google account's display name, or the bot's own join is not recognised. The name is read when each event arrives: changing it while bots are scheduled leaves their joins unmarked (they then count as people: only an `observe` warning). |
 | `RECALL_BASE_URL` | `https://ap-northeast-1.recall.ai` | The Recall region. |
 
 ### Go-live order
@@ -4064,7 +4100,7 @@ Preconditions, each with an owner:
 Then, in order:
 1. Every M034 PR merged and deployed dark; `R1_MEET_ENABLED` unset. The read-only queries below
    return nothing.
-2. Owner: the Dex Ashby user, the bot Workspace, the Recall login group (sections above).
+2. Owner: the Lexy Ashby user, the bot Workspace, the Recall login group (sections above).
 3. Owner: the secrets and the knobs (at least `R1_MEET_SERVICE_USER_ID`), still with the flag off.
 4. The voice worker's Meet channel, `R1_MEET_VOICE_ENABLED=true` on `project-hello-voice` (S08), in
    a zero-live window.
@@ -4117,7 +4153,7 @@ and bill. Drain first, then turn the flag off.
 
 3. **Then turn the flag off:** `fly secrets set R1_MEET_ENABLED=false -a project-hello-api`
    (exactly `false`, or unset it). The Ashby schedule actions go back to 400 `unresolvable_id`,
-   which Ashby does not retry (review the Dex interviews HR changed in that window before turning
+   which Ashby does not retry (review the Lexy interviews HR changed in that window before turning
    the flag back on), and the Recall paths answer 200 `disabled`.
 4. **The flag-off backstop.** With the flag deliberately off (status exactly `disabled`) and
    `RECALL_API_KEY` still set, the `r1-sweep` tick drains what is left, for example a bot created
@@ -4139,7 +4175,7 @@ and bill. Drain first, then turn the flag off.
      So while Meet bookings exist, NEVER use `R1_ENABLED=false` as the kill switch on its own: run the
      operator drain (step 1) first, or turn the Meet flag off first (step 3, which lets the backstop
      drain), and only then turn R1 off.
-6. **After a drain.** `drained` bookings are terminal and never revived: HR books a new Dex
+6. **After a drain.** `drained` bookings are terminal and never revived: HR books a new Lexy
    interview in Ashby. Jobs still queued stay pending while the flag is off, and run (or are
    dropped as stale, past or superseded) when it is back on.
 
@@ -4149,7 +4185,7 @@ and bill. Drain first, then turn the flag off.
 |---|---|---|
 | `r1_meet_bot_cap_reached` | The day's bot cap is reached; the booking is `blocked/bot_cap_reached`, no Recall call | Check the day's bookings; raise `R1_MEET_DAILY_BOT_CAP` if they are real, else look for a loop |
 | `r1_meet_bot_create_failed` | The create was refused for good (`error_type`: a 4xx category, `key_attempts_exhausted`, `too_late`); `failed/bot_create_failed` | Read the `r1_meet_recall_failed` lines; HR re-books |
-| `r1_meet_generation_exhausted` | The event was moved too many times; `failed/bot_create_failed` | HR books a new Dex interview |
+| `r1_meet_generation_exhausted` | The event was moved too many times; `failed/bot_create_failed` | HR books a new Lexy interview |
 | `r1_meet_recall_rejected` | Recall 401 (`unauthorized`: the key is wrong or revoked), 402 (`payment_required`: out of credit) or 403 (`forbidden`); the jobs retry every 5 minutes | Fix the key or the credit |
 | `r1_meet_stray_bot` | One of our bots is not its booking's current bot; its release is queued | None if rare; investigate if repeated |
 | `r1_meet_bot_in_use` | Recall returned a bot that another booking already holds; nothing is released | Investigate in the Recall dashboard |
@@ -4212,7 +4248,7 @@ that the bot's own join is not counted and HR leaves after admitting the candida
 - **B1.** Recall's Chrome reaches the R1 SFU (UDP 7882, TCP 7881): the bridge page connects.
 - **B2.** The `#t=` fragment survives Recall's page load, mid-call `output_media` works on Meet, and
   autoplay works. This picks `R1_MEET_ARM_AT_CREATE` (`false` if mid-call works). Also check
-  whether `bot.in_call_recording` arrives before anyone has joined (Dex would then start in an
+  whether `bot.in_call_recording` arrives before anyone has joined (Lexy would then start in an
   empty call).
 - **B3.** Who admits the candidate: HR as the organizer, open access, or the signed-in bot as a
   guest.
@@ -4239,10 +4275,10 @@ that the bot's own join is not counted and HR leaves after admitting the candida
   and recording notice in the chat (pinned, or re-sent at the join); the first bot create is
   accepted with `bot_detection.using_participant_names.activate_after` = 7200.
 
-## R1 over Google Meet: Dex's scorecard as Ashby feedback (M034 S09, dark)
+## R1 over Google Meet: Lexy's scorecard as Ashby feedback (M034 S09, dark)
 
-S09 posts Dex's R1 scorecard of a Meet round to Ashby as the feedback of that interview, on the Dex
-interview HR scheduled (`applicationFeedback.submit` with the booking's interview event and the Dex
+S09 posts Lexy's R1 scorecard of a Meet round to Ashby as the feedback of that interview, on the Lexy
+interview HR scheduled (`applicationFeedback.submit` with the booking's interview event and the Lexy
 Ashby user), so HR reads the result where they booked it (D-M034-11). The dashboard keeps showing
 the same scorecard, and browser rounds are unchanged. The code is `app/api/src/lib/r1/meet/`:
 `feedback.ts` (the `scorecard_feedback` job), `feedback-form.ts` (the mapping onto the form),
@@ -4262,7 +4298,7 @@ precondition of the S06 go-live order above: HR now sees "Via Meet", and no Reis
   then alerts and its receipt is `failed` (re-post it after the fix, below).
 - **Ashby's own switches stop it too.** The job reads them each time, like every other Ashby write,
   so the "stop all Ashby writes" rollback of `ashby-runtime-activation.md` section 6 (unset
-  `ASHBY_RUNTIME_ENABLED`, or `ASHBY_INTEGRATION_ENABLED=false`) also stops Dex's cards: each job then
+  `ASHBY_RUNTIME_ENABLED`, or `ASHBY_INTEGRATION_ENABLED=false`) also stops Lexy's cards: each job then
   makes no Ashby call, logs the warning `r1_meet_feedback_ashby_inactive`, ends
   `ignored` (`ashby_inactive`) and leaves its receipt `failed`, so the re-post below sends it once
   Ashby is back on. Pausing an Ashby job mapping does NOT stop it (Meet bookings are not
@@ -4298,14 +4334,14 @@ precondition of the S06 go-live order above: HR now sees "Via Meet", and no Reis
 - **Guards (D-S09-5): no card, closed reason.** An open appeal (`decision_use_blocked`), a withdrawn
   or declined consent of the round (`consent_withdrawn`), or more than 7 days after the slot ended
   (`stale`).
-- **Once (D-S09-1).** Every submit names the interview event and the Dex user, so Ashby UPDATES
-  Dex's one submission for that event instead of adding a card. And once the receipt is
+- **Once (D-S09-1).** Every submit names the interview event and the Lexy user, so Ashby UPDATES
+  Lexy's one submission for that event instead of adding a card. And once the receipt is
   `processed`, a re-delivered, replayed or re-posted job makes no Ashby call (`already_submitted`).
 - **What the card holds.** The Overall Recommendation 1..4 by verdict (the M029 rule: Reject 1,
   Borderline under 50 is 2, Borderline at 50 or more is 3, Select 4). The Summary: a header line
   (`<bot> (AI interviewer): <interview kind> over Google Meet. Verdict: <Select|Borderline|Reject>.
   Weighted <x>/4 across <n> of <m> metrics`, the bot and kind from the booking's objective profile:
-  today always `Dex` and `R1 sales role-play`), then each metric not scored, then each scored metric
+  today always `Lexy` and `R1 sales role-play`), then each metric not scored, then each scored metric
   as `<Name> — <score>/4: <rationale>` (a rationale at most 280 characters, the whole at most 2000,
   lines kept whole). One Score per metric the form has a field for, and the link
   `<web origin>/interviews/<round id>` (the R1 review page; a staff sign-in is needed). Never the
@@ -4318,9 +4354,9 @@ precondition of the S06 go-live order above: HR now sees "Via Meet", and no Reis
   attempt the receipt is `failed` (alert `r1_meet_job_failed`). A permanent 4xx is terminal at
   once, with an alert (below).
 
-### The Dex feedback form in Ashby (owner and HR, once)
+### The Lexy feedback form in Ashby (owner and HR, once)
 
-1. In Ashby, build the feedback form Dex fills, with:
+1. In Ashby, build the feedback form Lexy fills, with:
    - the **Overall Recommendation** field (path `overall_recommendation`), a single select whose
      option values are exactly `1`, `2`, `3` and `4`, as on the Christy form;
    - a **RichText** field titled exactly `Summary` (LongText or String also work);
@@ -4331,13 +4367,13 @@ precondition of the S06 go-live order above: HR now sees "Via Meet", and no Reis
      `ashby-scorecard-fields.md`). A metric without its field is simply not filled: the info line
      `r1_meet_feedback_submitted` counts it (`metrics_<bound>_unbound_<n>`);
    - optional: a **Url** field titled `Detailed report`;
-   - **no other REQUIRED field.** A required field Dex cannot fill refuses the whole card
+   - **no other REQUIRED field.** A required field Lexy cannot fill refuses the whole card
      (`form_required_field_unbound`).
-2. Attach this form to the Dex interview of the R1 stage in each job's interview plan. Every job's
-   Dex interview must use this ONE form: Ashby refuses a submit whose form is not the one assigned
+2. Attach this form to the Lexy interview of the R1 stage in each job's interview plan. Every job's
+   Lexy interview must use this ONE form: Ashby refuses a submit whose form is not the one assigned
    to the interview (`r1_meet_feedback_rejected`).
 3. Read the form id: Ashby Mission Control, Job mappings, **Discover feedback form** on the job
-   (`ashby-feedback-form-discovery.md`), the form of the Dex interview. Copy it as shown; its case
+   (`ashby-feedback-form-discovery.md`), the form of the Lexy interview. Copy it as shown; its case
    does not matter (the API lower-cases it and compares it with the form it reads as a UUID), but
    no spaces around it (a value with spaces is `invalid`).
 4. Set it on the API only:
@@ -4352,8 +4388,8 @@ The card goes through the existing `ASHBY_API_KEY` (the API's Fly secret; no new
 permissions must include `candidatesWrite` (`applicationFeedback.submit`) and
 `hiringProcessMetadataRead` (`feedbackFormDefinition.info`, the structure read before each post).
 Ashby applies "your feedback-editing settings and access permissions": the key's user must be
-allowed to submit feedback for another interviewer (the Dex user), and the tenant's feedback-editing
-setting must allow an interviewer's submitted feedback to be updated (a re-post updates Dex's card).
+allowed to submit feedback for another interviewer (the Lexy user), and the tenant's feedback-editing
+setting must allow an interviewer's submitted feedback to be updated (a re-post updates Lexy's card).
 Both are live-spike items. Without a usable key each interview alerts `ashby_key_missing` and its
 receipt is `failed`.
 
@@ -4362,8 +4398,8 @@ receipt is `failed`.
 | Alert (`error_category`, error level) | Meaning | Action |
 |---|---|---|
 | `r1_meet_feedback_config_invalid` | `error_type` `feedback_config_invalid`: `R1_MEET_ASHBY_FEEDBACK_FORM_ID` is not a UUID; or `ashby_key_missing`: no usable `ASHBY_API_KEY`. That interview's receipt is `failed` | Fix the value or set the key, then re-post (below) |
-| `r1_meet_feedback_form_invalid` | The Dex form cannot take the card (`error_type`): `form_unreadable` (Ashby 4xx on the form read, with `http_status`: a wrong id, or the key lacks `hiringProcessMetadataRead`), `form_mismatch`, `form_archived`, `form_overall_missing`, `form_overall_options_mismatch`, `form_summary_missing`, `form_summary_ambiguous`, `form_required_field_unbound`. Receipt `failed` | Fix the form in Ashby (setup above), then re-post |
-| `r1_meet_feedback_rejected` | Ashby refused the submit: a 4xx other than 429, or `success:false` (`error_type` `<category>[:<Ashby code>]`, `http_status`); the job ends `ashby_rejected_after_retry` when an earlier run of the job may have reached the submit OR the queue cannot tell (the queue keeps only the previous run's outcome: a 429 or 5xx submit, a throw past that wait, a run with no outcome, or more than one earlier run unless they were all waits for the booking to settle), and `ashby_rejected` otherwise (the job's first run; its only earlier run stopped before the submit: a wait for the booking or the form, Meet inactive, a database or build fault; or every earlier run waited for the booking). The client's own request check ends `ashby_request_invalid`. Receipt `failed` | 401 or 403: the key's permissions (above). `ashby_rejected_after_retry`: look for Dex's card in Ashby first; if there is none, treat it as `ashby_rejected`. `ashby_rejected`: no earlier run of THIS job can have posted the card; read the code, fix, re-post. After a re-post or a dead-letter replay (a new job that starts a new history), or when Ashby was failing around that time, look for the card first either way |
+| `r1_meet_feedback_form_invalid` | The Lexy form cannot take the card (`error_type`): `form_unreadable` (Ashby 4xx on the form read, with `http_status`: a wrong id, or the key lacks `hiringProcessMetadataRead`), `form_mismatch`, `form_archived`, `form_overall_missing`, `form_overall_options_mismatch`, `form_summary_missing`, `form_summary_ambiguous`, `form_required_field_unbound`. Receipt `failed` | Fix the form in Ashby (setup above), then re-post |
+| `r1_meet_feedback_rejected` | Ashby refused the submit: a 4xx other than 429, or `success:false` (`error_type` `<category>[:<Ashby code>]`, `http_status`); the job ends `ashby_rejected_after_retry` when an earlier run of the job may have reached the submit OR the queue cannot tell (the queue keeps only the previous run's outcome: a 429 or 5xx submit, a throw past that wait, a run with no outcome, or more than one earlier run unless they were all waits for the booking to settle), and `ashby_rejected` otherwise (the job's first run; its only earlier run stopped before the submit: a wait for the booking or the form, Meet inactive, a database or build fault; or every earlier run waited for the booking). The client's own request check ends `ashby_request_invalid`. Receipt `failed` | 401 or 403: the key's permissions (above). `ashby_rejected_after_retry`: look for Lexy's card in Ashby first; if there is none, treat it as `ashby_rejected`. `ashby_rejected`: no earlier run of THIS job can have posted the card; read the code, fix, re-post. After a re-post or a dead-letter replay (a new job that starts a new history), or when Ashby was failing around that time, look for the card first either way |
 
 Warnings: `r1_meet_feedback_enqueue_failed` (the trigger could not record; the re-drive tries again
 at every bucket for 26 hours), `r1_meet_feedback_redrive_failed` (the next bucket tries again),
@@ -4378,7 +4414,7 @@ id, a form, section or field id, a URL, a name or any rationale text.
 ### Read-only checks
 
 ```sql
--- Dex feedback outcomes, last 7 days (counts only)
+-- Lexy feedback outcomes, last 7 days (counts only)
 select outcome, count(*) from screening_v2.r1_meet_receipts
  where source = 'ashby' and event_type = 'scorecard_feedback'
    and received_at > now() - interval '7 days'
@@ -4429,7 +4465,7 @@ receipt `failed -> processed`; a `processed` receipt is never posted again. A re
 HR enters such a card by hand from the R1 review page. A dead-lettered feedback job can also be
 replayed with `select screening_v2.replay_dlq_job('<dlq id>');`. A re-posted or replayed job starts a
 new queue history, so a refusal on its first run reads `ashby_rejected` even when the earlier job's
-submit may have landed: look for Dex's card in Ashby before you act on such a refusal.
+submit may have landed: look for Lexy's card in Ashby before you act on such a refusal.
 
 ### Lost trigger: a completed Meet interview with no feedback receipt at all
 
@@ -4502,11 +4538,11 @@ squash commit: no migration, no data, one blank env name.
 
 ### Live spike: what only a real post can settle
 
-- Ashby accepts `userId` = the Dex user with `interviewEventId` from this API key (feedback
-  submitted for another interviewer), and the card shows as Dex's on the interview.
+- Ashby accepts `userId` = the Lexy user with `interviewEventId` from this API key (feedback
+  submitted for another interviewer), and the card shows as Lexy's on the interview.
 - A second submit for the same event and user UPDATES the card (the re-post and retry semantics)
   under the tenant's feedback-editing settings, and does not add a second card.
-- The Dex form's Overall field has the path `overall_recommendation` with values `1`..`4`, and its
+- The Lexy form's Overall field has the path `overall_recommendation` with values `1`..`4`, and its
   RichText `Summary` takes the `PlainText` value the Christy card already sends in production.
 - The Summary's line breaks read well on the Ashby card, and the `Detailed report` link opens the
   R1 review page after a staff sign-in.

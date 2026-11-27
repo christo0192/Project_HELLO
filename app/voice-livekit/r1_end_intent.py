@@ -34,7 +34,7 @@ import os
 import re
 from typing import Any
 
-from r1_script import interviewer_dex_enabled
+from r1_script import PERSONA_DEX, PERSONA_LEXY, interviewer_persona
 from r1_text import normalize
 from r1_tracker import (
     END_INTENT_LEVELS,
@@ -50,6 +50,8 @@ __all__ = [
     "END_INTENT_SYSTEM",
     "END_INTENT_SYSTEM_DEX",
     "AFTER_ASIDE_CONTEXT_DEX",
+    "END_INTENT_SYSTEM_LEXY",
+    "AFTER_ASIDE_CONTEXT_LEXY",
     "end_intent_system",
     "after_aside_context",
     "END_INTENT_WINDOW_WORDS",
@@ -137,17 +139,26 @@ ROLEPLAY_CONTEXT = 'The learner\'s last line: "{learner_last}"'
 AFTER_ASIDE_CONTEXT = 'Christy has just asked: "{question}"'
 END_INTENT_SYSTEM_DEX = END_INTENT_SYSTEM.replace("Christy", "Dex")
 AFTER_ASIDE_CONTEXT_DEX = 'Dex has just asked: "{question}"'
+# Owner 2026-11-27 (R1_INTERVIEWER_LEXY): Lexy's texts, the name swapped and nothing else.
+END_INTENT_SYSTEM_LEXY = END_INTENT_SYSTEM.replace("Christy", "Lexy")
+AFTER_ASIDE_CONTEXT_LEXY = 'Lexy has just asked: "{question}"'
 CONTEXTS = ("roleplay", "after_aside")
 
 
 def end_intent_system() -> str:
-    """Follow R1_INTERVIEWER_DEX; 0 gives the Christy text."""
-    return END_INTENT_SYSTEM_DEX if interviewer_dex_enabled() else END_INTENT_SYSTEM
+    """Follow the persona: Lexy (default), Dex (``R1_INTERVIEWER_LEXY=0``), Christy
+    (``R1_INTERVIEWER_DEX=0``)."""
+    return {PERSONA_LEXY: END_INTENT_SYSTEM_LEXY, PERSONA_DEX: END_INTENT_SYSTEM_DEX}.get(
+        interviewer_persona(), END_INTENT_SYSTEM
+    )
 
 
 def after_aside_context() -> str:
-    """Follow R1_INTERVIEWER_DEX; 0 gives the Christy text."""
-    return AFTER_ASIDE_CONTEXT_DEX if interviewer_dex_enabled() else AFTER_ASIDE_CONTEXT
+    """Follow the persona: Lexy (default), Dex (``R1_INTERVIEWER_LEXY=0``), Christy
+    (``R1_INTERVIEWER_DEX=0``)."""
+    return {PERSONA_LEXY: AFTER_ASIDE_CONTEXT_LEXY, PERSONA_DEX: AFTER_ASIDE_CONTEXT_DEX}.get(
+        interviewer_persona(), AFTER_ASIDE_CONTEXT
+    )
 
 
 def prefilter_hit(text: object) -> bool:

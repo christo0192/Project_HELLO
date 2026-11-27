@@ -1,4 +1,5 @@
-"""The simulator speaks of the R1 interviewer by the active persona (R1_INTERVIEWER_DEX).
+"""The simulator speaks of the R1 interviewer by the active persona (Lexy by default, she/her;
+Dex with R1_INTERVIEWER_LEXY=0, he/him; Christy with R1_INTERVIEWER_DEX=0).
 
 Stored records and the move library keep the name they were written with.
 """

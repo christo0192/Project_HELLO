@@ -217,7 +217,7 @@ export function R1MeetBookingsPage() {
       </nav>
       <h1 className="mt-1 text-title text-ink">Meet bookings</h1>
       <p className="mt-1 text-sm text-ink-secondary">
-        Interviews with Dex over Google Meet, scheduled in Ashby. Times are India Standard Time.
+        Interviews with Lexy over Google Meet, scheduled in Ashby. Times are India Standard Time.
       </p>
       <p ref={statusLineRef} tabIndex={-1} data-testid="meet-status" className={`mt-2 min-h-5 text-sm text-ink ${FOCUS_RING}`}>
         {meetOn !== null
@@ -260,7 +260,7 @@ export function R1MeetBookingsPage() {
         ) : isDefault ? (
           <EmptyPanel
             title="No Meet booking from today on."
-            hint="A booking appears when an interview is scheduled in Ashby with Dex as an interviewer."
+            hint="A booking appears when an interview is scheduled in Ashby with Lexy as an interviewer."
           />
         ) : (
           <EmptyPanel

@@ -73,7 +73,7 @@ const APPLICATION_ID = '7f000000-0000-4000-8000-000000000401';
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 const EXPECTED_SUMMARY = [
-  'Dex (AI interviewer): R1 sales role-play over Google Meet. Verdict: Borderline. Weighted 2.65/4 across 4 of 5 metrics; 1 not scored (listed below).',
+  'Lexy (AI interviewer): R1 sales role-play over Google Meet. Verdict: Borderline. Weighted 2.65/4 across 4 of 5 metrics; 1 not scored (listed below).',
   'Negotiation & discount discipline — NOT SCORED (insufficient evidence): Rationale 3.',
   'Probing & discovery — 3/4: Rationale 0.',
   'Objection handling — 3/4: Rationale 1.',

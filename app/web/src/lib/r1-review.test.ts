@@ -132,7 +132,7 @@ describe('reading the address', () => {
 
 describe('who is speaking', () => {
   it('names the two AI voices, and says neither is a person', () => {
-    expect(R1_INTERVIEWER_LABEL).toBe('Dex (AI interviewer)');
+    expect(R1_INTERVIEWER_LABEL).toBe('Lexy (AI interviewer)');
     expect(learnerLabel('Priya Nair')).toBe('Priya Nair (AI learner)');
     expect(learnerLabel(null)).toBe('AI learner');
   });
@@ -144,7 +144,7 @@ describe('who is speaking', () => {
       null,
     );
     expect(turns.map((t) => t.speakerLabel)).toEqual([
-      'Dex (AI interviewer)', 'Priya Nair (AI learner)', 'Ava Example', 'Dex (AI interviewer)', 'Dex (AI interviewer)',
+      'Lexy (AI interviewer)', 'Priya Nair (AI learner)', 'Ava Example', 'Lexy (AI interviewer)', 'Lexy (AI interviewer)',
     ]);
     expect(turns.map((t) => t.speakerKind)).toEqual(['interviewer', 'learner', 'candidate', 'interviewer', 'interviewer']);
   });
@@ -155,7 +155,7 @@ describe('who is speaking', () => {
       'Ava Example',
       null,
     );
-    expect(turns.map((t) => t.speakerLabel)).toEqual(['Priya Nair (AI learner)', 'Dex (AI interviewer)']);
+    expect(turns.map((t) => t.speakerLabel)).toEqual(['Priya Nair (AI learner)', 'Lexy (AI interviewer)']);
   });
 
   it('falls back to "AI learner" when the log does not name her', () => {

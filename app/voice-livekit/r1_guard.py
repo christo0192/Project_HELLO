@@ -14,7 +14,7 @@ What it blocks (each category logs as ``r1_guard_<category>``):
     words when the candidate describes a sales background.
 ``meta``
     Learner only: AI identity, "role-play", "this test", "persona", "instructions",
-    "Dex" or "Christy" (the interviewer's names).
+    "Lexy", "Dex" or "Christy" (the interviewer's names).
 ``persona_secret``
     Interviewer phases after the persona is revealed: persona names (except the
     candidate's own first name), "$7,000", "objection", "hidden need" and the active
@@ -694,6 +694,7 @@ _LEARNER_META = _ci(
     r"\bpersona\b|\bprompts?\b|\bmy instructions\b|\binstructions? (?:say|tell|state)\b",
     r"\bchristy\b",
     r"\bdex\b",
+    r"\blex(?:y|i|ie)\b",
 )
 _INTERVIEWER_SECRET = _ci(r"\$\s?7,?000\b", r"\bobjections?\b", r"\bhidden needs?\b")
 _FEEDBACK = _ci(

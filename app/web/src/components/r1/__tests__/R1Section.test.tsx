@@ -1314,14 +1314,14 @@ describe('a round held over Google Meet', () => {
     await user.click(await screen.findByRole('button', { name: 'Grant retake' }));
     const well = await screen.findByRole('group', { name: 'Grant the one retake?' });
     expect(well).toHaveTextContent(
-      'The round opens again for 72 hours. Schedule the retake in Ashby with Dex before then; there is no link.',
+      'The round opens again for 72 hours. Schedule the retake in Ashby with Lexy before then; there is no link.',
     );
     expect(well).not.toHaveTextContent(/original link/);
     api.listR1Rounds.mockResolvedValue({ rounds: [round({ channel: 'meet', status: 'invited', attempts_counted: 1 })] });
     await user.click(within(well).getByRole('button', { name: 'Grant retake' }));
     expect(api.grantR1Retake).toHaveBeenCalledWith('round-1');
     expect(
-      await screen.findByText('Retake granted. Schedule it in Ashby with Dex within 72 hours.'),
+      await screen.findByText('Retake granted. Schedule it in Ashby with Lexy within 72 hours.'),
     ).toBeInTheDocument();
     expect(screen.queryByText(/original link works again/)).not.toBeInTheDocument();
   });

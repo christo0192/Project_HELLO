@@ -115,9 +115,11 @@ def line(line_id: str, **values: object) -> str:
     An unknown first name is not spoken: the slot is deleted with its comma ("Thank you,
     {first_name}. We'll" -> "Thank you. We'll"), exactly as ``r1_script.line`` does.
     """
-    # R1_INTERVIEWER_DEX (default on): a line that names the interviewer speaks the active
-    # persona's text from r1_script; with the flag off that is exactly this table's Christy text.
-    text = r1_script.persona_text(line_id) if line_id in r1_script.DEX_LINES else LINES[line_id]
+    # R1_INTERVIEWER_DEX and R1_INTERVIEWER_LEXY (both default on): a line that names the
+    # interviewer speaks the active persona's text from r1_script (Lexy, Dex, or Christy).
+    text = (
+        r1_script.persona_text(line_id) if line_id in r1_script.NAMED_LINE_IDS else LINES[line_id]
+    )
     first_name = known_first_name(values.get("first_name"))
     if not first_name:
         text = _NAME_SLOT.sub("", text)

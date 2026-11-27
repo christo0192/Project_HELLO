@@ -35,12 +35,12 @@ const SLOT_START = '2026-12-01T10:30:00.000Z';
 const REALTIME_URL = 'https://hello.example.test/api/integrations/recall/realtime';
 const LOGIN_GROUP_ID = '7d3c2b1a-0f9e-4d8c-9b7a-6f5e4d3c2b1a';
 const PAGE_URL = 'https://hello.example.test/candidate/r1/meet#t=fixture';
-const DISCLOSURE = 'Dex is an AI interviewer from Interview Kickstart. This call is recorded.';
+const DISCLOSURE = 'Lexy is an AI interviewer from Interview Kickstart. This call is recorded.';
 
 /** The exact section 4 literal: login group set, no output media, default join lead. */
 const SECTION_4_BODY = {
   meeting_url: 'https://meet.google.com/abc-defg-hij',
-  bot_name: 'Dex',
+  bot_name: 'Lexy',
   join_at: '2026-12-01T10:28:00.000Z',
   variant: { google_meet: 'web_4_core' },
   automatic_leave: {
@@ -72,7 +72,7 @@ const SECTION_4_BODY = {
   chat: {
     on_bot_join: {
       send_to: 'everyone',
-      message: 'Dex is an AI interviewer from Interview Kickstart. This call is recorded.',
+      message: 'Lexy is an AI interviewer from Interview Kickstart. This call is recorded.',
       pin: true,
     },
     on_participant_join: {

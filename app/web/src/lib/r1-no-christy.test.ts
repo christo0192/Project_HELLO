@@ -15,10 +15,13 @@ function walk(directory: string): string[] {
 }
 
 const root = process.cwd();
+/** The interviewer's name before Lexy, as a word (identifiers like `dex_absent` never match). */
+const DEX = /\bDex\b/;
 const directories = ['src/components/candidate-r1', 'src/components/r1-review', 'src/components/r1'];
 const singles = ['src/lib/r1-review.ts', 'src/pages/R1InterviewsPage.tsx', 'src/pages/R1JoinPage.tsx',
   'src/pages/R1ReviewPage.tsx', 'src/pages/R1SettingsPage.tsx', 'src/pages/R1MeetBridgePage.tsx',
-  'src/pages/R1BookPage.tsx', 'src/pages/R1BookManagePage.tsx'];
+  'src/pages/R1BookPage.tsx', 'src/pages/R1BookManagePage.tsx',
+  'src/lib/r1-meet-bookings.ts', 'src/pages/R1MeetBookingsPage.tsx'];
 
 describe('R1 shipped copy', () => {
   it('strips comments while preserving code and URLs', () => {
@@ -31,13 +34,21 @@ describe('R1 shipped copy', () => {
     expect(codeWithoutComments("const u = 'https://x.test/Christy';")).toMatch(pattern);
   });
 
+  it('catches the shipped word Dex and keeps identifiers', () => {
+    expect("const a = 'Dex scheduled';").toMatch(DEX);
+    for (const identifier of ['dex_absent', 'r1_dex_sales', 'hasDex']) expect(identifier).not.toMatch(DEX);
+  });
+
   it('scans all expected files and excludes the old name', () => {
     for (const file of singles) expect(existsSync(resolve(root, file)), file).toBe(true);
     const files = [...directories.flatMap((dir) => walk(resolve(root, dir))),
       ...singles.map((file) => resolve(root, file))];
     expect(files.length).toBeGreaterThanOrEqual(15);
     for (const file of files) {
-      expect(codeWithoutComments(readFileSync(file, 'utf8')), relative(root, file)).not.toMatch(/christy/i);
+      const code = codeWithoutComments(readFileSync(file, 'utf8'));
+      expect(code, relative(root, file)).not.toMatch(/christy/i);
+      // Owner 2026-11-27: the interviewer is Lexy; Dex is gone from every shipped string.
+      expect(code, relative(root, file)).not.toMatch(DEX);
     }
   });
 });

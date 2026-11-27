@@ -653,7 +653,7 @@ def _asking_sentences(text: object) -> list[tuple[str, bool]]:
 
 
 def asks_christy(text: object) -> bool:
-    """True when a sentence asks the interviewer (Dex, or Christy with the flag off).
+    """True when a sentence asks the interviewer (Lexy, Dex or Christy, whatever the flags say).
 
     The function name is historical.
     """

@@ -101,7 +101,8 @@ const R1_DEX_SALES: R1MeetObjectiveProfile = Object.freeze({
   id: R1_MEET_DEFAULT_PROFILE_ID,
   interviewKind: 'sales_r1',
   consentMode: 'hr_attested_ashby',
-  botDisplayName: 'Dex',
+  // Owner 2026-11-27: the R1 interviewer is Lexy (the id above stays: it is a stored identifier).
+  botDisplayName: 'Lexy',
   maxCallMinutes: 45,
   botJoinLeadSec: 120,
   automaticLeave: Object.freeze({
@@ -119,7 +120,7 @@ const R1_DEX_SALES: R1MeetObjectiveProfile = Object.freeze({
       participantEvents: Object.freeze({ activateAfterSec: 1200, timeoutSec: 600 }),
     }),
   }),
-  disclosureChatMessage: 'Dex is an AI interviewer from Interview Kickstart. This call is recorded.',
+  disclosureChatMessage: 'Lexy is an AI interviewer from Interview Kickstart. This call is recorded.',
   participantMetadataRetentionHours: 1,
 });
 

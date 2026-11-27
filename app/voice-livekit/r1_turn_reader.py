@@ -65,7 +65,7 @@ from r1_negotiation import (
 )
 from r1_personas import asks_about_learner
 from r1_scheduler import EARLY_CLOSE_BEFORE_SEC, answered_topics, is_close_attempt
-from r1_script import interviewer_dex_enabled
+from r1_script import PERSONA_DEX, PERSONA_LEXY, interviewer_persona
 from r1_text import normalize
 from r1_tracker import (
     detect_end_request,
@@ -86,6 +86,7 @@ __all__ = [
     "READER_PHASES",
     "READER_PROMPT_VERSION",
     "READER_PROMPT_REVISION_CHRISTY",
+    "READER_PROMPT_REVISION_DEX",
     "READER_SESSION_MAX_CALLS",
     "READER_SHADOW_MAX_BYTES",
     "READER_SHADOW_MAX_ROWS",
@@ -94,6 +95,8 @@ __all__ = [
     "READER_SYSTEM",
     "READER_SYSTEM_DEX",
     "TRANSITION_CONTEXT_DEX",
+    "READER_SYSTEM_LEXY",
+    "TRANSITION_CONTEXT_LEXY",
     "reader_system",
     "transition_context",
     "reader_prompt_version",
@@ -177,8 +180,10 @@ READER_SHADOW_MEMORY_ROWS = 400
 READER_SPECULATIVE_STARTS_PER_ROW = 3
 READER_SPECULATIVE_MAX_CALLS = 120
 READER_SESSION_MAX_CALLS = 200
-# Bump the persona's own revision when its prompt or a context line changes.
-READER_PROMPT_REVISION = 3
+# Bump the persona's own revision when its prompt or a context line changes.  The default
+# persona's (Lexy, owner 2026-11-27) is READER_PROMPT_REVISION; Dex keeps 3 and Christy 2.
+READER_PROMPT_REVISION = 4
+READER_PROMPT_REVISION_DEX = 3
 READER_PROMPT_REVISION_CHRISTY = 2
 
 READER_SYSTEM = (
@@ -231,16 +236,28 @@ TRANSITION_CONTEXT_DEX = (
     "Phase: before the role-play. Dex is briefing the candidate; the learner has not "
     "spoken yet."
 )
+# Owner 2026-11-27 (R1_INTERVIEWER_LEXY): Lexy's texts, the name swapped and nothing else.
+READER_SYSTEM_LEXY = READER_SYSTEM.replace("Christy", "Lexy")
+TRANSITION_CONTEXT_LEXY = (
+    "Phase: before the role-play. Lexy is briefing the candidate; the learner has not "
+    "spoken yet."
+)
 
 
 def reader_system() -> str:
-    """Follow R1_INTERVIEWER_DEX; 0 gives the Christy text."""
-    return READER_SYSTEM_DEX if interviewer_dex_enabled() else READER_SYSTEM
+    """Follow the persona: Lexy (default), Dex (``R1_INTERVIEWER_LEXY=0``), Christy
+    (``R1_INTERVIEWER_DEX=0``)."""
+    return {PERSONA_LEXY: READER_SYSTEM_LEXY, PERSONA_DEX: READER_SYSTEM_DEX}.get(
+        interviewer_persona(), READER_SYSTEM
+    )
 
 
 def transition_context() -> str:
-    """Follow R1_INTERVIEWER_DEX; 0 gives the Christy text."""
-    return TRANSITION_CONTEXT_DEX if interviewer_dex_enabled() else TRANSITION_CONTEXT
+    """Follow the persona: Lexy (default), Dex (``R1_INTERVIEWER_LEXY=0``), Christy
+    (``R1_INTERVIEWER_DEX=0``)."""
+    return {PERSONA_LEXY: TRANSITION_CONTEXT_LEXY, PERSONA_DEX: TRANSITION_CONTEXT_DEX}.get(
+        interviewer_persona(), TRANSITION_CONTEXT
+    )
 
 
 def _prompt_sha() -> str:
@@ -256,9 +273,10 @@ def _prompt_sha() -> str:
 
 
 def reader_prompt_version() -> str:
-    """Follow R1_INTERVIEWER_DEX; 0 gives the Christy label (revision 2) exactly as before."""
-    revision = (
-        READER_PROMPT_REVISION if interviewer_dex_enabled() else READER_PROMPT_REVISION_CHRISTY
+    """Follow the persona: Lexy's label (revision 4) by default; ``R1_INTERVIEWER_LEXY=0`` gives
+    Dex's (revision 3) and ``R1_INTERVIEWER_DEX=0`` Christy's (revision 2) exactly as before."""
+    revision = {PERSONA_LEXY: READER_PROMPT_REVISION, PERSONA_DEX: READER_PROMPT_REVISION_DEX}.get(
+        interviewer_persona(), READER_PROMPT_REVISION_CHRISTY
     )
     return f"r1-reader-v{revision}+{_prompt_sha()[:12]}"
 

@@ -558,7 +558,7 @@ def _verdict(**scores) -> str:
                 "naturalness": [{"turn": 3, "quote": "I missed it"}],
             },
             "worst_moments": [
-                {"turn": 3, "speaker": "DEX", "why": "a bit abrupt"},
+                {"turn": 3, "speaker": "LEXY", "why": "a bit abrupt"},
                 {"turn": 2, "speaker": "CANDIDATE", "why": "not a bot line"},
             ],
         }
@@ -585,7 +585,7 @@ class FlowJudgeSchemaTests(unittest.TestCase):
 
         verdict = validate_flow(parse_flow(_verdict()), _record(ROWS))
         kept = verdict["evidence"]["adaptability"]
-        self.assertEqual([(i["turn"], i["speaker"]) for i in kept], [(3, "DEX"), (4, "LEARNER")])
+        self.assertEqual([(i["turn"], i["speaker"]) for i in kept], [(3, "LEXY"), (4, "LEARNER")])
         self.assertTrue(kept[1]["turn_corrected"])  # "this is Meera" is turn 4, not 1
         reasons = {
             item["quote"]: item["rejected"] for item in verdict["evidence_rejected"] if item["axis"] != "worst_moments"
@@ -596,7 +596,7 @@ class FlowJudgeSchemaTests(unittest.TestCase):
         self.assertEqual([(item["turn"], item["rejected"]) for item in rejected_worst], [(2, "not_a_bot_turn")])
         self.assertEqual(len(verdict["worst_moments"]), 1)
         worst = verdict["worst_moments"][0]
-        self.assertEqual((worst["turn"], worst["speaker"], worst["phase"]), (3, "DEX", "icebreaker"))
+        self.assertEqual((worst["turn"], worst["speaker"], worst["phase"]), (3, "LEXY", "icebreaker"))
         self.assertIn("Back to your last role", worst["line"])
 
     def test_the_live_judge_is_asked_again_once_and_sees_the_behaviour(self) -> None:
@@ -852,7 +852,7 @@ class FlowDesignRulesTests(unittest.TestCase):
         # policy endings too; graded objections they leave unreached are no failure.
         system, _user = self._messages(_early_end_record())
         self.assertIn("or the request itself names the end", system)
-        self.assertIn("When Dex offers to wrap up and the candidate agrees, the role-play ends there", system)
+        self.assertIn("When Lexy offers to wrap up and the candidate agrees, the role-play ends there", system)
         self.assertIn("After abuse from the candidate the learner hangs up", system)
         self.assertEqual(system.count("are no failure"), 3)
 
@@ -998,7 +998,7 @@ class FlowRound5Tests(unittest.TestCase):
             "- The opening agenda says the whole interview takes about thirty minutes and the role-play up "
             "to twenty: both are correct.", system)
         self.assertIn(
-            "- Dex asks once to confirm an end request that does not name the end, and may offer to wrap "
+            "- Lexy asks once to confirm an end request that does not name the end, and may offer to wrap "
             "up or note an early end; these asides are policy.", system)
         self.assertLess(system.index("DESIGN RULES"), system.index("thirty minutes"))
         self.assertLess(system.index("these asides are policy"), system.index("Score each axis"))
@@ -1184,16 +1184,26 @@ class FlowRound5Tests(unittest.TestCase):
             self.assertTrue((out / "rejudge.md").exists())
 
 
-class DexAdaptPersonaTests(unittest.TestCase):
+class AdaptPersonaTests(unittest.TestCase):
+    """The simulator speaks of the active interviewer: Lexy (she/her) by default since 2026-11-27,
+    Dex (he/him) with R1_INTERVIEWER_LEXY=0, Christy (she/her) with R1_INTERVIEWER_DEX=0."""
+
     @staticmethod
     def rendered_tasks():
         return [persona.fill(task) for behaviour in adapt.BEHAVIOURS.values()
                 for task in behaviour.live_tasks.values()]
 
-    def test_live_tasks_use_dex_and_him(self):
+    def test_live_tasks_use_lexy_and_her(self):
         rendered = self.rendered_tasks()
-        self.assertTrue(any("Dex's" in task for task in rendered))
-        self.assertTrue(any("Ask him" in task and "what he means" in task for task in rendered))
+        self.assertTrue(any("Lexy's" in task for task in rendered))
+        self.assertTrue(any("Ask her" in task and "what she means" in task for task in rendered))
+        self.assertFalse(any(re.search(r"\b(?:Dex|Christy|him|he)\b", task) for task in rendered))
+
+    def test_live_tasks_use_dex_and_him_with_lexy_off(self):
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_LEXY": "0"}):
+            rendered = self.rendered_tasks()
+            self.assertTrue(any("Dex's" in task for task in rendered))
+            self.assertTrue(any("Ask him" in task and "what he means" in task for task in rendered))
 
     def test_live_tasks_use_original_persona_with_flag_off(self):
         with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
@@ -1201,8 +1211,15 @@ class DexAdaptPersonaTests(unittest.TestCase):
             self.assertTrue(any("Christy's" in task for task in rendered))
             self.assertTrue(any("Ask her" in task and "what she means" in task for task in rendered))
 
-    def test_rubric_uses_dex_by_default(self):
-        self.assertNotRegex(flow_judge.rubric_text(), r"\b(?:Christy|CHRISTY|she)\b")
+    def test_rubric_uses_lexy_by_default(self):
+        rubric = flow_judge.rubric_text()
+        self.assertNotRegex(rubric, r"\b(?:Christy|CHRISTY|Dex|DEX|he|him|his)\b")
+        self.assertIn("Lexy", rubric)
+
+    def test_rubric_uses_dex_with_lexy_off(self):
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_LEXY": "0"}):
+            self.assertNotRegex(flow_judge.rubric_text(), r"\b(?:Christy|CHRISTY|Lexy|LEXY|she)\b")
+            self.assertIn("Dex", flow_judge.rubric_text())
 
     def test_rubrics_equal_constants_with_flag_off(self):
         cases = (("0", "0", flow_judge.RUBRIC), ("1", "0", flow_judge.RUBRIC_V2),
@@ -1220,6 +1237,7 @@ def setUpModule():
     global _persona_environment
     env = dict(os.environ)
     env.pop("R1_INTERVIEWER_DEX", None)
+    env.pop("R1_INTERVIEWER_LEXY", None)
     _persona_environment = mock.patch.dict(os.environ, env, clear=True)
     _persona_environment.start()
 

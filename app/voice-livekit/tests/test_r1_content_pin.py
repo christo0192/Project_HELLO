@@ -291,7 +291,10 @@ import r1_world
 # 54: owner 2026-11-24: the spoken -SP lines (R1_SPOKEN_LINES, SPOKEN_LINES); no text changed.
 #     Its review: stop first in the early-close questions, no "rather" in the wrap offer, no
 #     timing words before the start questions, and the brief no longer than W2's.
-PINNED_CONTENT_SHA256 = "c330b97cb977cc33413d690ea25a16f4c8c566909f3180e1953e151f09f72653"
+# 55: owner 2026-11-27: Lexy, the female interviewer, in the spoken lines (R1_INTERVIEWER_LEXY,
+#     LEXY_LINES) and her prompts: prefixes, wrap-up note, end-intent system, after-aside context.
+#     No existing text changed.
+PINNED_CONTENT_SHA256 = "40f8e71a6675dcc240264f64c4b6c66c89a41bf33e479f427c773f86920e97bc"
 
 CONTENT_MODULES = (
     "r1_text",

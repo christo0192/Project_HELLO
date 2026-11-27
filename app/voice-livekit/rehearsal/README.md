@@ -345,7 +345,8 @@ question or ignores fails.
 The flow judge (`rehearsal/flow_judge.py`, live only; offline it records `status: n/a`) reads the
 whole transcript, the scenario's behaviour and the call's facts, and scores the BOT on six axes, 1
 to 5: `christy_flow`, `learner_flow`, `adaptability`, `objective_kept`, `repetition`, `naturalness`,
-with evidence quotes that must be in an interviewer (DEX; CHRISTY with R1_INTERVIEWER_DEX=0) or
+with evidence quotes that must be in an interviewer (LEXY; DEX with R1_INTERVIEWER_LEXY=0;
+CHRISTY with R1_INTERVIEWER_DEX=0) or
 LEARNER line (a quote from a candidate line or from no line is rejected, listed under
 `evidence_rejected`) and the worst moments (turn, speaker, why). Per-call scores go to
 `results.jsonl` (`flow`), the means, minimums, gates and worst moments to `scorecard.md` /
@@ -379,5 +380,6 @@ it snapshots the scripted learner for speculative calls. Use `--spec-reply on` o
 timing-neutral adoption against OFF. The grid fails on timing-neutral transcript
 or decision drift. The default `env` leaves the process environment in control.
 
-The interviewer is Dex (Christy with `R1_INTERVIEWER_DEX=0`). Stored simulator records keep the
-voice label `christy` for the interviewer under either persona.
+The interviewer is Lexy (she/her; Dex, he/him, with `R1_INTERVIEWER_LEXY=0`; Christy with
+`R1_INTERVIEWER_DEX=0`). Stored simulator records keep the voice label `christy` for the
+interviewer under every persona.

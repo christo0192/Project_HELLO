@@ -122,8 +122,8 @@ const STATUS_TERM: Readonly<Record<R1MeetBookingStatus, MeetBookingTerm>> = {
   unmatched_application: { label: 'No matching candidate', tone: 'unresolved' },
   unmapped_scheduler: { label: 'Scheduler not matched', tone: 'unresolved' },
   blocked: { label: 'Blocked', tone: 'unresolved' },
-  bot_scheduled: { label: 'Dex scheduled', tone: 'moving' },
-  bot_joining: { label: 'Dex joining', tone: 'moving' },
+  bot_scheduled: { label: 'Lexy scheduled', tone: 'moving' },
+  bot_joining: { label: 'Lexy joining', tone: 'moving' },
   human_present: { label: 'Someone has joined', tone: 'moving' },
   in_call: { label: 'Interview in progress', tone: 'moving' },
   completed: { label: 'Completed', tone: 'ready' },
@@ -149,7 +149,7 @@ export function meetBookingTerm(status: string, reason?: string): MeetBookingTer
 }
 
 const REASON_TEXT: Readonly<Record<R1MeetBookingReason, string | null>> = {
-  dex_absent: 'Dex is no longer an interviewer in Ashby.',
+  dex_absent: 'Lexy is no longer an interviewer in Ashby.',
   cancelled: 'Cancelled in Ashby.',
   in_past: 'The slot had already started.',
   not_scheduled: 'Ashby does not show this interview as scheduled.',

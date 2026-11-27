@@ -62,7 +62,7 @@ describe('ensureBot: the happy path', () => {
     expect(create!.headers['idempotency-key']).toBe(keyOf(b.eventId, 0, 0));
     expect(create!.body).toEqual({
       meeting_url: MEET_URL,
-      bot_name: 'Dex',
+      bot_name: 'Lexy',
       join_at: new Date(Date.parse(startAt) - 120_000).toISOString(),
       variant: { google_meet: 'web_4_core' },
       automatic_leave: {
@@ -90,7 +90,7 @@ describe('ensureBot: the happy path', () => {
       chat: {
         on_bot_join: {
           send_to: 'everyone',
-          message: 'Dex is an AI interviewer from Interview Kickstart. This call is recorded.',
+          message: 'Lexy is an AI interviewer from Interview Kickstart. This call is recorded.',
           pin: true,
         },
         on_participant_join: {

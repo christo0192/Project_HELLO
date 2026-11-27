@@ -18,8 +18,8 @@ import {
   getR1MeetProfile,
 } from '../lib/r1/meet/profiles.js';
 
-/** D-M034-9 / D-M034-11: the exact notice Dex posts in the meeting chat (AI + recorded). */
-const DISCLOSURE = 'Dex is an AI interviewer from Interview Kickstart. This call is recorded.';
+/** D-M034-9 / D-M034-11: the exact notice Lexy posts in the meeting chat (AI + recorded; owner 2026-11-27). */
+const DISCLOSURE = 'Lexy is an AI interviewer from Interview Kickstart. This call is recorded.';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const read = (relative: string): string => readFileSync(path.resolve(here, relative), 'utf8');
@@ -60,7 +60,7 @@ function allowedRoundKinds(): string[] {
 const profiles = Object.values(R1_MEET_PROFILES);
 
 describe('R1 Meet profile registry', () => {
-  it('has exactly the one Dex R1 sales profile', () => {
+  it('has exactly the one R1 sales profile (id r1_dex_sales, an identifier kept from Dex)', () => {
     expect(R1_MEET_DEFAULT_PROFILE_ID).toBe('r1_dex_sales');
     expect(R1_MEET_PROFILE_IDS).toEqual(['r1_dex_sales']);
     expect(Object.keys(R1_MEET_PROFILES)).toEqual([...R1_MEET_PROFILE_IDS]);
@@ -71,7 +71,7 @@ describe('R1 Meet profile registry', () => {
       id: 'r1_dex_sales',
       interviewKind: 'sales_r1',
       consentMode: 'hr_attested_ashby',
-      botDisplayName: 'Dex',
+      botDisplayName: 'Lexy',
       maxCallMinutes: 45,
       botJoinLeadSec: 120,
       automaticLeave: {
@@ -100,7 +100,7 @@ describe('R1 Meet profile registry', () => {
     expect(getR1MeetProfile('r1_dex_sales')!.consentMode).toBe('hr_attested_ashby');
   });
 
-  it('posts exactly the owner-approved disclosure: Dex is an AI and the call is recorded', () => {
+  it('posts exactly the owner-approved disclosure: Lexy is an AI and the call is recorded', () => {
     const profile = getR1MeetProfile('r1_dex_sales')!;
     expect(profile.disclosureChatMessage).toBe(DISCLOSURE);
     expect(profile.disclosureChatMessage).toMatch(/\bAI\b/);
@@ -154,7 +154,7 @@ describe('R1 Meet profile registry', () => {
     expect(() => {
       (R1_MEET_PROFILE_IDS as string[]).push('r1_other');
     }).toThrow(TypeError);
-    expect(getR1MeetProfile('r1_dex_sales')!.botDisplayName).toBe('Dex');
+    expect(getR1MeetProfile('r1_dex_sales')!.botDisplayName).toBe('Lexy');
   });
 
   it('keys every profile by its own id', () => {

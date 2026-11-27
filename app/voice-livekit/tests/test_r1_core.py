@@ -870,7 +870,7 @@ class TestPhaseAndConfiguration(unittest.TestCase):
     def test_lines_and_llm_configuration_fail_closed(self) -> None:
         self.assertEqual(safe_first_name("not/a/name"), "there")
         self.assertIn(r1_script.interviewer_name(), line("L-OPEN", first_name="Asha"))
-        self.assertIn("I'm Dex,", line("L-OPEN", first_name="Asha"))
+        self.assertIn("I'm Lexy,", line("L-OPEN", first_name="Asha"))
         with self.assertRaises(r1_llm.R1LLMConfigurationError):
             r1_llm.r1_llm_config(
                 {"DEEPSEEK_API_KEY": "x", "R1_LLM_BASE_URL": "https://bad.example"}
@@ -3628,7 +3628,7 @@ class TestRunFlow(R1TestCase):
         text = self.spoken_line(exit_line)
         self.assertIn("let's pause the role-play here", text.lower())
         self.assertIn("do you have any questions for me about the role or the next steps?", text)
-        self.assertEqual(text.count("Dex"), 0 if exit_line == "L-EXIT-WRAP-ASIDE" else 1)
+        self.assertEqual(text.count("Lexy"), 0 if exit_line == "L-EXIT-WRAP-ASIDE" else 1)
         phases = {row["text"]: row["phase"] for row in self.bot_rows()}
         self.assertEqual(phases[text], "roleplay_exit")
         return spoken
@@ -4043,15 +4043,17 @@ class TestWrapupAndReadyDriveTheDriver(R1TestCase):
 
     async def test_agent_instructions_follow_persona(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertTrue(r1_session.r1_agent_instructions().startswith("You are Dex."))
+            self.assertTrue(r1_session.r1_agent_instructions().startswith("You are Lexy."))
             if r1_session.Agent is not object:
-                self.assertIn("You are Dex.", R1Agent(self.interview).instructions)
+                self.assertIn("You are Lexy.", R1Agent(self.interview).instructions)
             else:
                 with mock.patch.object(
                     r1_session, "r1_agent_instructions", wraps=r1_session.r1_agent_instructions
                 ) as instructions:
                     R1Agent(self.interview)
                 instructions.assert_called_once_with()
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_LEXY": "0"}, clear=True):
+            self.assertTrue(r1_session.r1_agent_instructions().startswith("You are Dex."))
         with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}, clear=True):
             self.assertTrue(r1_session.r1_agent_instructions().startswith("You are Christy."))
 
@@ -4590,7 +4592,7 @@ class TestUnknownAndSpokenFirstName(R1TestCase):
 
     async def test_the_placeholder_name_is_dropped_from_every_line(self) -> None:
         rendered = self.spoken_lines()
-        self.assertTrue(rendered["L-OPEN"].startswith("Hi, I'm Dex,"))
+        self.assertTrue(rendered["L-OPEN"].startswith("Hi, I'm Lexy,"))
         self.assertTrue(rendered["L-TRANSITION"].startswith("Thank you. Next, let's do a sales"))
         self.assertIn("for your time today. The hiring team", rendered["L-CLOSE"])
         self.assertEqual(rendered["L-SIL-IB"], "Are you still with me?")
@@ -4655,7 +4657,7 @@ class TestUnknownAndSpokenFirstName(R1TestCase):
 
     async def test_a_name_that_belongs_to_the_learner_or_the_interviewer_is_not_adopted(self) -> None:
         variant = self.interview.persona.variant
-        for name in (variant.first_name, variant.last_name, "Christy", "Dex"):
+        for name in (variant.first_name, variant.last_name, "Christy", "Dex", "Lexy"):
             with self.subTest(name=name):
                 await self.answer(f"Hello, my name is {name}.")
                 self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me?")
@@ -4664,6 +4666,14 @@ class TestUnknownAndSpokenFirstName(R1TestCase):
         self.interview.machine.phase = R1Phase.OPENING
         self.interview._learn_spoken_name("This is Dex.")
         self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me?")
+
+    async def test_lexy_introduction_is_not_adopted(self) -> None:
+        # Owner 2026-11-27: Lexy is the interviewer's name, never the candidate's.
+        self.interview.machine.phase = R1Phase.OPENING
+        for text in ("This is Lexy.", "My name is Lexy.", "Hi, myself Lexi."):
+            with self.subTest(text=text):
+                self.interview._learn_spoken_name(text)
+                self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me?")
 
     async def test_the_guard_may_repeat_the_name_the_candidate_gave(self) -> None:
         from r1_guard import guard_text
@@ -9205,9 +9215,9 @@ class TestEndIntentClassification(R1TestCase):
         await self.until(lambda: self.spoken_and_played("L-ASIDE-END"))
         await self.settle()
         self.assertEqual(len(runner.calls), 1)
-        self.assertNotIn("Dex has just asked", runner.calls[0][1]["content"])
+        self.assertNotIn("Lexy has just asked", runner.calls[0][1]["content"])
         self.assertTrue(await self.commit_turn("Okay, let's wrap it up then."))
-        self.assertIn("Dex has just asked", runner.calls[-1][1]["content"])
+        self.assertIn("Lexy has just asked", runner.calls[-1][1]["content"])
         self.assertTrue(self.interview.engine.end_confirmed)
 
 
@@ -9345,7 +9355,7 @@ class TestBareYesConfirmsTheEnd(R1TestCase):
         await self.settle()
         self.assertFalse(await self.commit_turn(text))
         self.assertTrue(runner.calls)
-        self.assertNotIn("Dex has just asked", runner.calls[-1][1]["content"])
+        self.assertNotIn("Lexy has just asked", runner.calls[-1][1]["content"])
         self.assertFalse(engine.end_confirmed)
         self.assertFalse(self.interview._roleplay_exit_requested())
 
@@ -12154,7 +12164,7 @@ class TestTheOpeningSoundCheck(R1TestCase):
         run = await self.opening()
         await self.hello_played(run)
         self.assertIn("AI interviewer", run.session.spoken[0])
-        self.assertTrue(run.session.spoken[0].startswith("Hi Asha, I'm Dex"))
+        self.assertTrue(run.session.spoken[0].startswith("Hi Asha, I'm Lexy"))
         self.assertFalse(run.session.handles[0].allow_interruptions)
 
     async def test_a_hi_during_the_hello_waits_for_the_answer_to_the_question(self) -> None:
@@ -12305,7 +12315,7 @@ class TestTheOpeningSoundCheck(R1TestCase):
     async def test_a_name_said_in_the_reply_is_used_from_then_on(self) -> None:
         run = await self.opening(context={"first_name": "there", "candidate_identity": "candidate"})
         await self.hello_played(run)
-        self.assertTrue(run.session.spoken[0].startswith("Hi, I'm Dex"))
+        self.assertTrue(run.session.spoken[0].startswith("Hi, I'm Lexy"))
         await self.reply(run, "Yes, hi, my name is Ravi.")
         await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
         self.assertEqual(run.interview._first_name(), "Ravi")

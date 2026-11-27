@@ -87,7 +87,7 @@ const missingReason = (name: string): string => `${name} is required when R1_MEE
 const MALFORMED_REASON: Record<(typeof R1_MEET_REQUIRED_VARIABLES)[number], string> = {
   RECALL_API_KEY: 'RECALL_API_KEY is malformed',
   RECALL_WEBHOOK_SECRET: 'RECALL_WEBHOOK_SECRET is malformed (expected the whsec_-prefixed workspace verification secret)',
-  R1_MEET_ASHBY_DEX_USER_ID: 'R1_MEET_ASHBY_DEX_USER_ID must be a UUID (the Ashby user id of "Dex (AI Interviewer)")',
+  R1_MEET_ASHBY_DEX_USER_ID: 'R1_MEET_ASHBY_DEX_USER_ID must be a UUID (the Ashby user id of "Lexy (AI Interviewer)")',
 };
 const UNEXPECTED_REASON = 'unexpected error while reading the Meet configuration';
 
@@ -821,7 +821,7 @@ describe('R1 Meet configuration: the drain', () => {
 });
 
 describe('R1 Meet configuration: the Ashby feedback form (M034 S09)', () => {
-  const FEEDBACK_REASON = 'R1_MEET_ASHBY_FEEDBACK_FORM_ID must be a UUID (the feedback form of the Dex interview in Ashby)';
+  const FEEDBACK_REASON = 'R1_MEET_ASHBY_FEEDBACK_FORM_ID must be a UUID (the feedback form of the Lexy interview in Ashby)';
   const FEEDBACK_UNEXPECTED_REASON = 'unexpected error while reading the Meet feedback configuration';
   const feedback = (value: unknown): R1MeetFeedbackConfig =>
     getR1MeetFeedbackConfig({ R1_MEET_ASHBY_FEEDBACK_FORM_ID: value as string });

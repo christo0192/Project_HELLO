@@ -150,7 +150,7 @@ function bind(f: ProbeFeedbackForm = form(), src: R1MeetFeedbackSource = source(
 }
 
 const HAPPY_SUMMARY = [
-  'Dex (AI interviewer): R1 sales role-play over Google Meet. Verdict: Select. Weighted 3.25/4 across 5 of 5 metrics.',
+  'Lexy (AI interviewer): R1 sales role-play over Google Meet. Verdict: Select. Weighted 3.25/4 across 5 of 5 metrics.',
   'Probing & discovery — 4/4: Asked four open questions before the first pitch.',
   'Objection handling — 3/4: Answered the price objection with prep-guide facts.',
   'Urgency & close — 3/4: Tied urgency to the stated career goal.',
@@ -347,7 +347,7 @@ describe('r1MeetFeedbackSummary', () => {
       ],
     });
     expect(r1MeetFeedbackSummary(src, DEX)).toBe([
-      'Dex (AI interviewer): R1 sales role-play over Google Meet. Verdict: Select. Weighted 3.4/4 across 3 of 5 metrics; 2 not scored (listed below).',
+      'Lexy (AI interviewer): R1 sales role-play over Google Meet. Verdict: Select. Weighted 3.4/4 across 3 of 5 metrics; 2 not scored (listed below).',
       'Objection handling — NOT SCORED (insufficient evidence): The learner raised no objection.',
       'Negotiation & discount discipline — NOT SCORED (insufficient evidence)',
       'Probing & discovery — 4/4: Asked four open questions before the first pitch.',
@@ -359,7 +359,7 @@ describe('r1MeetFeedbackSummary', () => {
   it('rounds the weighted score to two decimals and omits an empty rationale', () => {
     const summary = r1MeetFeedbackSummary(source({ weighted_score_5: 3.3333, metric_results: [metricResult(0, 3, '  ')] }), DEX);
     expect(summary).toBe(
-      'Dex (AI interviewer): R1 sales role-play over Google Meet. Verdict: Select. Weighted 3.33/4 across 1 of 1 metric.\n'
+      'Lexy (AI interviewer): R1 sales role-play over Google Meet. Verdict: Select. Weighted 3.33/4 across 1 of 1 metric.\n'
       + 'Probing & discovery — 3/4',
     );
   });
@@ -423,9 +423,9 @@ describe('r1MeetFeedbackSummary', () => {
     expect(R1_MEET_FEEDBACK_KIND_LABELS).toStrictEqual({ sales_r1: 'R1 sales role-play' });
     expect(Object.isFrozen(R1_MEET_FEEDBACK_KIND_LABELS)).toBe(true);
     const later = r1MeetFeedbackSummary(source(), { botDisplayName: 'Ava', interviewKind: 'sales_r1' });
-    expect(later).toBe(HAPPY_SUMMARY.replace(/^Dex \(AI interviewer\)/, 'Ava (AI interviewer)'));
+    expect(later).toBe(HAPPY_SUMMARY.replace(/^Lexy \(AI interviewer\)/, 'Ava (AI interviewer)'));
     expect(later.split('\n')[0]).toMatch(/^Ava \(AI interviewer\): R1 sales role-play over Google Meet\. Verdict: Select\. /);
-    expect(later).not.toContain('Dex');
+    expect(later).not.toContain('Lexy');
     // The profile's name is bounded and control-stripped like any other text on the card.
     const odd = r1MeetFeedbackSummary(source(), { botDisplayName: `Ava\u0000\n${'x'.repeat(60)}`, interviewKind: 'sales_r1' });
     const header = odd.split('\n')[0]!;
