@@ -25,7 +25,9 @@
  *
  * A round held over Google Meet (`channel: 'meet'`) carries a "Via Meet" chip
  * and has no candidate link: no Reissue, "Open until" for its expiry, and its
- * cancel and retake words point to Ashby, where the interview is scheduled.
+ * cancel and retake words cover both ways it can be booked (by the candidate on
+ * the public booking link, or by HR in Ashby). The panel cannot tell which: the
+ * round reads carry no source, so the same words must be true for either.
  * A round without `channel: 'meet'` reads exactly as before.
  *
  * Recordings: one chip per attempt that has anything to say (a recording in any
@@ -86,8 +88,9 @@ const CONFIRM_COPY: Record<
     title: 'Cancel this R1 round?',
     body: (round) =>
       isMeetRound(round)
-        ? `Its reserved minutes are released. ${runningCallNote(round)}The interview stays in Ashby ` +
-          'until it is cancelled there.'
+        ? `Its reserved minutes are released. ${runningCallNote(round)}If the candidate booked it on the ` +
+          'public booking link, it comes off Lexy’s calendar unless the slot has started. If it was ' +
+          'scheduled in Ashby, it stays there until it is cancelled there.'
         : `The link stops working and its reserved minutes are released. ${runningCallNote(round)}` +
           'A new round can be sent afterwards.',
     confirm: 'Cancel round',
@@ -97,8 +100,8 @@ const CONFIRM_COPY: Record<
     title: 'Grant the one retake?',
     body: (round) =>
       isMeetRound(round)
-        ? `The round opens again for ${R1_LINK_VALID_HOURS} hours. Schedule the retake in Ashby with Lexy ` +
-          'before then; there is no link.'
+        ? `The round opens again for ${R1_LINK_VALID_HOURS} hours. Before then, the candidate can book ` +
+          'the retake on the public booking link, or you can schedule it in Ashby with Lexy.'
         : 'The candidate can use their original link again for ' +
           `${R1_LINK_VALID_HOURS} hours. A retake can be granted once.`,
     confirm: 'Grant retake',
@@ -207,7 +210,8 @@ export function R1RoundsPanel({
         await api.grantR1Retake(round.id);
         onMessage(
           isMeetRound(round)
-            ? `Retake granted. Schedule it in Ashby with Lexy within ${R1_LINK_VALID_HOURS} hours.`
+            ? `Retake granted. Within ${R1_LINK_VALID_HOURS} hours, the candidate can book it on the ` +
+                'public booking link, or you can schedule it in Ashby with Lexy.'
             : 'Retake granted. The candidate’s original link works again for ' +
                 `${R1_LINK_VALID_HOURS} hours; reissue a link if you no longer have it.`,
         );

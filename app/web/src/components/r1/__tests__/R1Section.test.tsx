@@ -1286,42 +1286,50 @@ describe('a round held over Google Meet', () => {
     expect(row).not.toHaveTextContent('Link open');
   });
 
-  it('cancels with words about Ashby, not a link', async () => {
+  it('cancels with words true for both ways it can be booked, never about its own link', async () => {
     const user = userEvent.setup();
     await rowOf({ channel: 'meet' });
     await user.click(await screen.findByRole('button', { name: 'Cancel round' }));
     const well = await screen.findByRole('group', { name: 'Cancel this R1 round?' });
     expect(well).toHaveTextContent(
-      'Its reserved minutes are released. The interview stays in Ashby until it is cancelled there.',
+      'Its reserved minutes are released. If the candidate booked it on the public booking link, it comes ' +
+        'off Lexy’s calendar unless the slot has started. If it was scheduled in Ashby, it stays there until ' +
+        'it is cancelled there.',
     );
-    expect(well).not.toHaveTextContent(/link/i);
+    // The public booking link is where it is booked, not a link of the round's own: no browser-link words.
+    expect(well).not.toHaveTextContent(/link stops working|original link|reissue/i);
     expect(well).not.toHaveTextContent(/does not end a call/);
   });
 
-  it('warns that cancelling does not end a call that is already running', async () => {
+  it('warns that cancelling does not end a call that is already running, for both ways it can be booked', async () => {
     const user = userEvent.setup();
     await rowOf({ channel: 'meet', status: 'in_progress' });
     await user.click(await screen.findByRole('button', { name: 'Cancel round' }));
     expect(await screen.findByRole('group', { name: 'Cancel this R1 round?' })).toHaveTextContent(
       'Its reserved minutes are released. This does not end a call that is already running. ' +
-        'The interview stays in Ashby until it is cancelled there.',
+        'If the candidate booked it on the public booking link, it comes off Lexy’s calendar unless the ' +
+        'slot has started. If it was scheduled in Ashby, it stays there until it is cancelled there.',
     );
   });
 
-  it('grants the retake with words about scheduling it in Ashby, not a link', async () => {
+  it('grants the retake with words true for both ways it can be booked, never about its own link', async () => {
     const user = userEvent.setup();
     await rowOf({ channel: 'meet', status: 'completed', attempts_counted: 1 });
     await user.click(await screen.findByRole('button', { name: 'Grant retake' }));
     const well = await screen.findByRole('group', { name: 'Grant the one retake?' });
     expect(well).toHaveTextContent(
-      'The round opens again for 72 hours. Schedule the retake in Ashby with Lexy before then; there is no link.',
+      'The round opens again for 72 hours. Before then, the candidate can book the retake on the public ' +
+        'booking link, or you can schedule it in Ashby with Lexy.',
     );
-    expect(well).not.toHaveTextContent(/original link/);
+    expect(well).not.toHaveTextContent(/original link|reissue/i);
     api.listR1Rounds.mockResolvedValue({ rounds: [round({ channel: 'meet', status: 'invited', attempts_counted: 1 })] });
     await user.click(within(well).getByRole('button', { name: 'Grant retake' }));
     expect(api.grantR1Retake).toHaveBeenCalledWith('round-1');
     expect(
-      await screen.findByText('Retake granted. Schedule it in Ashby with Lexy within 72 hours.'),
+      await screen.findByText(
+        'Retake granted. Within 72 hours, the candidate can book it on the public booking link, or you can ' +
+          'schedule it in Ashby with Lexy.',
+      ),
     ).toBeInTheDocument();
     expect(screen.queryByText(/original link works again/)).not.toBeInTheDocument();
   });
