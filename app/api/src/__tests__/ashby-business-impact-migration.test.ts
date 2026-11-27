@@ -66,10 +66,12 @@ describe('0140 shape', () => {
     // progress table and nothing this read model depends on.
     // 0142_r1_meet_bookings.sql (M034 S02, R1 Meet bookings) touches none of these tables.
     // 0143_r1_meet_public_bookings.sql (M035 S01, public R1 Meet bookings) touches none of these tables.
+    // 0144_r1_meet_public_import.sql (M035 S12) redeclares v_ashby_application_impact as this file's view plus one marked hunk that leaves r1_public_booking links out (pinned in r1-meet-public-import-migration.test.ts); the text pinned here is unchanged.
     expect(files.slice(files.indexOf(FILE) + 1)).toEqual([
       '0141_ashby_progress_nudge.sql',
       '0142_r1_meet_bookings.sql',
       '0143_r1_meet_public_bookings.sql',
+      '0144_r1_meet_public_import.sql',
     ]);
     const between = files.slice(files.indexOf('0138_ashby_pipeline_progress.sql') + 1, files.indexOf(FILE));
     expect(between).toEqual(['0139_ashby_progress_worker.sql']);

@@ -19,12 +19,14 @@ import type {
   WorkflowLinkRow,
   AshbyCandidateProfileResult,
   AshbyIntakeType,
+  AshbyScreeningIntakeType,
   AshbyProfileOutcome,
   RecommendationTagLink,
   RecommendationTagSource,
 } from './orchestration.js';
+import { isAshbyIntakeType } from './orchestration.js';
 import type { AshbyLinkLookup } from './completion-observer.js';
-import { projectProfileOutcome } from './candidate-workflow.js';
+import { projectIntakeType, projectProfileOutcome } from './candidate-workflow.js';
 import { ashbyReviewPath, buildScorecard, type ScorecardSource } from './scorecard.js';
 import {
   isV2AdapterBlocked,
@@ -115,9 +117,13 @@ function statusOf(data: unknown): string {
   return (data as { status?: string } | null)?.status ?? 'error';
 }
 
-/** 0130: the link's `intake_type`, or undefined for anything outside the CHECK. */
+/**
+ * 0130 + 0144: the link's `intake_type` (any of the three CHECK values,
+ * `r1_public_booking` included, so the pipeline can fence such a link), or
+ * undefined for anything outside the CHECK.
+ */
 function intakeTypeOf(value: unknown): AshbyIntakeType | undefined {
-  return value === 'resume_parsing' || value === 'phone_parsing' ? value : undefined;
+  return isAshbyIntakeType(value) ? value : undefined;
 }
 
 /**
@@ -862,9 +868,10 @@ export interface MissionControlWorkflow {
    * M017 (0130): the link's intake type, and the last Ashby profile check's
    * outcome code (null before any check). Both are codes from closed CHECKs;
    * anything else reads as null. Optional only so older fakes still compile;
-   * the store always sets both.
+   * the store always sets both. 0144: an `r1_public_booking` link (the M035
+   * public booking import) reads as null too: Christy does not screen it.
    */
-  intakeType?: AshbyIntakeType | null;
+  intakeType?: AshbyScreeningIntakeType | null;
   profileOutcome?: AshbyProfileOutcome | null;
   updatedAt: string;
 }
@@ -1263,7 +1270,7 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
           sessionId: typeof r.session_id === 'string' ? r.session_id : null,
           // `null` (unreadable) must survive — `??` would turn it into false.
           heldForEvidence: heldOf(heldForEvidence, String(r.id)),
-          intakeType: intakeTypeOf(r.intake_type) ?? null,
+          intakeType: projectIntakeType(r.intake_type),
           profileOutcome: projectProfileOutcome(r.profile_outcome),
           updatedAt: String(r.updated_at),
         };

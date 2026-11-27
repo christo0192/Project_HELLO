@@ -2547,7 +2547,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '409':
-          description: A phone prerequisite refused the request (error phone_request_refused, with the stable status). Since 0114 (C8) a same-role duplicate application answers error duplicate_application instead - the engagement is held in pending_prereqs because the same person already has a live or completed screen for this role on another candidate row, which is never named. POST /api/candidates/{id}/phone/release-duplicate-hold lifts it.
+          description: A phone prerequisite refused the request (error phone_request_refused, with the stable status). Since 0114 (C8) a same-role duplicate application answers error duplicate_application instead - the engagement is held in pending_prereqs because the same person already has a live or completed screen for this role on another candidate row, which is never named. POST /api/candidates/{id}/phone/release-duplicate-hold lifts it. Since 0144 (M035) a candidate the public R1 booking page imported answers error not_phone_screened - such a candidate is never phone-screened, nothing was written, and a retry gives the same answer.
           content:
             application/json:
               schema:
@@ -2745,7 +2745,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/SimpleError' }
         '409':
-          description: Current cycle or slot policy refused the booking. The error is the RPC's own status, including slot_not_yet_eligible (0114 — the slot starts before the engagement's next_eligible_at) and daily_attempt_exists (0114 — the slot's IST day already holds the per-day dial cap). duplicate_application (0114 C8 - the same person already has a live or completed screen for this role on another candidate row, never named; nothing is booked until the hold is released through POST /api/candidates/{id}/phone/release-duplicate-hold).
+          description: Current cycle or slot policy refused the booking. The error is the RPC's own status, including slot_not_yet_eligible (0114 — the slot starts before the engagement's next_eligible_at) and daily_attempt_exists (0114 — the slot's IST day already holds the per-day dial cap). duplicate_application (0114 C8 - the same person already has a live or completed screen for this role on another candidate row, never named; nothing is booked until the hold is released through POST /api/candidates/{id}/phone/release-duplicate-hold). not_phone_screened (0144, M035 - a candidate the public R1 booking page imported is never phone-screened, so no slot can be booked; nothing is written).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/SimpleError' }

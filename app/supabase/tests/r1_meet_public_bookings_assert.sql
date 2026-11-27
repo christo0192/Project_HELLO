@@ -2478,10 +2478,15 @@ begin
            _r1_meet_public_tests.id(22, 340)::text, '2026-12-01 04:00:00+00'), '42501');
   -- The 0142 suite leaves the r1_meet_public_* names to this one (the T4 three included, in file
   -- order; T4-A, T4-B and T4-C check their posture).
+  -- 0144 (M035 S12) adds r1_meet_public_local_rows, r1_meet_public_import_application and
+  -- r1_meet_public_person_r1_check; r1_meet_public_import_assert.sql pins those three, so this
+  -- guard leaves them out.
   perform _r1_meet_public_tests.assert(
     'T2-H the screening_v2 functions named r1_meet_public_* are exactly these thirteen, one overload each',
     (select array_agg(x.oid order by x.oid) from pg_proc x
-      where x.pronamespace = 'screening_v2'::regnamespace and x.proname like 'r1\_meet\_public\_%')
+      where x.pronamespace = 'screening_v2'::regnamespace
+        and x.proname not in ('r1_meet_public_local_rows', 'r1_meet_public_import_application', 'r1_meet_public_person_r1_check')
+        and x.proname like 'r1\_meet\_public\_%')
     = (select array_agg(f::regprocedure::oid order by f::regprocedure::oid) from unnest(array[
          'screening_v2.r1_meet_public_slot_count(timestamptz, timestamptz, uuid)',
          'screening_v2.r1_meet_public_day_count(date, uuid)',

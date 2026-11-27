@@ -123,9 +123,9 @@ import { extractFileUrl, type AshbyRuntime } from './runtime.js';
 import { isUnreadableResumeReason, MATERIALIZE_FAILED_REASON } from './resume-ingestion.js';
 import type { PersistOutcome, StructuredResume } from './resume-ingestion.js';
 import type {
-  AshbyIntakeType,
   AshbyProfileOutcome,
   AshbyProfileSkipReason,
+  AshbyScreeningIntakeType,
   WorkflowLinkRow,
 } from './orchestration.js';
 import { MAX_FILE_HANDLE_LEN } from './client.js';
@@ -1032,6 +1032,20 @@ export function buildAshbyHandlers(
       // exhausts its attempts dead-letters LOUDLY instead of leaving an
       // invisible candidate behind.
       if (result.status === 'shell_unbound') throw new Error('ashby_import_shell_unbound');
+      // 0144: the M035 public booking import owns this application, so the
+      // import did nothing at all: no resume ingestion, no profile step and
+      // never a Christy call, for good (the intake never changes). A stage
+      // webhook or reconciliation reaches this when HR moves such an
+      // application into the AI-screening stage, which HR may expect to start
+      // Christy, so it is a WARNING (S12 fix round F2; runbook
+      // ashby-runtime-activation.md §12). Metadata only, no identifier.
+      if (result.status === 'skipped' && result.reason === 'r1_public_booking') {
+        logger.warn('unknown_event', {
+          error_category: 'ashby_import_skipped',
+          error_type: 'r1_public_booking',
+        });
+        return;
+      }
       if (result.status === 'imported' && result.legacyInviteSkipped) {
         // Metadata only, no identifier: the skip must be visible in the logs.
         logger.info('unknown_event', {
@@ -1068,7 +1082,10 @@ export function buildAshbyHandlers(
       if (phoneParsingEnabled) {
         try {
           const link = await runtime.stores.readLink(result.applicationLinkId);
+          // 0144: never for a public booking import (unreachable: `runImport`
+          // skips such a link; explicit so the rule holds on its own).
           if (link && !link.externalResumeFileHandle && link.intakeType !== 'phone_parsing'
+              && link.intakeType !== 'r1_public_booking'
               && result.decision.action === 'import') {
             const mapping = await runtime.resolveMappingByJobId(result.decision.jobId);
             if (mapping.screeningMode === 'phone_primary') {
@@ -1122,6 +1139,18 @@ export function buildAshbyHandlers(
       // provider calls and zero resume bytes.
       const current = await runtime.stores.readIngestion(linkId);
       if (current && TERMINAL_INGESTION_STATES.has(current.state)) return;
+
+      // ── The M035 public booking import owns this application (0144) ─────
+      // It never gets a resume ingestion (0144 §3 refuses the row), so a job
+      // that reached it anyway is a quiet, logged no-op: nothing resolves a
+      // URL, scans, parses or asks the profile job. Always on.
+      if (link.intakeType === 'r1_public_booking') {
+        logger.info('unknown_event', {
+          error_category: 'ashby_ingestion_skipped',
+          error_type: 'r1_public_booking',
+        });
+        return;
+      }
 
       // ── Phone parsing owns this application (ADR-0018) ──────────────────
       // The Ashby profile was applied, so the resume pipeline must never parse
@@ -1698,6 +1727,17 @@ export function buildAshbyHandlers(
         await recordOutcome('candidate_missing');
         return;
       }
+      // ── The M035 public booking import is never profiled (0144) ──────────
+      // The 0144 claim never returns such a link and its intake never
+      // changes, so a job that reached it anyway stops here: no Ashby read,
+      // no outcome write, no RPC. Metadata only, no identifier.
+      if (link.intakeType === 'r1_public_booking') {
+        logger.info('unknown_event', {
+          error_category: 'ashby_profile_skipped',
+          error_type: 'r1_public_booking',
+        });
+        return;
+      }
 
       // ── An unreadable resume falls back to phone parsing (B3) ────────────
       // A link with a handle whose ingestion rests in `failed_review` ("Resume
@@ -1725,7 +1765,7 @@ export function buildAshbyHandlers(
         await recordOutcome('resume_found');
         return;
       }
-      const intake: AshbyIntakeType = resumeLink ? 'resume_parsing' : 'phone_parsing';
+      const intake: AshbyScreeningIntakeType = resumeLink ? 'resume_parsing' : 'phone_parsing';
 
       // ── Re-read the application: decide on Ashby's state NOW ─────────────
       const info = await readAshby(() => runtime.client.applicationInfo(link.externalApplicationId));
