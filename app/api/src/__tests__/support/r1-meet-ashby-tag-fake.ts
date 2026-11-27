@@ -31,11 +31,30 @@
  *                      the state mid-run, to advance a clock, ...);
  *   requests           `{ path, body, raw, headers }` per request, `authorization` redacted.
  *
+ * T3 adds the TABLES half (`createBookedTagTables()`): the two tables the booked-tag store reads,
+ * `r1_meet_bookings` and `ashby_application_links`, as plain rows behind an in-memory client whose
+ * `from(table)` answers a query with `select(columns)`, `eq`, `in`, `order(column, { ascending })`
+ * (stable; successive calls are successive sort keys; nulls last ascending and first descending, as
+ * Postgres sorts), `limit(n)`, `maybeSingle()` (PGRST116 on more than one row) and `then`.
+ *   select projects the named columns; a column the row does not have stays ABSENT (not null), so
+ *                a test can prove that a missing selected column is drift;
+ *   failNext     the next query of a table answers a DB error (`'error'`, the default), rejects
+ *                (`'reject'`) or throws from `from()` (`'throw'`, a builder that throws);
+ *   calls        one `{ table, columns, filters, orders, limit, terminal }` per query, in order;
+ *   seeds        `publicBooking({ applicationId, ... })` (defaults: source `public_page`, status
+ *                `pending`, a slot 24 h after `HARNESS_NOW`, `created_at = updated_at = HARNESS_NOW`;
+ *                the row also carries columns the store must never read: our candidate id, the Meet
+ *                URL, a ticket digest, the calendar and manage columns) and
+ *                `link({ applicationId, candidateId })` (provider `ashby`, lifecycle `imported`).
+ *
  * Ids are fixture ids (`7f000000-0000-4000-8000-…`); the key is built at run time and never looks
  * like a real credential. Never shipped: `tsconfig.build.json` excludes `src/__tests__`.
  */
 
 import type { AshbyTransport, AshbyTransportRequest, AshbyTransportResponse } from '../../integrations/ashby/client.js';
+import type { R1MeetBookingStatus } from '../../lib/r1/meet/bookings-read.js';
+import type { supabase } from '../../lib/supabase.js';
+import { HARNESS_NOW, MEET_URL, fixtureId } from './r1-meet-harness.js';
 
 /** The five paths the lane may ever call. */
 export const ASHBY_TAG_LANE_PATHS = Object.freeze([
@@ -244,4 +263,268 @@ export function createFakeAshbyTags(): FakeAshbyTags {
     requestsOf: (path: string) => requests.filter((request) => request.path === path),
     tagsOf: (candidateId: string) => candidates.get(candidateId)?.map((tag) => ({ ...tag })),
   });
+}
+
+// ── The tables half (T3): the rows the booked-tag store reads ───────────────
+
+export type BookedTagTable = 'r1_meet_bookings' | 'ashby_application_links';
+export type BookedTagRow = Record<string, unknown>;
+
+export interface BookedTagFilter {
+  readonly op: 'eq' | 'in';
+  readonly column: string;
+  readonly value: unknown;
+}
+
+export interface BookedTagOrder {
+  readonly column: string;
+  readonly ascending: boolean;
+}
+
+export interface BookedTagQueryCall {
+  readonly table: string;
+  /** The `select` argument exactly as passed, or null when none was. */
+  columns: string | null;
+  readonly filters: BookedTagFilter[];
+  readonly orders: BookedTagOrder[];
+  limit: number | null;
+  /** How the query was settled. */
+  terminal: 'maybeSingle' | 'then' | null;
+}
+
+/** `'error'`: a DB error answer; `'reject'`: the call rejects; `'throw'`: `from()` itself throws. */
+export type BookedTagFailure = 'error' | 'reject' | 'throw';
+
+export interface PublicBookingSeed {
+  readonly id?: string;
+  readonly applicationId: string;
+  readonly status?: R1MeetBookingStatus;
+  readonly startAt?: string;
+  readonly updatedAt?: string;
+  readonly createdAt?: string;
+  /** Default `public_page`; `ashby` seeds an Ashby-scheduled row (its three Ashby ids set). */
+  readonly source?: string;
+}
+
+export interface LinkSeed {
+  readonly applicationId: string;
+  readonly candidateId: string | null;
+}
+
+export interface BookedTagTables {
+  readonly rows: { readonly r1_meet_bookings: BookedTagRow[]; readonly ashby_application_links: BookedTagRow[] };
+  /** The in-memory client, typed as the service-role client the store takes. */
+  readonly client: typeof supabase;
+  readonly calls: BookedTagQueryCall[];
+  /** The next query of `table` fails (see `BookedTagFailure`). */
+  failNext(table: BookedTagTable, failure?: BookedTagFailure): void;
+  /** Seeds one booking row and answers it (the stored object: a test may change it in place). */
+  publicBooking(seed: PublicBookingSeed): BookedTagRow;
+  /** Seeds one link row and answers it (the stored object). */
+  link(seed: LinkSeed): BookedTagRow;
+  /** The recorded queries of one table, in order. */
+  callsOf(table: BookedTagTable): BookedTagQueryCall[];
+}
+
+type TableAnswer = { data: unknown; error: { code: string; message: string } | null };
+
+const ZONED_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/;
+const ANY_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Postgres-like: null sorts as the largest value; instants by time, UUIDs by value, else by text. */
+function compareCells(a: unknown, b: unknown): number {
+  const aNull = a === null || a === undefined;
+  const bNull = b === null || b === undefined;
+  if (aNull || bNull) return aNull === bNull ? 0 : aNull ? 1 : -1;
+  if (typeof a === 'number' && typeof b === 'number') return a - b;
+  if (typeof a === 'string' && typeof b === 'string') {
+    if (ZONED_INSTANT.test(a) && ZONED_INSTANT.test(b)) return Date.parse(a) - Date.parse(b);
+    const [x, y] = ANY_UUID.test(a) && ANY_UUID.test(b) ? [a.toLowerCase(), b.toLowerCase()] : [a, b];
+    return x < y ? -1 : x > y ? 1 : 0;
+  }
+  const [x, y] = [String(a), String(b)];
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/** select / eq / in / order / limit / maybeSingle / then over plain rows, recording the query. */
+class BookedTagQuery {
+  constructor(
+    private readonly rows: () => BookedTagRow[],
+    private readonly call: BookedTagQueryCall,
+    private readonly failure: BookedTagFailure | undefined,
+  ) {}
+
+  select(columns?: string): this {
+    this.call.columns = columns ?? null;
+    return this;
+  }
+
+  eq(column: string, value: unknown): this {
+    this.call.filters.push({ op: 'eq', column, value });
+    return this;
+  }
+
+  in(column: string, values: readonly unknown[]): this {
+    this.call.filters.push({ op: 'in', column, value: [...values] });
+    return this;
+  }
+
+  order(column: string, options: { ascending?: boolean } = {}): this {
+    this.call.orders.push({ column, ascending: options.ascending !== false });
+    return this;
+  }
+
+  limit(count: number): this {
+    this.call.limit = count;
+    return this;
+  }
+
+  private run(): TableAnswer {
+    if (this.failure === 'error') return { data: null, error: { code: 'XX000', message: 'fake_db_failure' } };
+    const matches = (row: BookedTagRow) =>
+      this.call.filters.every((filter) =>
+        filter.op === 'eq' ? row[filter.column] === filter.value : (filter.value as unknown[]).includes(row[filter.column]),
+      );
+    const ordered = this.rows()
+      .filter(matches)
+      .map((row, index) => ({ row, index }))
+      .sort((left, right) => {
+        for (const order of this.call.orders) {
+          const cmp = compareCells(left.row[order.column], right.row[order.column]);
+          if (cmp !== 0) return order.ascending ? cmp : -cmp;
+        }
+        return left.index - right.index;
+      })
+      .map(({ row }) => row);
+    const limited = this.call.limit === null ? ordered : ordered.slice(0, this.call.limit);
+    const columns = this.call.columns === null || this.call.columns.trim() === '*'
+      ? null
+      : this.call.columns.split(',').map((column) => column.trim());
+    return {
+      data: limited.map((row) => {
+        if (columns === null) return structuredClone(row);
+        const out: BookedTagRow = {};
+        for (const column of columns) {
+          if (Object.prototype.hasOwnProperty.call(row, column)) out[column] = structuredClone(row[column]);
+        }
+        return out;
+      }),
+      error: null,
+    };
+  }
+
+  private settle(terminal: 'maybeSingle' | 'then'): Promise<TableAnswer> {
+    this.call.terminal = terminal;
+    if (this.failure === 'reject') return Promise.reject(new Error('fake driver detail that must not leak'));
+    return Promise.resolve(this.run());
+  }
+
+  async maybeSingle(): Promise<TableAnswer> {
+    const result = await this.settle('maybeSingle');
+    if (result.error) return result;
+    const rows = result.data as BookedTagRow[];
+    if (rows.length > 1) return { data: null, error: { code: 'PGRST116', message: 'more than one row' } };
+    return { data: rows[0] ?? null, error: null };
+  }
+
+  then<A = TableAnswer, B = never>(
+    onFulfilled?: ((value: TableAnswer) => A | PromiseLike<A>) | null,
+    onRejected?: ((reason: unknown) => B | PromiseLike<B>) | null,
+  ): PromiseLike<A | B> {
+    return this.settle('then').then(onFulfilled, onRejected);
+  }
+}
+
+/** The reason a seeded booking carries for its status (one 0142 pairing each; the store never reads it). */
+const SEED_REASONS: Readonly<Record<string, string>> = Object.freeze({
+  pending: 'eligible',
+  bot_scheduled: 'eligible',
+  bot_joining: 'eligible',
+  human_present: 'eligible',
+  in_call: 'eligible',
+  blocked: 'paused',
+  unmatched_application: 'application_unknown',
+  unmapped_scheduler: 'scheduler_unmapped',
+  completed: 'attempt_settled',
+  cancelled: 'cancelled',
+  failed: 'bot_create_failed',
+  drained: 'flag_off',
+});
+
+export function createBookedTagTables(): BookedTagTables {
+  const rows = { r1_meet_bookings: [] as BookedTagRow[], ashby_application_links: [] as BookedTagRow[] };
+  const calls: BookedTagQueryCall[] = [];
+  const failures = new Map<string, BookedTagFailure[]>();
+  const nowMs = Date.parse(HARNESS_NOW);
+
+  const client = {
+    from(table: string) {
+      const call: BookedTagQueryCall = { table, columns: null, filters: [], orders: [], limit: null, terminal: null };
+      calls.push(call);
+      const failure = failures.get(table)?.shift();
+      if (failure === 'throw') throw new Error('fake builder detail that must not leak');
+      if (table !== 'r1_meet_bookings' && table !== 'ashby_application_links') {
+        throw new Error(`fake booked-tag tables: no table ${table}`);
+      }
+      return new BookedTagQuery(() => rows[table], call, failure);
+    },
+  };
+
+  return {
+    rows,
+    client: client as unknown as typeof supabase,
+    calls,
+    failNext(table: BookedTagTable, failure: BookedTagFailure = 'error') {
+      const list = failures.get(table) ?? [];
+      list.push(failure);
+      failures.set(table, list);
+    },
+    publicBooking(seed: PublicBookingSeed) {
+      const source = seed.source ?? 'public_page';
+      const status = seed.status ?? 'pending';
+      const startAt = seed.startAt ?? new Date(nowMs + 24 * 3600 * 1000).toISOString();
+      const isPublic = source === 'public_page';
+      const row: BookedTagRow = {
+        id: seed.id ?? fixtureId(),
+        source,
+        status,
+        reason: SEED_REASONS[status] ?? 'eligible',
+        ashby_interview_event_id: isPublic ? null : fixtureId(),
+        ashby_schedule_id: isPublic ? null : fixtureId(),
+        ashby_application_id: seed.applicationId,
+        ashby_scheduled_by_user_id: isPublic ? null : fixtureId(),
+        candidate_id: fixtureId(),
+        round_id: fixtureId(),
+        meet_url: MEET_URL,
+        ticket_digest: 'd'.repeat(64),
+        start_at: startAt,
+        end_at: new Date(Date.parse(startAt) + 45 * 60 * 1000).toISOString(),
+        google_calendar_event_id: isPublic ? 'fakecalendarevent0001' : null,
+        calendar_state: isPublic ? 'invited' : null,
+        public_request_id: isPublic ? fixtureId() : null,
+        manage_token_digest: isPublic ? 'm'.repeat(64) : null,
+        move_count: 0,
+        created_at: seed.createdAt ?? HARNESS_NOW,
+        updated_at: seed.updatedAt ?? HARNESS_NOW,
+      };
+      rows.r1_meet_bookings.push(row);
+      return row;
+    },
+    link(seed: LinkSeed) {
+      const row: BookedTagRow = {
+        id: fixtureId(),
+        provider: 'ashby',
+        external_application_id: seed.applicationId,
+        external_candidate_id: seed.candidateId,
+        candidate_id: fixtureId(),
+        lifecycle: 'imported',
+        terminal_state: null,
+        created_at: HARNESS_NOW,
+        updated_at: HARNESS_NOW,
+      };
+      rows.ashby_application_links.push(row);
+      return row;
+    },
+    callsOf: (table: BookedTagTable) => calls.filter((call) => call.table === table),
+  };
 }
