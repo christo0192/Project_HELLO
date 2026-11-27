@@ -262,10 +262,17 @@ function sourceFiles(directory: string): string[] {
 
 /**
  * M034: the vendor modules R1-over-Meet uses. They sit outside lib/r1 but are R1 code. The booking
- * source is Ashby (D-M034-11), so there is no booking-vendor module.
+ * source is Ashby (D-M034-11), so there is no booking-vendor module. M035 S03 adds the Google
+ * Calendar and Meet client for Dex (integrations/google), fenced the same way.
  */
-const meetVendorDirs = ['recall', 'google-meet'].map((name) => path.join(src, 'integrations', name));
+const meetVendorDirs = ['recall', 'google-meet', 'google'].map((name) => path.join(src, 'integrations', name));
 const meetVendorSources = meetVendorDirs.flatMap((directory) => sourceFiles(directory));
+/**
+ * What phone-only code may never name: lib/r1, the R1 routes and the Meet vendor modules. `recall`
+ * and `google-meet` keep M034's prefix match; only the M035 `google` folder carries the look-ahead,
+ * so a look-alike such as `integrations/google-sheets` is not R1 code.
+ */
+const PHONE_FORBIDDEN_R1_PATH = /lib\/r1\/|routes\/r1|r1-candidate|integrations\/(?:recall|google-meet|google(?![\w-]))/;
 /**
  * The Meet routes (routes/, outside lib/r1, but R1 code: critic C6): the Recall webhook receivers
  * (M034 S03) and the HR read of the Meet bookings (M034 S05).
@@ -285,7 +292,10 @@ const r1Sources = [
   path.join(src, 'routes', 'ashby-webhook.ts'),
 ];
 
-/** The M034 Meet variables, declared in config/environment.schema.json (api): non-secrets, then credentials. */
+/**
+ * The thirty-five Meet variables, declared in config/environment.schema.json (api): the twelve M034
+ * ones (non-secrets, then credentials), then the twenty-three M035 public booking ones.
+ */
 const MEET_ENV_NAMES = [
   'R1_MEET_ENABLED',
   'R1_MEET_BOT_NAME',
@@ -299,6 +309,30 @@ const MEET_ENV_NAMES = [
   'R1_MEET_ASHBY_FEEDBACK_FORM_ID',
   'RECALL_API_KEY',
   'RECALL_WEBHOOK_SECRET',
+  // M035 public booking link (S03), in R1_MEET_PUBLIC_ENV_VARIABLES order.
+  'R1_MEET_PUBLIC_BOOKING_ENABLED',
+  'R1_MEET_GOOGLE_AUTH_MODE', // oauth_refresh (default) or service_account
+  'R1_MEET_GOOGLE_OAUTH_CLIENT_ID', // oauth_refresh mode
+  'R1_MEET_GOOGLE_OAUTH_CLIENT_SECRET', // oauth_refresh mode, a Fly secret
+  'R1_MEET_GOOGLE_OAUTH_REFRESH_TOKEN', // oauth_refresh mode, a Fly secret
+  'R1_MEET_GOOGLE_SA_KEY_B64', // service_account mode, a Fly secret
+  'R1_MEET_GOOGLE_DEX_EMAIL',
+  'R1_MEET_GOOGLE_MEET_MODE',
+  'R1_MEET_PUBLIC_SLOT_MINUTES',
+  'R1_MEET_PUBLIC_SLOT_STEP_MINUTES',
+  'R1_MEET_PUBLIC_HOURS_IST',
+  'R1_MEET_PUBLIC_DAYS',
+  'R1_MEET_PUBLIC_CLOSED_DATES',
+  'R1_MEET_PUBLIC_MIN_NOTICE_MINUTES',
+  'R1_MEET_PUBLIC_HORIZON_DAYS',
+  'R1_MEET_PUBLIC_SLOT_CAPACITY',
+  'R1_MEET_PUBLIC_BROWSER_HEADROOM',
+  'R1_MEET_PUBLIC_DAILY_CAP',
+  'R1_MEET_PUBLIC_MAX_MOVES',
+  'R1_MEET_PUBLIC_MANAGE_CUTOFF_MINUTES',
+  'R1_MEET_PUBLIC_REQUIRE_R1_STAGE',
+  'R1_MEET_PUBLIC_CALENDAR_RETENTION_DAYS',
+  'R1_MEET_PUBLIC_PRESLOT_RECHECK',
 ];
 
 /** Strip comments so a fence cannot be satisfied (or tripped) by prose. */
@@ -321,6 +355,10 @@ describe('R1 source fences', () => {
     }
     for (const name of ['config.ts', 'profiles.ts']) {
       expect(r1Sources, name).toContain(path.join(src, 'lib', 'r1', 'meet', name));
+    }
+    // M035 S03: the Google Calendar and Meet client for Dex is a fenced Meet vendor module.
+    for (const name of ['calendar.ts', 'client.ts', 'errors.ts', 'http.ts', 'meet.ts', 'token.ts']) {
+      expect(meetVendorSources, name).toContain(path.join(src, 'integrations', 'google', name));
     }
     // M034 S03: the Recall receivers are fenced like lib/r1 (no egress, no legacy consent, no
     // quoted livekit literal).
@@ -376,10 +414,30 @@ describe('R1 source fences', () => {
     ];
     expect(phoneFiles.length).toBeGreaterThan(0);
     for (const file of phoneFiles) {
-      // M034: nor the R1-over-Meet vendor modules.
-      expect(readFileSync(file, 'utf8'), file).not.toMatch(
-        /lib\/r1\/|routes\/r1|r1-candidate|integrations\/(?:recall|google-meet)/,
-      );
+      // M034: nor the R1-over-Meet vendor modules (M035 S03: the Google client for Dex too).
+      expect(readFileSync(file, 'utf8'), file).not.toMatch(PHONE_FORBIDDEN_R1_PATH);
+    }
+  });
+
+  it('the phone fence pattern keeps the M034 prefix matches and adds integrations/google exactly', () => {
+    // M034's prefix matches stay: anything starting with recall or google-meet is still R1 code.
+    for (const text of [
+      "from '../lib/r1/meet/config.js'",
+      "from '../routes/r1.js'",
+      "from './r1-candidate.js'",
+      "from '../integrations/recall/client.js'",
+      "from '../integrations/recall-utils/x.js'",
+      "from '../integrations/google-meet/url.js'",
+      "from '../integrations/google-meet-x/y.js'",
+      // M035 S03: the Google client for Dex, by folder name only.
+      "from '../integrations/google/client.js'",
+      'const file = `../integrations/google/${name}.js`;',
+    ]) {
+      expect(PHONE_FORBIDDEN_R1_PATH.test(text), text).toBe(true);
+    }
+    // A look-alike folder (a future, non-R1 Google module) does not trip the fence.
+    for (const text of ["from '../integrations/google-sheets/x.js'", "from '../integrations/googleish/x.js'"]) {
+      expect(PHONE_FORBIDDEN_R1_PATH.test(text), text).toBe(false);
     }
   });
 

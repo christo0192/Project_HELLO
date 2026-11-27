@@ -22,6 +22,8 @@ import {
   R1_MEET_ENV_VARIABLES,
   R1_MEET_MULTI_HUMAN_POLICIES,
   R1_MEET_MULTI_HUMAN_POLICY_DEFAULT,
+  R1_MEET_PUBLIC_ENV_VARIABLES,
+  R1_MEET_PUBLIC_SECRET_VARIABLES,
   R1_MEET_RECALL_REALTIME_PATH,
   R1_MEET_REQUIRED_VARIABLES,
   R1_MEET_SECRET_VARIABLES,
@@ -29,6 +31,8 @@ import {
   getR1MeetConfig,
   getR1MeetDrainConfig,
   getR1MeetFeedbackConfig,
+  getR1MeetPublicConfig,
+  getR1MeetPublicDrainConfig,
   r1MeetActive,
   r1MeetDrainAllowed,
   resetR1MeetConfigReport,
@@ -207,6 +211,16 @@ describe('R1 Meet configuration: enabled', () => {
     expect(R1_MEET_MULTI_HUMAN_POLICY_DEFAULT).toBe('observe');
     expect(R1_MEET_REQUIRED_VARIABLES).toEqual(['RECALL_API_KEY', 'RECALL_WEBHOOK_SECRET', 'R1_MEET_ASHBY_DEX_USER_ID']);
     expect(R1_MEET_SECRET_VARIABLES).toEqual(['RECALL_API_KEY', 'RECALL_WEBHOOK_SECRET']);
+    // M035: the three Google credentials are secrets too, but never Meet requirements.
+    expect(R1_MEET_PUBLIC_SECRET_VARIABLES).toEqual([
+      'R1_MEET_GOOGLE_OAUTH_CLIENT_SECRET',
+      'R1_MEET_GOOGLE_OAUTH_REFRESH_TOKEN',
+      'R1_MEET_GOOGLE_SA_KEY_B64',
+    ]);
+    for (const name of R1_MEET_PUBLIC_SECRET_VARIABLES) {
+      expect(R1_MEET_SECRET_VARIABLES as readonly string[], name).not.toContain(name);
+      expect(R1_MEET_REQUIRED_VARIABLES as readonly string[], name).not.toContain(name);
+    }
   });
 
   it.each([
@@ -974,7 +988,33 @@ describe('R1 Meet configuration: env contract', () => {
   ) as { components: { api: { variables: Record<string, { requiredInProduction: boolean; secret: boolean; external?: boolean }> } } };
   const example = readFileSync(fileURLToPath(new URL('../../.env.example', import.meta.url)), 'utf8');
 
-  it('lists exactly the twelve Meet variables: non-secrets first, then the two credentials', () => {
+  it('lists exactly the thirty-five Meet variables: the twelve M034 ones, then the twenty-three M035 public ones', () => {
+    const PUBLIC_NAMES = [
+      'R1_MEET_PUBLIC_BOOKING_ENABLED',
+      'R1_MEET_GOOGLE_AUTH_MODE',
+      'R1_MEET_GOOGLE_OAUTH_CLIENT_ID',
+      'R1_MEET_GOOGLE_OAUTH_CLIENT_SECRET',
+      'R1_MEET_GOOGLE_OAUTH_REFRESH_TOKEN',
+      'R1_MEET_GOOGLE_SA_KEY_B64',
+      'R1_MEET_GOOGLE_DEX_EMAIL',
+      'R1_MEET_GOOGLE_MEET_MODE',
+      'R1_MEET_PUBLIC_SLOT_MINUTES',
+      'R1_MEET_PUBLIC_SLOT_STEP_MINUTES',
+      'R1_MEET_PUBLIC_HOURS_IST',
+      'R1_MEET_PUBLIC_DAYS',
+      'R1_MEET_PUBLIC_CLOSED_DATES',
+      'R1_MEET_PUBLIC_MIN_NOTICE_MINUTES',
+      'R1_MEET_PUBLIC_HORIZON_DAYS',
+      'R1_MEET_PUBLIC_SLOT_CAPACITY',
+      'R1_MEET_PUBLIC_BROWSER_HEADROOM',
+      'R1_MEET_PUBLIC_DAILY_CAP',
+      'R1_MEET_PUBLIC_MAX_MOVES',
+      'R1_MEET_PUBLIC_MANAGE_CUTOFF_MINUTES',
+      'R1_MEET_PUBLIC_REQUIRE_R1_STAGE',
+      'R1_MEET_PUBLIC_CALENDAR_RETENTION_DAYS',
+      'R1_MEET_PUBLIC_PRESLOT_RECHECK',
+    ];
+    expect([...R1_MEET_PUBLIC_ENV_VARIABLES]).toEqual(PUBLIC_NAMES);
     expect([...R1_MEET_ENV_VARIABLES]).toEqual([
       'R1_MEET_ENABLED',
       'R1_MEET_BOT_NAME',
@@ -988,12 +1028,21 @@ describe('R1 Meet configuration: env contract', () => {
       'R1_MEET_ASHBY_FEEDBACK_FORM_ID',
       'RECALL_API_KEY',
       'RECALL_WEBHOOK_SECRET',
+      ...PUBLIC_NAMES,
     ]);
+    expect(R1_MEET_ENV_VARIABLES).toHaveLength(35);
+    expect(new Set(R1_MEET_ENV_VARIABLES).size).toBe(35);
   });
 
-  it('declares each in the api schema: optional, secret exactly for the two Recall credentials, never external', () => {
-    const secrets = new Set<string>(R1_MEET_SECRET_VARIABLES);
-    expect([...secrets]).toEqual(['RECALL_API_KEY', 'RECALL_WEBHOOK_SECRET']);
+  it('declares each in the api schema: optional, secret exactly for the Recall pair and the three Google credentials, never external', () => {
+    const secrets = new Set<string>([...R1_MEET_SECRET_VARIABLES, ...R1_MEET_PUBLIC_SECRET_VARIABLES]);
+    expect([...secrets]).toEqual([
+      'RECALL_API_KEY',
+      'RECALL_WEBHOOK_SECRET',
+      'R1_MEET_GOOGLE_OAUTH_CLIENT_SECRET',
+      'R1_MEET_GOOGLE_OAUTH_REFRESH_TOKEN',
+      'R1_MEET_GOOGLE_SA_KEY_B64',
+    ]);
     for (const name of R1_MEET_ENV_VARIABLES) {
       const entry = schema.components.api.variables[name];
       expect(entry, name).toBeDefined();
@@ -1013,7 +1062,7 @@ describe('R1 Meet configuration: env contract', () => {
   });
 
   it('puts each in the api .env.example: blank values, replace_me for the credentials, no example secret', () => {
-    const secrets = new Set<string>(R1_MEET_SECRET_VARIABLES);
+    const secrets = new Set<string>([...R1_MEET_SECRET_VARIABLES, ...R1_MEET_PUBLIC_SECRET_VARIABLES]);
     const parsed: Record<string, string> = {};
     for (const name of R1_MEET_ENV_VARIABLES) {
       const match = new RegExp(`^${name}=(.*)$`, 'm').exec(example);
@@ -1022,9 +1071,108 @@ describe('R1 Meet configuration: env contract', () => {
       parsed[name] = match![1]!;
     }
     expect(example).not.toMatch(/whsec_[A-Za-z0-9+/]{8,}/);
+    // No Google-shaped example value and no PEM armour (both built so this file never spells them).
+    const googleShaped = new RegExp(['GOC' + 'SPX-', 'ya' + '29\\.', 'AI' + 'za[0-9A-Za-z_-]{20,}'].join('|'));
+    expect(example).not.toMatch(googleShaped);
+    expect(example).not.toContain(['PRIVATE', 'KEY'].join(' '));
     // A copied example file is "disabled", not "half configured".
     expect(getR1MeetConfig(parsed as R1MeetEnvSource)).toEqual({ enabled: false, status: 'disabled' });
     expect(getR1MeetFeedbackConfig(parsed as R1MeetEnvSource)).toStrictEqual({ status: 'off' });
+    // M035: the public link is off, and the placeholders give the Google drain nothing to use.
+    expect(getR1MeetPublicConfig(parsed as R1MeetEnvSource)).toStrictEqual({ status: 'off' });
+    expect(getR1MeetPublicDrainConfig(parsed as R1MeetEnvSource)).toStrictEqual({ available: false });
+    // Even with the public flag flipped on, the copied file stays inert: Meet itself is disabled.
+    const flipped = getR1MeetPublicConfig({ ...(parsed as R1MeetEnvSource), R1_MEET_PUBLIC_BOOKING_ENABLED: 'true' });
+    expect(flipped.status).toBe('invalid');
+    expect(logged).toEqual([]);
+  });
+});
+
+describe('R1 Meet configuration: the M035 public variables never reach getR1MeetConfig', () => {
+  /** One malformed value per public variable (each would make the public config invalid). */
+  const MALFORMED_PUBLIC: Record<string, string> = {
+    R1_MEET_PUBLIC_BOOKING_ENABLED: 'yes',
+    R1_MEET_GOOGLE_AUTH_MODE: 'dwd',
+    R1_MEET_GOOGLE_OAUTH_CLIENT_ID: 'not a client id',
+    R1_MEET_GOOGLE_OAUTH_CLIENT_SECRET: ' ',
+    R1_MEET_GOOGLE_OAUTH_REFRESH_TOKEN: ' ',
+    R1_MEET_GOOGLE_SA_KEY_B64: '%%%',
+    R1_MEET_GOOGLE_DEX_EMAIL: 'not-an-email',
+    R1_MEET_GOOGLE_MEET_MODE: 'zoom',
+    R1_MEET_PUBLIC_SLOT_MINUTES: '0',
+    R1_MEET_PUBLIC_SLOT_STEP_MINUTES: '7',
+    R1_MEET_PUBLIC_HOURS_IST: '25:00-26:00',
+    R1_MEET_PUBLIC_DAYS: 'funday',
+    R1_MEET_PUBLIC_CLOSED_DATES: '2026-02-30',
+    R1_MEET_PUBLIC_MIN_NOTICE_MINUTES: '1',
+    R1_MEET_PUBLIC_HORIZON_DAYS: '99',
+    R1_MEET_PUBLIC_SLOT_CAPACITY: '0',
+    R1_MEET_PUBLIC_BROWSER_HEADROOM: '-1',
+    R1_MEET_PUBLIC_DAILY_CAP: '0',
+    R1_MEET_PUBLIC_MAX_MOVES: '11',
+    R1_MEET_PUBLIC_MANAGE_CUTOFF_MINUTES: '1',
+    R1_MEET_PUBLIC_REQUIRE_R1_STAGE: 'maybe',
+    R1_MEET_PUBLIC_CALENDAR_RETENTION_DAYS: '0',
+    R1_MEET_PUBLIC_PRESLOT_RECHECK: 'maybe',
+  };
+
+  it('covers every public variable', () => {
+    expect(Object.keys(MALFORMED_PUBLIC)).toEqual([...R1_MEET_PUBLIC_ENV_VARIABLES]);
+  });
+
+  it('getR1MeetConfig never reads one of the twenty-three public names', () => {
+    const reads: string[] = [];
+    const source = new Proxy(valid({ R1_MEET_SERVICE_USER_ID: SERVICE_ID, ...MALFORMED_PUBLIC }), {
+      get(target, name) {
+        reads.push(String(name));
+        return target[name as keyof R1MeetEnvSource];
+      },
+    });
+    expect(getR1MeetConfig(source).status).toBe('enabled');
+    expect(reads.length).toBeGreaterThan(0);
+    for (const name of R1_MEET_PUBLIC_ENV_VARIABLES) expect(reads, name).not.toContain(name);
+  });
+
+  it('answers exactly the same with every public variable malformed, for every Meet state', () => {
+    const bases: R1MeetEnvSource[] = [
+      valid(),
+      valid({ R1_MEET_SERVICE_USER_ID: SERVICE_ID, R1_MEET_GOOGLE_LOGIN_GROUP_ID: GROUP_ID }),
+      {},
+      valid({ R1_MEET_ENABLED: 'false' }),
+      valid({ R1_MEET_ENABLED: 'yes' }),
+      valid({ R1_MEET_DAILY_BOT_CAP: '0' }),
+      valid({ RECALL_API_KEY: undefined }),
+    ];
+    for (const [index, base] of bases.entries()) {
+      const without = getR1MeetConfig(base);
+      const withPublic = getR1MeetConfig({ ...base, ...MALFORMED_PUBLIC });
+      expect(withPublic, String(index)).toStrictEqual(without);
+      if (without.enabled && withPublic.enabled) {
+        // The hidden credentials are non-enumerable, so toStrictEqual skips them: compare by name.
+        expect([withPublic.recall.apiKey, withPublic.recall.webhookSecret]).toEqual([
+          without.recall.apiKey,
+          without.recall.webhookSecret,
+        ]);
+      }
+    }
+    // The public reader turns the bad values into its own (silent) reason; Meet stays enabled.
+    expect(getR1MeetPublicConfig({ ...valid(), ...MALFORMED_PUBLIC }).status).toBe('invalid');
+    expect(getR1MeetConfig({ ...valid(), ...MALFORMED_PUBLIC }).status).toBe('enabled');
+    for (const line of logged) expect(line).not.toMatch(/PUBLIC|GOOGLE_(?:AUTH|OAUTH|SA|DEX|MEET_MODE)/);
+  });
+
+  it('getR1MeetConfig from process.env is unchanged with every public variable malformed', () => {
+    for (const name of R1_MEET_ENV_VARIABLES) vi.stubEnv(name, '');
+    vi.stubEnv('R1_MEET_ENABLED', 'true');
+    vi.stubEnv('R1_MEET_ASHBY_DEX_USER_ID', DEX_ID);
+    vi.stubEnv('RECALL_API_KEY', RECALL_KEY_VALUE);
+    vi.stubEnv('RECALL_WEBHOOK_SECRET', RECALL_WEBHOOK_VALUE);
+    vi.stubEnv('WEB_ORIGIN', WEB);
+    const without = getR1MeetConfig();
+    expect(without.status).toBe('enabled');
+    for (const [name, bad] of Object.entries(MALFORMED_PUBLIC)) vi.stubEnv(name, bad);
+    expect(getR1MeetConfig()).toStrictEqual(without);
+    expect(getR1MeetPublicConfig().status).toBe('invalid');
     expect(logged).toEqual([]);
   });
 });

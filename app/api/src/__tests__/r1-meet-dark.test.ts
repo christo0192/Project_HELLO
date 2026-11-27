@@ -13,11 +13,14 @@
  * assessment handler's `onResult`, which queues Dex's Ashby feedback for a Meet round and reads
  * nothing while Meet is off or the feedback form setting is blank (r1-meet-feedback-notify.test.ts,
  * r1-runtime.test.ts).
+ * M035 S03 adds the owner-run Google scripts under app/api/scripts (local, never in CI or the API
+ * process), each pinned in `WIRED_IMPORTS` with its exact targets rather than exempted by folder.
  *
  * What "dark" means here (S01 plan R21, R30, R31; S03 plan R16; S05 plan D-S05-18; D-M034-11):
- *  (a) no runtime file outside the three Meet folders (integrations/recall, integrations/google-meet,
- *      lib/r1/meet) imports a module inside them, except each `WIRED_IMPORTS` importer, whose Meet
- *      imports must EQUAL its list (so the allowlist can neither go stale nor widen silently).
+ *  (a) no runtime file outside the four Meet folders (integrations/recall, integrations/google-meet,
+ *      integrations/google since M035 S03, lib/r1/meet) imports a module inside them, except each
+ *      `WIRED_IMPORTS` importer, whose Meet imports must EQUAL its list (so the allowlist can neither
+ *      go stale nor widen silently).
  *      Static, side-effect, re-export, dynamic `import()` and `require()` specifiers are resolved
  *      relative to the importing file; type-only imports count too. A second check refuses any Meet
  *      module path written as text (a computed specifier would otherwise slip past the resolver),
@@ -33,7 +36,16 @@
  *  (d) the retired booking vendor of the first plan is gone from the API source and the env contract
  *      (its name is built from two halves below so this file never contains it).
  *  (e) no Recall Calendar V2 and no Recall PATCH: S06 deletes a scheduled bot and creates a new one.
+ *      M035 S03: the Google Calendar/Meet client in integrations/google uses PATCH on purpose
+ *      (events.patch, and spaces.patch with a narrow updateMask), so it is exempt from the PATCH ban
+ *      and pinned to the exact set of its files that write the verb; the Recall rule stays, and the
+ *      Calendar V2 ban covers every Meet folder, google included.
  *  (f) loading every Meet module performs no network call, and an empty environment is `disabled`.
+ *  (g) M035 S03 (review S03-R1): runtime code takes Dex's Google client from `getR1MeetGoogle` only.
+ *      The factories that build a NEW token cache (`createR1MeetGoogle`, the two token sources, the
+ *      Calendar and Meet client constructors) and the process cache's test seams are named only
+ *      inside integrations/google, the owner scripts (app/api/scripts) and the test tree. One token
+ *      source per process is what holds a revoked grant to one token-endpoint call a minute.
  *
  * Each walker has a control that feeds it a synthetic violation, so the pin cannot pass by matching
  * nothing. Comments are NOT stripped before scanning: a false positive fails loudly and is fixed by
@@ -56,16 +68,25 @@ const TESTS_DIR = path.join(SRC, '__tests__');
 const MEET_DIRS = [
   path.join(SRC, 'integrations', 'recall'),
   path.join(SRC, 'integrations', 'google-meet'),
+  // M035 S03: the Google Calendar and Meet client for Dex (public booking link).
+  path.join(SRC, 'integrations', 'google'),
   path.join(SRC, 'lib', 'r1', 'meet'),
 ] as const;
 const MEET_CONFIG = path.join(SRC, 'lib', 'r1', 'meet', 'config.ts');
 const RECALL_CLIENT = path.join(SRC, 'integrations', 'recall', 'client.ts');
+/** M035 S03: the one Meet folder that may write the PATCH verb (events.patch, spaces.patch). */
+const GOOGLE_DIR = path.join(SRC, 'integrations', 'google');
 /** The Meet test doubles: test-only, but they must not drift toward Calendar V2 either. */
 const MEET_SUPPORT_FILES = ['recall-fake.ts', 'meet-webhook-signing.ts', 'ashby-schedule-fixture.ts'].map(
   (name) => path.join(TESTS_DIR, 'support', name),
 );
+/** The Google double (M035 S03): it answers PATCH like Google, so only the Calendar V2 ban applies. */
+const GOOGLE_SUPPORT_FILES = ['google-fake.ts'].map((name) => path.join(TESTS_DIR, 'support', name));
 
-/** The twelve Meet variables (config/environment.schema.json, api), in `R1_MEET_ENV_VARIABLES` order. */
+/**
+ * The thirty-five Meet variables (config/environment.schema.json, api), in `R1_MEET_ENV_VARIABLES`
+ * order: the twelve M034 ones, then the twenty-three M035 public booking ones.
+ */
 const MEET_ENV_NAMES = [
   'R1_MEET_ENABLED',
   'R1_MEET_BOT_NAME',
@@ -79,6 +100,30 @@ const MEET_ENV_NAMES = [
   'R1_MEET_ASHBY_FEEDBACK_FORM_ID',
   'RECALL_API_KEY',
   'RECALL_WEBHOOK_SECRET',
+  // M035 public booking link (S03), in R1_MEET_PUBLIC_ENV_VARIABLES order.
+  'R1_MEET_PUBLIC_BOOKING_ENABLED',
+  'R1_MEET_GOOGLE_AUTH_MODE', // oauth_refresh (default) or service_account
+  'R1_MEET_GOOGLE_OAUTH_CLIENT_ID', // oauth_refresh mode
+  'R1_MEET_GOOGLE_OAUTH_CLIENT_SECRET', // oauth_refresh mode, a Fly secret
+  'R1_MEET_GOOGLE_OAUTH_REFRESH_TOKEN', // oauth_refresh mode, a Fly secret
+  'R1_MEET_GOOGLE_SA_KEY_B64', // service_account mode, a Fly secret
+  'R1_MEET_GOOGLE_DEX_EMAIL',
+  'R1_MEET_GOOGLE_MEET_MODE',
+  'R1_MEET_PUBLIC_SLOT_MINUTES',
+  'R1_MEET_PUBLIC_SLOT_STEP_MINUTES',
+  'R1_MEET_PUBLIC_HOURS_IST',
+  'R1_MEET_PUBLIC_DAYS',
+  'R1_MEET_PUBLIC_CLOSED_DATES',
+  'R1_MEET_PUBLIC_MIN_NOTICE_MINUTES',
+  'R1_MEET_PUBLIC_HORIZON_DAYS',
+  'R1_MEET_PUBLIC_SLOT_CAPACITY',
+  'R1_MEET_PUBLIC_BROWSER_HEADROOM',
+  'R1_MEET_PUBLIC_DAILY_CAP',
+  'R1_MEET_PUBLIC_MAX_MOVES',
+  'R1_MEET_PUBLIC_MANAGE_CUTOFF_MINUTES',
+  'R1_MEET_PUBLIC_REQUIRE_R1_STAGE',
+  'R1_MEET_PUBLIC_CALENDAR_RETENTION_DAYS',
+  'R1_MEET_PUBLIC_PRESLOT_RECHECK',
 ] as const;
 
 /** D-M034-11 retired this booking vendor; built from halves so this file never names it. */
@@ -170,6 +215,19 @@ const WIRED_IMPORTS: Readonly<Record<string, readonly string[]>> = {
   'app/api/src/routes/r1.ts': [
     'app/api/src/lib/r1/meet/attempt-ended.js',
   ],
+  // M035 S03: the owner-run OAuth consent helper (local, never in CI or the API process).
+  'app/api/scripts/m035-google-oauth-consent.ts': [
+    'app/api/src/integrations/google/errors.js',
+    'app/api/src/integrations/google/http.js',
+    'app/api/src/integrations/google/token.js',
+    'app/api/src/lib/r1/meet/config.js',
+  ],
+  // M035 S03: the owner-run Google spike for Dex's meetings (local, never in CI or the API process).
+  'app/api/scripts/m035-google-spike.ts': [
+    'app/api/src/integrations/google/client.js',
+    'app/api/src/integrations/google/errors.js',
+    'app/api/src/lib/r1/meet/config.js',
+  ],
 };
 const AUTH_FILE = path.join(SRC, 'lib', 'auth.ts');
 const APP_FILE = path.join(SRC, 'app.ts');
@@ -205,17 +263,31 @@ const testTreeImports = (importer: string, source: string): string[] =>
 
 /**
  * A Meet module path written as text: `integrations/recall`, `integrations/google-meet`,
- * `r1/meet` (not `r1/meeting`), or a relative `./meet/` hop from inside lib/r1.
+ * `integrations/google` (M035 S03), `r1/meet` (not `r1/meeting`), or a relative `./meet/` hop from
+ * inside lib/r1.
  */
 const MEET_PATH_TEXT = new RegExp(
   [
-    String.raw`integrations\/(?:recall|google-meet)(?![\w-])`,
+    String.raw`integrations\/(?:recall|google-meet|google)(?![\w-])`,
     String.raw`\br1\/meet(?![\w-])`,
     String.raw`['"\x60](?:\.{1,2}\/)+meet(?:\/|['"\x60])`,
   ].join('|'),
 );
 
 const read = (file: string): string => readFileSync(file, 'utf8');
+
+/** (g) The Google names that build a fresh token cache, or reach the process cache's test seams. */
+const GOOGLE_FRESH_CACHE_NAMES = [
+  'createR1MeetGoogle',
+  'createGoogleOAuthRefreshTokenSource',
+  'createGoogleDwdTokenSource',
+  'createGoogleCalendarClient',
+  'createGoogleMeetClient',
+  'setR1MeetGoogleTestSeams',
+  'resetR1MeetGoogleCache',
+] as const;
+const GOOGLE_FRESH_CACHE_TEXT = new RegExp(String.raw`\b(?:${GOOGLE_FRESH_CACHE_NAMES.join('|')})\b`);
+const API_SCRIPTS_DIR = path.join(API_ROOT, 'scripts');
 
 describe('M034 S01: the Meet modules are dark libraries', () => {
   it('finds the runtime tree and the Meet modules', () => {
@@ -237,6 +309,8 @@ describe('M034 S01: the Meet modules are dark libraries', () => {
   it('(a) each wired importer imports EXACTLY its listed Meet modules (no stale or silent widening)', () => {
     const wired = Object.keys(WIRED_IMPORTS).sort();
     expect(wired).toEqual([
+      'app/api/scripts/m035-google-oauth-consent.ts',
+      'app/api/scripts/m035-google-spike.ts',
       'app/api/src/lib/r1/runtime.ts',
       'app/api/src/routes/ashby-webhook.ts',
       'app/api/src/routes/r1-candidate.ts',
@@ -321,13 +395,17 @@ describe('M034 S01: the Meet modules are dark libraries', () => {
       "import '../lib/r1/meet/profiles.js';",
       "const builder = await import('../lib/r1/meet/recall-bot.js');",
       "const client = require('../integrations/recall/client.js');",
+      // M035 S03: the Google client for Dex is a Meet module too.
+      "import { createR1MeetGoogle } from '../integrations/google/client.js';",
       // Not Meet modules: a sibling with a shared prefix, and a path that resolves under routes/.
       "import { other } from '../lib/r1/meeting.js';",
       "import { nested } from './integrations/recall/client.js';",
+      "import { lookalike } from '../integrations/googleish/client.js';",
     ].join('\n');
     expect(meetImports(importer, source).map(rel).sort()).toEqual(
       [
         'app/api/src/integrations/google-meet/url.js',
+        'app/api/src/integrations/google/client.js',
         'app/api/src/integrations/recall/client.js',
         'app/api/src/integrations/recall/types.js',
         'app/api/src/lib/r1/meet/config.js',
@@ -343,6 +421,10 @@ describe('M034 S01: the Meet modules are dark libraries', () => {
     expect(MEET_PATH_TEXT.test(r1Source)).toBe(true);
     expect(MEET_PATH_TEXT.test('const file = `../integrations/recall/${name}.js`;')).toBe(true);
     expect(MEET_PATH_TEXT.test("import { x } from '../lib/r1/meeting.js';")).toBe(false);
+    // M035 S03: the Google client path is caught as text; a look-alike folder name is not.
+    expect(MEET_PATH_TEXT.test("import { createR1MeetGoogle } from '../integrations/google/client.js';")).toBe(true);
+    expect(MEET_PATH_TEXT.test('const file = `../integrations/google/${name}.js`;')).toBe(true);
+    expect(MEET_PATH_TEXT.test("import { x } from '../integrations/googleish/client.js';")).toBe(false);
   });
 
   it('(b) no runtime file imports the test tree (fakes, fixtures, the Svix test signer)', () => {
@@ -396,14 +478,28 @@ describe('M034 S01: the Meet modules are dark libraries', () => {
     expect(offenders).toEqual([]);
   });
 
-  it('(e) no Recall Calendar V2 and no PATCH verb in the Recall client (R30, R31)', () => {
+  it('(e) no Recall Calendar V2 anywhere, and no PATCH verb outside the Google client (R30, R31; M035 S03 R15)', () => {
     const meetFiles = MEET_DIRS.flatMap((directory) => walk(directory));
     expect(meetFiles.length).toBeGreaterThanOrEqual(10);
-    for (const file of [...meetFiles, ...MEET_SUPPORT_FILES]) {
-      const text = read(file);
-      expect(text, rel(file)).not.toMatch(/api\/v2\/calendar/i);
-      expect(text, rel(file)).not.toMatch(/['"`]PATCH['"`]/i);
+    const googleFiles = walk(GOOGLE_DIR);
+    expect(googleFiles.length).toBeGreaterThanOrEqual(6);
+    for (const file of googleFiles) expect(meetFiles, rel(file)).toContain(file);
+    // Calendar V2: every Meet file, the Google client included, and every Meet double.
+    for (const file of [...meetFiles, ...MEET_SUPPORT_FILES, ...GOOGLE_SUPPORT_FILES]) {
+      expect(read(file), rel(file)).not.toMatch(/api\/v2\/calendar/i);
     }
+    // PATCH: every Meet file except the Google client, and the Recall-side doubles.
+    const patchBanned = [...meetFiles.filter((file) => !inside(file, GOOGLE_DIR)), ...MEET_SUPPORT_FILES];
+    expect(patchBanned.length).toBe(meetFiles.length - googleFiles.length + MEET_SUPPORT_FILES.length);
+    for (const file of patchBanned) {
+      expect(read(file), rel(file)).not.toMatch(/['"`]PATCH['"`]/i);
+    }
+    // The exemption is exact: these Google files write the verb, and no other file there may.
+    const googlePatchFiles = googleFiles
+      .filter((file) => /['"`]PATCH['"`]/i.test(read(file)))
+      .map((file) => path.basename(file))
+      .sort();
+    expect(googlePatchFiles).toEqual(['calendar.ts', 'http.ts', 'meet.ts']);
 
     // Both method unions in the client (the transport request and the prepared request).
     const client = read(RECALL_CLIENT);
@@ -415,6 +511,38 @@ describe('M034 S01: the Meet modules are dark libraries', () => {
     // Compile-time pin: adding PATCH to the transport union turns this type into `true` and fails tsc.
     const patchIsATransportMethod: 'PATCH' extends RecallTransportRequest['method'] ? true : false = false;
     expect(patchIsATransportMethod).toBe(false);
+  });
+
+  it('(g) runtime code builds no fresh Google token cache: only getR1MeetGoogle outside integrations/google, the scripts and tests', () => {
+    const checked = RUNTIME_FILES.filter((file) => !inside(file, GOOGLE_DIR) && !inside(file, API_SCRIPTS_DIR));
+    expect(checked.length).toBeGreaterThan(100);
+    expect(checked).toContain(MEET_CONFIG);
+    const offenders = checked.filter((file) => GOOGLE_FRESH_CACHE_TEXT.test(read(file))).map(rel);
+    expect(offenders).toEqual([]);
+  });
+
+  it('(g) control: every banned name is a real export of integrations/google, a script may use one, and an S05/S06-style call is caught', () => {
+    const googleText = walk(GOOGLE_DIR).map(read).join('\n');
+    for (const name of GOOGLE_FRESH_CACHE_NAMES) {
+      expect(googleText, name).toMatch(new RegExp(String.raw`export function ${name}\(`));
+    }
+    expect(googleText).toMatch(/export function getR1MeetGoogle\(/);
+    expect(GOOGLE_FRESH_CACHE_TEXT.test(read(path.join(API_SCRIPTS_DIR, 'm035-google-spike.ts')))).toBe(true);
+    for (const caught of [
+      'const google = createR1MeetGoogle({ settings: config.google, meetMode: config.meetMode });',
+      "import { createGoogleOAuthRefreshTokenSource } from '../../../integrations/google/token.js';",
+      'const calendar = createGoogleCalendarClient({ tokenSource });',
+      'resetR1MeetGoogleCache();',
+    ]) {
+      expect(GOOGLE_FRESH_CACHE_TEXT.test(caught), caught).toBe(true);
+    }
+    for (const allowed of [
+      'const google = getR1MeetGoogle({ settings: config.google, meetMode: config.meetMode, logger });',
+      'const inputs = getR1MeetGoogleOAuthClientInputs();',
+      'type T = R1MeetGoogleProcessOptions;',
+    ]) {
+      expect(GOOGLE_FRESH_CACHE_TEXT.test(allowed), allowed).toBe(false);
+    }
   });
 });
 
@@ -446,6 +574,9 @@ describe('(f) loading the Meet modules is inert', () => {
     }
     for (const file of modules) expect(Object.keys(loaded.get(file)!).length, rel(file)).toBeGreaterThan(0);
     expect(fetchSpy).not.toHaveBeenCalled();
+    // M035 S03: the Google client modules are among them, and loading them built nothing.
+    expect(modules.filter((file) => inside(file, GOOGLE_DIR)).length).toBeGreaterThanOrEqual(6);
+    expect(typeof loaded.get(path.join(GOOGLE_DIR, 'client.ts'))!.createR1MeetGoogle).toBe('function');
 
     const config = loaded.get(MEET_CONFIG) as unknown as typeof import('../lib/r1/meet/config.js');
     expect(config.getR1MeetConfig({})).toStrictEqual({ enabled: false, status: 'disabled' });
