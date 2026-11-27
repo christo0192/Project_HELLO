@@ -35,12 +35,12 @@ const SLOT_START = '2026-12-01T10:30:00.000Z';
 const REALTIME_URL = 'https://hello.example.test/api/integrations/recall/realtime';
 const LOGIN_GROUP_ID = '7d3c2b1a-0f9e-4d8c-9b7a-6f5e4d3c2b1a';
 const PAGE_URL = 'https://hello.example.test/candidate/r1/meet#t=fixture';
-const DISCLOSURE = 'Dex is an AI interviewer from Interview Kickstart. This call is recorded.';
+const DISCLOSURE = 'Lexy is an AI interviewer from Interview Kickstart. This call is recorded.';
 
 /** The exact section 4 literal: login group set, no output media, default join lead. */
 const SECTION_4_BODY = {
   meeting_url: 'https://meet.google.com/abc-defg-hij',
-  bot_name: 'Dex',
+  bot_name: 'Lexy',
   join_at: '2026-12-01T10:28:00.000Z',
   variant: { google_meet: 'web_4_core' },
   automatic_leave: {
@@ -72,11 +72,11 @@ const SECTION_4_BODY = {
   chat: {
     on_bot_join: {
       send_to: 'everyone',
-      message: 'Dex is an AI interviewer from Interview Kickstart. This call is recorded.',
+      message: 'Lexy is an AI interviewer from Interview Kickstart. This call is recorded.',
       pin: true,
     },
     on_participant_join: {
-      message: 'Dex is an AI interviewer from Interview Kickstart. This call is recorded.',
+      message: 'Lexy is an AI interviewer from Interview Kickstart. This call is recorded.',
       exclude_host: false,
     },
   },
@@ -85,12 +85,12 @@ const SECTION_4_BODY = {
 };
 
 /**
- * The exact GUEST body (M035 S09, D-S09-1): no login group configured, the default for Dex's own
+ * The exact GUEST body (M035 S09, D-S09-1): no login group configured, the default for Lexy's own
  * Workspace. Identical to the signed-in literal except that there is no `google_meet` key at all.
  */
 const GUEST_BODY = {
   meeting_url: 'https://meet.google.com/abc-defg-hij',
-  bot_name: 'Dex',
+  bot_name: 'Lexy',
   join_at: '2026-12-01T10:28:00.000Z',
   variant: { google_meet: 'web_4_core' },
   automatic_leave: {
@@ -122,11 +122,11 @@ const GUEST_BODY = {
   chat: {
     on_bot_join: {
       send_to: 'everyone',
-      message: 'Dex is an AI interviewer from Interview Kickstart. This call is recorded.',
+      message: 'Lexy is an AI interviewer from Interview Kickstart. This call is recorded.',
       pin: true,
     },
     on_participant_join: {
-      message: 'Dex is an AI interviewer from Interview Kickstart. This call is recorded.',
+      message: 'Lexy is an AI interviewer from Interview Kickstart. This call is recorded.',
       exclude_host: false,
     },
   },
@@ -245,7 +245,7 @@ describe('buildR1MeetCreateBotRequest: the section 4 body', () => {
       using_participant_names: { matches: ['notetaker', 'recorder', 'assistant'], timeout: 600, activate_after: 7200 },
     });
     const names = leave.bot_detection!.using_participant_names!;
-    // A candidate named "...assistant..." never makes Dex leave: the heuristic activates after the
+    // A candidate named "...assistant..." never makes Lexy leave: the heuristic activates after the
     // longest the bot can stay (the not-recording window plus the recorded-call cap).
     expect(names.activate_after).toBeGreaterThan(leave.in_call_not_recording_timeout! + leave.in_call_recording_timeout!);
     // Recall's limits: timeout >= 10, activate_after >= 1, matches items at least one character.
@@ -269,8 +269,8 @@ describe('buildR1MeetCreateBotRequest: the section 4 body', () => {
   });
 
   it('uses the bot name override instead of the profile name', () => {
-    const body = bodyOf(build({}, { botNameOverride: 'Dex from Interview Kickstart' }));
-    expect(body).toStrictEqual({ ...SECTION_4_BODY, bot_name: 'Dex from Interview Kickstart' });
+    const body = bodyOf(build({}, { botNameOverride: 'Lexy from Interview Kickstart' }));
+    expect(body).toStrictEqual({ ...SECTION_4_BODY, bot_name: 'Lexy from Interview Kickstart' });
   });
 
   it.each([
@@ -367,7 +367,7 @@ describe('buildR1MeetCreateBotRequest: failures', () => {
       realtimeWebhookUrl: 'http://hello.example.test/api/integrations/recall/realtime',
       outputMediaUrl: 'http://hello.example.test/candidate/r1/meet',
       googleLoginGroupId: 'not-a-group',
-      botNameOverride: ' Dex',
+      botNameOverride: ' Lexy',
     };
     const fixes: Array<() => void> = [
       () => (profileId = R1_MEET_DEFAULT_PROFILE_ID),
@@ -437,7 +437,7 @@ describe('buildR1MeetCreateBotRequest: failures', () => {
     ],
     ['malformed login group id', 'invalid_login_group_id', () => build({}, { googleLoginGroupId: 'not-a-group' })],
     ['numeric login group id', 'invalid_login_group_id', () => build({}, { googleLoginGroupId: 7 })],
-    ['padded bot name', 'invalid_bot_name', () => build({}, { botNameOverride: ' Dex' })],
+    ['padded bot name', 'invalid_bot_name', () => build({}, { botNameOverride: ' Lexy' })],
     ['101-character bot name', 'invalid_bot_name', () => build({}, { botNameOverride: 'D'.repeat(101) })],
     ['bot name with a zero-width space', 'invalid_bot_name', () => build({}, { botNameOverride: 'De​x' })],
     ['empty bot name', 'invalid_bot_name', () => build({}, { botNameOverride: '' })],

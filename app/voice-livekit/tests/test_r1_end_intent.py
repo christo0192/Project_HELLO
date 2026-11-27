@@ -212,7 +212,7 @@ class MessagesTests(unittest.TestCase):
         user = build_end_intent_messages(
             "yeah, wrap it up", context="after_aside", question=question, seed="s", turn=1
         )[1]["content"]
-        self.assertTrue(user.startswith(f'Dex has just asked: "{question}"'))
+        self.assertTrue(user.startswith(f'Lexy has just asked: "{question}"'))
         self.assertNotIn("learner's last line", user)
 
     def test_the_turn_and_the_learner_line_are_capped(self):

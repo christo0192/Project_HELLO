@@ -2032,7 +2032,7 @@ class EndRequestTests(unittest.TestCase):
         self.assertEqual(plan.scripted_text, line("L-ASIDE-END", **P1.line_values))
         self.assertEqual(
             plan.scripted_text,
-            "This is Dex, your interviewer. If you want to end the interview now, please say: "
+            "This is Lexy, your interviewer. If you want to end the interview now, please say: "
             "end the interview. Otherwise, just carry on with Meera Iyer.",
         )
         self.assertIsNone(plan.move_id)
@@ -11269,14 +11269,14 @@ class EarlyCloseAsideTests(unittest.TestCase):
         # stop first so that a bare "No." means "don't stop" (it resumes: see below).
         self.assertEqual(
             plan.scripted_text,
-            "This is Dex, stepping in for a moment. It sounds like you're wrapping up the call "
+            "This is Lexy, stepping in for a moment. It sounds like you're wrapping up the call "
             "with Meera. Would you like to stop the role-play here, or keep going with her?",
         )
         with mock.patch.dict(r1_roleplay.os.environ, {"R1_SPOKEN_LINES": "0"}):
             rollback = done_session().say("Thanks for your time, bye.", 650)
         self.assertEqual(
             rollback.scripted_text,
-            "This is Dex, stepping in for a moment. It sounds like you're wrapping up the call "
+            "This is Lexy, stepping in for a moment. It sounds like you're wrapping up the call "
             "with Meera. You're welcome to keep going with her, or if you'd rather stop the "
             "role-play here, just say so.",
         )
@@ -11466,7 +11466,7 @@ class LateEndRequestTests(unittest.TestCase):
         self.assertTrue(aside.continuation)
         self.assertEqual(
             aside.scripted_text,
-            "This is Dex, your interviewer. Of course, we'll stop in just a moment; Meera has "
+            "This is Lexy, your interviewer. Of course, we'll stop in just a moment; Meera has "
             "one last thing she'd like to say first.",
         )
         point = s.eng.continuation_plan(846)
@@ -13740,7 +13740,7 @@ class EndAsideV2Tests(unittest.TestCase):
         # Owner 2026-11-24 (R1_SPOKEN_LINES): the yes/no question is the last thing said.
         self.assertEqual(
             plan.scripted_text,
-            "This is Dex, your interviewer. If you want to keep going, just carry on with Meera. "
+            "This is Lexy, your interviewer. If you want to keep going, just carry on with Meera. "
             "Would you like to stop the role-play here and finish the interview?",
         )
         self.assertNotIn("please say", plan.scripted_text)
@@ -13750,7 +13750,7 @@ class EndAsideV2Tests(unittest.TestCase):
             plan = s.say("You can disconnect the call.", 300)
         self.assertEqual(
             plan.scripted_text,
-            "This is Dex, your interviewer. Would you like to stop the role-play here and "
+            "This is Lexy, your interviewer. Would you like to stop the role-play here and "
             "finish the interview? Just say yes, or carry on with Meera.",
         )
         with d3_flags(R1_END_ASIDE_V2="0"):
@@ -14683,7 +14683,7 @@ class D4ReviewLastPointExitTests(unittest.TestCase):
             s.eng._last_point = {"move_id": "F4-PRIMARY", "answer": answer}
             s.eng.end_confirmed = True
             self.assertEqual(s.eng.exit_kind(), r1_roleplay.EXIT_FAREWELL, answer)
-        self.assertIn("Dex again", line("L-EXIT-WRAP-2"))
+        self.assertIn("Lexy again", line("L-EXIT-WRAP-2"))
         self.assertIn("thanks", line("L-EXIT-WRAP-2"))
 
 

@@ -505,15 +505,20 @@ class MessagesTests(unittest.TestCase):
         # purpose (r1_turn_reader.READER_PROMPT_REVISION) and update this pin.
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(
-                r1_turn_reader.reader_prompt_version(), "r1-reader-v3+" + PINNED_PROMPT_SHA
+                r1_turn_reader.reader_prompt_version(), "r1-reader-v4+" + PINNED_PROMPT_SHA
             )
-        self.assertEqual(r1_turn_reader._prompt_sha()[:12], PINNED_PROMPT_SHA)
+            self.assertEqual(r1_turn_reader._prompt_sha()[:12], PINNED_PROMPT_SHA)
+        # Lexy off: Dex's prompt and label exactly as before (owner 2026-11-27 rollback).
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_LEXY": "0"}, clear=True):
+            self.assertEqual(r1_turn_reader._prompt_sha()[:12], PINNED_PROMPT_SHA_DEX)
+            self.assertEqual(r1_turn_reader.reader_prompt_version(), "r1-reader-v3+4381c2cb5af3")
         with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
             self.assertEqual(r1_turn_reader._prompt_sha()[:12], PINNED_PROMPT_SHA_CHRISTY)
             self.assertEqual(r1_turn_reader.reader_prompt_version(), "r1-reader-v2+a015037dcc35")
 
 
-PINNED_PROMPT_SHA = "4381c2cb5af3"
+PINNED_PROMPT_SHA = "e01395cff726"
+PINNED_PROMPT_SHA_DEX = "4381c2cb5af3"
 PINNED_PROMPT_SHA_CHRISTY = "a015037dcc35"
 
 

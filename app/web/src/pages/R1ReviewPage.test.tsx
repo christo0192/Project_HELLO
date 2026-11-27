@@ -1427,7 +1427,7 @@ describe('Recording: the transcript panel', () => {
   it('names each speaker, AI as AI', async () => {
     await opened(review(), '?tab=recording');
     const transcript = screen.getByRole('region', { name: 'Transcript' });
-    expect(within(transcript).getAllByText('Dex (AI interviewer)').length).toBeGreaterThan(0);
+    expect(within(transcript).getAllByText('Lexy (AI interviewer)').length).toBeGreaterThan(0);
     expect(within(transcript).getAllByText('Priya Nair (AI learner)').length).toBeGreaterThan(0);
     expect(within(transcript).getAllByText('Ava Example').length).toBeGreaterThan(0);
   });

@@ -102,9 +102,10 @@ export const R1_PLAYBACK_RATES = [0.75, 1, 1.25, 1.5, 1.75, 2] as const;
 
 /* ── Speakers ─────────────────────────────────────────────────────── */
 
-// The R1 interviewer is Dex (owner, 2026-11-19); ai_voice `interviewer` maps to this label.
-// Earlier transcripts retain the words spoken at the time and are shown verbatim, never rewritten.
-export const R1_INTERVIEWER_LABEL = 'Dex (AI interviewer)';
+// The R1 interviewer is Lexy (owner, 2026-11-27; Dex before, from 2026-11-19); ai_voice
+// `interviewer` maps to this label. Earlier transcripts retain the words spoken at the time and are
+// shown verbatim, never rewritten.
+export const R1_INTERVIEWER_LABEL = 'Lexy (AI interviewer)';
 
 /** "Priya Nair (AI learner)"; "AI learner" when the worker's log does not name her. */
 export function learnerLabel(name: string | null): string {

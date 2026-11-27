@@ -80,7 +80,7 @@ class InterviewerPrefixTests(unittest.TestCase):
             self.assertNotIn(word.lower(), lowered, word)
 
     def test_it_carries_the_deck_faq_and_the_deflection_and_prohibitions(self):
-        self.assertIn("Dex", self.PREFIX)
+        self.assertIn("Lexy", self.PREFIX)
         self.assertIn("10:00 PM to 8 AM IST", self.PREFIX)
         self.assertIn("3:30 AM to 8 AM IST", self.PREFIX)
         self.assertIn("That's a good question for the hiring team", self.PREFIX)

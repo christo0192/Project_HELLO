@@ -114,7 +114,7 @@ const FULL_STARTS: readonly string[] = Object.freeze([
 const R1_BOOK_CONSENT_ITEMS = [
   {
     type: 'ai_interview',
-    label: 'I agree to take part in a first-round interview on Google Meet led by Dex, an AI interviewer, including a sales role-play.',
+    label: 'I agree to take part in a first-round interview on Google Meet led by Lexy, an AI interviewer, including a sales role-play.',
   },
   {
     type: 'video_audio_recording',
@@ -137,7 +137,7 @@ export const R1_BOOK_TEMPLATE_VERSION = 'e2e-book-v1';
 export const R1_BOOK_TEMPLATE = Object.freeze({
   version: R1_BOOK_TEMPLATE_VERSION,
   locale: 'en-IN',
-  title: 'Notice and consent for your interview with Dex',
+  title: 'Notice and consent for your interview with Lexy',
   body_md: [
     '# What we collect',
     'Your video and voice in the Google Meet, the interview transcript and your scores.',

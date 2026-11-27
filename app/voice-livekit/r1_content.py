@@ -429,7 +429,11 @@ import r1_world
 # 54: owner 2026-11-24 (R1_SPOKEN_LINES): spoken -SP variants of the brief, replay, recaps, start
 #    prompts, two field answers, the coach/end/wrap/early-close asides and L-EXIT
 #    (r1_script.SPOKEN_LINES); no existing text changed.
-CONTENT_REVISION = 54
+# 55: owner 2026-11-27 (R1_INTERVIEWER_LEXY): Lexy, a female interviewer (she/her), replaces Dex in
+#    the spoken lines (r1_script.LEXY_LINES, the name swapped and nothing else); her prefixes,
+#    wrap-up note, end-intent system and after-aside context are pinned beside Dex's and
+#    Christy's, which stay as the rollbacks.  No existing text changed.
+CONTENT_REVISION = 55
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -895,6 +899,9 @@ def manifest() -> dict[str, Any]:
             # Revision 47 (R1_INTERVIEWER_DEX).
             "interviewer_name_dex": r1_script.INTERVIEWER_NAME_DEX,
             "dex_lines": dict(r1_script.DEX_LINES),
+            # Revision 55 (R1_INTERVIEWER_LEXY).
+            "interviewer_name_lexy": r1_script.INTERVIEWER_NAME_LEXY,
+            "lexy_lines": dict(r1_script.LEXY_LINES),
             "exit_cue": r1_script.EXIT_CUE,
             "lines": dict(r1_script.LINES),
             # Revision 31 (D4-BRIEF2, D4-TRANS-PRESENT1, D4-TRANS-Q1).
@@ -1108,6 +1115,17 @@ def manifest() -> dict[str, Any]:
             "interviewer_prefix_reactions_v2_dex": r1_prompts.interviewer_prefix(
                 voice=True, reactions=True, reactions_v2=True, name=r1_script.INTERVIEWER_NAME_DEX
             ),
+            # Revision 55 (R1_INTERVIEWER_LEXY).
+            "interviewer_prefix_lexy": r1_prompts.interviewer_prefix(
+                voice=True, reactions=False, reactions_v2=False,
+                name=r1_script.INTERVIEWER_NAME_LEXY,
+            ),
+            "interviewer_prefix_reactions_lexy": r1_prompts.interviewer_prefix(
+                voice=True, reactions=True, reactions_v2=False, name=r1_script.INTERVIEWER_NAME_LEXY
+            ),
+            "interviewer_prefix_reactions_v2_lexy": r1_prompts.interviewer_prefix(
+                voice=True, reactions=True, reactions_v2=True, name=r1_script.INTERVIEWER_NAME_LEXY
+            ),
             "interviewer_voice_text": r1_prompts.INTERVIEWER_VOICE_TEXT,
             "interviewer_delivery_rider": r1_prompts.INTERVIEWER_DELIVERY_RIDER,
             # Revision 29 (D3-ICE1, R1_REACTION_VARIETY): the reworded react clause.
@@ -1127,6 +1145,7 @@ def manifest() -> dict[str, Any]:
             "interviewer_delivery_rider_reactions": r1_prompts.INTERVIEWER_DELIVERY_RIDER_REACTIONS,
             "wrapup_note": r1_prompts.WRAPUP_NOTE,
             "wrapup_note_dex": r1_prompts.WRAPUP_NOTE_DEX,
+            "wrapup_note_lexy": r1_prompts.WRAPUP_NOTE_LEXY,
             "wrapup_reminder": r1_prompts.WRAPUP_REMINDER,
             "transition_reminder": r1_prompts.TRANSITION_REMINDER,
             "transition_reminder_repaired": r1_prompts.TRANSITION_REMINDER_REPAIRED,
@@ -1321,6 +1340,9 @@ def manifest() -> dict[str, Any]:
             "roleplay_context": r1_end_intent.ROLEPLAY_CONTEXT,
             "after_aside_context": r1_end_intent.AFTER_ASIDE_CONTEXT,
             "after_aside_context_dex": r1_end_intent.AFTER_ASIDE_CONTEXT_DEX,
+            # Revision 55 (R1_INTERVIEWER_LEXY).
+            "system_lexy": r1_end_intent.END_INTENT_SYSTEM_LEXY,
+            "after_aside_context_lexy": r1_end_intent.AFTER_ASIDE_CONTEXT_LEXY,
             "window_words": r1_end_intent.END_INTENT_WINDOW_WORDS,
             "labels": list(r1_end_intent.END_INTENT_LABELS),
         },

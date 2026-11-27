@@ -506,7 +506,7 @@ export function getR1MeetConfig(source?: R1MeetEnvSource): R1MeetConfig {
     }
     const dexUserId: unknown = env.R1_MEET_ASHBY_DEX_USER_ID;
     if (typeof dexUserId !== 'string' || !UUID.test(dexUserId)) {
-      return invalid('R1_MEET_ASHBY_DEX_USER_ID must be a UUID (the Ashby user id of "Dex (AI Interviewer)")');
+      return invalid('R1_MEET_ASHBY_DEX_USER_ID must be a UUID (the Ashby user id of "Lexy (AI Interviewer)")');
     }
 
     return Object.freeze({
@@ -535,7 +535,7 @@ export function r1MeetActive(r1: { readonly enabled: boolean }, meet: R1MeetConf
 
 const FEEDBACK_OFF: R1MeetFeedbackConfig = Object.freeze({ status: 'off' as const });
 const FEEDBACK_FORM_REASON =
-  'R1_MEET_ASHBY_FEEDBACK_FORM_ID must be a UUID (the feedback form of the Dex interview in Ashby)';
+  'R1_MEET_ASHBY_FEEDBACK_FORM_ID must be a UUID (the feedback form of the Lexy interview in Ashby)';
 /** The nil UUID names no Ashby form: refused, like `R1_MEET_REFUSED_SERVICE_USER_IDS`. */
 const NIL_UUID = '00000000-0000-0000-0000-000000000000';
 

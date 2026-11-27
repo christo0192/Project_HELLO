@@ -183,9 +183,14 @@ class RunTests(unittest.TestCase):
 
 
 class PersonaQuestionTests(unittest.TestCase):
-    def test_question_uses_dex_by_default(self):
+    def test_question_uses_lexy_by_default(self):
         self.assertEqual(ev.aside_question(), r1_script.line("L-ASIDE-END", lead_name="Meera Iyer"))
-        self.assertIn("Dex", ev.aside_question())
+        self.assertIn("Lexy", ev.aside_question())
+
+    def test_question_uses_dex_with_lexy_off(self):
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_LEXY": "0"}):
+            self.assertEqual(ev.aside_question(), r1_script.line("L-ASIDE-END", lead_name="Meera Iyer"))
+            self.assertIn("Dex", ev.aside_question())
 
     def test_question_uses_original_persona_with_flag_off(self):
         with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
@@ -197,6 +202,7 @@ def setUpModule():
     global _persona_environment
     env = dict(os.environ)
     env.pop("R1_INTERVIEWER_DEX", None)
+    env.pop("R1_INTERVIEWER_LEXY", None)
     _persona_environment = mock.patch.dict(os.environ, env, clear=True)
     _persona_environment.start()
 

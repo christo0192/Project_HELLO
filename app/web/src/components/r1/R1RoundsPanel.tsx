@@ -97,7 +97,7 @@ const CONFIRM_COPY: Record<
     title: 'Grant the one retake?',
     body: (round) =>
       isMeetRound(round)
-        ? `The round opens again for ${R1_LINK_VALID_HOURS} hours. Schedule the retake in Ashby with Dex ` +
+        ? `The round opens again for ${R1_LINK_VALID_HOURS} hours. Schedule the retake in Ashby with Lexy ` +
           'before then; there is no link.'
         : 'The candidate can use their original link again for ' +
           `${R1_LINK_VALID_HOURS} hours. A retake can be granted once.`,
@@ -207,7 +207,7 @@ export function R1RoundsPanel({
         await api.grantR1Retake(round.id);
         onMessage(
           isMeetRound(round)
-            ? `Retake granted. Schedule it in Ashby with Dex within ${R1_LINK_VALID_HOURS} hours.`
+            ? `Retake granted. Schedule it in Ashby with Lexy within ${R1_LINK_VALID_HOURS} hours.`
             : 'Retake granted. The candidate’s original link works again for ' +
                 `${R1_LINK_VALID_HOURS} hours; reissue a link if you no longer have it.`,
         );

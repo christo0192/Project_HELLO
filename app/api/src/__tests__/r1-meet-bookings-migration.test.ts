@@ -1776,9 +1776,9 @@ describe('migration 0142: docs (T5)', () => {
     // Review F4: the template-release recovery is a new HR act after the old booking is cancelled
     // (a new event while it is live is refused), never an automatic re-attestation.
     expect(text).toContain('Nothing re-attests automatically');
-    expect(text).toContain('HR cancels the Dex interview');
+    expect(text).toContain('HR cancels the Lexy interview');
     expect(text).toContain('`blocked/round_active`, so the cancel comes first');
-    expect(text).not.toContain('Recovery: HR schedules a new Dex event in Ashby. The Meet round RPC then');
+    expect(text).not.toContain('Recovery: HR schedules a new Lexy event in Ashby. The Meet round RPC then');
     // Review F1 and F3: per-event recovery and the fenced round actions.
     expect(text).toContain('`rebound: true`');
     expect(text).toContain('r1-meet:round-cancelled:');

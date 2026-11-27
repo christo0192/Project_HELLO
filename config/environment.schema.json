@@ -306,6 +306,7 @@
         "R1_OPENING_SOUND_CHECK": { "requiredInProduction": false, "secret": false },
         "R1_OPENING_NO_HEARING_CHECK": { "requiredInProduction": false, "secret": false },
         "R1_INTERVIEWER_DEX": { "requiredInProduction": false, "secret": false },
+        "R1_INTERVIEWER_LEXY": { "requiredInProduction": false, "secret": false },
         "R1_MUTE_ASIDE_V2": { "requiredInProduction": false, "secret": false },
         "R1_NATURAL_TIMING": { "requiredInProduction": false, "secret": false },
         "R1_RESPOND_FIRST": { "requiredInProduction": false, "secret": false },

@@ -145,7 +145,7 @@ describe('opening the page', () => {
     open();
     await table();
     expect(
-      screen.getByText('Interviews with Dex over Google Meet, scheduled in Ashby. Times are India Standard Time.'),
+      screen.getByText('Interviews with Lexy over Google Meet, scheduled in Ashby. Times are India Standard Time.'),
     ).toBeInTheDocument();
     const trail = screen.getByRole('navigation', { name: 'Breadcrumb' });
     expect(trail).toHaveTextContent('R1 interviews / Meet bookings');
@@ -290,7 +290,7 @@ describe('a row', () => {
 
   it.each([
     ['pending', 'eligible', 'Booked', 'bg-moving-soft'],
-    ['bot_scheduled', 'eligible', 'Dex scheduled', 'bg-moving-soft'],
+    ['bot_scheduled', 'eligible', 'Lexy scheduled', 'bg-moving-soft'],
     ['completed', 'attempt_settled', 'Completed', 'bg-ready-soft'],
     ['blocked', 'slot_too_far', 'Blocked', 'bg-unresolved-soft'],
     ['unmapped_scheduler', 'scheduler_unmapped', 'Scheduler not matched', 'bg-unresolved-soft'],
@@ -318,7 +318,7 @@ describe('a row', () => {
     open();
     await table();
     const status = within(bodyRows()[0]).getAllByRole('cell')[2];
-    expect(status.textContent).toBe('Status: Dex scheduled');
+    expect(status.textContent).toBe('Status: Lexy scheduled');
   });
 
   it('keeps a booking this page has no words for, in words that print no code', async () => {
@@ -617,7 +617,7 @@ describe('loading, empty and failed', () => {
     open();
     expect(await screen.findByText('No Meet booking from today on.')).toBeInTheDocument();
     expect(
-      screen.getByText('A booking appears when an interview is scheduled in Ashby with Dex as an interviewer.'),
+      screen.getByText('A booking appears when an interview is scheduled in Ashby with Lexy as an interviewer.'),
     ).toBeInTheDocument();
     expect(screen.getByTestId('meet-status')).toHaveTextContent('Google Meet interviews are on.');
     expect(screen.queryByText(/^Showing/)).toBeNull();

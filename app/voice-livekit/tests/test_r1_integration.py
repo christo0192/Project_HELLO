@@ -534,8 +534,9 @@ class TestPinsAreRecorded(unittest.IsolatedAsyncioTestCase):
 
     async def test_interviewer_persona_pin_tracks_flag(self) -> None:
         rig = Rig()
-        for value, expected in ((None, "dex"), ("0", "christy")):
-            env = {} if value is None else {"R1_INTERVIEWER_DEX": value}
+        for env, expected in (({}, "lexy"), ({"R1_INTERVIEWER_LEXY": "0"}, "dex"),
+                              ({"R1_INTERVIEWER_DEX": "0"}, "christy"),
+                              ({"R1_INTERVIEWER_DEX": "0", "R1_INTERVIEWER_LEXY": "1"}, "christy")):
             with mock.patch.dict(os.environ, env, clear=True), capture_r1_logs() as lines:
                 rig.interview._record_pins()
             labels = [entry["error_category"] for entry in lines

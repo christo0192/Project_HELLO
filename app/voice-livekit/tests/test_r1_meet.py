@@ -1188,7 +1188,13 @@ NOT_OPENING_IDS = (
 # closes, the system stop, the no-audio ladder and the transition's last reask.
 EDGE_IDS = (*OPENING_IDS, "L-OPEN-HELLO-AGAIN", *NOT_OPENING_IDS, "L-SIL-END-NOAUDIO")
 MUTE_IDS = ("L-MUTE", "L-MUTE-RP", "L-MUTE-IV")
-INTERVIEWERS = {"1": "Dex", "0": "Christy"}  # R1_INTERVIEWER_DEX -> who introduces themself
+# The persona flags -> who introduces themself: Lexy (the default, owner 2026-11-27), Dex
+# (R1_INTERVIEWER_LEXY=0) and Christy (R1_INTERVIEWER_DEX=0).
+INTERVIEWERS = (
+    ({"R1_INTERVIEWER_DEX": "1", "R1_INTERVIEWER_LEXY": "1"}, "Lexy"),
+    ({"R1_INTERVIEWER_DEX": "1", "R1_INTERVIEWER_LEXY": "0"}, "Dex"),
+    ({"R1_INTERVIEWER_DEX": "0"}, "Christy"),
+)
 
 
 def shrinking(seconds: float):
@@ -1281,8 +1287,8 @@ class TestMeetRendering(MeetCase):
     the browser text of every other id; a browser round renders exactly as it did."""
 
     FLAG_STATES = tuple(
-        {"R1_INTERVIEWER_DEX": dex, "R1_BRIEF_WORDING_V2": wording}
-        for dex in ("1", "0")
+        {**persona, "R1_BRIEF_WORDING_V2": wording}
+        for persona, _name in INTERVIEWERS
         for wording in ("1", "0")
     )
 
@@ -1324,10 +1330,8 @@ class TestMeetRendering(MeetCase):
                     )
 
     async def test_the_meet_openings_name_the_interviewer_the_flag_picks(self) -> None:
-        for dex, name in INTERVIEWERS.items():
-            with self.subTest(interviewer=name), mock.patch.dict(
-                os.environ, {"R1_INTERVIEWER_DEX": dex}
-            ):
+        for persona, name in INTERVIEWERS:
+            with self.subTest(interviewer=name), mock.patch.dict(os.environ, persona):
                 self.assertEqual(
                     self.spoken_line("L-OPEN-HI"),
                     f"Hi Asha, I'm {name}, an AI interviewer from Interview Kickstart. Just so "
@@ -1406,11 +1410,11 @@ class TestMeetDisclosure(MeetRunnerRig, unittest.IsolatedAsyncioTestCase):
 
     async def test_the_first_meet_line_discloses_the_ai_and_the_recording(self) -> None:
         for env, base in self.OPENINGS:
-            for dex, name in INTERVIEWERS.items():
+            for persona, name in INTERVIEWERS:
                 with self.subTest(opening=base, interviewer=name):
                     rig = self.rig(activate_ok=True)
                     first, expected = await self.first_line(
-                        rig, flag="1", extra_env={**env, "R1_INTERVIEWER_DEX": dex}, base=base
+                        rig, flag="1", extra_env={**env, **persona}, base=base
                     )
                     self.assertEqual(expected.interview._meet, MEET_CHANNEL)
                     self.assertEqual(first, expected.meet)
@@ -1430,12 +1434,12 @@ class TestMeetDisclosure(MeetRunnerRig, unittest.IsolatedAsyncioTestCase):
             ),
         )
         for env, base in self.OPENINGS:
-            for dex, name in INTERVIEWERS.items():
+            for persona, name in INTERVIEWERS:
                 for case, flag, overrides in cases:
                     with self.subTest(opening=base, interviewer=name, case=case):
                         rig = self.rig(activate_ok=True, participants=("candidate",), **overrides)
                         first, expected = await self.first_line(
-                            rig, flag=flag, extra_env={**env, "R1_INTERVIEWER_DEX": dex},
+                            rig, flag=flag, extra_env={**env, **persona},
                             base=base,
                         )
                         self.assertIsNone(expected.interview._meet)
@@ -1605,6 +1609,7 @@ class TestMeetNoButtonOrLinkWording(MeetCase):
     async def test_nothing_a_meet_round_speaks_asks_for_a_button_a_link_or_a_page(self) -> None:
         for env in (
             {},
+            {"R1_INTERVIEWER_LEXY": "0"},
             {"R1_INTERVIEWER_DEX": "0"},
             {"R1_BRIEF_WORDING_V2": "0", "R1_TRANSITION_REPAIR": "0"},
             {"R1_OPENING_SOUND_CHECK": "0", "R1_MUTE_ASIDE_V2": "0"},

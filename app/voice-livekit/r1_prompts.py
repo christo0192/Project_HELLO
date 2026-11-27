@@ -28,8 +28,11 @@ from r1_personas import TOPIC_LABELS, RenderedPersona
 from r1_script import (
     INTERVIEWER_NAME,
     INTERVIEWER_NAME_DEX,
-    interviewer_dex_enabled,
+    INTERVIEWER_NAME_LEXY,
+    PERSONA_DEX,
+    PERSONA_LEXY,
     interviewer_name,
+    interviewer_persona,
     LINES,
     transition_answers_enabled,
     transition_repair_enabled,
@@ -42,6 +45,9 @@ ANCHOR_PRICE_USD = 7000
 WRAPUP_NOTE = f"The role-play has ended. You are {INTERVIEWER_NAME}, the interviewer, again."
 WRAPUP_NOTE_DEX = (
     f"The role-play has ended. You are {INTERVIEWER_NAME_DEX}, the interviewer, again."
+)
+WRAPUP_NOTE_LEXY = (
+    f"The role-play has ended. You are {INTERVIEWER_NAME_LEXY}, the interviewer, again."
 )
 CARD_MARKER = "YOUR CARD (public):\n"
 IGNORE_RULE_NOTE = (
@@ -1304,8 +1310,12 @@ _INTERVIEW_CONTEXT_PHASES = {
 
 
 def wrapup_note() -> str:
-    """Follow R1_INTERVIEWER_DEX; 0 gives the Christy text."""
-    return WRAPUP_NOTE_DEX if interviewer_dex_enabled() else WRAPUP_NOTE
+    """Follow the persona: Lexy (default), Dex (``R1_INTERVIEWER_LEXY=0``), Christy
+    (``R1_INTERVIEWER_DEX=0``)."""
+    persona = interviewer_persona()
+    if persona == PERSONA_LEXY:
+        return WRAPUP_NOTE_LEXY
+    return WRAPUP_NOTE_DEX if persona == PERSONA_DEX else WRAPUP_NOTE
 
 
 def interviewer_prefix(

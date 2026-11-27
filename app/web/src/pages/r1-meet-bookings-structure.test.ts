@@ -106,10 +106,16 @@ const GUARDS: Guard[] = [
     ],
   },
   {
-    // Dex is the R1 interviewer; the old name stays off every new R1 surface.
+    // Lexy is the R1 interviewer (owner 2026-11-27); the old names stay off every new R1 surface.
     what: 'the retired interviewer name',
     pattern: /christy/i,
     caught: ['Christy', 'christy_voice'],
+  },
+  {
+    // The word only: identifiers such as `dex_absent` are stored reason codes, not copy.
+    what: 'the interviewer name before Lexy',
+    pattern: /\bDex\b/,
+    caught: ['Dex', 'Dex scheduled', 'with Dex as an interviewer'],
   },
 ];
 

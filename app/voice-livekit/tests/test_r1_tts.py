@@ -412,6 +412,7 @@ class TestModuleSurface(unittest.TestCase):
 
 VOICE_ENV = (
     "R1_INTERVIEWER_DEX",
+    "R1_INTERVIEWER_LEXY",
     "R1_TTS_PROFILE",
     "R1_TTS_INTERVIEWER_VOICE",
     "R1_TTS_LEARNER_VOICE",
@@ -463,7 +464,7 @@ class TestVoices(unittest.TestCase):
                 self.assertEqual(voices.profile, "v4")
                 self.assertEqual(
                     voices.kwargs("interviewer"),
-                    {"model": "bulbul:v4-flash", "speaker": "deven_en_conversation", "pace": 1.0},
+                    {"model": "bulbul:v4-flash", "speaker": "roopa_en_conversational", "pace": 1.0},
                 )
                 self.assertEqual(
                     voices.kwargs("learner"),
@@ -499,7 +500,7 @@ class TestVoices(unittest.TestCase):
                 os.environ["R1_TTS_INTERVIEWER_VOICE"] = bad
                 voices = r1_tts.r1_voice_set()
                 self.assertEqual(voices.speaker("learner"), "zarina_en_conversation")
-                self.assertEqual(voices.speaker("interviewer"), "deven_en_conversation")
+                self.assertEqual(voices.speaker("interviewer"), "roopa_en_conversational")
                 self.assertEqual(
                     voices.notes, ("interviewer_voice_rejected", "learner_voice_rejected")
                 )
@@ -546,13 +547,18 @@ class TestVoices(unittest.TestCase):
         self.assertEqual(r1_tts.V4_MODEL, "bulbul:v4-flash")
         self.assertEqual(
             dict(r1_tts.V4_DEFAULT_SPEAKERS),
+            {"interviewer": "roopa_en_conversational", "learner": "zarina_en_conversation"},
+        )
+        self.assertEqual(dict(r1_tts.V4_LEXY_SPEAKERS), dict(r1_tts.V4_DEFAULT_SPEAKERS))
+        self.assertEqual(
+            dict(r1_tts.V4_DEX_SPEAKERS),
             {"interviewer": "deven_en_conversation", "learner": "zarina_en_conversation"},
         )
         self.assertEqual(
             dict(r1_tts.V4_CHRISTY_SPEAKERS),
             {"interviewer": "simran_en_customer", "learner": "zarina_en_conversation"},
         )
-        for speaker in (*r1_tts.V4_DEFAULT_SPEAKERS.values(),
+        for speaker in (*r1_tts.V4_LEXY_SPEAKERS.values(), *r1_tts.V4_DEX_SPEAKERS.values(),
                         *r1_tts.V4_CHRISTY_SPEAKERS.values()):
             self.assertIn(speaker, r1_tts.V4_SPEAKERS)
         self.assertNotIn("simran", r1_tts.V4_SPEAKERS)
@@ -608,18 +614,34 @@ class TestBoundVoice(unittest.IsolatedAsyncioTestCase):
 class TestInterviewerVoiceMismatch(unittest.TestCase):
     def test_male_speakers(self):
         self.assertLessEqual(r1_tts.V4_MALE_SPEAKERS, r1_tts.V4_SPEAKERS)
-        self.assertIn(r1_tts.V4_DEFAULT_SPEAKERS[r1_tts.INTERVIEWER], r1_tts.V4_MALE_SPEAKERS)
+        self.assertIn(r1_tts.V4_DEX_SPEAKERS[r1_tts.INTERVIEWER], r1_tts.V4_MALE_SPEAKERS)
         self.assertNotIn("simran_en_customer", r1_tts.V4_MALE_SPEAKERS)
         self.assertNotIn("zarina_en_conversation", r1_tts.V4_MALE_SPEAKERS)
+        self.assertNotIn("roopa_en_conversational", r1_tts.V4_MALE_SPEAKERS)
+
+    def test_female_speakers(self):
+        self.assertLessEqual(r1_tts.V4_FEMALE_SPEAKERS, r1_tts.V4_SPEAKERS)
+        self.assertIn(r1_tts.V4_LEXY_SPEAKERS[r1_tts.INTERVIEWER], r1_tts.V4_FEMALE_SPEAKERS)
+        self.assertEqual(r1_tts.V4_FEMALE_SPEAKERS & r1_tts.V4_MALE_SPEAKERS, frozenset())
 
     def test_mismatches(self):
+        dex = {"R1_INTERVIEWER_LEXY": "0"}
         cases = [
+            # Lexy (the default): female.
             ({}, False, None),
             ({"R1_TTS_PROFILE": "v3"}, False, "legacy_voice"),
             ({"R1_TTS_PROFILE": "unknown"}, False, "legacy_voice"),
             ({}, True, "legacy_voice"),
-            ({"R1_TTS_INTERVIEWER_VOICE": "simran_en_customer"}, False, "voice_not_male"),
-            ({"R1_TTS_INTERVIEWER_VOICE": "shubh_en_narration"}, False, None),
+            ({"R1_TTS_INTERVIEWER_VOICE": "simran_en_customer"}, False, None),
+            ({"R1_TTS_INTERVIEWER_VOICE": "shubh_en_narration"}, False, "voice_not_female"),
+            # Dex (R1_INTERVIEWER_LEXY=0): male, exactly as before.
+            (dex, False, None),
+            ({**dex, "R1_TTS_PROFILE": "v3"}, False, "legacy_voice"),
+            ({**dex, "R1_TTS_PROFILE": "unknown"}, False, "legacy_voice"),
+            (dex, True, "legacy_voice"),
+            ({**dex, "R1_TTS_INTERVIEWER_VOICE": "simran_en_customer"}, False, "voice_not_male"),
+            ({**dex, "R1_TTS_INTERVIEWER_VOICE": "shubh_en_narration"}, False, None),
+            # Christy (R1_INTERVIEWER_DEX=0): never a mismatch.
             ({"R1_INTERVIEWER_DEX": "0"}, False, None),
             ({"R1_INTERVIEWER_DEX": "0", "R1_TTS_PROFILE": "v3"}, False, None),
             ({"R1_INTERVIEWER_DEX": "0"}, True, None),

@@ -31,12 +31,20 @@ from typing import Any
 INTERVIEWER_NAME = "Christy"
 # Owner 2026-11-19, R1_INTERVIEWER_DEX: Dex is a male interviewer.
 INTERVIEWER_NAME_DEX = "Dex"
+# Owner 2026-11-27, R1_INTERVIEWER_LEXY: Lexy is a female interviewer (she/her).
+INTERVIEWER_NAME_LEXY = "Lexy"
+# The active persona, as ``interviewer_persona`` names it (also the r1_interviewer_persona log).
+PERSONA_CHRISTY = "christy"
+PERSONA_DEX = "dex"
+PERSONA_LEXY = "lexy"
 
-# Owner 2026-11-19 (R1_INTERVIEWER_DEX): names candidates may call the interviewer,
-# as speech-to-text spells them; detectors accept all of them whatever the flag.
+# Owner 2026-11-19 (R1_INTERVIEWER_DEX) and 2026-11-27 (R1_INTERVIEWER_LEXY): names candidates may
+# call the interviewer, as speech-to-text spells them; detectors accept all of them whatever the
+# flags say.
 INTERVIEWER_ADDRESS_NAMES = (
     "christy", "christie", "christi", "kristy", "kristie", "cristy",
     "dex", "decks", "dax", "deks",
+    "lexy", "lexi", "lexie",
 )
 INTERVIEWER_ADDRESS_ALT = "|".join(sorted(INTERVIEWER_ADDRESS_NAMES, key=len, reverse=True))
 # "desk" is an address only in name-only turns ("Desk?", "Hello desk?"), never a filler.
@@ -740,6 +748,15 @@ DEX_LINES: dict[str, str] = {
     line_id: text.replace(INTERVIEWER_NAME, INTERVIEWER_NAME_DEX)
     for line_id, text in LINES.items() if INTERVIEWER_NAME in text
 }
+# Owner 2026-11-27, R1_INTERVIEWER_LEXY: the same lines with Lexy's name.  Lexy is she/her, as
+# Christy was, and no line has an interviewer pronoun anyway (each "she"/"her" is the learner's),
+# so the name is the only change; placeholders remain unchanged.
+LEXY_LINES: dict[str, str] = {
+    line_id: text.replace(INTERVIEWER_NAME, INTERVIEWER_NAME_LEXY)
+    for line_id, text in LINES.items() if INTERVIEWER_NAME in text
+}
+# The ids of the lines that name the interviewer: the keys of both maps above.
+NAMED_LINE_IDS = frozenset(DEX_LINES)
 
 # M032 S6: ``R1_TRANSITION_REPAIR=0`` (the rollback) speaks each of these lines as it was before
 # S6, under its old text's id.  ``active_line_id`` is the one place that choice is made: the
@@ -892,29 +909,63 @@ def wrap_offer_variant_enabled() -> bool:
 
 
 def interviewer_dex_enabled() -> bool:
-    """``R1_INTERVIEWER_DEX`` (default on; owner 2026-11-19): the R1 interviewer is Dex, a male
-    interviewer.  His name is spoken in every line that names the interviewer (``DEX_LINES``), and
-    the interviewer's voice and wording read the same flag.  Read at use.  Off gives back content
-    revision 46's Christy lines exactly.  Rollback:
+    """``R1_INTERVIEWER_DEX`` (default on; owner 2026-11-19): the R1 interviewer is no longer
+    Christy.  It is Dex, a male interviewer, or Lexy while ``R1_INTERVIEWER_LEXY`` is on (the
+    default since 2026-11-27; ``interviewer_persona``).  The name is spoken in every line that
+    names the interviewer (``DEX_LINES``, ``LEXY_LINES``), and the interviewer's voice and wording
+    read the same flags.  Read at use.  Off gives back content revision 46's Christy lines exactly,
+    whatever ``R1_INTERVIEWER_LEXY`` says.  Rollback to Christy:
     ``fly secrets set R1_INTERVIEWER_DEX=0 -a project-hello-voice``.
     """
     return (os.getenv("R1_INTERVIEWER_DEX") or "1").strip().lower() not in _OFF_VALUES
 
 
+def interviewer_lexy_enabled() -> bool:
+    """``R1_INTERVIEWER_LEXY`` (default on, only with ``R1_INTERVIEWER_DEX``; owner 2026-11-27):
+    the R1 interviewer is Lexy, a female interviewer (she/her), in place of Dex.  Her name is
+    spoken in every line that names the interviewer (``LEXY_LINES``), every prompt names her, and
+    the default interviewer voice is ``roopa_en_conversational`` (``r1_tts``): the name and the
+    voice always switch together.  Read at use.  Off gives back Dex (content revision 54's lines,
+    prompts and ``deven_en_conversation`` voice) byte for byte.  Rollback to Dex:
+    ``fly secrets set R1_INTERVIEWER_LEXY=0 -a project-hello-voice``.
+    """
+    return interviewer_dex_enabled() and (
+        (os.getenv("R1_INTERVIEWER_LEXY") or "1").strip().lower() not in _OFF_VALUES
+    )
+
+
+def interviewer_persona() -> str:
+    """The active interviewer: ``PERSONA_LEXY`` (the default), ``PERSONA_DEX``
+    (``R1_INTERVIEWER_LEXY=0``) or ``PERSONA_CHRISTY`` (``R1_INTERVIEWER_DEX=0``, whatever
+    ``R1_INTERVIEWER_LEXY`` says)."""
+    if not interviewer_dex_enabled():
+        return PERSONA_CHRISTY
+    return PERSONA_LEXY if interviewer_lexy_enabled() else PERSONA_DEX
+
+
+_PERSONA_NAMES = {
+    PERSONA_CHRISTY: INTERVIEWER_NAME,
+    PERSONA_DEX: INTERVIEWER_NAME_DEX,
+    PERSONA_LEXY: INTERVIEWER_NAME_LEXY,
+}
+_PERSONA_LINES = {PERSONA_DEX: DEX_LINES, PERSONA_LEXY: LEXY_LINES}
+
+
 def interviewer_name() -> str:
     """Return the active interviewer name."""
-    return INTERVIEWER_NAME_DEX if interviewer_dex_enabled() else INTERVIEWER_NAME
+    return _PERSONA_NAMES[interviewer_persona()]
 
 
 def interviewer_pronouns() -> tuple[str, str, str]:
     """Return subject, object and possessive pronouns for the active interviewer."""
-    return ("he", "him", "his") if interviewer_dex_enabled() else ("she", "her", "her")
+    return ("he", "him", "his") if interviewer_persona() == PERSONA_DEX else ("she", "her", "her")
 
 
 def persona_text(line_id: str) -> str:
     """Return the active persona's text for a reviewed line."""
-    if interviewer_dex_enabled() and line_id in DEX_LINES:
-        return DEX_LINES[line_id]
+    named = _PERSONA_LINES.get(interviewer_persona())
+    if named is not None and line_id in named:
+        return named[line_id]
     return LINES[line_id]
 
 

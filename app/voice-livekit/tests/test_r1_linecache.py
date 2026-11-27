@@ -512,10 +512,12 @@ class TestLineCacheWarm(unittest.IsolatedAsyncioTestCase):
 
         cache, *_ = make_cache(FakeSynthesizer(), directory=self.directory)
         with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "1"}):
+            lexy = r1_script.line("L-OPEN-HI", first_name="Asha")
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "1", "R1_INTERVIEWER_LEXY": "0"}):
             dex = r1_script.line("L-OPEN-HI", first_name="Asha")
         with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}):
             christy = r1_script.line("L-OPEN-HI", first_name="Asha")
-        self.assertNotEqual(cache.key(dex), cache.key(christy))
+        self.assertEqual(len({cache.key(lexy), cache.key(dex), cache.key(christy)}), 3)
 
     async def test_persona_voice_separates_disk_cache(self) -> None:
         import r1_script
@@ -524,7 +526,8 @@ class TestLineCacheWarm(unittest.IsolatedAsyncioTestCase):
         with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "0"}, clear=True):
             christy_text = r1_script.line("L-MUTE")
             christy_voice = r1_tts.r1_voice_set().interviewer
-        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "1"}, clear=True):
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_DEX": "1", "R1_INTERVIEWER_LEXY": "0"},
+                             clear=True):
             dex_text = r1_script.line("L-MUTE")
             dex_voice = r1_tts.r1_voice_set().interviewer
         old = LineCache(FakeSynthesizer(), voice=christy_voice, sample_rate=RATE,
@@ -876,6 +879,7 @@ class TestBuildLineCache(unittest.TestCase):
 
 
 V3 = {"model": "bulbul:v3", "speaker": "simran", "pace": 1.0, "temperature": 0.8}
+V4_LEXY = {"model": "bulbul:v4-flash", "speaker": "roopa_en_conversational", "pace": 1.0}
 V4_DEX = {"model": "bulbul:v4-flash", "speaker": "deven_en_conversation", "pace": 1.0}
 V4_CHRISTY = {"model": "bulbul:v4-flash", "speaker": "simran_en_customer", "pace": 1.0}
 V4_LEARNER = {"model": "bulbul:v4-flash", "speaker": "zarina_en_conversation", "pace": 1.0}
@@ -1007,7 +1011,9 @@ class TestBuildLineCacheVoices(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {}, clear=False)
         patcher.start()
         self.addCleanup(patcher.stop)
-        for key in ("R1_LINE_CACHE", "R1_TTS_PROFILE", "SARVAM_TTS_VOICE", "SARVAM_TTS_MODEL"):
+        for key in ("R1_LINE_CACHE", "R1_TTS_PROFILE", "SARVAM_TTS_VOICE", "SARVAM_TTS_MODEL",
+                    "R1_INTERVIEWER_DEX", "R1_INTERVIEWER_LEXY", "R1_TTS_INTERVIEWER_VOICE",
+                    "R1_TTS_LEARNER_VOICE"):
             os.environ.pop(key, None)
         self.seen: list[dict] = []
 
@@ -1021,11 +1027,21 @@ class TestBuildLineCacheVoices(unittest.TestCase):
         voices = r1_tts.r1_voice_set()  # v4: R1_TTS_PROFILE is unset
         tts = SimpleNamespace(sample_rate=RATE, num_channels=1, r1_voice_set=voices)
         cache = build_line_cache(SimpleNamespace(tts=tts), synthesizer_factory=self.factory)
-        self.assertEqual(self.seen, [V4_DEX, V4_LEARNER])
+        self.assertEqual(self.seen, [V4_LEXY, V4_LEARNER])
         self.assertEqual(
             cache.key("x", "learner"),
             LineCache(FakeSynthesizer(), voice=V4_LEARNER, sample_rate=RATE).key("x"),
         )
+        # Dex (R1_INTERVIEWER_LEXY=0): his voice, and the learner's key is unchanged.
+        self.seen.clear()
+        with mock.patch.dict(os.environ, {"R1_INTERVIEWER_LEXY": "0"}):
+            dex_tts = SimpleNamespace(sample_rate=RATE, num_channels=1,
+                                      r1_voice_set=r1_tts.r1_voice_set())
+            dex_cache = build_line_cache(SimpleNamespace(tts=dex_tts),
+                                         synthesizer_factory=self.factory)
+        self.assertEqual(self.seen, [V4_DEX, V4_LEARNER])
+        self.assertEqual(dex_cache.key("x", "learner"), cache.key("x", "learner"))
+        self.assertNotEqual(dex_cache.key("x", "interviewer"), cache.key("x", "interviewer"))
         # A plain TTS is today's voice, even when the environment says v4 (a build fallback).
         self.seen.clear()
         plain = SimpleNamespace(sample_rate=RATE, num_channels=1)
@@ -1050,7 +1066,7 @@ class TestBuildLineCacheVoices(unittest.TestCase):
         self.assertIsInstance(synths["learner"], SarvamSynthesizer)
         self.assertIsNot(synths["learner"], synths["interviewer"])
         self.assertEqual(synths["learner"]._kwargs, V4_LEARNER)
-        self.assertEqual(synths["interviewer"]._kwargs, V4_DEX)
+        self.assertEqual(synths["interviewer"]._kwargs, V4_LEXY)
         plain = SimpleNamespace(sample_rate=RATE, num_channels=1)
         cache = build_line_cache(SimpleNamespace(tts=plain))
         self.assertIs(cache._synthesizers["learner"], cache._synthesizers["interviewer"])

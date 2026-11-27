@@ -66,8 +66,8 @@ const STATUS_WORDS: Record<R1MeetBookingStatus, readonly [label: string, tone: s
   unmatched_application: ['No matching candidate', 'unresolved'],
   unmapped_scheduler: ['Scheduler not matched', 'unresolved'],
   blocked: ['Blocked', 'unresolved'],
-  bot_scheduled: ['Dex scheduled', 'moving'],
-  bot_joining: ['Dex joining', 'moving'],
+  bot_scheduled: ['Lexy scheduled', 'moving'],
+  bot_joining: ['Lexy joining', 'moving'],
   human_present: ['Someone has joined', 'moving'],
   in_call: ['Interview in progress', 'moving'],
   completed: ['Completed', 'ready'],
@@ -78,7 +78,7 @@ const STATUS_WORDS: Record<R1MeetBookingStatus, readonly [label: string, tone: s
 
 const REASON_WORDS: Record<R1MeetBookingReason, string | null> = {
   eligible: null,
-  dex_absent: 'Dex is no longer an interviewer in Ashby.',
+  dex_absent: 'Lexy is no longer an interviewer in Ashby.',
   cancelled: 'Cancelled in Ashby.',
   in_past: 'The slot had already started.',
   not_scheduled: 'Ashby does not show this interview as scheduled.',

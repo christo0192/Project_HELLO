@@ -196,9 +196,9 @@ class RenderTests(unittest.TestCase):
             self.assertEqual(safe_first_name(bad), "there", repr(bad))
 
     def test_lines_render_with_the_sanitised_name(self):
-        self.assertTrue(line("L-OPEN", first_name="Arjun").startswith("Hi Arjun, I'm Dex"))
+        self.assertTrue(line("L-OPEN", first_name="Arjun").startswith("Hi Arjun, I'm Lexy"))
         # A name the sanitiser rejects is unknown, not "there": the slot is dropped.
-        self.assertTrue(line("L-OPEN", first_name="Arjun<b>").startswith("Hi, I'm Dex"))
+        self.assertTrue(line("L-OPEN", first_name="Arjun<b>").startswith("Hi, I'm Lexy"))
         self.assertEqual(line("L-SIL-IB", first_name="Arjun"), "Are you still with me, Arjun?")
         self.assertEqual(line("L-WRAP"), LINES["L-WRAP"])
 
@@ -285,9 +285,9 @@ class UnknownNameTests(unittest.TestCase):
     def test_each_name_line_reads_naturally_without_a_name(self):
         values = self.persona_values()
         expected = {
-            "L-OPEN": "Hi, I'm Dex, an AI interviewer from Interview Kickstart, and I'll",
-            "L-OPEN-HELLO": "Hi, I'm Dex, an AI interviewer from Interview Kickstart. Can you",
-            "L-OPEN-HI": "Hi, I'm Dex, an AI interviewer from Interview Kickstart.",
+            "L-OPEN": "Hi, I'm Lexy, an AI interviewer from Interview Kickstart, and I'll",
+            "L-OPEN-HELLO": "Hi, I'm Lexy, an AI interviewer from Interview Kickstart. Can you",
+            "L-OPEN-HI": "Hi, I'm Lexy, an AI interviewer from Interview Kickstart.",
             "L-TRANSITION": "Thank you. Next, let's do a sales role-play. I'll play",
             "L-TRANSITION-V20": (
                 "Thank you. We'll now move to the role-play. I'll play a prospective"
@@ -327,16 +327,16 @@ class UnknownNameTests(unittest.TestCase):
             ),
             # M034 S08 (R1_MEET_VOICE_ENABLED): the Google Meet variants that carry the name.
             "L-OPEN-MEET": (
-                "Hi, I'm Dex, an AI interviewer from Interview Kickstart, and I'll be running your "
+                "Hi, I'm Lexy, an AI interviewer from Interview Kickstart, and I'll be running your "
                 "first-round interview for the Sales Program Advisor role. Just so you know, this "
                 "call is recorded. It takes about thirty minutes."
             ),
             "L-OPEN-HELLO-MEET": (
-                "Hi, I'm Dex, an AI interviewer from Interview Kickstart. Just so you know, this "
+                "Hi, I'm Lexy, an AI interviewer from Interview Kickstart. Just so you know, this "
                 "call is recorded. Can you hear me okay?"
             ),
             "L-OPEN-HI-MEET": (
-                "Hi, I'm Dex, an AI interviewer from Interview Kickstart. Just so you know, this "
+                "Hi, I'm Lexy, an AI interviewer from Interview Kickstart. Just so you know, this "
                 "call is recorded."
             ),
             "L-SYSTEM-STOP-MEET": (
@@ -650,9 +650,9 @@ class OpeningSoundCheckLineTests(unittest.TestCase):
         self.assertEqual(placeholders("L-OPEN-HI"), {"first_name"})
         self.assertFalse(is_candidate_free("L-OPEN-HI"))
         self.assertEqual(line("L-OPEN-HI", first_name="Arjun"),
-                         "Hi Arjun, I'm Dex, an AI interviewer from Interview Kickstart.")
+                         "Hi Arjun, I'm Lexy, an AI interviewer from Interview Kickstart.")
         self.assertEqual(line("L-OPEN-HI", first_name=""),
-                         "Hi, I'm Dex, an AI interviewer from Interview Kickstart.")
+                         "Hi, I'm Lexy, an AI interviewer from Interview Kickstart.")
         self.assertNotIn("?", LINES["L-OPEN-HI"])
         self.assertNotIn("hear", LINES["L-OPEN-HI"].lower())
         self.assertIn("AI interviewer", LINES["L-OPEN-HI"])
@@ -685,11 +685,11 @@ class OpeningSoundCheckLineTests(unittest.TestCase):
         self.assertIn("AI interviewer", LINES["L-OPEN-HELLO"])
         self.assertFalse(is_candidate_free("L-OPEN-HELLO"))
         self.assertTrue(
-            line("L-OPEN-HELLO", first_name="Arjun").startswith("Hi Arjun, I'm Dex, an AI")
+            line("L-OPEN-HELLO", first_name="Arjun").startswith("Hi Arjun, I'm Lexy, an AI")
         )
         self.assertEqual(
             line("L-OPEN-HELLO", first_name=""),
-            "Hi, I'm Dex, an AI interviewer from Interview Kickstart. Can you hear me okay?",
+            "Hi, I'm Lexy, an AI interviewer from Interview Kickstart. Can you hear me okay?",
         )
 
     def test_every_agenda_keeps_the_owner_durations_once_and_is_short(self):
@@ -924,10 +924,10 @@ class TestMeetLines(unittest.TestCase):
         "Sorry about that. Please check your speaker or headphone volume. Just so you know, I'm an "
         "AI interviewer and this call is recorded. Can you hear me now?"
     )
-    # What the default interviewer (Dex) says to a candidate called Asha: plan section 2, exactly.
-    DEX_OPENINGS = {
+    # What the default interviewer (Lexy) says to a candidate called Asha: plan section 2, exactly.
+    LEXY_OPENINGS = {
         "L-OPEN-MEET": (
-            "Hi Asha, I'm Dex, an AI interviewer from Interview Kickstart, and I'll be running "
+            "Hi Asha, I'm Lexy, an AI interviewer from Interview Kickstart, and I'll be running "
             "your first-round interview for the Sales Program Advisor role. Just so you know, this "
             "call is recorded. It takes about thirty minutes. We'll spend a few minutes getting to "
             "know you, then I'll switch into a sales role-play of up to twenty minutes where I "
@@ -936,11 +936,11 @@ class TestMeetLines(unittest.TestCase):
             "sales or customer-facing work you've done?"
         ),
         "L-OPEN-HELLO-MEET": (
-            "Hi Asha, I'm Dex, an AI interviewer from Interview Kickstart. Just so you know, this "
+            "Hi Asha, I'm Lexy, an AI interviewer from Interview Kickstart. Just so you know, this "
             "call is recorded. Can you hear me okay?"
         ),
         "L-OPEN-HI-MEET": (
-            "Hi Asha, I'm Dex, an AI interviewer from Interview Kickstart. Just so you know, this "
+            "Hi Asha, I'm Lexy, an AI interviewer from Interview Kickstart. Just so you know, this "
             "call is recorded."
         ),
     }
@@ -974,6 +974,9 @@ class TestMeetLines(unittest.TestCase):
 
     @staticmethod
     def persona_env(dex: str | None) -> dict[str, str]:
+        """None: the default (Lexy); "1"/"0": R1_INTERVIEWER_DEX; "lexy-off": Dex (Lexy off)."""
+        if dex == "lexy-off":
+            return {"R1_INTERVIEWER_LEXY": "0"}
         return {} if dex is None else {"R1_INTERVIEWER_DEX": dex}
 
     def test_no_browser_text_changed(self):
@@ -1035,7 +1038,7 @@ class TestMeetLines(unittest.TestCase):
     def test_each_pair_has_the_same_placeholders_and_cacheability(self):
         # So the warm-up's persist or candidate-free choice for a base id stays right for the
         # text a Meet session speaks: a clip that carries the name is never kept on disk.
-        for dex in (None, "1", "0"):
+        for dex in (None, "1", "0", "lexy-off"):
             with mock.patch.dict(os.environ, self.persona_env(dex), clear=True):
                 for key, value in r1_script.MEET_LINES.items():
                     with self.subTest(dex=dex, line=key):
@@ -1048,7 +1051,7 @@ class TestMeetLines(unittest.TestCase):
 
     def test_no_meet_line_tells_the_candidate_to_press_open_or_close_anything(self):
         values = self.values()
-        for dex in (None, "1", "0"):
+        for dex in (None, "1", "0", "lexy-off"):
             with mock.patch.dict(os.environ, self.persona_env(dex), clear=True):
                 for line_id in LINES:
                     with self.subTest(dex=dex, line=line_id):
@@ -1060,7 +1063,7 @@ class TestMeetLines(unittest.TestCase):
                 self.assertEqual(matching, set(self.NOT_OPENINGS))
 
     def test_the_meet_openings_disclose_the_ai_and_the_recording(self):
-        for dex, name in ((None, "Dex"), ("1", "Dex"), ("0", "Christy")):
+        for dex, name in ((None, "Lexy"), ("1", "Lexy"), ("lexy-off", "Dex"), ("0", "Christy")):
             with mock.patch.dict(os.environ, self.persona_env(dex), clear=True):
                 for key in self.OPENINGS:
                     meet_id = r1_script.meet_line_id(key)
@@ -1069,9 +1072,8 @@ class TestMeetLines(unittest.TestCase):
                             text = line(meet_id, first_name=first_name)
                             self.assertIn("AI interviewer", text)
                             self.assertIn("this call is recorded", text)
-                            self.assertNotIn(
-                                "Christy" if name == "Dex" else "Dex", text
-                            )
+                            for other in {"Christy", "Dex", "Lexy"} - {name}:
+                                self.assertNotIn(other, text)
                         self.assertTrue(
                             line(meet_id, first_name="Asha").startswith(f"Hi Asha, I'm {name}")
                         )
@@ -1082,11 +1084,15 @@ class TestMeetLines(unittest.TestCase):
                             LINES[meet_id].replace(" Just so you know, this call is recorded.", ""),
                             LINES[key],
                         )
-        with mock.patch.dict(os.environ, {}, clear=True):
-            for meet_id, expected in self.DEX_OPENINGS.items():
-                with self.subTest(line=meet_id):
-                    self.assertEqual(line(meet_id, first_name="Asha"), expected)
-                    self.assertIn(meet_id, r1_script.DEX_LINES)
+        for env, name in (({}, "Lexy"), ({"R1_INTERVIEWER_LEXY": "0"}, "Dex")):
+            with mock.patch.dict(os.environ, env, clear=True):
+                for meet_id, expected in self.LEXY_OPENINGS.items():
+                    with self.subTest(line=meet_id, name=name):
+                        self.assertEqual(
+                            line(meet_id, first_name="Asha"), expected.replace("Lexy", name)
+                        )
+                        self.assertIn(meet_id, r1_script.DEX_LINES)
+                        self.assertIn(meet_id, r1_script.LEXY_LINES)
 
     def test_the_meet_hello_again_repeats_the_ai_and_recording_disclosure(self):
         # Review S08-2: in Meet the spoken notice is the only one (no consent page), so the repeat
@@ -1105,7 +1111,8 @@ class TestMeetLines(unittest.TestCase):
         self.assertNotIn("recorded", LINES["L-OPEN-HELLO-AGAIN"])
         self.assertIn("L-OPEN-HELLO-AGAIN-MEET", NAME_FREE_LINES)
         self.assertNotIn("L-OPEN-HELLO-AGAIN-MEET", r1_script.DEX_LINES)  # persona-neutral
-        for dex in (None, "1", "0"):
+        self.assertNotIn("L-OPEN-HELLO-AGAIN-MEET", r1_script.LEXY_LINES)
+        for dex in (None, "1", "0", "lexy-off"):
             with self.subTest(dex=dex), mock.patch.dict(
                 os.environ, self.persona_env(dex), clear=True
             ):
@@ -1116,6 +1123,7 @@ class TestMeetLines(unittest.TestCase):
             with self.subTest(line=meet_id):
                 self.assertEqual(LINES[meet_id], expected)
                 self.assertNotIn(meet_id, r1_script.DEX_LINES)  # persona-neutral
+                self.assertNotIn(meet_id, r1_script.LEXY_LINES)
         # The base lines' own rules carry over to their Meet variants.
         reask = LINES["L-TRANSITION-REASK-2-MEET"]
         self.assertIn("ready", reask)
@@ -1197,7 +1205,7 @@ class SpokenLinesTests(unittest.TestCase):
 
     # sha256 of the canonical JSON of {id: line(active_line_id(id), **values)} over the 125 ids on
     # 50b4e882 (content revision 53): default flags (Dex), persona p1_career_switcher v1, first name
-    # Asha.  ``R1_SPOKEN_LINES=0`` gives it back exactly.
+    # Asha.  ``R1_SPOKEN_LINES=0`` gives it back exactly (with ``R1_INTERVIEWER_LEXY=0``: Dex).
     ROLLBACK_DIGEST = "3ac26527c6528b9e9231cd4f66a8a210d4dc31553002f4e7191c014265602130"
     PRE_EXISTING = 125
     BODY = (
@@ -1209,7 +1217,8 @@ class SpokenLinesTests(unittest.TestCase):
         "Just say 'ready' to begin, and she'll pick up. Any questions before we start?"
     )
     SCENARIO = BODY.removeprefix("Next, let's do a sales role-play. ")
-    # The reviewed wording, word for word, as written in LINES (Christy; DEX_LINES swaps the name).
+    # The reviewed wording, word for word, as written in LINES (Christy; LEXY_LINES and DEX_LINES
+    # swap the name).
     SPOKEN = {
         "L-TRANSITION-SP": "Thank you, {first_name}. " + BODY,
         "L-TRANSITION-THANKS-A-SP": "Thanks, {first_name}. " + BODY,
@@ -1437,7 +1446,7 @@ class SpokenLinesTests(unittest.TestCase):
             for key, spoken in r1_script.SPOKEN_LINES.items():
                 with self.subTest(key=key):
                     self.assertEqual(
-                        line(key, **values), LINES[key].replace("Christy", "Dex").format(**values)
+                        line(key, **values), LINES[key].replace("Christy", "Lexy").format(**values)
                     )
                     self.assertNotEqual(line(key, **values), line(spoken, **values))
 
@@ -1454,7 +1463,9 @@ class SpokenLinesTests(unittest.TestCase):
             canonical = json.dumps(table, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
             return hashlib.sha256(canonical.encode()).hexdigest()
 
-        off, on = rendered({"R1_SPOKEN_LINES": "0"}), rendered({})
+        # Revision 53's digest was taken with Dex, the interviewer then (R1_INTERVIEWER_LEXY=0).
+        dex = {"R1_INTERVIEWER_LEXY": "0"}
+        off, on = rendered({"R1_SPOKEN_LINES": "0", **dex}), rendered(dex)
         self.assertEqual(digest(off), self.ROLLBACK_DIGEST)
         self.assertNotEqual(digest(on), self.ROLLBACK_DIGEST)
         changed = {i for i in old_ids if on[i] != off[i]}
@@ -1470,8 +1481,8 @@ class SpokenLinesTests(unittest.TestCase):
         self.assertEqual(LINES["L-FAQ-DEFER"], r1_world.INTERVIEWER_DEFLECTION)
 
     def test_every_default_line_is_spoken_style(self) -> None:
-        for dex in (None, "0"):
-            env = {} if dex is None else {"R1_INTERVIEWER_DEX": dex}
+        for dex in (None, "0", "lexy-off"):
+            env = TestMeetLines.persona_env(dex)
             with mock.patch.dict(os.environ, env, clear=True):
                 for persona in PERSONAS:
                     for variant in persona.variants:
@@ -1495,8 +1506,8 @@ class SpokenLinesTests(unittest.TestCase):
         self.assertEqual(routed - failing, {"L-ASIDE-EARLY-CLOSE"})
 
     def test_each_pair_keeps_its_facts_placeholders_and_cacheability(self) -> None:
-        for dex in (None, "1", "0"):
-            env = {} if dex is None else {"R1_INTERVIEWER_DEX": dex}
+        for dex in (None, "1", "0", "lexy-off"):
+            env = TestMeetLines.persona_env(dex)
             with mock.patch.dict(os.environ, env, clear=True):
                 for base, spoken in r1_script.SPOKEN_LINES.items():
                     with self.subTest(dex=dex, line=base):
@@ -1508,6 +1519,9 @@ class SpokenLinesTests(unittest.TestCase):
                         )
                         self.assertEqual(
                             spoken in r1_script.DEX_LINES, base in r1_script.DEX_LINES
+                        )
+                        self.assertEqual(
+                            spoken in r1_script.LEXY_LINES, base in r1_script.LEXY_LINES
                         )
                         for kept in self.KEPT:
                             self.assertEqual(
@@ -1679,10 +1693,12 @@ class SpokenLinesTests(unittest.TestCase):
         meet = set(r1_script.MEET_LINES) | set(r1_script.MEET_LINES.values())
         self.assertEqual((set(spoken) | set(spoken.values())) & meet, set())
         self.assertEqual({i for i in spoken.values() if i in r1_script.DEX_LINES}, set(self.NAMED))
-        with mock.patch.dict(os.environ, {}, clear=True):
-            for line_id in self.NAMED:
-                self.assertIn("Dex", line(line_id, **self.values()))
-                self.assertNotIn("Christy", line(line_id, **self.values()))
+        self.assertEqual({i for i in spoken.values() if i in r1_script.LEXY_LINES}, set(self.NAMED))
+        for env, name in (({}, "Lexy"), ({"R1_INTERVIEWER_LEXY": "0"}, "Dex")):
+            with mock.patch.dict(os.environ, env, clear=True):
+                for line_id in self.NAMED:
+                    self.assertIn(name, line(line_id, **self.values()))
+                    self.assertNotIn("Christy", line(line_id, **self.values()))
 
     def test_no_spoken_line_names_a_page_a_price_or_a_number(self) -> None:
         values = self.values()
