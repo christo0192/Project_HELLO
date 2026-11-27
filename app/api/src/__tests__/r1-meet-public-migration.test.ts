@@ -2173,7 +2173,7 @@ const BRIEF_CASES: ReadonlyArray<readonly [string, readonly string[]]> = [
   ]],
 ];
 
-describe('migration 0143: T6 the final function list, the privilege proof and the story', () => {
+describe('migration 0143: T6 the final function list, the privilege proof, the story and the docs', () => {
   const suite = read('app/supabase/tests/r1_meet_public_bookings_assert.sql');
   const suite0142 = read('app/supabase/tests/r1_meet_bookings_assert.sql');
   const proof = (): string => blockOf(suite, '-- T6-A. ', '-- T6-B. ');
@@ -2365,5 +2365,81 @@ describe('migration 0143: T6 the final function list, the privilege proof and th
         expect(has([`'invalid_request:${f}'`, `"field": "${f}"`, `'${f}',`, `'${f}']`]), `${sig} field ${f}`).toBe(true);
       }
     }
+  });
+
+  /** The text from `heading` up to the next heading of the same or a higher level. */
+  function section(doc: string, heading: string, level: number): string {
+    const start = doc.indexOf(`\n${heading}\n`);
+    expect(start, heading).toBeGreaterThan(-1);
+    const rest = doc.slice(start + heading.length + 2);
+    const next = rest.search(new RegExp(`\\n#{1,${level}} `));
+    return next === -1 ? rest : rest.slice(0, next);
+  }
+
+  it('docs/data-classification.md classifies every 0143 column, right before the classification summary', () => {
+    const doc = read('docs/data-classification.md');
+    const heading = '### R1 Meet public bookings (0143, M035)';
+    expect(doc.split(`\n${heading}\n`)).toHaveLength(2);
+    expect(doc.indexOf(heading)).toBeGreaterThan(doc.indexOf('### R1 Meet bookings (0142, M034)'));
+    const text = section(doc, heading, 3);
+    expect(doc.indexOf(heading) + heading.length + 1 + text.length).toBe(doc.indexOf('\n## Classification summary'));
+    expect(text).toContain(FILE);
+    expect(text).toContain('R1_MEET_PUBLIC_BOOKING_ENABLED');
+    const rowOf = (part: string, column: string): string => {
+      const line = part.split('\n').find((l) => l.startsWith('| ') && l.split('|')[1]!.includes(`\`${column}\``));
+      expect(line, column).toBeDefined();
+      return line!;
+    };
+    const bookings = section(text, '#### `screening_v2.r1_meet_bookings` (0143 columns)', 4);
+    const throttle = section(text, '#### `screening_v2.r1_meet_public_throttle`', 4);
+    // Every column 0143 adds to the bookings table, and every column of the throttle table.
+    const added = [...top.matchAll(/add column if not exists ([a-z_]+) /g)].map((m) => m[1]!);
+    expect(added).toEqual(['source', 'google_calendar_event_id', 'calendar_state', 'invite_sent_at',
+      'public_request_id', 'manage_token_digest', 'move_count']);
+    for (const column of added) {
+      expect(rowOf(bookings, column), column).toContain(column === 'manage_token_digest' ? '| **Secret** |' : '| Internal |');
+    }
+    expect(rowOf(throttle, 'key_digest')).toContain('| **Confidential** |');
+    expect(rowOf(throttle, 'bucket_start')).toContain('| Internal |');
+    expect(rowOf(throttle, 'hits')).toContain('| Internal |');
+    // Consent proof, DSAR purge, retention and the job payload rule.
+    expect(text).toContain('candidate_web');
+    expect(text).toContain('`ip_prefix`');
+    expect(text).toContain('`user_agent`, at most 256 characters');
+    expect(text).toContain('india_location_confirmed: true');
+    expect(text).toContain('No name, email or phone is stored');
+    expect(text).toContain('`ON DELETE CASCADE`');
+    expect(text).toContain('enqueue_r1_meet_calendar_purge');
+    expect(text).toContain("`{kind: 'calendar_sync', op: 'purge', booking_id}`");
+    expect(text).toContain('`r1-meet:calendar:<booking id>:purge`');
+    expect(text).toContain('enqueue_r1_meet_bot_release');
+    expect(text).toContain('r1_meet_public_throttle_prune');
+    expect(text).toContain('refuses an age under 1 hour or\nover 365 days');
+    expect(text).toContain('holds ids, ops and\nclosed words only');
+  });
+
+  it('docs/runbooks/r1-operations.md has the 0143 deploy note right after the 0142 note, read-only SQL only', () => {
+    const doc = read('docs/runbooks/r1-operations.md');
+    const heading = '### Deploying 0143 (M035 S01, public bookings, dark)';
+    expect(doc.split(`\n${heading}\n`)).toHaveLength(2);
+    const prior = section(doc, '### Deploying 0142 (M034 S02, Meet bookings, dark)', 3);
+    expect(doc.indexOf(heading)).toBe(doc.indexOf('### Deploying 0142 (M034 S02, Meet bookings, dark)')
+      + '### Deploying 0142 (M034 S02, Meet bookings, dark)'.length + 1 + prior.length + 1);
+    const text = section(doc, heading, 3);
+    expect(doc.indexOf(heading) + heading.length + 1 + text.length + 1).toBe(doc.indexOf('### Meet webhook receivers (M034 S03, dark)'));
+    for (const fact of [
+      'R1_MEET_PUBLIC_BOOKING_ENABLED', 'R1_MEET_ENABLED', 'chk_r1_meet_bookings_source_ids',
+      '`ashby_application_id` stays NOT\n  NULL on every row', 'scripts/migrate-rollback.test.mjs',
+      "set local lock_timeout = '10s'", '07:00-08:30 IST', 'with R1 paused',
+      "status in ('created', 'waiting', 'in_progress');",
+      'select source, count(*) from screening_v2.r1_meet_bookings group by 1;',
+      '0143 is forward-only, and there is no rollback SQL',
+    ]) {
+      expect(text, fact).toContain(fact);
+    }
+    // Its SQL is read-only.
+    const sqlBlocks = [...text.matchAll(/```sql\n([\s\S]*?)```/g)].map((m) => m[1]!.replace(/--.*$/gm, ''));
+    expect(sqlBlocks).toHaveLength(2);
+    for (const block of sqlBlocks) expect(block).not.toMatch(/\b(insert|update|delete|drop|alter|truncate|create|grant|revoke)\b/i);
   });
 });
