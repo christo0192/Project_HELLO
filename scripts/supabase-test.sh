@@ -849,6 +849,20 @@ fi
 log '0143: PASS — R1 public Meet assertions ran against the complete migration chain in supabase-check.'
 
 # =====================================================================
+# 0144 R1 over Google Meet public booking (M035 S12) — the on-the-spot
+# Ashby import, its local lookup and the intake fences (resume
+# ingestion, the profile claim, the phone lane, the impact view) on the
+# complete chain, in one rolled-back transaction.
+# =====================================================================
+log '0144: R1 Meet public import, local lookup, intake fence, profile claim and impact assertions...'
+env SUPABASE_DB_CONTAINER="$SUPABASE_DB_CONTAINER" bash scripts/test-r1-meet-public-import.sh 2>&1 | tee -a "$RESULTS_FILE"
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+  log 'ERROR: 0144 R1 Meet public import assertions FAILED.'
+  exit 1
+fi
+log '0144: PASS — R1 Meet public import assertions ran against the complete migration chain in supabase-check.'
+
+# =====================================================================
 # TST-15 rollback rehearsal — clean reset / roll-forward / restore
 # (Phase 6 lane L4). No reverse SQL exists or is invented; this proves the
 # sanctioned recovery path: the committed migration set can always be

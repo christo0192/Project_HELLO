@@ -378,7 +378,7 @@ counter, timestamp or opaque id: none holds a name, email or number.
 
 | Table / column | Classification | Notes |
 |----------------|---------------|-------|
-| `ashby_application_links.intake_type` | Internal | `resume_parsing` (default) or `phone_parsing`; how the application is screened |
+| `ashby_application_links.intake_type` | Internal | `resume_parsing` (default), `phone_parsing`, or `r1_public_booking` (M035: imported on the spot by the public R1 booking page; never resume-ingested, profiled or phone-screened); how the application is screened |
 | `ashby_application_links.profile_checked_at` | Public | Timestamp of the last profile-sweep claim or recorded outcome |
 | `ashby_application_links.profile_attempts` | Internal | Count of profile-sweep claims (bounded) |
 | `ashby_application_links.profile_outcome` | Internal | Last profile-step outcome, from a closed CHECK vocabulary of codes |

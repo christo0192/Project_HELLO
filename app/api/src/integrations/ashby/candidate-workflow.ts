@@ -15,7 +15,9 @@
  *                        (pending|running|succeeded|failed|blocked|cancelled)
  *   - `sessionStatus`  — call_sessions.status
  *   - `intakeType`     — ashby_application_links.intake_type
- *                        (resume_parsing|phone_parsing; 0130, M017)
+ *                        (resume_parsing|phone_parsing; 0130, M017). The
+ *                        CHECK's third value, r1_public_booking (0144, the
+ *                        M035 public booking import), projects to null.
  *   - `profileOutcome` — ashby_application_links.profile_outcome
  *                        (the closed 0130 CHECK vocabulary, a code only)
  * See `MissionControlWorkflow` in workflow-stores.ts for the operator-facing
@@ -49,7 +51,8 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type { AshbyIntakeType, AshbyProfileOutcome } from './orchestration.js';
+import type { AshbyProfileOutcome, AshbyScreeningIntakeType } from './orchestration.js';
+import { isAshbyIntakeType } from './orchestration.js';
 
 /**
  * 0130 §1: the link's closed `profile_outcome` vocabulary, in the CHECK's
@@ -63,9 +66,26 @@ export const ASHBY_PROFILE_OUTCOMES: readonly AshbyProfileOutcome[] = [
   'identity_unconfirmed', 'application_terminal', 'candidate_missing',
 ];
 
-/** A link's `intake_type`, or null for anything outside the 0130 CHECK. */
-export function projectIntakeType(value: unknown): AshbyIntakeType | null {
-  return value === 'resume_parsing' || value === 'phone_parsing' ? value : null;
+/**
+ * A link's `intake_type` as staff surfaces show it: one of the two screening
+ * intakes, or null. `r1_public_booking` (0144: an application the M035 public
+ * booking import brought in) is null ON PURPOSE, so no badge, resume review or
+ * OpenAPI enum widens for it; anything outside the CHECK is null too. The
+ * switch is exhaustive over the CHECK, so a fourth value fails to compile.
+ */
+export function projectIntakeType(value: unknown): AshbyScreeningIntakeType | null {
+  if (!isAshbyIntakeType(value)) return null;
+  switch (value) {
+    case 'resume_parsing':
+    case 'phone_parsing':
+      return value;
+    case 'r1_public_booking':
+      return null;
+    default: {
+      const unreachable: never = value;
+      return unreachable;
+    }
+  }
 }
 
 /** A link's `profile_outcome`, or null for anything outside the closed vocabulary. */
@@ -98,8 +118,11 @@ export interface CandidateAshbyWorkflowView {
   /** At most one entry per type — the most recently updated row for that leg. */
   operations: CandidateAshbyWorkflowOperation[];
   sessionStatus: string | null;
-  /** M017: how this application is screened; null for a value outside the CHECK. */
-  intakeType: AshbyIntakeType | null;
+  /**
+   * M017: how this application is screened; null for a value outside the
+   * CHECK and for an `r1_public_booking` link (0144).
+   */
+  intakeType: AshbyScreeningIntakeType | null;
   /** M017: the last Ashby profile check's outcome code; null before any check. */
   profileOutcome: AshbyProfileOutcome | null;
   /** Null when the row carries no usable timestamp — never a fabricated one. */
