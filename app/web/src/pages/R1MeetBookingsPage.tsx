@@ -1,5 +1,6 @@
 /**
- * Meet bookings: the R1 interviews HR scheduled in Ashby for Dex to hold over Google Meet (M034 S10, dark).
+ * Meet bookings: the R1 interviews Lexy holds over Google Meet, booked by candidates on the public booking
+ * link (M035) or scheduled by HR in Ashby (M034 S10), dark.
  *
  *   /interviews/meet-bookings?status=blocked&from=2026-11-24&to=2026-11-30
  *
@@ -217,7 +218,8 @@ export function R1MeetBookingsPage() {
       </nav>
       <h1 className="mt-1 text-title text-ink">Meet bookings</h1>
       <p className="mt-1 text-sm text-ink-secondary">
-        Interviews with Lexy over Google Meet, scheduled in Ashby. Times are India Standard Time.
+        Interviews with Lexy over Google Meet, booked by candidates on the public booking link or scheduled in
+        Ashby. Times are India Standard Time.
       </p>
       <p ref={statusLineRef} tabIndex={-1} data-testid="meet-status" className={`mt-2 min-h-5 text-sm text-ink ${FOCUS_RING}`}>
         {meetOn !== null
@@ -260,7 +262,7 @@ export function R1MeetBookingsPage() {
         ) : isDefault ? (
           <EmptyPanel
             title="No Meet booking from today on."
-            hint="A booking appears when an interview is scheduled in Ashby with Lexy as an interviewer."
+            hint="A booking appears when a candidate books on the public booking link, or when an interview is scheduled in Ashby with Lexy as an interviewer."
           />
         ) : (
           <EmptyPanel
