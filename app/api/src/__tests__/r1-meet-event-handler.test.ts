@@ -35,7 +35,9 @@
  *    bot is a bot failure too, a 503 defers before the move and a 404 keeps the event's reason;
  *  - a `bot.in_waiting_room` of a live booking's bot alerts once per run that ends (PR #449 review
  *    S09-R1: a re-run alerts too, a run that throws or defers before its end never does, so the
- *    alert is never lost), never for a terminal booking, and the status mapping is unchanged.
+ *    alert is never lost), never for a terminal booking, and the status mapping is unchanged; its
+ *    `error_type` is the booking's source, at warn level for `ashby` and error for `public_page`
+ *    (M035 S02, S09-R2).
  *
  * M035 S09 T4 (D-S09-6, UNVERIFIED until the live spike S0c), the bot's own participant:
  *  - `r1MeetBotInCallAtMs` (the oldest `in_call_*` time) and `r1MeetBotParticipantId` (the EARLIEST
@@ -54,6 +56,7 @@
 import { describe, expect, it } from 'vitest';
 import { createLogger } from '../lib/logger.js';
 import { armBridge } from '../lib/r1/meet/arm.js';
+import { R1_MEET_BOOKING_SOURCES } from '../lib/r1/meet/bookings-read.js';
 import { ensureBot } from '../lib/r1/meet/bot-flow.js';
 import {
   R1_MEET_ADMISSION_SUB_CODES,
@@ -116,6 +119,10 @@ const outputMedia = (h: R1MeetHarness) => h.requests.filter((request) => request
 const recallOps = (h: R1MeetHarness) => h.requests.map((request) => request.op);
 /** The error lines (alerts) with their whole meta, so a test pins `error_type` too. */
 const errorLines = (h: R1MeetHarness) => h.logs.filter((line) => line.level === 'error');
+/** Every `r1_meet_bot_waiting_room` line, at any level (M035 S02, S09-R2: the level follows the source). */
+const waitingRoomLines = (h: R1MeetHarness) => h.logs.filter((line) => line.meta.error_category === 'r1_meet_bot_waiting_room');
+const WAITING_ROOM_ASHBY = { level: 'warn', meta: { error_category: 'r1_meet_bot_waiting_room', error_type: 'ashby' } };
+const WAITING_ROOM_PUBLIC = { level: 'error', meta: { error_category: 'r1_meet_bot_waiting_room', error_type: 'public_page' } };
 /** The timeline without the test's own enqueue of the event row (what S03 does). */
 const steps = (h: R1MeetHarness) => h.timeline.filter((step) => step !== 'queue:recall_event');
 const pageUrlOf = (request: { body: unknown }) => (request.body as { camera: { config: { url: string } } }).camera.config.url;
@@ -176,9 +183,11 @@ interface Booked {
 async function booked(
   h: R1MeetHarness,
   start: Start = 'bot_scheduled',
-  options: { readonly sessionStatus?: string } = {},
+  options: { readonly sessionStatus?: string; readonly source?: 'ashby' | 'public_page' } = {},
 ): Promise<Booked> {
-  const created = await h.createBooking({ startAt: iso(h.now() + MIN) });
+  const created = options.source === 'public_page'
+    ? h.createPublicBooking({ startAt: iso(h.now() + MIN) })
+    : await h.createBooking({ startAt: iso(h.now() + MIN) });
   expect(await ensureBot(h.deps, created.bookingId, h.meta())).toMatchObject({ code: 'bot_scheduled' });
   const row = h.db.booking(created.bookingId)!;
   const id = row.id as string;
@@ -660,13 +669,12 @@ describe('recall_event: every event from every booking status (D-S06-24)', () =>
       expect(releases[0]!.payload).toEqual({ kind: 'bot_release', recall_bot_id: b.botId, booking_id: b.id });
       expect(recallOps(h)).toEqual([]);
     }
-    // A stray alerts as such; a live booking's own bot in the waiting room alerts at once (M035 S09).
-    const alerts = code === 'stray_bot'
-      ? ['r1_meet_stray_bot']
-      : label === 'bot.in_waiting_room' && LIVE_STARTS.has(start)
-        ? ['r1_meet_bot_waiting_room']
-        : [];
-    expect(h.alerts()).toEqual(alerts);
+    // A stray alerts as such; a live booking's own bot in the waiting room alerts at once (M035 S09),
+    // at warn level for these Ashby bookings (M035 S02, S09-R2).
+    expect(h.alerts()).toEqual(code === 'stray_bot' ? ['r1_meet_stray_bot'] : []);
+    expect(waitingRoomLines(h)).toEqual(
+      code !== 'stray_bot' && label === 'bot.in_waiting_room' && LIVE_STARTS.has(start) ? [WAITING_ROOM_ASHBY] : [],
+    );
     // Never a create, never a PATCH; a release is at most one GET then one command.
     expect(recallOps(h)).not.toContain('create');
     expect(h.requests.map((request) => request.method)).not.toContain('PATCH');
@@ -1224,9 +1232,10 @@ describe('recall_event: a bot held, denied, blocked or unable to sign in fails t
     expect(await deliver(h, b, 'bot.in_waiting_room')).toEqual(done('processed', 'bot_joining'));
     h.advance(10 * MIN);
     expect(await deliver(h, b, 'bot.call_ended', { subCode: 'timeout_exceeded_waiting_room' })).toEqual(done('processed', 'failed_bot_fatal'));
-    expect(errorLines(h).map((line) => line.meta)).toEqual([
-      { error_category: 'r1_meet_bot_waiting_room' },
-      { error_category: ADMISSION_WORD, error_type: 'timeout_exceeded_waiting_room' },
+    // An Ashby meeting: the door is a warning (HR admits Dex); the timeout is the alert (S09-R2).
+    expect(h.logs.filter((line) => line.level !== 'info')).toEqual([
+      WAITING_ROOM_ASHBY,
+      { level: 'error', meta: { error_category: ADMISSION_WORD, error_type: 'timeout_exceeded_waiting_room' } },
     ]);
     expectNoPii(h);
   });
@@ -1259,14 +1268,15 @@ describe('recall_event: a bot held, denied, blocked or unable to sign in fails t
 // ── The waiting room (M035 S09 D-S09-4(b)) ──────────────────────────────────
 
 describe('recall_event: a bot held in the waiting room alerts at once (M035 S09)', () => {
-  const WAITING_ROOM = { level: 'error', meta: { error_category: 'r1_meet_bot_waiting_room' } };
+  // These are Ashby bookings: the line is a warning with error_type ashby (M035 S02, S09-R2).
+  const WAITING_ROOM = WAITING_ROOM_ASHBY;
 
   it('bot_scheduled: -> bot_joining (unchanged mapping) and one alert, no Recall call', async () => {
     const h = world();
     const b = await booked(h, 'bot_scheduled');
     expect(await deliver(h, b, 'bot.in_waiting_room')).toEqual(done('processed', 'bot_joining'));
     expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', reason: 'eligible' });
-    expect(errorLines(h)).toEqual([WAITING_ROOM]);
+    expect(waitingRoomLines(h)).toEqual([WAITING_ROOM]);
     expect(h.requests).toEqual([]);
     expectNoPii(h);
   });
@@ -1276,14 +1286,14 @@ describe('recall_event: a bot held in the waiting room alerts at once (M035 S09)
     const b = await booked(h, 'bot_joining');
     expect(await deliver(h, b, 'bot.in_waiting_room')).toEqual(done('ignored', 'no_change'));
     expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining' });
-    expect(errorLines(h)).toEqual([WAITING_ROOM]);
+    expect(waitingRoomLines(h)).toEqual([WAITING_ROOM]);
   });
 
   it('a run that is a re-run (attempts 2) still alerts: one line per run that ends (PR #449 review S09-R1)', async () => {
     const h = world();
     const b = await booked(h, 'bot_scheduled');
     expect(await deliver(h, b, 'bot.in_waiting_room', {}, h.meta({ attempts: 2 }))).toEqual(done('processed', 'bot_joining'));
-    expect(errorLines(h)).toEqual([WAITING_ROOM]);
+    expect(waitingRoomLines(h)).toEqual([WAITING_ROOM]);
   });
 
   it('the first attempt dies at the booking read: no alert; its retry (attempts 2) alerts once', async () => {
@@ -1293,9 +1303,10 @@ describe('recall_event: a bot held in the waiting room alerts at once (M035 S09)
     h.db.failNext('r1_meet_bookings');
     await expect(run(h, payload)).rejects.toThrow('r1_meet_db_error');
     expect(h.alerts()).toEqual([]);
+    expect(waitingRoomLines(h)).toEqual([]);
     expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_scheduled' });
     expect(await run(h, payload, h.meta({ attempts: 2 }))).toEqual(done('processed', 'bot_joining'));
-    expect(errorLines(h)).toEqual([WAITING_ROOM]);
+    expect(waitingRoomLines(h)).toEqual([WAITING_ROOM]);
   });
 
   it('the status step fails (a database error): that run writes no alert, its retry writes the one line', async () => {
@@ -1305,8 +1316,9 @@ describe('recall_event: a bot held in the waiting room alerts at once (M035 S09)
     h.db.failNext('r1_meet_transition_booking');
     await expect(run(h, payload)).rejects.toThrow('r1_meet_db_error');
     expect(h.alerts()).toEqual([]);
+    expect(waitingRoomLines(h)).toEqual([]);
     expect(await run(h, payload, h.meta({ attempts: 2 }))).toEqual(done('processed', 'bot_joining'));
-    expect(errorLines(h)).toEqual([WAITING_ROOM]);
+    expect(waitingRoomLines(h)).toEqual([WAITING_ROOM]);
   });
 
   it('the event of a bot a pending booking is attaching: deferred with no alert; the re-run against the attached booking alerts once', async () => {
@@ -1315,13 +1327,14 @@ describe('recall_event: a bot held in the waiting room alerts at once (M035 S09)
     const payload = event(h, s, 'bot.in_waiting_room');
     expect(await run(h, payload)).toEqual(deferred('stray_pending', 30));
     expect(h.alerts()).toEqual([]);
+    expect(waitingRoomLines(h)).toEqual([]);
     expect(await ensureBot(h.deps, s.id, h.meta())).toMatchObject({ code: 'bot_scheduled' });
     h.advance(30 * SEC);
     reset(h);
     expect(await run(h, payload, h.meta({ deferCount: 1, deferredAt: iso(h.now() - 30 * SEC) }))).toEqual(
       done('processed', 'bot_joining'),
     );
-    expect(errorLines(h)).toEqual([WAITING_ROOM]);
+    expect(waitingRoomLines(h)).toEqual([WAITING_ROOM]);
     expect(h.db.jobs('bot_release')).toEqual([]);
     expectNoPii(h);
   });
@@ -1346,7 +1359,7 @@ describe('recall_event: a bot held in the waiting room alerts at once (M035 S09)
     expect(await runJob(h, r1MeetRecallEventDefinition, event(h, b, 'bot.in_waiting_room'), h.meta(), deps)).toEqual(
       done('processed', 'bot_joining'),
     );
-    expect(errorLines(h)).toEqual([WAITING_ROOM]);
+    expect(waitingRoomLines(h)).toEqual([WAITING_ROOM]);
   });
 
   it('a terminal booking (an owed release) queues the release and raises no waiting-room alert', async () => {
@@ -1354,6 +1367,7 @@ describe('recall_event: a bot held in the waiting room alerts at once (M035 S09)
     const b = await booked(h, 'failed_owed');
     expect(await deliver(h, b, 'bot.in_waiting_room')).toEqual(done('processed', 'release_queued'));
     expect(h.alerts()).toEqual([]);
+    expect(waitingRoomLines(h)).toEqual([]);
   });
 
   it('a stray or a bot that is not ours raises only what it raised before', async () => {
@@ -1364,6 +1378,38 @@ describe('recall_event: a bot held in the waiting room alerts at once (M035 S09)
       done('ignored', 'unknown_bot'),
     );
     expect(h.alerts()).toEqual(['r1_meet_stray_bot']);
+    expect(waitingRoomLines(h)).toEqual([]);
+  });
+
+  it('a public-page booking: the same mapping, one ERROR line with error_type public_page (M035 S02, S09-R2)', async () => {
+    for (const [start, code] of [['bot_scheduled', done('processed', 'bot_joining')], ['bot_joining', done('ignored', 'no_change')]] as const) {
+      const h = world();
+      const b = await booked(h, start, { source: 'public_page' });
+      expect(h.db.booking(b.id)!.source).toBe('public_page');
+      expect(await deliver(h, b, 'bot.in_waiting_room')).toEqual(code);
+      expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', reason: 'eligible' });
+      expect(waitingRoomLines(h)).toEqual([WAITING_ROOM_PUBLIC]);
+      expect(h.alerts()).toEqual(['r1_meet_bot_waiting_room']);
+      expect(h.requests).toEqual([]);
+      expectNoPii(h);
+    }
+  });
+
+  it('a terminal public-page booking (an owed release) raises no waiting-room line', async () => {
+    const h = world();
+    const b = await booked(h, 'failed_owed', { source: 'public_page' });
+    expect(await deliver(h, b, 'bot.in_waiting_room')).toEqual(done('processed', 'release_queued'));
+    expect(waitingRoomLines(h)).toEqual([]);
+  });
+
+  it('both sources survive the real logger as error_type', () => {
+    const lines: string[] = [];
+    const logger = createLogger('r1-meet', { writer: (line) => lines.push(line) });
+    for (const source of R1_MEET_BOOKING_SOURCES) {
+      expect(source).toMatch(SAFE_IDENT_RE);
+      logger.warn('unknown_event', { error_category: 'r1_meet_bot_waiting_room', error_type: source });
+    }
+    expect(lines.map((line) => (JSON.parse(line) as { error_type?: string }).error_type)).toEqual([...R1_MEET_BOOKING_SOURCES]);
   });
 });
 

@@ -4220,14 +4220,15 @@ and bill. Drain first, then turn the flag off.
 | `r1_meet_drain_failed` | A drain could not release a bot (`<op>:<category>`), a pass threw, or `passes_exhausted` | Check Recall; insert the drain job again |
 | `r1_meet_malformed_payload` / `r1_meet_unknown_kind` | A job this build cannot read (version skew during a deploy) | Finish the deploy; replay from the DLQ |
 | `r1_meet_job_failed` | A job's final attempt failed; its receipt is `failed` | Read the DLQ `error_message`, fix the cause, replay |
-| `r1_meet_bot_waiting_room` | Dex's bot reported `bot.in_waiting_room` (no `error_type`): the meeting is not OPEN, or nobody has admitted Dex. The booking stays live; the bot waits up to 600 s. One line per processed event; a retried job may repeat it, never drop it | Public bookings: fix the Dex unit's Meet settings at once, before more candidates are stranded (access Open, people who are not signed in may join, waiting room off, the host need not join first). Ashby bookings: someone in the meeting must admit Dex |
+| `r1_meet_bot_waiting_room` | Dex's bot reported `bot.in_waiting_room` (`error_type` = the booking's source, M035 S02): the meeting is not OPEN, or nobody has admitted Dex. The booking stays live; the bot waits up to 600 s. One line per processed event; a retried job may repeat it, never drop it. ERROR level for `public_page`; for `ashby` the same line is a WARNING (admitting Dex is HR's normal step there; a bot nobody admits still raises `r1_meet_bot_admission_blocked`) | `public_page`: fix the Dex unit's Meet settings at once, before more candidates are stranded (access Open, people who are not signed in may join, waiting room off, the host need not join first). `ashby`: someone in the meeting must admit Dex |
 | `r1_meet_bot_admission_blocked` | The bot never got in (`error_type` = the Recall sub-code: a waiting-room timeout, `bot_kicked_from_waiting_room`, `meeting_not_started`, `google_meet_bot_blocked`, `google_meet_knocking_disabled`, `google_meet_sign_in_missing_login_credentials`, `google_meet_organisation_restricted`); `failed/bot_fatal`, never a candidate no-show. Once per booking | Fix the Meet settings (as above; a meeting restricted to the organisation, or one that needs a signed-in user, also refuses a guest bot); HR re-books the candidate |
 | `r1_meet_bot_sign_in_failed` | Signed-in mode only (`R1_MEET_GOOGLE_LOGIN_GROUP_ID` set): the bot could not sign in to Google (`error_type` = the Recall sub-code); `failed/bot_fatal`. Once per booking | Check the Recall Google Login Group and its login, the Legacy SSO profile and certificate, and the concurrent sign-in count (30 per account); or unset the login group to go back to the guest bot. HR re-books |
 
 Warnings: `r1_meet_receipt_finish_failed`, `r1_meet_maintenance_had_errors` (`error_type` = the
 failed steps), `r1_meet_attempt_ended_enqueue_failed` (maintenance re-drives it),
 `r1_meet_multi_human_observed`, `r1_meet_recall_failed`, `r1_meet_queue_poll_error`,
-`r1_meet_queue_stale_lease`, `r1_meet_queue_no_handler`, `r1_meet_maintenance_enqueue_error`.
+`r1_meet_queue_stale_lease`, `r1_meet_queue_no_handler`, `r1_meet_maintenance_enqueue_error`,
+`r1_meet_bot_waiting_room` with `error_type` `ashby` (an Ashby meeting; the row above).
 
 **Cost.** Three bounds: the daily cap (`r1_meet_bot_cap_reached`), Recall's own usage alert (above),
 and the automatic-leave timers (a lost bot costs at most about 15 minutes before a call, 45 minutes
