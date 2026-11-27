@@ -4606,6 +4606,14 @@ before the network). Every other check above is the same.
 - **Re-post.** The SQL above re-posts public cards too: each re-posted job runs the guard first, so a
   card that did land before the job failed is found (`already_posted`) instead of posted again. Only
   Dex's cards count: a card HR entered by hand under their own Ashby user does not stop the post.
+- **Known limit: a public card is never updated.** The guard looks only for Dex's card on the form
+  since the slot start; it cannot tell which assessment a card holds, and a general card has no
+  Ashby update. So when a newer assessment of the same attempt becomes the round's current one (a
+  re-score, or a re-queued R1 assessment), its receipt ends `already_posted` and Ashby keeps the
+  FIRST verdict and scores, while our review page shows the new ones. An Ashby-scheduled booking
+  instead updates its one card (the interview-event submit). If the Ashby card must show the new
+  result, a recruiter deletes Dex's card on the application in Ashby, then re-posts the newer
+  receipt with the SQL above (the guard then finds no card and submits the current assessment).
 - **Live spike (roadmap S11).** A general submit (no `interviewEventId`) with `userId` = the Dex user
   is accepted from this key and shows as Dex's card on the application; `applicationFeedback.list`
   answers `results` entries with `submittedByUser.id`, `creditedToUser.id`, `submittedAt` (zoned ISO

@@ -191,7 +191,7 @@ const REASON_TEXT: Readonly<Record<R1MeetBookingReason, string | null>> = {
   attempt_settled: 'The interview has ended.',
   flag_off: 'Google Meet interviews were turned off.',
   candidate_cancelled: 'The candidate cancelled with the link in their invite.',
-  invite_undeliverable: 'Dex’s calendar invite could not be sent.',
+  invite_undeliverable: 'Lexy’s calendar invite could not be sent.',
 };
 
 /** Why a booking is where it is, or null when there is nothing to say. Never the reason's code. */

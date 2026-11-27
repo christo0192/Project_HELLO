@@ -22,8 +22,9 @@
  * 10  M035 S02, a public-page booking (no interview event): general feedback guarded by
  *     `applicationFeedback.list` before every submit (`[form, list, submit]`, the body without
  *     `interviewEventId`; Dex's card already there is `already_posted`; list failures defer or end
- *     terminal and never submit; a lost submit answer is found on the re-run), while an Ashby booking
- *     never lists and posts exactly as before.
+ *     terminal and never submit; a lost submit answer is found on the re-run; a re-score of the same
+ *     attempt is `already_posted` too, the known limit of S02-R2), while an Ashby booking never lists
+ *     and posts exactly as before (a re-score updates its one card).
  */
 
 import { describe, expect, it } from 'vitest';
@@ -59,6 +60,7 @@ import {
   createR1MeetDispatcher,
   type R1MeetDispatcher,
 } from '../lib/r1/meet/dispatcher.js';
+import { r1MeetFeedbackReceiptKey } from '../lib/r1/meet/feedback-store.js';
 import type { R1MeetFlowDeps } from '../lib/r1/meet/recall-actions.js';
 import { R1_MEET_LIVE_STATUSES, R1_MEET_TERMINAL_STATUSES } from '../lib/r1/meet/runtime-store.js';
 import { FAKE_STATUS_REASONS } from './support/r1-meet-fake-db.js';
@@ -69,6 +71,7 @@ import {
   createR1MeetFeedbackWorld,
   dexFormDefinition,
   dexFormFields,
+  finalAssessmentRow,
   type AshbyStep,
   type CompletedBooking,
   type R1MeetFeedbackWorld,
@@ -1106,6 +1109,53 @@ describe('10. a public-page booking: general feedback guarded by applicationFeed
     expect(jobLines(w).at(-1)).toBe('scorecard_feedback:already_posted');
     expect(w.ashby.submits()).toHaveLength(1);
     expect(outcome(w, b)).toBe('processed');
+  });
+
+  /**
+   * A newer assessment of the same attempt becomes the round's current one (a re-score): the trigger
+   * records a second receipt for the booking. Returns the receipt key and its queued job's payload.
+   */
+  async function rescore(w: R1MeetFeedbackWorld, b: CompletedBooking): Promise<{ key: string; payload: unknown }> {
+    const newer = fixtureId();
+    w.tables.assessments.push(finalAssessmentRow(newer, b.sessionId, { recommendation: 'advance', overall_score: 75 }));
+    w.h.db.tables.interview_rounds.find((round) => round.id === b.roundId)!.assessment_id = newer;
+    const recorded = await w.store.recordFeedback(b.bookingId, newer, w.h.now());
+    expect(recorded).toMatchObject({ enqueued: true });
+    const id = (recorded as { id: string }).id;
+    const job = w.h.db.jobs('scorecard_feedback').find((row) => row.payload?.receipt_id === id);
+    expect(job).toBeDefined();
+    return { key: r1MeetFeedbackReceiptKey(b.bookingId, newer), payload: job!.payload };
+  }
+
+  it('KNOWN LIMIT (S02-R2): a re-score of a public booking never updates its card; Ashby keeps the first one', async () => {
+    const { w, b } = await publicWorld();
+    await w.dispatcher.handle(w.queueJob(b.job!.payload));
+    expect(w.ashby.submits()).toHaveLength(1);
+
+    const second = await rescore(w, b);
+    await expect(w.dispatcher.handle(w.queueJob(second.payload))).resolves.toBeUndefined();
+    // Ashby has no update of a general card, and the guard cannot tell which assessment a card holds:
+    // the first card stays, the new receipt ends processed, and nothing is posted twice.
+    expect(jobLines(w)).toEqual(['scorecard_feedback:submitted', 'scorecard_feedback:already_posted']);
+    expect(ops(w)).toEqual(['form', 'list', 'submit', 'form', 'list']);
+    expect(w.ashby.submits()).toHaveLength(1);
+    expect(w.ashby.feedbackList).toHaveLength(1);
+    expect(w.receiptRow(second.key)).toMatchObject({ outcome: 'processed' });
+    expect(infoLines(w, R1_MEET_FEEDBACK_ALREADY_POSTED_LOG)).toHaveLength(1);
+  });
+
+  it('the same re-score of an Ashby booking updates its one card (the interview-event submit)', async () => {
+    const { w, b } = await world();
+    await w.dispatcher.handle(w.queueJob(b.job!.payload));
+
+    const second = await rescore(w, b);
+    await expect(w.dispatcher.handle(w.queueJob(second.payload))).resolves.toBeUndefined();
+    expect(jobLines(w)).toEqual(['scorecard_feedback:submitted', 'scorecard_feedback:submitted']);
+    expect(ops(w)).toEqual(['form', 'submit', 'form', 'submit']);
+    expect(w.ashby.submits()).toHaveLength(2);
+    expect(w.ashby.submits()[1]!.raw).not.toBe(w.ashby.submits()[0]!.raw);
+    expect(w.ashby.feedbackList).toHaveLength(1);
+    expect(w.receiptRow(second.key)).toMatchObject({ outcome: 'processed' });
   });
 
   it('a failed settle after already_posted only warns; the dispatcher finishes the receipt', async () => {

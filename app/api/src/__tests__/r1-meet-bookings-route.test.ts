@@ -920,6 +920,10 @@ describe('the closed lists', () => {
       expect((props.source as YMap).type).toBe('string');
       expect((props.source as YMap).enum).toEqual([...R1_MEET_BOOKING_SOURCES]);
       expect((props.source as YMap).nullable).toBeUndefined();
+      // Owner 2026-11-27: the interviewer is Lexy, so the source's words name no interviewer (S02-R4).
+      expect(String((props.source as YMap).description)).toBe(
+        'Where the booking came from: ashby = scheduled by HR in Ashby (M034); public_page = booked by the candidate on the public R1 booking page (M035).',
+      );
       expect((props.candidate_id as YMap).nullable).toBe(true);
       expect((props.round_id as YMap).nullable).toBe(true);
     }

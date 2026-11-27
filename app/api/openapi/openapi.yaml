@@ -373,7 +373,7 @@ paths:
                         source:
                           type: string
                           enum: [ashby, public_page]
-                          description: 'Where the booking came from: ashby = scheduled by HR in Ashby with Dex (M034); public_page = booked by the candidate on the public R1 booking page (M035).'
+                          description: 'Where the booking came from: ashby = scheduled by HR in Ashby (M034); public_page = booked by the candidate on the public R1 booking page (M035).'
                   next_cursor:
                     type: string
                     nullable: true
@@ -440,7 +440,7 @@ paths:
                   source:
                     type: string
                     enum: [ashby, public_page]
-                    description: 'Where the booking came from: ashby = scheduled by HR in Ashby with Dex (M034); public_page = booked by the candidate on the public R1 booking page (M035).'
+                    description: 'Where the booking came from: ashby = scheduled by HR in Ashby (M034); public_page = booked by the candidate on the public R1 booking page (M035).'
         '400': { description: Malformed booking id (invalid_id). }
         '403': { description: The caller's account is inactive (access_denied). }
         '404': { description: 'No such booking, not one the caller may see, or Meet is off (not_found).' }
