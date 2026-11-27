@@ -4,8 +4,8 @@
  * step and the phone lane). The behavioural SQL assertions run in supabase-ci
  * (app/supabase/tests/r1_meet_public_import_assert.sql); these text-level checks keep the file
  * dark, additive, independent of 0143, keep the lifted claim_ashby_profile_due,
- * v_ashby_application_impact and v_funnel_candidate equal to their 0130, 0140 and 0122
- * declarations plus exactly one marked hunk each, keep the local lookup RPC in step with the S04
+ * v_ashby_application_impact, v_funnel_candidate and v_funnel_intake equal to their 0130, 0140,
+ * 0122 and 0090 declarations plus exactly one marked hunk each, keep the local lookup RPC in step with the S04
  * store that reads it, keep the import RPC's order, writes and answers to the contract (link
  * first, then the shell; never an ingestion, an engagement or any other row; one R1 per Ashby
  * person), and keep the book path's person check in step with its store (person-store.ts).
@@ -183,6 +183,14 @@ const FUNNEL_0122 = slice(M0122, FUNNEL_START, FUNNEL_END);
 const FUNNEL_0144 = slice(sql, FUNNEL_START, FUNNEL_END);
 const FUNNEL = stripHunks(FUNNEL_0144);
 
+/** §8b: the parse-stage funnel view as 0090 and 0144 declare it (from its header through its last branch). */
+const M0090 = lf(readFileSync(path.join(migrations, '0090_funnel_observability.sql'), 'utf8'));
+const INTAKE_START = 'create or replace view screening_v2.v_funnel_intake';
+const INTAKE_END = '\n  from screening_v2.resume_intake_failures f;\n';
+const INTAKE_0090 = slice(M0090, INTAKE_START, INTAKE_END);
+const INTAKE_0144 = slice(sql, INTAKE_START, INTAKE_END);
+const INTAKE = stripHunks(INTAKE_0144);
+
 /** §6, §7 and §9: the three RPCs, as written and as executable text. */
 const LOCAL_ROWS_RAW = bodyIn(sql, R1_PUBLIC_LOCAL_ROWS_RPC);
 const LOCAL_ROWS = flat(LOCAL_ROWS_RAW);
@@ -313,7 +321,8 @@ describe('migration 0144: file and frame', () => {
     expect(header).toContain('R1_MEET_PUBLIC_BOOKING_ENABLED (default OFF');
     expect(header).toContain(
       'Redeclares (lifted in full, ONE marked hunk each): claim_ashby_profile_due (0130 §6), ' +
-        'v_ashby_application_impact (0140 §2), v_funnel_candidate (0122 §8). References no 0143 object.',
+        'v_ashby_application_impact (0140 §2), v_funnel_candidate (0122 §8), v_funnel_intake (0090 §5). ' +
+        'References no 0143 object.',
     );
   });
 
@@ -336,7 +345,10 @@ describe('migration 0144: file and frame', () => {
   });
 
   it('keeps its sections in order, each between two dash rules', () => {
-    const markers = ['-- §1. ', '-- §2. ', '-- §3. ', '-- §4. ', '-- §5. ', '-- §6. ', '-- §7. ', '-- §8. ', '-- §9. ', '-- §90. '];
+    const markers = [
+      '-- §1. ', '-- §2. ', '-- §3. ', '-- §4. ', '-- §5. ', '-- §6. ', '-- §7. ', '-- §8. ', '-- §8b. ', '-- §9. ',
+      '-- §90. ',
+    ];
     const lines = sql.split('\n');
     let last = -1;
     for (const marker of markers) {
@@ -444,10 +456,10 @@ describe('migration 0144 §4: claim_ashby_profile_due is the 0130 claim plus one
   it('has exactly one hunk, M035-S12-a, whose code is the intake filter', () => {
     expect(CLAIM.tags).toEqual(['M035-S12-a']);
     expect(withoutComments(CLAIM.hunks['M035-S12-a']!).trim()).toBe("and l.intake_type <> 'r1_public_booking'");
-    // The file holds exactly three hunks: this one (§4), the impact view's (§5) and the funnel view's (§8).
-    expect(stripHunks(sql).tags).toEqual(['M035-S12-a', 'M035-S12-b', 'M035-S12-c']);
-    expect(sql.split('▼ 0144')).toHaveLength(4);
-    expect(sql.split('▲ 0144')).toHaveLength(4);
+    // The file holds exactly four hunks: this one (§4), the impact view's (§5) and the two funnel views' (§8, §8b).
+    expect(stripHunks(sql).tags).toEqual(['M035-S12-a', 'M035-S12-b', 'M035-S12-c', 'M035-S12-d']);
+    expect(sql.split('▼ 0144')).toHaveLength(5);
+    expect(sql.split('▲ 0144')).toHaveLength(5);
   });
 
   it('places the hunk right after the lifecycle filter, inside the due CTE', () => {
@@ -892,6 +904,84 @@ describe('migration 0144 §8: v_funnel_candidate is the 0122 view plus one marke
     expect(sql).not.toContain('create or replace view screening_v2.v_funnel_hr_state');
     const m0098 = lf(readFileSync(path.join(migrations, '0098_funnel_hr_disposition.sql'), 'utf8'));
     expect(flat(bodyIn(m0098, 'refresh_funnel_rollup'))).toContain('from screening_v2.v_funnel_candidate where cohort_day >= v_window_start');
+  });
+});
+
+describe('migration 0144 §8b: v_funnel_intake is the 0090 view plus one marked hunk (S12 fix round 2, F1)', () => {
+  const HUNK =
+    "where not (exists (select 1 from screening_v2.ashby_application_links pb where pb.candidate_id = c.id and " +
+    "pb.intake_type = 'r1_public_booking') and not exists (select 1 from screening_v2.ashby_application_links ol " +
+    "where ol.candidate_id = c.id and ol.intake_type <> 'r1_public_booking'))";
+
+  it('is byte-identical to the 0090 view once the hunk is removed', () => {
+    expect(INTAKE.residue).toBe(INTAKE_0090);
+  });
+
+  it('has exactly one hunk, M035-S12-d, with the very predicate of the candidate view (§8)', () => {
+    expect(INTAKE.tags).toEqual(['M035-S12-d']);
+    expect(flat(INTAKE.hunks['M035-S12-d']!)).toBe(HUNK);
+    // One predicate for both views: for any day and role, parsed_ok and candidates_total leave out the same rows.
+    expect(flat(INTAKE.hunks['M035-S12-d']!)).toBe(flat(FUNNEL.hunks['M035-S12-c']!));
+  });
+
+  it("gives the first ('candidate') branch its WHERE, right after its FROM, and touches no other branch", () => {
+    const lines = INTAKE_0144.split('\n');
+    const open = lines.findIndex((line) => line.includes('-- ▼ 0144 M035-S12-d'));
+    expect(lines[open - 1]).toBe('  from screening_v2.candidates c');
+    const close = lines.findIndex((line) => line.includes('-- ▲ 0144 M035-S12-d'));
+    expect(lines[close + 1]).toBe('  union all');
+    // The 0090 candidate branch had no WHERE; the hunk sits before the first union.
+    const first = INTAKE_0090.slice(0, INTAKE_0090.indexOf('  union all\n'));
+    expect(first).not.toMatch(/\bwhere\b/);
+    expect(INTAKE_0144.indexOf('▲ 0144')).toBeLessThan(INTAKE_0144.indexOf('  union all\n'));
+    // Both later branches are the 0090 text, byte for byte.
+    expect(INTAKE_0144.slice(INTAKE_0144.indexOf('  union all\n'))).toBe(
+      INTAKE_0090.slice(INTAKE_0090.indexOf('  union all\n')),
+    );
+  });
+
+  it('still runs as its caller', () => {
+    expect(INTAKE_0144.startsWith(`${INTAKE_START}\n  with (security_invoker = true) as\n`)).toBe(true);
+  });
+
+  it('keeps the 0090 revoke and grant lines verbatim, once, after the view and its comment', () => {
+    const grants = slice(M0090, 'revoke all on screening_v2.v_funnel_intake from', 'to service_role;\n');
+    expect(grants.split('\n')).toHaveLength(3);
+    expect(sql.split(grants)).toHaveLength(2);
+    const comment = sql.indexOf('comment on view screening_v2.v_funnel_intake is');
+    expect(comment).toBeGreaterThan(sql.indexOf(INTAKE_0144));
+    expect(sql.indexOf(grants)).toBeGreaterThan(comment);
+  });
+
+  it('keeps the 0090 comment and appends the 0144 sentence', () => {
+    const anchor = 'comment on view screening_v2.v_funnel_intake is\n';
+    expect(commentText(sql, anchor)).toBe(
+      `${commentText(M0090, anchor)} 0144 (M035 S12): a candidate the public R1 booking page imported ` +
+        '(its only Ashby links are r1_public_booking) is not a parsed intake and is left out.',
+    );
+  });
+
+  it('up to 0144 only 0090 and 0144 declare the view, so 0144 is the declaration a later change lifts from', () => {
+    const declaring = readdirSync(migrations)
+      .filter((name) => /^\d{4}_.*\.sql$/.test(name) && name <= FILE)
+      .sort()
+      .filter((name) => lf(readFileSync(path.join(migrations, name), 'utf8')).includes(INTAKE_START));
+    expect(declaring).toEqual(['0090_funnel_observability.sql', FILE]);
+  });
+
+  it("the rollup's parse-stage counts read this view by name (refresh_funnel_rollup is not redeclared after 0098)", () => {
+    const m0098 = lf(readFileSync(path.join(migrations, '0098_funnel_hr_disposition.sql'), 'utf8'));
+    const rollup = flat(bodyIn(m0098, 'refresh_funnel_rollup'));
+    expect(rollup).toContain("count(*) filter (where outcome = 'parsed') as parsed_ok");
+    expect(rollup).toContain('from screening_v2.v_funnel_intake where (occurred_at)::date >= v_window_start');
+    const redeclaring = readdirSync(migrations)
+      .filter((name) => /^\d{4}_.*\.sql$/.test(name) && name > '0098_funnel_hr_disposition.sql' && name <= FILE)
+      .filter((name) =>
+        lf(readFileSync(path.join(migrations, name), 'utf8')).includes(
+          'create or replace function screening_v2.refresh_funnel_rollup(',
+        ),
+      );
+    expect(redeclaring).toEqual([]);
   });
 });
 

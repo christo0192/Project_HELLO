@@ -13,8 +13,8 @@
 --     column comment), the six 0144 functions (signature, security definer, the pinned
 --     search_path, language, volatility, return type, no EXECUTE for anon, authenticated or
 --     PUBLIC, service_role on the two RPCs and the claim), the three triggers (enabled, BEFORE,
---     row level, the right table and event, the WHEN clause of the lock only) and the view's
---     security_invoker option.
+--     row level, the right table and event, the WHEN clause of the lock only) and the three
+--     lifted views' security_invoker option (the two funnel views also their comment and grants).
 --   B the intake lock: an r1_public_booking link never changes its intake and no link becomes one;
 --     the 0130 stamp resume_parsing -> phone_parsing and every other column still update.
 --   C the two insert guards (the exact closed messages), also reached through
@@ -34,8 +34,9 @@
 --     adoption, the holds over the Ashby person and their precedence, one R1 per Ashby person
 --     (S12 fix round F3), the mapping, and the privileges (anon / authenticated refused,
 --     service_role runs both RPCs).
---   H the Christy phone funnel (v_funnel_candidate, and the funnel_stage_daily rollup built from
---     it) leaves an import out and keeps every other candidate (S12 fix round F1).
+--   H the Christy phone funnel leaves an import out and keeps every other candidate (S12 fix
+--     round F1 and its round 2): v_funnel_candidate, v_funnel_intake (the parse stage), and the
+--     funnel_stage_daily rollup built from them (candidates_total, entered_parse, parsed_ok).
 --   I r1_meet_public_person_r1_check: the book path's one-R1-per-person lookup (S12 fix round
 --     F3): every invalid input, application_unknown, r1_completed only for the person's OTHER
 --     candidates, the exact answers, no write, and the privileges.
@@ -546,6 +547,18 @@ begin
     has_table_privilege('service_role', 'screening_v2.v_funnel_candidate', 'select')
     and not has_table_privilege('anon', 'screening_v2.v_funnel_candidate', 'select')
     and not has_table_privilege('authenticated', 'screening_v2.v_funnel_candidate', 'select'));
+  perform _r1_mpi_tests.assert('A v_funnel_intake still runs as its caller (security_invoker)',
+    (select c.reloptions from pg_class c
+      where c.oid = 'screening_v2.v_funnel_intake'::regclass) @> array['security_invoker=true']);
+  perform _r1_mpi_tests.assert('A the parse-stage view comment keeps the 0090 text and names the 0144 change',
+    position('Resume-parser intake events' in
+             obj_description('screening_v2.v_funnel_intake'::regclass, 'pg_class')) = 1
+    and position('0144 (M035 S12)' in
+                 obj_description('screening_v2.v_funnel_intake'::regclass, 'pg_class')) > 0);
+  perform _r1_mpi_tests.assert('A the parse-stage view is still service-role only',
+    has_table_privilege('service_role', 'screening_v2.v_funnel_intake', 'select')
+    and not has_table_privilege('anon', 'screening_v2.v_funnel_intake', 'select')
+    and not has_table_privilege('authenticated', 'screening_v2.v_funnel_intake', 'select'));
 end;
 $$;
 
@@ -1593,11 +1606,12 @@ end;
 $$;
 
 -- =================================================================================================
--- H. The Christy phone funnel leaves an on-the-spot import out (S12 fix round F1).
+-- H. The Christy phone funnel leaves an on-the-spot import out (S12 fix round F1 and round 2).
 -- =================================================================================================
--- v_funnel_candidate has one row per candidate; without the 0144 hunk every import would join its
--- mapped role's funnel as parsed, missing_phone and not_dialed, and the funnel_stage_daily rollup
--- (refresh_funnel_rollup, 0098) would count it. Every import of sections E, G and H is created at
+-- v_funnel_candidate and v_funnel_intake's 'candidate' branch have one row per candidate; without
+-- the 0144 hunks every import would join its mapped role's funnel as parsed, missing_phone and
+-- not_dialed, and the funnel_stage_daily rollup (refresh_funnel_rollup, 0098) would count it in
+-- candidates_total, entered_parse and parsed_ok. Every import of sections E, G and H is created at
 -- the pinned clock on role 1, so the rollup's (2026-12-01, role 1) grain holds many of them.
 do $$
 declare
@@ -1614,6 +1628,10 @@ declare
   v_view bigint;
   v_all bigint;
   v_rolled bigint;
+  v_intake bigint;
+  v_only_day bigint;
+  v_entered_rolled bigint;
+  v_parsed_rolled bigint;
 begin
   -- An import WITH a dialable Ashby number: still not a Christy funnel candidate.
   v := _r1_mpi_tests.import_app(320, 'mpi-job-1', _r1_mpi_tests.name(320), _r1_mpi_tests.email(320),
@@ -1661,11 +1679,45 @@ begin
     and (select count(*) from screening_v2.v_funnel_candidate)
       = (select count(distinct f.candidate_id) from screening_v2.v_funnel_candidate f));
 
-  -- The stored rollup is built from the view, so the imports are left out of it too.
+  -- The parse stage (v_funnel_intake, 0144 §8b; S12 fix round 2): its 'candidate' branch has one
+  -- 'parsed' row per candidates row, so without the hunk every import would be an "Entered parser"
+  -- and "Parsed OK" row for its role. The control candidates stay parsed intakes.
+  perform _r1_mpi_tests.assert('H the import is not a parsed intake in v_funnel_intake',
+    not exists (select 1 from screening_v2.v_funnel_intake i
+                 where i.entity_kind = 'candidate' and i.entity_id = v_shell::text));
+  perform _r1_mpi_tests.assert('H the resume, phone-parsing, mixed and link-less candidates are parsed intakes',
+    (select count(*) from screening_v2.v_funnel_intake i
+      where i.entity_kind = 'candidate' and i.outcome = 'parsed'
+        and i.entity_id in (v_rp::text, v_pp::text, v_mixed::text, v_bare::text)) = 4);
+  perform _r1_mpi_tests.assert('H no import-only candidate is a parsed intake, and every other candidate is one',
+    not exists (select 1 from screening_v2.v_funnel_intake i
+                 where i.entity_kind = 'candidate'
+                   and exists (select 1 from screening_v2.ashby_application_links l
+                                where l.candidate_id::text = i.entity_id and l.intake_type = 'r1_public_booking')
+                   and not exists (select 1 from screening_v2.ashby_application_links l
+                                    where l.candidate_id::text = i.entity_id and l.intake_type <> 'r1_public_booking'))
+    and (select count(*) from screening_v2.v_funnel_intake i where i.entity_kind = 'candidate')
+      = (select count(*) from screening_v2.candidates) - v_only
+    and (select count(*) from screening_v2.v_funnel_intake i where i.entity_kind = 'candidate')
+      = (select count(distinct i.entity_id) from screening_v2.v_funnel_intake i where i.entity_kind = 'candidate'));
+
+  -- The stored rollup is built from the two views, so the imports are left out of it too: of the
+  -- dial-and-after counts (candidates_total, from v_funnel_candidate) and of the parse-stage counts
+  -- (entered_parse and parsed_ok, from v_funnel_intake). One predicate in both views, so for the
+  -- imports' day and role parsed_ok equals candidates_total; before the fix it was candidates_total
+  -- plus the imports.
+  -- The four controls join the imports' day (cand() stamps now()), so the day and role holds
+  -- candidates the rollup must count next to the imports it must not.
+  update screening_v2.candidates set created_at = k_t0 where id in (v_rp, v_pp, v_mixed, v_bare);
   v := screening_v2.refresh_funnel_rollup(k_t0, 30);
   perform _r1_mpi_tests.assert('H refresh_funnel_rollup runs', v ->> 'status' = 'ok', v::text);
   select count(*) into v_view from screening_v2.v_funnel_candidate f
    where f.cohort_day = (k_t0)::date and f.role_id = k_role;
+  perform _r1_mpi_tests.assert('H the four controls are in the imports'' day and role cohort',
+    (select count(*) from screening_v2.v_funnel_candidate f
+      where f.cohort_day = (k_t0)::date and f.role_id = k_role
+        and f.candidate_id in (v_rp, v_pp, v_mixed, v_bare)) = 4
+    and v_view >= 4, 'view ' || v_view);
   select count(*) into v_all from screening_v2.candidates c
    where (c.created_at)::date = (k_t0)::date and c.role_id = k_role;
   select coalesce((select d.candidates_total from screening_v2.funnel_stage_daily d
@@ -1673,6 +1725,32 @@ begin
   perform _r1_mpi_tests.assert('H the rollup''s candidates_total for the imports'' day and role counts no import',
     v_rolled = v_view and v_all > v_view,
     'rolled ' || v_rolled || ', view ' || v_view || ', all ' || v_all);
+  select count(*) into v_intake from screening_v2.v_funnel_intake i
+   where (i.occurred_at)::date = (k_t0)::date and i.role_id = k_role;
+  select count(*) into v_only_day
+    from screening_v2.candidates c
+   where (c.created_at)::date = (k_t0)::date and c.role_id = k_role
+     and exists (select 1 from screening_v2.ashby_application_links l
+                  where l.candidate_id = c.id and l.intake_type = 'r1_public_booking')
+     and not exists (select 1 from screening_v2.ashby_application_links l
+                      where l.candidate_id = c.id and l.intake_type <> 'r1_public_booking');
+  select coalesce((select d.entered_parse from screening_v2.funnel_stage_daily d
+                    where d.cohort_day = (k_t0)::date and d.role_id = k_role), 0),
+         coalesce((select d.parsed_ok from screening_v2.funnel_stage_daily d
+                    where d.cohort_day = (k_t0)::date and d.role_id = k_role), 0)
+    into v_entered_rolled, v_parsed_rolled;
+  perform _r1_mpi_tests.assert('H imports exist on that day and role (the next checks are not vacuous)',
+    v_only_day >= 1 and v_all - v_only_day = v_view, 'imports ' || v_only_day);
+  perform _r1_mpi_tests.assert('H the rollup''s parsed_ok for the imports'' day and role counts no import',
+    v_parsed_rolled = v_rolled and v_parsed_rolled = v_all - v_only_day and v_parsed_rolled >= 4,
+    'parsed_ok ' || v_parsed_rolled || ', candidates_total ' || v_rolled || ', all ' || v_all
+      || ', imports ' || v_only_day);
+  perform _r1_mpi_tests.assert('H the rollup''s entered_parse for the imports'' day and role counts no import',
+    v_entered_rolled = v_intake and v_entered_rolled >= v_parsed_rolled
+    and v_entered_rolled - v_parsed_rolled
+      = (select count(*) from screening_v2.v_funnel_intake i
+          where (i.occurred_at)::date = (k_t0)::date and i.role_id = k_role and i.outcome <> 'parsed'),
+    'entered_parse ' || v_entered_rolled || ', view ' || v_intake || ', parsed_ok ' || v_parsed_rolled);
 end;
 $$;
 

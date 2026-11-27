@@ -10,8 +10,8 @@
 # leaving an import out, the read-only r1_meet_public_local_rows lookup, and the
 # r1_meet_public_import_application RPC (validation, holds over the Ashby person, adoption of an
 # existing link, one R1 per Ashby person, the mapping, the exact link and shell it writes, nothing
-# else written, and the privilege posture), v_funnel_candidate and the funnel rollup leaving an
-# import out, and the book path's r1_meet_public_person_r1_check lookup. The whole file runs in
+# else written, and the privilege posture), v_funnel_candidate, v_funnel_intake and the funnel
+# rollup leaving an import out, and the book path's r1_meet_public_person_r1_check lookup. The whole file runs in
 # one transaction and is rolled back.
 set -euo pipefail
 cd "$(dirname "$0")/.."

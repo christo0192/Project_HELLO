@@ -23,13 +23,16 @@
 --   §7 r1_meet_public_import_application: the on-the-spot import, link first, then the shell; the
 --      only writer of r1_public_booking. A person who has done R1 is never imported.
 --   §8 v_funnel_candidate leaves a candidate the public booking page imported out of the Christy
---      phone funnel (and so out of the funnel_stage_daily rollup).
+--      phone funnel (and so out of the funnel_stage_daily rollup's dial-and-after counts).
+--   §8b v_funnel_intake leaves the same candidates out of the parse stage (and so out of the
+--      rollup's entered_parse and parsed_ok).
 --   §9 r1_meet_public_person_r1_check: the public page's book-path lookup, one R1 per Ashby person.
 --   §90 privileges (the RPCs are service-role only; no client role may execute a trigger function)
 --      and comments.
 --
 -- Redeclares (lifted in full, ONE marked hunk each): claim_ashby_profile_due (0130 §6),
--- v_ashby_application_impact (0140 §2), v_funnel_candidate (0122 §8). References no 0143 object.
+-- v_ashby_application_impact (0140 §2), v_funnel_candidate (0122 §8), v_funnel_intake (0090 §5).
+-- References no 0143 object.
 --
 -- PII-minimal: the fences store nothing and their messages carry no id and no value.
 --
@@ -900,9 +903,10 @@ $$;
 -- candidate per application). A candidate with no link at all (a recruiter upload) stays.
 -- idx_ashby_application_links_candidate (0029) serves both probes. v_funnel_hr_state is not
 -- lifted: its hr_state is null without a non-R1 assessment, which an import never has, and the
--- rollup left-joins it to this view, so an import adds nothing there either. The output columns
--- are unchanged, so `create or replace view` keeps every dependent valid. The 0122 grants follow
--- verbatim, and the 0122 comment with one sentence more.
+-- rollup left-joins it to this view, so an import adds nothing there either. The rollup's third
+-- source, v_funnel_intake (its parse-stage counts), gets the same predicate in §8b. The output
+-- columns are unchanged, so `create or replace view` keeps every dependent valid. The 0122 grants
+-- follow verbatim, and the 0122 comment with one sentence more.
 create or replace view screening_v2.v_funnel_candidate
   with (security_invoker = true) as
   with att as (
@@ -1087,6 +1091,73 @@ comment on view screening_v2.v_funnel_candidate is
 
 revoke all on screening_v2.v_funnel_candidate from anon, authenticated, public;
 grant select on screening_v2.v_funnel_candidate to service_role;
+
+-- ---------------------------------------------------------------------------------------------
+-- §8b. v_funnel_intake leaves public booking imports out of the parse stage.
+-- ---------------------------------------------------------------------------------------------
+-- Lifted in full from 0090 §5 (its only declaration) by script, byte-identical except ONE marked
+-- hunk (M035-S12-d) that gives the view's first ('candidate') branch a WHERE. That branch has one
+-- 'parsed' row per candidates row, and refresh_funnel_rollup (0098) counts it into
+-- funnel_stage_daily.entered_parse and parsed_ok, which Mission Control's Christy funnel shows as
+-- "Entered parser" and "Parsed OK" and lib/funnel/summary.ts divides into parse_to_dial. An
+-- on-the-spot import is a shell, not a parsed resume, so without the hunk every import would
+-- raise both counts for its mapped role and lower parse_to_dial. The hunk's predicate is §8's
+-- (M035-S12-c) verbatim, so for any day and role parsed_ok and candidates_total leave out the
+-- same candidates. The other two branches need no hunk: an import never has an Ashby ingestion
+-- (§3) and is never a recruiter upload failure. The output columns are unchanged, so `create or
+-- replace view` keeps every dependent valid. The 0090 grants follow verbatim, and the 0090 comment
+-- with one sentence more.
+create or replace view screening_v2.v_funnel_intake
+  with (security_invoker = true) as
+  select
+    c.id::text                    as entity_id,
+    'candidate'::text             as entity_kind,
+    c.created_at                  as occurred_at,
+    c.role_id                     as role_id,
+    'parsed'::text                as outcome,
+    null::text                    as failed_reason,
+    (c.phone_valid is not true)   as missing_phone
+  from screening_v2.candidates c
+  -- ▼ 0144 M035-S12-d a candidate the public booking page imported is not a parsed intake
+  where not (exists (select 1 from screening_v2.ashby_application_links pb
+                      where pb.candidate_id = c.id and pb.intake_type = 'r1_public_booking')
+             and not exists (select 1 from screening_v2.ashby_application_links ol
+                              where ol.candidate_id = c.id and ol.intake_type <> 'r1_public_booking'))
+  -- ▲ 0144 M035-S12-d a candidate the public booking page imported is not a parsed intake
+  union all
+  select
+    i.id::text,
+    'ashby_ingestion'::text,
+    i.updated_at,
+    jm.role_id,
+    'needs_review'::text,
+    case when i.failed_reason ~ '^[a-z0-9_.:-]{1,64}$' then i.failed_reason else 'other' end,
+    null::boolean
+  from screening_v2.ashby_resume_ingestions i
+  join screening_v2.ashby_application_links l on l.id = i.application_link_id
+  left join screening_v2.ashby_job_mappings jm on jm.id = l.job_mapping_id
+  where i.state = 'failed_review'
+  union all
+  select
+    f.id::text,
+    'recruiter_upload'::text,
+    f.occurred_at,
+    f.role_id,
+    'failed'::text,
+    f.failed_reason,
+    null::boolean
+  from screening_v2.resume_intake_failures f;
+
+comment on view screening_v2.v_funnel_intake is
+  'Resume-parser intake events: parsed candidates (outcome=parsed), Ashby '
+  'ingestions in failed_review (outcome=needs_review, with the sanitized '
+  'failed_reason bucket), and recruiter sync-upload failures (outcome=failed). '
+  'Ready ingestions are represented by their candidate row, never here.'
+  ' 0144 (M035 S12): a candidate the public R1 booking page imported (its only Ashby links are '
+  'r1_public_booking) is not a parsed intake and is left out.';
+
+revoke all on screening_v2.v_funnel_intake from anon, authenticated, public;
+grant select on screening_v2.v_funnel_intake to service_role;
 
 -- ---------------------------------------------------------------------------------------------
 -- §9. r1_meet_public_person_r1_check: one R1 per Ashby person on the book path.

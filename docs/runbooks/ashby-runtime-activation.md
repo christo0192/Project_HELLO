@@ -1222,8 +1222,10 @@ any change). Nothing here runs while the flag is off.
 **What HR sees.**
 
 - The candidate is in the role's candidate list as `queued`, with no phone
-  screening and no intake label. They are not counted in the Christy phone funnel
-  (0144 §8) or in the business-impact figures (0144 §5).
+  screening and no intake label. They are not counted anywhere in the Christy phone
+  funnel: not as "Entered parser" or "Parsed OK" (0144 §8b), not as "Awaiting first
+  dial" or any later stage (0144 §8). They are not in the business-impact figures
+  either (0144 §5).
 - If HR moves the application into the AI-screening stage in Ashby, Christy does not
   start. Each stage webhook or reconciliation that reaches it writes one warning,
   `ashby_import_skipped` / `r1_public_booking`, and nothing else.
