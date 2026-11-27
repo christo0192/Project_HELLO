@@ -843,3 +843,113 @@ describe('migration 0144: additive and dark', () => {
     }
   });
 });
+
+describe('migration 0144: SQL test wiring (T3)', () => {
+  const repo = path.resolve(here, '../../../..');
+  const read = (rel: string): string => lf(readFileSync(path.join(repo, rel), 'utf8'));
+  const SCRIPT = 'scripts/test-r1-meet-public-import.sh';
+  const ASSERT_FILE = 'app/supabase/tests/r1_meet_public_import_assert.sql';
+  const assertions = read(ASSERT_FILE);
+  /** The assert file with whole-line comments removed. */
+  const statements = assertions.replace(/^\s*--.*$/gm, '').trim();
+
+  it('the helper runs the assert file with ON_ERROR_STOP=1 under its own log prefix', () => {
+    const script = read(SCRIPT);
+    expect(script.startsWith('#!/usr/bin/env bash\n')).toBe(true);
+    expect(script).toContain('set -euo pipefail');
+    expect(script).toContain('migration 0144, M035 S12');
+    expect(script).toContain('psql -U postgres -d postgres -q -v ON_ERROR_STOP=1');
+    expect(script).toContain('< "$TESTS/r1_meet_public_import_assert.sql"');
+    expect(script).toContain("log() { printf '[r1-meet-public-import] %s %s\\n'");
+  });
+
+  it('supabase-test.sh runs it once, after the 0142 suite and before the TST-15 rehearsal, and fails the run on failure', () => {
+    const suite = read('scripts/supabase-test.sh');
+    const call =
+      'env SUPABASE_DB_CONTAINER="$SUPABASE_DB_CONTAINER" bash scripts/test-r1-meet-public-import.sh 2>&1 | tee -a "$RESULTS_FILE"';
+    expect(suite.split('bash scripts/test-r1-meet-public-import.sh')).toHaveLength(2);
+    expect(suite).toContain(`${call}\nif [ "\${PIPESTATUS[0]}" -ne 0 ]; then\n  log 'ERROR: 0144 R1 Meet public import assertions FAILED.'\n  exit 1\nfi\n`);
+    expect(suite.indexOf(call)).toBeGreaterThan(suite.indexOf('bash scripts/test-r1-meet.sh'));
+    expect(suite.indexOf(call)).toBeLessThan(suite.indexOf('TST-15 rollback rehearsal'));
+  });
+
+  it('supabase-ci.yml names the helper in both path filters, each after the 0142 helper', () => {
+    const ci = read('.github/workflows/supabase-ci.yml');
+    const ours = [...ci.matchAll(/^ +- 'scripts\/test-r1-meet-public-import\.sh'$/gm)].map((m) => m.index!);
+    const meet = [...ci.matchAll(/^ +- 'scripts\/test-r1-meet\.sh'$/gm)].map((m) => m.index!);
+    expect(ours).toHaveLength(2);
+    expect(meet).toHaveLength(2);
+    expect(meet[0]!).toBeLessThan(ours[0]!);
+    expect(ours[0]!).toBeLessThan(meet[1]!);
+    expect(meet[1]!).toBeLessThan(ours[1]!);
+  });
+
+  it('runs in one rolled-back transaction, deletes nothing, and keeps fixtures in the 7f144000 namespace', () => {
+    expect(statements.startsWith('begin;')).toBe(true);
+    expect(statements.endsWith('rollback;')).toBe(true);
+    expect(assertions.trimEnd().split('\n').at(-1)).toBe('rollback;');
+    expect(statements).not.toMatch(/\bcommit;/i);
+    expect(statements).not.toMatch(/\bdelete from\b|\btruncate\b/i);
+    expect(assertions).toContain("'7f144000-0000-4000-8000-' || lpad(p_kind::text, 4, '0') || lpad(p_n::text, 8, '0')");
+    const ids = [...assertions.matchAll(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-/gi)].map((m) => m[0]);
+    expect(ids.length).toBeGreaterThan(0);
+    for (const id of ids) expect(id.startsWith('7f144000-'), id).toBe(true);
+  });
+
+  it('holds no secret-shaped or contact-shaped literal (gitleaks rules; numbers are built at run time)', () => {
+    expect(assertions).not.toMatch(/[0-9a-f]{40,}/i);
+    expect(assertions).not.toMatch(/whsec_/i);
+    expect(assertions).not.toMatch(/\bkey\s*=\s*'/i);
+    expect(assertions).not.toMatch(/'\+91[0-9]{10}'/);
+    for (const m of assertions.matchAll(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]+/gi)) {
+      expect(m[0].toLowerCase().endsWith('@example.test'), m[0]).toBe(true);
+    }
+  });
+
+  it('switches a guard off only for its own fixture rows, and back on', () => {
+    for (const guard of GUARDS.slice(1)) {
+      const table = guard.table;
+      const off = statements.split(`alter table ${table} disable trigger ${guard.trigger};`);
+      const on = statements.split(`alter table ${table} enable trigger ${guard.trigger};`);
+      expect(off, guard.trigger).toHaveLength(2);
+      expect(on, guard.trigger).toHaveLength(2);
+      expect(statements.indexOf(`disable trigger ${guard.trigger};`)).toBeLessThan(
+        statements.indexOf(`enable trigger ${guard.trigger};`),
+      );
+    }
+    expect(statements).not.toMatch(/disable trigger (?!trg_ashby_resume_ingestions_r1_public_booking;|trg_phone_engagements_r1_public_booking;)/);
+    expect(statements).not.toMatch(/session_replication_role/);
+  });
+
+  it('exercises every 0144 object, the three writers it fences, every closed message, field, code and row key', () => {
+    for (const name of [
+      'claim_ashby_profile_due',
+      'v_ashby_application_impact',
+      'impact_application_rows',
+      R1_PUBLIC_LOCAL_ROWS_RPC,
+      IMPORT_RPC,
+      'advance_ashby_ingestion',
+      'apply_ashby_candidate_profile',
+      'ensure_ashby_phone_engagement',
+      ...GUARDS.map((g) => g.fn),
+      ...GUARDS.map((g) => g.trigger),
+    ]) {
+      expect(statements, name).toContain(name);
+    }
+    for (const guard of GUARDS) expect(assertions, guard.fn).toContain(`'${guard.message}'`);
+    for (const field of IMPORT_FIELDS) expect(statements, field).toContain(`('${field}', '`);
+    for (const code of IMPORT_CODES) expect(statements, code).toContain(`"code":"${code}"`);
+    for (const key of R1_PUBLIC_LOCAL_ROW_COLUMNS) expect(statements, key).toContain(`'${key}'`);
+    for (const value of INTAKE_VALUES) expect(statements, value).toContain(`'${value}'`);
+  });
+
+  it('keeps sections A to G in order', () => {
+    let at = -1;
+    for (const label of ['A. Catalog posture.', 'B. The intake lock', 'C. The two insert guards', 'D. claim_ashby_profile_due',
+      'E. The business-impact read model', 'F. r1_meet_public_local_rows', 'G. r1_meet_public_import_application']) {
+      const next = assertions.indexOf(`\n-- ${label}`);
+      expect(next, label).toBeGreaterThan(at);
+      at = next;
+    }
+  });
+});
