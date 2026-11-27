@@ -1782,6 +1782,7 @@ describe('migration 0143: wiring and the SQL suite', () => {
       'T3-D the same Ashby person held under another local candidate',
       "T3-D race: the re-linkable round cancelled under r1_send_round''s settings lock, a completed R1: r1_completed",
       'T3-D race ... the new round, its hold and its month row are undone: nothing written',
+      'T3-D race ... and without the race the same submit re-links the round',
       'T3-E a consent with a field the shape does not name',
       'T3-E a 257-character user_agent',
       'T3-E an expiry one second past now + 14 days',
@@ -1912,6 +1913,86 @@ describe('migration 0143: wiring and the SQL suite', () => {
     // The retry is proved with a test-only trigger that is dropped again.
     expect(suite).toContain('create trigger t4_bump_round before update of status on screening_v2.r1_meet_bookings');
     expect(suite).toContain('drop trigger t4_bump_round on screening_v2.r1_meet_bookings;');
+  });
+
+  it('never reads a table in the statement that made the write it checks (a stale snapshot passes or fails vacuously)', () => {
+    // One SQL statement runs on one snapshot, taken before any function it calls, so an inline
+    // `(select ... from screening_v2.x)` cannot see what a writing RPC called by that same
+    // statement wrote (PR #450, supabase-check: the T3-D re-link assert read NULL and failed). The
+    // units scanned: every `perform _r1_meet_public_tests.assert(` statement, and every SQL text
+    // run as one statement (a string literal starting with select or with; adjacent literals split
+    // only by a newline are one literal). Comments are skipped, `''` is an escaped quote.
+    const writer = new RegExp(
+      '(?:_r1_meet_public_tests\\.(?:create|move|cancel|reconsent|t4_book)\\('
+      + '|screening_v2\\.r1_(?:meet_create_round_from_public|meet_public_(?:move_booking|cancel_booking|reconsent'
+      + '|set_manage_digest|set_calendar_state|throttle_hit|throttle_prune)|meet_transition_booking'
+      + '|meet_cancel_booking|transition_round|send_round)\\()',
+    );
+    const reads = /\bfrom screening_v2\./;
+    const units: Array<{ at: number; sql: string }> = [];
+    const literals: Array<{ at: number; end: number; sql: string }> = [];
+    for (let i = 0; i < suite.length;) {
+      if (suite.startsWith('--', i)) {
+        const nl = suite.indexOf('\n', i);
+        i = nl < 0 ? suite.length : nl;
+        continue;
+      }
+      if (suite[i] === "'") {
+        let j = i + 1;
+        let s = '';
+        for (;;) {
+          expect(j, `unterminated literal at ${i}`).toBeLessThan(suite.length);
+          if (suite[j] === "'" && suite[j + 1] === "'") {
+            s += "'";
+            j += 2;
+            continue;
+          }
+          if (suite[j] === "'") break;
+          s += suite.charAt(j);
+          j += 1;
+        }
+        const prev = literals.at(-1);
+        if (prev && /^\s*\n\s*$/.test(suite.slice(prev.end, i))) {
+          prev.sql += s;
+          prev.end = j + 1;
+        } else {
+          literals.push({ at: i, end: j + 1, sql: s });
+        }
+        i = j + 1;
+        continue;
+      }
+      i += 1;
+    }
+    for (const l of literals) {
+      if (/^\s*(?:select|with)\b/i.test(l.sql)) units.push({ at: l.at, sql: l.sql });
+    }
+    let asserts = 0;
+    for (let i = 0; ;) {
+      const at = suite.indexOf('perform _r1_meet_public_tests.assert(', i);
+      if (at < 0) break;
+      const end = suite.indexOf(');\n', at);
+      expect(end, `unterminated assert at ${at}`).toBeGreaterThan(at);
+      units.push({ at, sql: suite.slice(at, end + 2) });
+      asserts += 1;
+      i = end + 1;
+    }
+    expect(asserts).toBeGreaterThan(400);
+    const lineOf = (at: number): number => suite.slice(0, at).split('\n').length;
+    const offenders = units
+      .filter((u) => writer.test(u.sql) && reads.test(u.sql))
+      .map((u) => `line ${lineOf(u.at)}: ${u.sql.slice(0, 100).replace(/\s+/g, ' ')}`);
+    expect(offenders).toEqual([]);
+    // The two cases that broke the rule now write first and read in the next statement.
+    const race = blockOf(suite, "'T3-D race ... and without the race the same submit re-links the round'", '$$;');
+    const raceAt = suite.indexOf("'T3-D race ... and without the race the same submit re-links the round'");
+    expect(suite.lastIndexOf('res := _r1_meet_public_tests.create(543);', raceAt)).toBeGreaterThan(
+      suite.lastIndexOf('drop trigger r1_meet_public_tests_race on screening_v2.r1_budget_month;', raceAt),
+    );
+    expect(race).toContain("_r1_meet_public_tests.outcome(res) = 'booked:relinked' and (res ->> 'round_id')::uuid = r");
+    expect(suite).toContain(
+      "format('select set_config(%L, screening_v2.r1_meet_public_cancel_booking(%L, false, 3600, %L)::text, true)',",
+    );
+    expect(suite).toContain("format('select jsonb_build_object(''cancel'', current_setting(%L)::jsonb, '");
   });
 });
 

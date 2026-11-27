@@ -2998,10 +2998,15 @@ begin
     _r1_meet_public_tests.counts() = v_before
     and (select count(*) = 2 from screening_v2.interview_rounds x where x.candidate_id = _r1_meet_public_tests.id(10, 543)),
     res::text);
+  -- The create runs in its own statement: a statement that called it could not see the booking
+  -- it wrote (the statement's snapshot is taken before the call), so the read comes next.
+  res := _r1_meet_public_tests.create(543);
   perform _r1_meet_public_tests.assert(
     'T3-D race ... and without the race the same submit re-links the round',
-    _r1_meet_public_tests.outcome(_r1_meet_public_tests.create(543)) = 'booked:relinked'
-    and (select x.round_id = r from screening_v2.r1_meet_bookings x where x.id = _r1_meet_public_tests.id(40, 543)));
+    _r1_meet_public_tests.outcome(res) = 'booked:relinked' and (res ->> 'round_id')::uuid = r
+    and (select x.round_id = r and x.source = 'public_page'
+           from screening_v2.r1_meet_bookings x where x.id = _r1_meet_public_tests.id(40, 543)),
+    res::text);
 end;
 $$;
 
@@ -4198,13 +4203,17 @@ begin
     '{}'::jsonb, 'refused:not_found');
   ab := _r1_meet_public_tests.ashby_booking(694, jsonb_build_object('status', 'blocked', 'reason', 'not_scheduled',
           'start_at', '2026-12-31 07:00:00+00'::timestamptz, 'end_at', '2026-12-31 07:45:00+00'::timestamptz));
+  -- The cancel runs in its own statement and parks its answer in a transaction-local setting; the
+  -- status is read by the next statement (one statement could not see a write of the cancel).
   res := _r1_meet_public_tests.in_rollback(array[
       'alter table screening_v2.r1_meet_bookings drop constraint chk_r1_meet_bookings_public_columns',
       format('update screening_v2.r1_meet_bookings set manage_token_digest = %L where id = %L',
-             _r1_meet_public_tests.md(694), ab)],
-    format('select jsonb_build_object(''cancel'', screening_v2.r1_meet_public_cancel_booking(%L, false, 3600, %L), '
+             _r1_meet_public_tests.md(694), ab),
+      format('select set_config(%L, screening_v2.r1_meet_public_cancel_booking(%L, false, 3600, %L)::text, true)',
+             'r1_meet_public_tests.t4b_ashby_cancel', _r1_meet_public_tests.md(694), t4)],
+    format('select jsonb_build_object(''cancel'', current_setting(%L)::jsonb, '
            '''status'', (select x.status from screening_v2.r1_meet_bookings x where x.id = %L))',
-           _r1_meet_public_tests.md(694), t4, ab));
+           'r1_meet_public_tests.t4b_ashby_cancel', ab));
   perform _r1_meet_public_tests.assert(
     'T4-B a live Ashby booking holding the digest (CHECK lifted, rolled back): not_found, untouched',
     res = '{"cancel": {"status": "refused", "code": "not_found"}, "status": "blocked"}'::jsonb, res::text);
