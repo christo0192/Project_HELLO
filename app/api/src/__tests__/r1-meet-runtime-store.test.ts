@@ -222,6 +222,23 @@ const raw = readFileSync(path.join(migrations, '0142_r1_meet_bookings.sql'), 'ut
 /** Comments stripped, whitespace collapsed. */
 const sql = raw.replace(/^\s*--.*$/gm, '').replace(/\s+/g, ' ');
 
+// ── Migration 0143 (M035 S01): the source column and its CHECK ─────────────────
+
+const raw0143 = readFileSync(path.join(migrations, '0143_r1_meet_public_bookings.sql'), 'utf8').replace(/\r\n/g, '\n');
+/** Comments stripped, whitespace collapsed (as `sql` above). */
+const sql0143 = raw0143.replace(/^\s*--.*$/gm, '').replace(/\s+/g, ' ');
+/** Every column 0143 adds to the bookings table, in order. */
+const added0143 = [...sql0143.matchAll(/alter table screening_v2\.r1_meet_bookings add column if not exists ([a-z_]+) /g)].map(
+  (m) => m[1]!,
+);
+/**
+ * The column bound by `chk_r1_meet_bookings_source` (the rule `parseBooking`'s source reader enforces),
+ * its default and its closed list, parsed from its `add column` statement.
+ */
+const SOURCE_0143 = /add column if not exists ([a-z_]+) text not null default '([a-z_]+)' constraint chk_r1_meet_bookings_source check \(([a-z_]+) in \(([^)]*)\)\);/.exec(
+  sql0143,
+);
+
 function functionText(name: string): string {
   const start = sql.indexOf(`create or replace function screening_v2.${name}(`);
   expect(start, name).toBeGreaterThan(-1);
@@ -276,12 +293,20 @@ describe('what is selected', () => {
     const table = sql.slice(start, sql.indexOf('constraint uq_r1_meet_bookings_event', start));
     const declared = [...table.matchAll(/[(,] ([a-z_]+) (?:uuid|text|timestamptz|integer)\b/g)].map((m) => m[1]!);
     expect(declared).toHaveLength(27);
-    // `source` is the one column 0143 (M035 S01) adds that the runtime reads (contracts 3.1), appended
-    // last. A literal until 0143 is on main; M035 S02 T6 swaps in the column parsed from 0143.
+    // 0143 (M035 S01) adds seven columns; the runtime reads exactly one of them, the column of
+    // `chk_r1_meet_bookings_source`, appended last (contracts 3.1). The calendar, request and manage
+    // columns are never selected here (S05 reads them itself).
+    expect(SOURCE_0143, 'chk_r1_meet_bookings_source').not.toBeNull();
+    const [, sourceColumn, , checkedColumn] = SOURCE_0143!;
+    expect(checkedColumn, 'the CHECK reads its own column').toBe(sourceColumn);
+    expect(added0143).toHaveLength(7);
+    expect(added0143).toContain(sourceColumn);
+    for (const name of declared) expect(added0143, name).not.toContain(name);
     expect(COLUMNS.split(', ')).toEqual([
       ...declared.filter((name) => name !== 'ticket_digest' && name !== 'candidate_id'),
-      'source',
+      sourceColumn,
     ]);
+    for (const name of added0143.filter((n) => n !== sourceColumn)) expect(COLUMNS.split(', '), name).not.toContain(name);
   });
 
   it('partitions the twelve statuses of 0142', () => {
@@ -492,8 +517,13 @@ describe('two sources (M035 S02): the Ashby and the public-page booking', () => 
     ashby_scheduled_by_user_id: SCHEDULER,
   };
 
-  it("the closed list of sources is 0143's, frozen", () => {
-    expect([...R1_MEET_BOOKING_SOURCES]).toEqual(['ashby', 'public_page']);
+  it("the closed list of sources is 0143's, frozen; a row written before 0143 reads as the first", () => {
+    expect(SOURCE_0143, 'chk_r1_meet_bookings_source').not.toBeNull();
+    const [, , defaultValue, , list] = SOURCE_0143!;
+    const values = [...list!.matchAll(/'([^']*)'/g)].map((m) => m[1]!);
+    expect(values).toHaveLength(2);
+    expect([...R1_MEET_BOOKING_SOURCES]).toEqual(values);
+    expect(defaultValue).toBe(R1_MEET_BOOKING_SOURCES[0]);
     expect(Object.isFrozen(R1_MEET_BOOKING_SOURCES)).toBe(true);
   });
 
@@ -728,19 +758,25 @@ describe('the IST day of the bot cap', () => {
     expect(await fakeDb({ data: null, error: null, count: 0 }).store.countBotsInDay({ ...window, excludeId: BOOKING })).toBe(0);
   });
 
-  it('counts exactly the status and reason pairs that follow an attached bot', () => {
-    const pairing = /constraint chk_r1_meet_bookings_status_reason check \((.*?)\), constraint/.exec(sql)![1]!;
-    const families = [...pairing.matchAll(/status in \(([^)]*)\) and reason in \(([^)]*)\)/g)].map((m) => ({
-      statuses: [...m[1]!.matchAll(/'(\w+)'/g)].map((s) => s[1]!),
-      reasons: [...m[2]!.matchAll(/'(\w+)'/g)].map((s) => s[1]!),
-    }));
-    expect(families).toHaveLength(8);
-    const counted = families.flatMap(({ statuses, reasons }) =>
-      statuses.filter((s) => (R1_MEET_CAP_STATUSES as readonly string[]).includes(s)).flatMap((s) =>
-        reasons.filter((r) => (R1_MEET_CAP_REASONS as readonly string[]).includes(r)).map((r) => `${s}/${r}`),
-      ),
-    );
-    expect(counted.sort()).toEqual([
+  it('counts exactly the status and reason pairs that follow an attached bot (0142, and 0143 adds none)', () => {
+    const countedOf = (pairing: string): string[] => {
+      const families = [...pairing.matchAll(/status in \(([^)]*)\) and reason in \(([^)]*)\)/g)].map((m) => ({
+        statuses: [...m[1]!.matchAll(/'(\w+)'/g)].map((s) => s[1]!),
+        reasons: [...m[2]!.matchAll(/'(\w+)'/g)].map((s) => s[1]!),
+      }));
+      expect(families).toHaveLength(8);
+      return families.flatMap(({ statuses, reasons }) =>
+        statuses.filter((s) => (R1_MEET_CAP_STATUSES as readonly string[]).includes(s)).flatMap((s) =>
+          reasons.filter((r) => (R1_MEET_CAP_REASONS as readonly string[]).includes(r)).map((r) => `${s}/${r}`),
+        ),
+      ).sort();
+    };
+    const counted = countedOf(/constraint chk_r1_meet_bookings_status_reason check \((.*?)\), constraint/.exec(sql)![1]!);
+    // 0143 swaps the pairing CHECK (M035 S01): its two new pairs are not bot-day pairs.
+    const swapped = /add constraint chk_r1_meet_bookings_status_reason check \((.*?)\) not valid;/.exec(sql0143);
+    expect(swapped, '0143 chk_r1_meet_bookings_status_reason').not.toBeNull();
+    expect(countedOf(swapped![1]!)).toEqual(counted);
+    expect(counted).toEqual([
       'bot_joining/eligible',
       'bot_scheduled/eligible',
       'completed/attempt_settled',

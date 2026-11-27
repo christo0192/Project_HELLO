@@ -560,16 +560,35 @@ describe('the call side over a public booking, as over an Ashby one', () => {
     });
   });
 
-  it('a terminal event of a joining bot: failed/no_show, then the release at Recall and its record', async () => {
+  it('a terminal event of a joining bot that was in the call: Recall read first (M035 S09), failed/no_show, released', async () => {
+    await twins(async (w) => {
+      const { h } = w;
+      const b = await booked(w, 'bot_joining');
+      h.recall.setStatus(b.botId!, 'in_call_not_recording');
+      const result = await deliver(w, b, 'bot.call_ended', { subCode: 'call_ended_by_host' });
+      expect(result).toEqual(done('processed', 'failed_no_show'));
+      expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'no_show', recall_bot_id: null });
+      // The one GET before the move already says the call ended: no second Recall call.
+      expect(h.timeline.filter((step) => step !== 'queue:recall_event')).toEqual([
+        'recall:get',
+        'db:transition:failed',
+        'db:set_bot:release',
+      ]);
+      expect(h.alerts()).toEqual([]);
+      return observe(w, [b], [result]);
+    });
+  });
+
+  it('a terminal event of a joining bot that never got into the call: failed/bot_fatal (M035 S09), released', async () => {
     await twins(async (w) => {
       const { h } = w;
       const b = await booked(w, 'bot_joining');
       const result = await deliver(w, b, 'bot.call_ended', { subCode: 'call_ended_by_host' });
-      expect(result).toEqual(done('processed', 'failed_no_show'));
-      expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'no_show', recall_bot_id: null });
+      expect(result).toEqual(done('processed', 'failed_bot_fatal'));
+      expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'bot_fatal', recall_bot_id: null });
       expect(h.timeline.filter((step) => step !== 'queue:recall_event')).toEqual([
-        'db:transition:failed',
         'recall:get',
+        'db:transition:failed',
         'db:set_bot:release',
       ]);
       return observe(w, [b], [result]);

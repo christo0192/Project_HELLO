@@ -4,7 +4,8 @@
  *
  * Pinned:
  *  - the status/reason pairing and the transition matrix equal the SQL of
- *    `chk_r1_meet_bookings_status_reason` and `r1_meet_transition_booking`, parsed from 0142;
+ *    `chk_r1_meet_bookings_status_reason` (as 0143 swapped it: 0142's pairs plus two) and
+ *    `r1_meet_transition_booking` (0142);
  *  - every answer of every RPC the runtime and the bridge page call is reachable through the port, and
  *    the set of answers equals the RPC's catalog comment (the one answer the CHECKs make unreachable is
  *    named, with why);
@@ -48,6 +49,22 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const raw = readFileSync(path.resolve(here, '../../../supabase/migrations/0142_r1_meet_bookings.sql'), 'utf8').replace(/\r\n/g, '\n');
 const sql = raw.replace(/^\s*--.*$/gm, '').replace(/\s+/g, ' ');
 const quoted = (list: string): string[] => [...list.matchAll(/'([a-z_]+)'/g)].map((match) => match[1]!);
+/** Migration 0143 (M035 S01), comments stripped and whitespace collapsed as `sql`. */
+const sql0143 = readFileSync(path.resolve(here, '../../../supabase/migrations/0143_r1_meet_public_bookings.sql'), 'utf8')
+  .replace(/\r\n/g, '\n')
+  .replace(/^\s*--.*$/gm, '')
+  .replace(/\s+/g, ' ');
+
+/** The reasons of each status in one `chk_r1_meet_bookings_status_reason` text (8 families). */
+function statusReasons(block: string): Record<string, string[]> {
+  const pairs = [...block.matchAll(/status in \(([^)]*)\) and reason in \(([^)]*)\)/g)];
+  expect(pairs.length).toBe(8);
+  const out: Record<string, string[]> = {};
+  for (const [, statuses, reasons] of pairs) {
+    for (const s of quoted(statuses!)) out[s] = [...(out[s] ?? []), ...quoted(reasons!)];
+  }
+  return out;
+}
 
 function functionText(name: string): string {
   const start = sql.indexOf(`create or replace function screening_v2.${name}(`);
@@ -165,35 +182,30 @@ function expectAnswerSet(name: string, seen: Set<string>, expected: readonly str
 
 // ── The port's vocabulary is the migration's ─────────────────────────────────
 
-/**
- * What 0143 (M035 S01) adds to 0142's `chk_r1_meet_bookings_status_reason` (contracts 3.1): one reason
- * each for `cancelled` and `failed`, every other family unchanged. A literal until 0143 is on main;
- * M035 S02 T6 swaps in the pairs parsed from 0143.
- */
-const PUBLIC_PAIR_DELTA: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  cancelled: ['candidate_cancelled'],
-  failed: ['invite_undeliverable'],
-});
-
 describe('the port is pinned to the 0142 text', () => {
-  it('chk_r1_meet_bookings_status_reason: the reasons of each status (0142, then the 0143 delta)', () => {
+  it('chk_r1_meet_bookings_status_reason: the reasons of each status are 0143 swapped CHECK (0142 plus two)', () => {
     const start = sql.indexOf('constraint chk_r1_meet_bookings_status_reason check (');
-    const block = sql.slice(start, sql.indexOf('constraint chk_r1_meet_bookings_version', start));
-    const pairs = [...block.matchAll(/status in \(([^)]*)\) and reason in \(([^)]*)\)/g)];
-    expect(pairs.length).toBe(8);
-    const fromSql: Record<string, string[]> = {};
-    for (const [, statuses, reasons] of pairs) {
-      for (const s of quoted(statuses!)) fromSql[s] = [...(fromSql[s] ?? []), ...quoted(reasons!)];
+    const from0142 = statusReasons(sql.slice(start, sql.indexOf('constraint chk_r1_meet_bookings_version', start)));
+    // 0143 (M035 S01) drops and re-adds the CHECK: this text is the one the database enforces.
+    const start0143 = sql0143.indexOf('add constraint chk_r1_meet_bookings_status_reason check (');
+    expect(start0143, '0143 chk_r1_meet_bookings_status_reason').toBeGreaterThan(-1);
+    const fromSql = statusReasons(sql0143.slice(start0143, sql0143.indexOf(') not valid;', start0143)));
+    expect(Object.keys(fromSql)).toEqual(Object.keys(from0142));
+    // 0143 only appends: each status keeps 0142's reasons in 0142's order, and what it adds is new to
+    // 0142 and is exactly the two reasons 0143 appends to the reason CHECK.
+    const added: string[] = [];
+    for (const [s, reasons] of Object.entries(fromSql)) {
+      expect(reasons.slice(0, from0142[s]!.length), s).toEqual(from0142[s]);
+      const delta = reasons.slice(from0142[s]!.length);
+      for (const reason of delta) expect(Object.values(from0142).flat(), reason).not.toContain(reason);
+      // The fake lists each status's reasons in the migration's order, so the delta is appended too.
+      expect([...FAKE_STATUS_REASONS[s]!], s).toEqual(reasons);
+      added.push(...delta);
     }
-    // The delta is new to 0142: no status already accepts it.
-    for (const reason of Object.values(PUBLIC_PAIR_DELTA).flat()) {
-      expect(Object.values(fromSql).flat(), reason).not.toContain(reason);
-    }
-    for (const [s, added] of Object.entries(PUBLIC_PAIR_DELTA)) {
-      // Appended to the fake's list, after 0142's reasons of that status.
-      expect(FAKE_STATUS_REASONS[s]!.slice(-added.length), s).toEqual([...added]);
-      fromSql[s] = [...fromSql[s]!, ...added];
-    }
+    const reasonList0143 = /add constraint chk_r1_meet_bookings_reason check \(reason in \(([^)]*)\)\) not valid;/.exec(sql0143);
+    expect(reasonList0143, '0143 chk_r1_meet_bookings_reason').not.toBeNull();
+    expect(added.sort()).toEqual(quoted(reasonList0143![1]!).slice(32).sort());
+    expect(added).toHaveLength(2);
     const sorted = (record: Readonly<Record<string, readonly string[]>>): Record<string, string[]> =>
       Object.fromEntries(
         Object.entries(record)

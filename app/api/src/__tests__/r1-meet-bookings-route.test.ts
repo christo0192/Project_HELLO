@@ -18,8 +18,9 @@
  *  - (M035 S02) `source`, the eleventh field: `ashby` or `public_page` as stored, anything else a 503;
  *    a public-page row (no Ashby schedule ids) reads like any other;
  *  - a read failure or a drifted row is a 503, never a partial page;
- *  - the closed status and reason lists equal migration 0142's CHECK lists (the reasons followed by
- *    the two 0143 adds) and the spec's enums, and every body validates against the spec's inline schema.
+ *  - the closed status list equals migration 0142's CHECK list, the reason and source lists equal
+ *    0143's (its reasons are 0142's in order, then two), all equal the spec's enums, and every body
+ *    validates against the spec's inline schema.
  */
 
 import { readFileSync } from 'node:fs';
@@ -57,6 +58,9 @@ type Role = 'admin' | 'interviewer' | 'viewer';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const SPEC = parseYamlDocument(readFileSync(path.resolve(here, '../../openapi/openapi.yaml'), 'utf8'));
 const MIGRATION = readFileSync(path.resolve(here, '../../../supabase/migrations/0142_r1_meet_bookings.sql'), 'utf8')
+  .replace(/\r\n/g, '\n');
+/** M035 S01: the source column and the swapped reason CHECK. */
+const MIGRATION_0143 = readFileSync(path.resolve(here, '../../../supabase/migrations/0143_r1_meet_public_bookings.sql'), 'utf8')
   .replace(/\r\n/g, '\n');
 
 const LIST = '/api/interview-rounds/meet-bookings';
@@ -862,25 +866,25 @@ describe('failures', () => {
 
 describe('the closed lists', () => {
   /** Whole-line comments removed, whitespace collapsed (the parse of r1-meet-bookings-migration.test.ts). */
-  const code = MIGRATION.replace(/^\s*--.*$/gm, '').replace(/\s+/g, ' ').trim();
-  const inList = (constraint: string, column: string): string[] => {
-    const m = new RegExp(`constraint ${constraint} check \\( ?${column} in \\(([^)]*)\\) ?\\)`).exec(code);
+  const strip = (text: string): string => text.replace(/^\s*--.*$/gm, '').replace(/\s+/g, ' ').trim();
+  const code = strip(MIGRATION);
+  const code0143 = strip(MIGRATION_0143);
+  const inList = (constraint: string, column: string, text = code): string[] => {
+    const m = new RegExp(`constraint ${constraint} check \\( ?${column} in \\(([^)]*)\\) ?\\)`).exec(text);
     expect(m, constraint).not.toBeNull();
     return [...m![1]!.matchAll(/'([^']*)'/g)].map((match) => match[1]!);
   };
 
-  /**
-   * The two reasons 0143 (M035 S01) appends to 0142's reason CHECK (contracts 3.1). A literal until
-   * 0143 is on main; M035 S02 T6 swaps in the list parsed from 0143.
-   */
-  const PUBLIC_REASONS = ['candidate_cancelled', 'invite_undeliverable'];
-
-  it('the twelve statuses are 0142 CHECK lists; the thirty-four reasons are 0142 then the two of 0143, in order', () => {
+  it('the twelve statuses are 0142 CHECK lists; the thirty-four reasons are 0143 CHECK lists (0142 first, in order)', () => {
     expect([...R1_MEET_BOOKING_STATUSES]).toEqual(inList('chk_r1_meet_bookings_status', 'status'));
     const reasons0142 = inList('chk_r1_meet_bookings_reason', 'reason');
+    const reasons0143 = inList('chk_r1_meet_bookings_reason', 'reason', code0143);
     expect(reasons0142).toHaveLength(32);
-    for (const reason of PUBLIC_REASONS) expect(reasons0142, reason).not.toContain(reason);
-    expect([...R1_MEET_BOOKING_REASONS]).toEqual([...reasons0142, ...PUBLIC_REASONS]);
+    expect(reasons0143).toHaveLength(34);
+    // 0143 (M035 S01) swaps the CHECK: 0142's 32 in 0142's order, then its own two.
+    expect(reasons0143.slice(0, 32)).toEqual(reasons0142);
+    for (const reason of reasons0143.slice(32)) expect(reasons0142, reason).not.toContain(reason);
+    expect([...R1_MEET_BOOKING_REASONS]).toEqual(reasons0143);
     expect(R1_MEET_BOOKING_STATUSES).toHaveLength(12);
     expect(R1_MEET_BOOKING_REASONS).toHaveLength(34);
     expect(new Set(R1_MEET_BOOKING_REASONS).size).toBe(34);
@@ -888,8 +892,9 @@ describe('the closed lists', () => {
     expect(Object.isFrozen(R1_MEET_BOOKING_REASONS)).toBe(true);
   });
 
-  it('the two sources are frozen, ashby then public_page; source is the eleventh and last field', () => {
-    expect([...R1_MEET_BOOKING_SOURCES]).toEqual(['ashby', 'public_page']);
+  it('the two sources are the 0143 CHECK list, frozen; source is the eleventh and last field', () => {
+    expect([...R1_MEET_BOOKING_SOURCES]).toEqual(inList('chk_r1_meet_bookings_source', 'source', code0143));
+    expect(R1_MEET_BOOKING_SOURCES).toHaveLength(2);
     expect(Object.isFrozen(R1_MEET_BOOKING_SOURCES)).toBe(true);
     expect(Object.isFrozen(R1_MEET_BOOKING_FIELDS)).toBe(true);
     expect([...R1_MEET_BOOKING_FIELDS]).toEqual([
