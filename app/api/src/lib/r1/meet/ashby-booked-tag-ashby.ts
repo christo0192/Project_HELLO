@@ -26,9 +26,13 @@
  * not a list, or an answer that is not a Candidate, is malformed and the job waits.
  *
  * THE CLIENT AND THE RUN BUDGET (D-S11-8). A dedicated Ashby client with one attempt per call and a
- * 10 s timeout: the `r1-meet` queue does every retry. A run has 30 s from its start: each call is
+ * 5 s timeout: the `r1-meet` queue does every retry. A run has 20 s from its start: each call is
  * handed the time LEFT, carried across to the wall clock the client keeps (the two clocks are never
  * compared), and no call starts with under 3 s left, so nothing is half-written when time runs out.
+ * The tag jobs share the `r1-meet` lane (two slots) with the time-critical jobs of live interviews,
+ * so a slow Ashby holds a slot for at most 20 s a run (it was 30 s with 10 s calls before PR #453
+ * review S11-R3; the job also backs its waits off, `ashby-booked-tag.ts`). A healthy run is about
+ * four calls of well under a second each.
  * The port exposes exactly five calls: `application.info`, `candidate.info`, `candidateTag.list`,
  * `candidate.addTag` and `candidate.removeTag`, and never forwards an `extra` field.
  *
@@ -52,8 +56,8 @@ import type { R1MeetLog } from './recall-actions.js';
 /** The exact title the Ashby admin creates. Compared after a trim, case-sensitive. */
 export const R1_MEET_BOOKED_TAG_TITLE = 'Dex R1: Booked';
 
-/** The client settings of the port (D-S11-8): no retries inside the client, 10 s per call. */
-export const R1_MEET_ASHBY_TAG_CLIENT_SETTINGS = Object.freeze({ maxAttempts: 1, timeoutMs: 10_000 });
+/** The client settings of the port (D-S11-8, S11-R3): no retries inside the client, 5 s per call. */
+export const R1_MEET_ASHBY_TAG_CLIENT_SETTINGS = Object.freeze({ maxAttempts: 1, timeoutMs: 5_000 });
 
 /** A complete catalogue walk is reused this long (per port, so per process). */
 export const R1_MEET_BOOKED_TAG_CACHE_MS = 5 * 60_000;
@@ -61,8 +65,8 @@ export const R1_MEET_BOOKED_TAG_CACHE_MS = 5 * 60_000;
 export const R1_MEET_BOOKED_TAG_PAGE_SIZE = 100;
 /** A tenant needs far fewer pages than this; more reads as a truncated catalogue. */
 export const R1_MEET_BOOKED_TAG_MAX_PAGES = 100;
-/** One run's time for every Ashby call it makes. */
-export const R1_MEET_ASHBY_TAG_RUN_MS = 30_000;
+/** One run's time for every Ashby call it makes (S11-R3: 20 s, well inside the lane's 60 s lease). */
+export const R1_MEET_ASHBY_TAG_RUN_MS = 20_000;
 /** No Ashby call starts with less than this left of the run. */
 export const R1_MEET_ASHBY_TAG_MIN_CALL_MS = 3_000;
 /** At most this many `candidate.removeTag` calls in one run. */
@@ -230,7 +234,7 @@ export interface R1MeetAshbyTagPortOptions {
 }
 
 /**
- * Build the port: one client (one attempt per call, 10 s), the resolver over it, both frozen. The
+ * Build the port: one client (one attempt per call, 5 s), the resolver over it, both frozen. The
  * client is narrowed to the five calls of {@link R1MeetAshbyTagClient} and never forwards `extra`.
  * Throws the client's `invalid_request` (`missing_api_key`) for an empty key, so the caller builds
  * it only with a usable key.

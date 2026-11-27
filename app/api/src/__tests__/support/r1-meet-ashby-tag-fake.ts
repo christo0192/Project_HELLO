@@ -33,7 +33,8 @@
  *
  * T3 adds the TABLES half (`createBookedTagTables()`): the two tables the booked-tag store reads,
  * `r1_meet_bookings` and `ashby_application_links`, as plain rows behind an in-memory client whose
- * `from(table)` answers a query with `select(columns)`, `eq`, `in`, `order(column, { ascending })`
+ * `from(table)` answers a query with `select(columns)`, `eq`, `in`, `ilike` (Postgres ILIKE: `%` and
+ * `_` wildcards, `\` escapes, case ignored; PR #453 review S11-R4), `order(column, { ascending })`
  * (stable; successive calls are successive sort keys; nulls last ascending and first descending, as
  * Postgres sorts), `limit(n)`, `maybeSingle()` (PGRST116 on more than one row) and `then`.
  *   select projects the named columns; a column the row does not have stays ABSENT (not null), so
@@ -42,7 +43,9 @@
  *                (`'reject'`) or throws from `from()` (`'throw'`, a builder that throws);
  *   calls        one `{ table, columns, filters, orders, limit, terminal }` per query, in order;
  *   seeds        `publicBooking({ applicationId, ... })` (defaults: source `public_page`, status
- *                `pending`, a slot 24 h after `HARNESS_NOW`, `created_at = updated_at = HARNESS_NOW`;
+ *                `pending`, the reason of its status (`SEED_REASONS`; a `failed` row is `no_show`, a
+ *                failure after a bot was sent), a slot 24 h after `HARNESS_NOW`,
+ *                `created_at = updated_at = HARNESS_NOW`;
  *                the row also carries columns the store must never read: our candidate id, the Meet
  *                URL, a ticket digest, the calendar and manage columns) and
  *                `link({ applicationId, candidateId })` (provider `ashby`, lifecycle `imported`).
@@ -297,7 +300,7 @@ export type BookedTagTable = 'r1_meet_bookings' | 'ashby_application_links';
 export type BookedTagRow = Record<string, unknown>;
 
 export interface BookedTagFilter {
-  readonly op: 'eq' | 'in';
+  readonly op: 'eq' | 'in' | 'ilike';
   readonly column: string;
   readonly value: unknown;
 }
@@ -325,6 +328,8 @@ export interface PublicBookingSeed {
   readonly id?: string;
   readonly applicationId: string;
   readonly status?: R1MeetBookingStatus;
+  /** Default: the status's own reason (`SEED_REASONS`). */
+  readonly reason?: string;
   readonly startAt?: string;
   readonly updatedAt?: string;
   readonly createdAt?: string;
@@ -356,6 +361,27 @@ type TableAnswer = { data: unknown; error: { code: string; message: string } | n
 
 const ZONED_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/;
 const ANY_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Postgres ILIKE over text: `%` any run, `_` one character, `\` escapes the next, case ignored. */
+function ilikeMatches(cell: unknown, pattern: unknown): boolean {
+  if (typeof cell !== 'string' || typeof pattern !== 'string') return false;
+  const literal = (ch: string): string => ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  let source = '';
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i]!;
+    if (ch === '\\' && i + 1 < pattern.length) {
+      i += 1;
+      source += literal(pattern[i]!);
+    } else if (ch === '%') {
+      source += '[\\s\\S]*';
+    } else if (ch === '_') {
+      source += '[\\s\\S]';
+    } else {
+      source += literal(ch);
+    }
+  }
+  return new RegExp(`^${source}$`, 'i').test(cell);
+}
 
 /** Postgres-like: null sorts as the largest value; instants by time, UUIDs by value, else by text. */
 function compareCells(a: unknown, b: unknown): number {
@@ -395,6 +421,11 @@ class BookedTagQuery {
     return this;
   }
 
+  ilike(column: string, pattern: string): this {
+    this.call.filters.push({ op: 'ilike', column, value: pattern });
+    return this;
+  }
+
   order(column: string, options: { ascending?: boolean } = {}): this {
     this.call.orders.push({ column, ascending: options.ascending !== false });
     return this;
@@ -408,9 +439,11 @@ class BookedTagQuery {
   private run(): TableAnswer {
     if (this.failure === 'error') return { data: null, error: { code: 'XX000', message: 'fake_db_failure' } };
     const matches = (row: BookedTagRow) =>
-      this.call.filters.every((filter) =>
-        filter.op === 'eq' ? row[filter.column] === filter.value : (filter.value as unknown[]).includes(row[filter.column]),
-      );
+      this.call.filters.every((filter) => {
+        if (filter.op === 'eq') return row[filter.column] === filter.value;
+        if (filter.op === 'ilike') return ilikeMatches(row[filter.column], filter.value);
+        return (filter.value as unknown[]).includes(row[filter.column]);
+      });
     const ordered = this.rows()
       .filter(matches)
       .map((row, index) => ({ row, index }))
@@ -461,7 +494,11 @@ class BookedTagQuery {
   }
 }
 
-/** The reason a seeded booking carries for its status (one 0142 pairing each; the store never reads it). */
+/**
+ * The reason a seeded booking carries for its status (one 0142 pairing each). The store reads it since
+ * PR #453 review S11-R1: a `failed` row defaults to `no_show` (a bot was sent, so the time rule
+ * applies); a test that needs a failure that was never an interview sets the reason itself.
+ */
 const SEED_REASONS: Readonly<Record<string, string>> = Object.freeze({
   pending: 'eligible',
   bot_scheduled: 'eligible',
@@ -473,7 +510,7 @@ const SEED_REASONS: Readonly<Record<string, string>> = Object.freeze({
   unmapped_scheduler: 'scheduler_unmapped',
   completed: 'attempt_settled',
   cancelled: 'cancelled',
-  failed: 'bot_create_failed',
+  failed: 'no_show',
   drained: 'flag_off',
 });
 
@@ -514,7 +551,7 @@ export function createBookedTagTables(): BookedTagTables {
         id: seed.id ?? fixtureId(),
         source,
         status,
-        reason: SEED_REASONS[status] ?? 'eligible',
+        reason: seed.reason ?? SEED_REASONS[status] ?? 'eligible',
         ashby_interview_event_id: isPublic ? null : fixtureId(),
         ashby_schedule_id: isPublic ? null : fixtureId(),
         ashby_application_id: seed.applicationId,

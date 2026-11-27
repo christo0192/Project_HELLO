@@ -11,11 +11,13 @@
  *    row is null; every drifted row, DB error, rejected call and throwing builder is
  *    `r1_meet_db_error` and the message is that code alone;
  *  - `applicationLink`, `candidateApplications` (0 / 1 / 25 rows, the 26th an overflow with no ids,
- *    another candidate's links never seen) and `newestPublicBooking` (created_at, then id, both
+ *    another candidate's links never seen, the candidate id matched in any case like 0143's
+ *    `lower() = lower()`, PR #453 review S11-R4) and `newestPublicBooking` (created_at, then id, both
  *    descending; Ashby rows and other applications never answered);
  *  - schema pins: every booking column but `source` is a 0142 column; `source` is 0143's (contracts
  *    §3.1; 0143 is on main since S01, #450, so the pin no longer has a dark branch) and 0142 has none;
- *    the two link columns are 0029's.
+ *    the reasons the store accepts are 0143's reason CHECK (PR #453 review S11-R1); the two link
+ *    columns are 0029's.
  */
 
 import { readFileSync, readdirSync } from 'node:fs';
@@ -25,10 +27,11 @@ import { describe, expect, it } from 'vitest';
 import {
   R1_MEET_BOOKED_TAG_BOOKING_COLUMNS,
   R1_MEET_BOOKED_TAG_MAX_APPLICATIONS,
+  R1_MEET_BOOKED_TAG_REASONS,
   createR1MeetBookedTagStore,
   type R1MeetBookedTagStore,
 } from '../lib/r1/meet/ashby-booked-tag-store.js';
-import { R1_MEET_BOOKING_STATUSES } from '../lib/r1/meet/bookings-read.js';
+import { R1_MEET_BOOKING_REASONS, R1_MEET_BOOKING_STATUSES } from '../lib/r1/meet/bookings-read.js';
 import { R1MeetJobError, R1_MEET_DB_ERROR } from '../lib/r1/meet/jobs.js';
 import type { supabase } from '../lib/supabase.js';
 import { createBookedTagTables, type BookedTagRow, type BookedTagTables } from './support/r1-meet-ashby-tag-fake.js';
@@ -54,7 +57,7 @@ async function expectDbError(promise: Promise<unknown>, label?: string): Promise
 /** A client whose every query answers `answer`: the shapes the in-memory tables never produce. */
 function answering(answer: unknown): R1MeetBookedTagStore {
   const builder: Record<string, unknown> = {};
-  for (const op of ['select', 'eq', 'in', 'order', 'limit']) builder[op] = () => builder;
+  for (const op of ['select', 'eq', 'in', 'ilike', 'order', 'limit']) builder[op] = () => builder;
   builder.maybeSingle = async () => answer;
   builder.then = (resolve: (value: unknown) => unknown, reject: (reason: unknown) => unknown) =>
     Promise.resolve(answer).then(resolve, reject);
@@ -65,15 +68,15 @@ function answering(answer: unknown): R1MeetBookedTagStore {
 const ORDERED_LOW = '7f000000-0000-4000-8000-0000ee0000a1';
 const ORDERED_HIGH = '7f000000-0000-4000-8000-0000ee0000a2';
 
-const BOOKING_KEYS = ['id', 'source', 'status', 'applicationId', 'startAt', 'updatedAt', 'createdAt'];
+const BOOKING_KEYS = ['id', 'source', 'status', 'reason', 'applicationId', 'startAt', 'updatedAt', 'createdAt'];
 const SELECTED = R1_MEET_BOOKED_TAG_BOOKING_COLUMNS.split(',').map((column) => column.trim());
 
 // ── The four queries ─────────────────────────────────────────────────────────
 
 describe('the booked-tag store: the exact queries', () => {
-  it('selects exactly seven booking columns, none of them a contact, link, ticket or calendar column', () => {
-    expect(R1_MEET_BOOKED_TAG_BOOKING_COLUMNS).toBe('id, source, status, ashby_application_id, start_at, updated_at, created_at');
-    expect(SELECTED).toEqual(['id', 'source', 'status', 'ashby_application_id', 'start_at', 'updated_at', 'created_at']);
+  it('selects exactly eight booking columns, none of them a contact, link, ticket or calendar column', () => {
+    expect(R1_MEET_BOOKED_TAG_BOOKING_COLUMNS).toBe('id, source, status, reason, ashby_application_id, start_at, updated_at, created_at');
+    expect(SELECTED).toEqual(['id', 'source', 'status', 'reason', 'ashby_application_id', 'start_at', 'updated_at', 'created_at']);
     for (const word of ['candidate_id', 'meet_url', 'ticket', 'calendar', 'manage', 'request', 'move_count', 'invite']) {
       expect(R1_MEET_BOOKED_TAG_BOOKING_COLUMNS, word).not.toContain(word);
     }
@@ -115,23 +118,34 @@ describe('the booked-tag store: the exact queries', () => {
     ]);
   });
 
-  it('candidateApplications: one list read by the Ashby candidate id, ordered, at most 26 rows', async () => {
+  it('candidateApplications: one list read by the Ashby candidate id in any case, ordered, at most 26 rows', async () => {
     const { tables, store } = world();
     const candidateId = fixtureId();
     await store.candidateApplications(candidateId);
     expect(tables.calls).toEqual([
       {
         table: 'ashby_application_links',
-        columns: 'external_application_id',
+        columns: 'external_application_id, external_candidate_id',
         filters: [
           { op: 'eq', column: 'provider', value: 'ashby' },
-          { op: 'eq', column: 'external_candidate_id', value: candidateId },
+          // S11-R4: a UUID has no LIKE wildcard, so ilike on it is 0143's lower() = lower().
+          { op: 'ilike', column: 'external_candidate_id', value: candidateId },
         ],
         orders: [{ column: 'external_application_id', ascending: true }],
         limit: R1_MEET_BOOKED_TAG_MAX_APPLICATIONS + 1,
         terminal: 'then',
       },
     ]);
+  });
+
+  it('candidateApplications: an id with any character outside letters, digits and dashes is matched verbatim (eq)', async () => {
+    for (const candidateId of ['cand%', 'cand_1', 'cand\\x', 'cand*', 'cand.1', 'c a']) {
+      const { tables, store } = world();
+      await store.candidateApplications(candidateId);
+      expect(tables.calls.map((call) => call.filters[1]), candidateId).toEqual([
+        { op: 'eq', column: 'external_candidate_id', value: candidateId },
+      ]);
+    }
   });
 
   it('newestPublicBooking: one list read of public rows of the application, newest first, one row', async () => {
@@ -202,6 +216,7 @@ describe('booking', () => {
       id: id.toLowerCase(),
       source: 'public_page',
       status: 'bot_scheduled',
+      reason: 'eligible',
       applicationId,
       startAt: '2030-01-02T10:00:00.000Z',
       updatedAt: '2030-01-01T10:00:00.123Z',
@@ -218,6 +233,18 @@ describe('booking', () => {
         expect(booking?.status, status).toBe(status);
         expect(booking?.source, status).toBe(source);
       }
+    }
+  });
+
+  it('reads every reason of 0143, the two 0143 appends included (S11-R1)', async () => {
+    const { tables, store } = world();
+    for (const reason of R1_MEET_BOOKED_TAG_REASONS) {
+      const row = tables.publicBooking({ applicationId: fixtureId(), status: 'failed', reason });
+      expect((await store.booking(row.id as string))?.reason, reason).toBe(reason);
+    }
+    for (const reason of ['candidate_cancelled', 'invite_undeliverable']) {
+      const row = tables.publicBooking({ applicationId: fixtureId(), reason });
+      expect((await store.booking(row.id as string))?.reason, reason).toBe(reason);
     }
   });
 
@@ -241,6 +268,9 @@ describe('booking', () => {
     ['unknown status', (row) => (row.status = 'live')],
     ['status in another case', (row) => (row.status = 'Completed')],
     ['null status', (row) => (row.status = null)],
+    ['unknown reason', (row) => (row.reason = 'slot_gone')],
+    ['reason in another case', (row) => (row.reason = 'IN_PAST')],
+    ['null reason', (row) => (row.reason = null)],
     ['zoneless start', (row) => (row.start_at = '2030-01-02T10:00:00')],
     ['garbage start', (row) => (row.start_at = 'soon')],
     ['numeric start', (row) => (row.start_at = 1893456000000)],
@@ -396,10 +426,32 @@ describe('candidateApplications', () => {
     const mine = linked(tables, candidateId, 2);
     linked(tables, fixtureId(), 3);
     tables.link({ applicationId: fixtureId(), candidateId: null });
-    tables.link({ applicationId: fixtureId(), candidateId: candidateId.toUpperCase() });
     // The in-memory table has no unique index; the store still answers each id once.
     tables.link({ applicationId: mine[0]!, candidateId });
     expect(await store.candidateApplications(candidateId)).toStrictEqual({ applicationIds: mine, overflow: false });
+  });
+
+  // PR #453 review S11-R4: 0143's person-wide rules match `lower(external_candidate_id)`; the lane must
+  // see the same applications, or B's remove would miss A's completed interview and drop the tag.
+  it('a link whose Ashby candidate id differs only in case is the same person, asked in either case', async () => {
+    const { tables, store } = world();
+    const candidateId = fixtureId();
+    const lower = fixtureId();
+    const upper = fixtureId();
+    tables.link({ applicationId: lower, candidateId });
+    tables.link({ applicationId: upper, candidateId: candidateId.toUpperCase() });
+    const both = [lower, upper].sort();
+    expect(await store.candidateApplications(candidateId)).toStrictEqual({ applicationIds: both, overflow: false });
+    expect(await store.candidateApplications(candidateId.toUpperCase())).toStrictEqual({ applicationIds: both, overflow: false });
+  });
+
+  it('an id that is not LIKE-safe is never a wildcard: only the exact id matches', async () => {
+    const { tables, store } = world();
+    const exact = fixtureId();
+    tables.link({ applicationId: exact, candidateId: 'cand%' });
+    tables.link({ applicationId: fixtureId(), candidateId: 'cand-anything' });
+    tables.link({ applicationId: fixtureId(), candidateId: 'CAND%' });
+    expect(await store.candidateApplications('cand%')).toStrictEqual({ applicationIds: [exact], overflow: false });
   });
 
   it('a drifted id, an answer that is not a list and a DB error are r1_meet_db_error', async () => {
@@ -420,6 +472,19 @@ describe('candidateApplications', () => {
     for (const answer of [{ data: null, error: null }, { data: { external_application_id: 'x' }, error: null }, { data: ['x'], error: null }]) {
       await expectDbError(answering(answer).candidateApplications(fixtureId()), JSON.stringify(answer));
     }
+    // A row of another candidate, or with no candidate id, is not this person's: drift.
+    const asked = fixtureId();
+    for (const other of [fixtureId(), null, undefined]) {
+      const row: Record<string, unknown> = { external_application_id: fixtureId() };
+      if (other !== undefined) row.external_candidate_id = other;
+      await expectDbError(answering({ data: [row], error: null }).candidateApplications(asked), String(other));
+    }
+    // The same person in another case is read.
+    const own = { external_application_id: fixtureId(), external_candidate_id: asked.toUpperCase() };
+    expect(await answering({ data: [own], error: null }).candidateApplications(asked)).toStrictEqual({
+      applicationIds: [own.external_application_id],
+      overflow: false,
+    });
   });
 });
 
@@ -469,6 +534,7 @@ describe('newestPublicBooking', () => {
       id: own.id,
       source: 'public_page',
       status: 'completed',
+      reason: 'attempt_settled',
       applicationId,
       startAt: own.start_at,
       updatedAt: HARNESS_NOW,
@@ -545,6 +611,7 @@ describe('the columns exist in the migrations', () => {
     const types: Record<string, string> = {
       id: 'uuid primary key',
       status: 'text not null',
+      reason: 'text not null',
       ashby_application_id: 'text not null',
       start_at: 'timestamptz not null',
       updated_at: 'timestamptz not null',
@@ -559,6 +626,20 @@ describe('the columns exist in the migrations', () => {
     expect(check).not.toBeNull();
     const listed = check![1]!.split(',').map((value) => value.trim().replace(/^'|'$/g, ''));
     expect(listed).toEqual([...R1_MEET_BOOKING_STATUSES]);
+  });
+
+  // PR #453 review S11-R1: the store reads `reason`, so it must accept exactly 0143's swapped CHECK
+  // (0142's 32 in 0142 order, then candidate_cancelled and invite_undeliverable), whichever of S02
+  // (which appends the two to R1_MEET_BOOKING_REASONS) and S11 merges first.
+  it('the reason list the store accepts is the 0143 reason CHECK, the 0142 list first', () => {
+    const sql = sqlOf(PUBLIC_MIGRATION);
+    const check = /add constraint chk_r1_meet_bookings_reason check \(reason in \(([^)]*)\)\)/.exec(sql);
+    expect(check).not.toBeNull();
+    const listed = check![1]!.split(',').map((value) => value.trim().replace(/^'|'$/g, ''));
+    expect([...R1_MEET_BOOKED_TAG_REASONS]).toEqual(listed);
+    expect(listed).toHaveLength(34);
+    expect(listed.slice(0, 32)).toEqual([...R1_MEET_BOOKING_REASONS].slice(0, 32));
+    expect(Object.isFrozen(R1_MEET_BOOKED_TAG_REASONS)).toBe(true);
   });
 
   // S01's 0143 is on main (#450), so this pin no longer has its dark branch (0143 absent, 0142 with no

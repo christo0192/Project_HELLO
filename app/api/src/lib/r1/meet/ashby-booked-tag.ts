@@ -17,9 +17,14 @@
  * THE CONVERGE RULE (D-S11-2). Decided from the database on EVERY run: `op` is a hint and decides
  * nothing. Per application, its NEWEST public booking (by `created_at`, then `id`) wants the tag when
  * it is live, `completed`, or `failed` / `drained` at or after its start (`updated_at >= start_at`);
- * a cancelled booking, or one that failed or was drained before its start, does not. The tag is
- * candidate-wide, so it is wanted when ANY application of the Ashby candidate wants it: the booking's
- * own application plus every application linked to the same Ashby candidate (at most 25).
+ * a cancelled booking, or one that failed or was drained before its start, does not. Nor does a
+ * booking that FAILED with a reason of `R1_MEET_BOOKED_TAG_PRE_INTERVIEW_REASONS` (no bot was ever
+ * created, its round expired first, or the invite never reached the candidate), whatever the time:
+ * maintenance fails a booking that never got a bot `in_past` 30 minutes after its slot ENDS, long
+ * after the start, and that was never an interview (PR #453 review S11-R1; owner decision 5: removed
+ * when the booking "fails before the interview"). The tag is candidate-wide, so it is wanted when ANY
+ * application of the Ashby candidate wants it: the booking's own application plus every application
+ * linked to the same Ashby candidate (at most 25, its id matched in any case as 0143 does).
  *
  * THE STEPS, each stopping at its first answer (closed codes):
  *   1  unwired                  `deps.ashbyTag` absent: throw `r1_meet_ashby_tag_unwired` (a build bug).
@@ -48,15 +53,24 @@
  * An Ashby failure out of steps 5-9 (`classifyR1MeetAshbyTagFailure`): `permission` (401, 403,
  * `missing_endpoint_permission`) alerts `permission_denied` and waits; `rate_limited` and
  * `unavailable` wait; a refused READ alerts its detail and is `ignored('ashby_rejected')`; the
- * client's own request validation alerts and is `ignored('ashby_request_invalid')`. Every failed write
- * also drops the cached tag id (it may be dead), unless the run was out of time. Anything that is not
- * an Ashby failure (a store fault is `r1_meet_db_error`) is rethrown unchanged.
+ * client's own request validation alerts and is `ignored('ashby_request_invalid')`. Only a write the
+ * tenant REFUSES drops the cached tag id (it may be dead); a 429, a 5xx, a timeout, a permission
+ * fault or the run's own time running out says nothing about the id, so the cache is kept and the
+ * next run does not walk the catalogue again while Ashby is throttling (PR #453 review S11-R5).
+ * Anything that is not an Ashby failure (a store fault is `r1_meet_db_error`) is rethrown unchanged.
  *
  * THE WAITS (`R1_MEET_ASHBY_TAG_WAITS`). Each is an `r1MeetDefer(code, seconds)` within
  * `canDeferR1MeetJob` (30 deferrals, a 60-minute streak); past that bound the job throws the wait's
  * closed code (bounded attempts, then the dead-letter queue):
  *   ashby_inactive, ashby_key_missing, ashby_permission_denied, tag_not_found, tag_ambiguous  3600 s
  *   ashby_rate_limited 60 s, ashby_unavailable 30 s, tag_contended 60 s.
+ * BACK-OFF (PR #453 review S11-R3). `ashby_rate_limited` and `ashby_unavailable` grow while the same
+ * wait repeats: the delay is the time the job has already waited in that streak (the queue keeps the
+ * streak's start, `deferred_at`, while the reason repeats: 0037), at least the base and at most
+ * `R1_MEET_ASHBY_TAG_BACKOFF_MAX_SEC`, so the delays run 30, 30, 60, 120, 240, 300, ... s. A burst of
+ * tag jobs during an Ashby slowdown so asks the shared `r1-meet` lane for fewer and fewer runs instead
+ * of one every 30 s each, and each run holds a lane slot for at most its 20 s budget
+ * (`ashby-booked-tag-ashby.ts`: 5 s per call), leaving the lane to the interview jobs.
  *
  * THE PUBLIC FLAG. Not read here (contracts §2): a job queued just before the flag went off still
  * converges, so existing public bookings finish and cancel normally.
@@ -72,7 +86,6 @@
 import { extractApplicationInfo } from '../../../integrations/ashby/extractors.js';
 import {
   R1_MEET_ASHBY_TAG_MAX_REMOVES,
-  R1MeetAshbyTagOutOfTime,
   classifyR1MeetAshbyTagFailure,
   r1MeetAshbyTagBudget,
   r1MeetBookedTagHolds,
@@ -81,7 +94,7 @@ import {
   type R1MeetBookedTagResolution,
   type R1MeetDexTag,
 } from './ashby-booked-tag-ashby.js';
-import type { R1MeetBookedTagBooking, R1MeetBookedTagStore } from './ashby-booked-tag-store.js';
+import type { R1MeetBookedTagBooking, R1MeetBookedTagReason, R1MeetBookedTagStore } from './ashby-booked-tag-store.js';
 import {
   R1MeetJobError,
   canDeferR1MeetJob,
@@ -157,23 +170,71 @@ const LIVE: ReadonlySet<string> = new Set(R1_MEET_LIVE_STATUSES);
 const PUBLIC_SOURCE = 'public_page';
 
 /**
- * Does this booking, the newest public booking of its application, want the tag (D-S11-2, the
- * per-application rule)? Live or `completed`: yes. `failed` or `drained` at or after its start
- * (`updated_at >= start_at`): yes, the interview's time had come. Cancelled, or failed or drained
- * before its start: no. An instant that does not parse fails closed (no). Pure.
+ * The `failed` reasons that mean no interview could have taken place, whatever the time
+ * (PR #453 review S11-R1): `in_past` (the booking never got a bot: maintenance fails a pending,
+ * blocked, unmatched or unmapped booking 30 minutes after its slot ends), `bot_create_failed` (the
+ * bot could not be created), `round_expired` (the round expired before a bot was created; these three
+ * never had a bot, `runtime-store.ts` `R1_MEET_CAP_REASONS`) and `invite_undeliverable` (0143: the
+ * calendar invite never reached the candidate). The other `failed` reasons (`no_show`, `bot_fatal`,
+ * `admission_refused`, `multiple_humans`) follow a bot that was sent to the interview: they keep the
+ * time rule. Frozen.
  */
-export function r1MeetBookedTagWanted(booking: Pick<R1MeetBookedTagBooking, 'status' | 'startAt' | 'updatedAt'>): boolean {
+export const R1_MEET_BOOKED_TAG_PRE_INTERVIEW_REASONS = Object.freeze([
+  'in_past',
+  'bot_create_failed',
+  'round_expired',
+  'invite_undeliverable',
+] as const satisfies readonly R1MeetBookedTagReason[]);
+const PRE_INTERVIEW: ReadonlySet<string> = new Set(R1_MEET_BOOKED_TAG_PRE_INTERVIEW_REASONS);
+
+/**
+ * Does this booking, the newest public booking of its application, want the tag (D-S11-2, the
+ * per-application rule)? Live or `completed`: yes. `failed` with a reason of
+ * `R1_MEET_BOOKED_TAG_PRE_INTERVIEW_REASONS`: no, at any time (it was never an interview). Any other
+ * `failed`, or `drained`, at or after its start (`updated_at >= start_at`): yes, the interview's time
+ * had come. Cancelled, or failed or drained before its start: no. An instant that does not parse
+ * fails closed (no). Pure.
+ */
+export function r1MeetBookedTagWanted(
+  booking: Pick<R1MeetBookedTagBooking, 'status' | 'reason' | 'startAt' | 'updatedAt'>,
+): boolean {
   if (LIVE.has(booking.status) || booking.status === 'completed') return true;
   if (booking.status !== 'failed' && booking.status !== 'drained') return false;
+  if (booking.status === 'failed' && PRE_INTERVIEW.has(booking.reason)) return false;
   const updatedMs = Date.parse(booking.updatedAt);
   const startMs = Date.parse(booking.startAt);
   return Number.isFinite(updatedMs) && Number.isFinite(startMs) && updatedMs >= startMs;
 }
 
+/** The longest a backed-off wait (`ashby_rate_limited`, `ashby_unavailable`) ever gets. */
+export const R1_MEET_ASHBY_TAG_BACKOFF_MAX_SEC = 300;
+
+/**
+ * The delay of a backed-off wait (see the header): the base when the previous run did not end in the
+ * same wait, else the seconds already waited in this streak, between the base and the cap. A streak
+ * start that does not parse, or lies in the future, answers the base. Pure.
+ */
+export function r1MeetAshbyTagBackoffSeconds(
+  meta: Pick<R1MeetJobMeta, 'lastDeferReason' | 'deferredAt'>,
+  nowMs: number,
+  wait: Pick<R1MeetAshbyTagWait, 'code' | 'seconds'>,
+): number {
+  if (meta.lastDeferReason !== wait.code || meta.deferredAt === null) return wait.seconds;
+  const since = Date.parse(meta.deferredAt);
+  if (!Number.isFinite(since) || !Number.isFinite(nowMs) || nowMs < since) return wait.seconds;
+  const waited = Math.floor((nowMs - since) / 1000);
+  return Math.min(Math.max(wait.seconds, waited), Math.max(wait.seconds, R1_MEET_ASHBY_TAG_BACKOFF_MAX_SEC));
+}
+
 /** A wait within the job's deferral bound; past it, the wait's closed code is thrown (retries, DLQ). */
-function deferOrThrow(meta: R1MeetJobMeta, nowMs: number, wait: R1MeetAshbyTagWait): R1MeetJobResult {
+function deferOrThrow(
+  meta: R1MeetJobMeta,
+  nowMs: number,
+  wait: R1MeetAshbyTagWait,
+  seconds: number = wait.seconds,
+): R1MeetJobResult {
   if (!canDeferR1MeetJob(meta, nowMs)) throw new R1MeetJobError(wait.thrown);
-  return r1MeetDefer(wait.code, wait.seconds);
+  return r1MeetDefer(wait.code, seconds);
 }
 
 function alert(log: R1MeetLog, errorType: string, httpStatus: number | null = null): void {
@@ -206,6 +267,11 @@ export async function runR1MeetAshbyBookedTag(
   if (tag === undefined || tag === null) throw new R1MeetJobError(R1_MEET_ASHBY_TAG_UNWIRED);
   const store = tag.store;
   const wait = (which: R1MeetAshbyTagWait): R1MeetJobResult => deferOrThrow(meta, deps.now(), which);
+  /** A transient Ashby wait, backed off while it repeats (see the header). */
+  const backoff = (which: R1MeetAshbyTagWait): R1MeetJobResult => {
+    const nowMs = deps.now();
+    return deferOrThrow(meta, nowMs, which, r1MeetAshbyTagBackoffSeconds(meta, nowMs, which));
+  };
 
   // 2. The booking: public only. Nothing else is read for a missing or an Ashby-scheduled row.
   const booking = await store.booking(job.bookingId);
@@ -252,18 +318,18 @@ export async function runR1MeetAshbyBookedTag(
   };
 
   /**
-   * One tag write. A failed write may mean the cached tag id is dead, whatever Ashby answered, so the
-   * cache is dropped (a run out of time wrote nothing). A refusal by the tenant answers `refused`;
-   * every other failure propagates to the classification below.
+   * One tag write. A refusal by the tenant may mean the cached tag id is dead, so it drops the cache
+   * and answers `refused`. Every other failure (429, 5xx, a timeout, a permission fault, out of time)
+   * keeps the cache and propagates to the classification below.
    */
   const write = async (send: () => Promise<unknown>): Promise<'written' | 'refused'> => {
     try {
       await send();
       return 'written';
     } catch (error) {
-      if (!(error instanceof R1MeetAshbyTagOutOfTime)) resolver.invalidate();
-      if (classifyR1MeetAshbyTagFailure(error)?.kind === 'rejected') return 'refused';
-      throw error;
+      if (classifyR1MeetAshbyTagFailure(error)?.kind !== 'rejected') throw error;
+      resolver.invalidate();
+      return 'refused';
     }
   };
 
@@ -277,7 +343,7 @@ export async function runR1MeetAshbyBookedTag(
         alert(deps.log, 'tag_ambiguous');
         return wait(R1_MEET_ASHBY_TAG_WAITS.ambiguous);
       default:
-        return wait(R1_MEET_ASHBY_TAG_WAITS.unavailable);
+        return backoff(R1_MEET_ASHBY_TAG_WAITS.unavailable);
     }
   };
 
@@ -360,9 +426,9 @@ export async function runR1MeetAshbyBookedTag(
         alert(deps.log, 'permission_denied', failure.httpStatus);
         return wait(R1_MEET_ASHBY_TAG_WAITS.permission);
       case 'rate_limited':
-        return wait(R1_MEET_ASHBY_TAG_WAITS.rateLimited);
+        return backoff(R1_MEET_ASHBY_TAG_WAITS.rateLimited);
       case 'unavailable':
-        return wait(R1_MEET_ASHBY_TAG_WAITS.unavailable);
+        return backoff(R1_MEET_ASHBY_TAG_WAITS.unavailable);
       case 'rejected':
         alert(deps.log, failure.detail, failure.httpStatus);
         return r1MeetIgnored('ashby_rejected');

@@ -3,12 +3,15 @@
  *
  * WHAT IT READS. Four narrow reads over the service-role client, one query each, and no write:
  *   booking               one booking by id (`r1_meet_bookings`), the columns
- *                         `R1_MEET_BOOKED_TAG_BOOKING_COLUMNS` and nothing else;
+ *                         `R1_MEET_BOOKED_TAG_BOOKING_COLUMNS` and nothing else (the `reason` tells a
+ *                         failure that could not have been an interview, PR #453 review S11-R1);
  *   applicationLink       the Ashby candidate id of one Ashby application (`ashby_application_links`,
  *                         provider `ashby`, `external_application_id` matched verbatim; unique by
  *                         `uq_ashby_application_links_app`, 0029);
  *   candidateApplications every application linked to one Ashby candidate (`external_candidate_id`
- *                         matched verbatim, any lifecycle or terminal state), at most
+ *                         matched case-insensitively, as 0143's person-wide rules match it with
+ *                         `lower(...) = lower(...)`, PR #453 review S11-R4; any lifecycle or terminal
+ *                         state), at most
  *                         `R1_MEET_BOOKED_TAG_MAX_APPLICATIONS`: one more row than that answers
  *                         `overflow` and no ids, so the job never decides from a partial list;
  *   newestPublicBooking   the newest public booking (`source = 'public_page'`) of one application,
@@ -26,7 +29,8 @@
  * works in either merge order with the slice that teaches the runtime store about public rows.
  *
  * IDS. A booking id answers lower-cased; Ashby ids (application, candidate) are Ashby's own
- * spelling, kept verbatim, because the links match them exactly. Every instant answers as
+ * spelling, kept verbatim, because the links match them exactly (the one exception: the person-wide
+ * read above ignores the case of the candidate id, like 0143). Every instant answers as
  * `toISOString()`; a zoneless or unparseable one is drift.
  *
  * FAILURES. A DB error, a rejected call, a builder that throws, or a row the schema does not allow
@@ -40,14 +44,15 @@
  */
 
 import type { supabase } from '../../supabase.js';
-import { R1_MEET_BOOKING_STATUSES, type R1MeetBookingStatus } from './bookings-read.js';
+import { R1_MEET_BOOKING_REASONS, R1_MEET_BOOKING_STATUSES, type R1MeetBookingReason, type R1MeetBookingStatus } from './bookings-read.js';
 import { R1MeetJobError, R1_MEET_DB_ERROR } from './jobs.js';
 import { parseR1MeetInstant } from './ticket.js';
 
 type Db = typeof supabase;
 
 /** Exactly what the booking reads select (D-S11-3). */
-export const R1_MEET_BOOKED_TAG_BOOKING_COLUMNS = 'id, source, status, ashby_application_id, start_at, updated_at, created_at';
+export const R1_MEET_BOOKED_TAG_BOOKING_COLUMNS =
+  'id, source, status, reason, ashby_application_id, start_at, updated_at, created_at';
 
 /** At most this many applications of one Ashby candidate are weighed; one more is an overflow. */
 export const R1_MEET_BOOKED_TAG_MAX_APPLICATIONS = 25;
@@ -59,6 +64,18 @@ export const R1_MEET_BOOKED_TAG_MAX_APPLICATIONS = 25;
 const SOURCES = Object.freeze(['ashby', 'public_page'] as const);
 const PUBLIC_SOURCE = 'public_page';
 
+/** The two reasons 0143 appends to 0142's 32 in `chk_r1_meet_bookings_reason`. */
+const PUBLIC_REASONS = Object.freeze(['candidate_cancelled', 'invite_undeliverable'] as const);
+
+/**
+ * The booking reasons of 0143's `chk_r1_meet_bookings_reason`: 0142's 32 (`R1_MEET_BOOKING_REASONS`),
+ * then the two 0143 appends, each once. A set union on purpose, so it stays the same 34 when S02
+ * appends the two to `R1_MEET_BOOKING_REASONS` (either merge order). Frozen.
+ */
+export const R1_MEET_BOOKED_TAG_REASONS: readonly R1MeetBookedTagReason[] = Object.freeze([
+  ...new Set<R1MeetBookedTagReason>([...R1_MEET_BOOKING_REASONS, ...PUBLIC_REASONS]),
+]);
+
 /** The two columns of a link the lane reads. */
 const LINK_COLUMNS = 'external_application_id, external_candidate_id';
 const LINK_PROVIDER = 'ashby';
@@ -66,16 +83,24 @@ const LINK_PROVIDER = 'ashby';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** The length bound of every Ashby id column (0029's link CHECKs). */
 const ASHBY_ID_MAX_LENGTH = 256;
+/**
+ * An Ashby id with no LIKE wildcard or escape character in it (Ashby ids are UUIDs), so `ilike` on it
+ * is exactly `lower(column) = lower(id)`. Any other id is matched verbatim.
+ */
+const CASELESS_SAFE_ID = /^[0-9A-Za-z-]{1,256}$/;
 
 // ── Shapes ──────────────────────────────────────────────────────────────────
 
 export type R1MeetBookedTagSource = (typeof SOURCES)[number];
+export type R1MeetBookedTagReason = R1MeetBookingReason | (typeof PUBLIC_REASONS)[number];
 
 export interface R1MeetBookedTagBooking {
   /** Lower-cased. */
   readonly id: string;
   readonly source: R1MeetBookedTagSource;
   readonly status: R1MeetBookingStatus;
+  /** One of `R1_MEET_BOOKED_TAG_REASONS` (0143's reason CHECK). */
+  readonly reason: R1MeetBookedTagReason;
   /** Verbatim (1..256 characters). */
   readonly applicationId: string;
   /** `toISOString()`. */
@@ -103,7 +128,7 @@ export interface R1MeetBookedTagStore {
   booking(id: string): Promise<R1MeetBookedTagBooking | null>;
   /** The link of one Ashby application, or null when there is none. */
   applicationLink(applicationId: string): Promise<R1MeetBookedTagLink | null>;
-  /** Every application linked to one Ashby candidate (bounded; see the header). */
+  /** Every application linked to one Ashby candidate, its id in any case (bounded; see the header). */
   candidateApplications(externalCandidateId: string): Promise<R1MeetBookedTagApplications>;
   /** The newest public booking of one Ashby application, or null. */
   newestPublicBooking(applicationId: string): Promise<R1MeetBookedTagBooking | null>;
@@ -192,6 +217,7 @@ function parseBooking(row: unknown): R1MeetBookedTagBooking {
     id: read.uuid('id'),
     source: read.oneOf('source', SOURCES),
     status: read.oneOf('status', R1_MEET_BOOKING_STATUSES),
+    reason: read.oneOf('reason', R1_MEET_BOOKED_TAG_REASONS),
     applicationId: read.ashbyId('ashby_application_id'),
     startAt: read.instant('start_at'),
     updatedAt: read.instant('updated_at'),
@@ -233,18 +259,25 @@ export function createR1MeetBookedTagStore(client: Db): R1MeetBookedTagStore {
     },
 
     async candidateApplications(externalCandidateId: string) {
+      // 0143 matches the person with lower() on both sides; `ilike` on an id with no wildcard is that.
+      const caseless = CASELESS_SAFE_ID.test(externalCandidateId);
       const rows = rowsOf(
-        await run(() =>
-          client
-            .from('ashby_application_links')
-            .select('external_application_id')
-            .eq('provider', LINK_PROVIDER)
-            .eq('external_candidate_id', externalCandidateId)
+        await run(() => {
+          const query = client.from('ashby_application_links').select(LINK_COLUMNS).eq('provider', LINK_PROVIDER);
+          return (caseless
+            ? query.ilike('external_candidate_id', externalCandidateId)
+            : query.eq('external_candidate_id', externalCandidateId))
             .order('external_application_id', { ascending: true })
-            .limit(R1_MEET_BOOKED_TAG_MAX_APPLICATIONS + 1),
-        ),
+            .limit(R1_MEET_BOOKED_TAG_MAX_APPLICATIONS + 1);
+        }),
       );
-      const ids = rows.map((row) => new FieldReader(row).ashbyId('external_application_id'));
+      const asked = externalCandidateId.toLowerCase();
+      const ids = rows.map((row) => {
+        const read = new FieldReader(row);
+        // Every row answers the candidate that was asked for (in any case), or it is drift.
+        if (read.ashbyId('external_candidate_id').toLowerCase() !== asked) read.fail();
+        return read.ashbyId('external_application_id');
+      });
       if (ids.length > R1_MEET_BOOKED_TAG_MAX_APPLICATIONS) {
         return Object.freeze({ applicationIds: Object.freeze([] as string[]), overflow: true });
       }

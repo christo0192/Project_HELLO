@@ -7,12 +7,16 @@
  *
  * Pinned (plan T4 item 5):
  *  - add once and repeat (one write across reruns); removes after a candidate cancel, an HR cancel, a
- *    failure or a drain before the start; kept after `completed`, a failure or drain after the start,
- *    and at `updated_at == start_at`; `op` is only a hint; cancel then rebook converges to present in
- *    either order; the rule is candidate-wide, with an overflow guard;
+ *    failure or a drain before the start, and after a failure that was never an interview at ANY time
+ *    (`in_past`, `bot_create_failed`, `round_expired`, `invite_undeliverable`: PR #453 review S11-R1);
+ *    kept after `completed`, a failure after a bot was sent or a drain after the start, and at
+ *    `updated_at == start_at`; `op` is only a hint; cancel then rebook converges to present in
+ *    either order; the rule is candidate-wide (the candidate id in any case, S11-R4), with an overflow
+ *    guard;
  *  - the Ashby candidate id from the link, else `application.info`; Ashby-scheduled and missing rows
  *    are ignored with no Ashby call; only the Dex tag is ever written, and never a create;
- *  - catalogue miss / ambiguous / truncated; every Ashby failure class; write refusals; contention
+ *  - catalogue miss / ambiguous / truncated; every Ashby failure class; only a refused write drops the
+ *    cached tag id (S11-R5); the back-off of the transient waits (S11-R3); write refusals; contention
  *    (a recruiter and a booking changing mid-run); the switches, the key and the wiring; the run's
  *    time; a database fault;
  *  - after EVERY test: no log line, thrown message or result code carries a fixture id, a sentinel,
@@ -20,19 +24,25 @@
  *    paths; no write to the 0142 port and no Recall request.
  */
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   R1_MEET_ASHBY_TAG_ALERT_TYPES,
+  R1_MEET_ASHBY_TAG_BACKOFF_MAX_SEC,
   R1_MEET_ASHBY_TAG_INACTIVE_LOG,
   R1_MEET_ASHBY_TAG_UNWIRED,
   R1_MEET_ASHBY_TAG_WAITS,
+  R1_MEET_BOOKED_TAG_PRE_INTERVIEW_REASONS,
   r1MeetAshbyBookedTagDefinition,
+  r1MeetAshbyTagBackoffSeconds,
   r1MeetBookedTagWanted,
   runR1MeetAshbyBookedTag,
 } from '../lib/r1/meet/ashby-booked-tag.js';
 import { R1_MEET_ASHBY_TAG_MAX_REMOVES, R1_MEET_BOOKED_TAG_TITLE } from '../lib/r1/meet/ashby-booked-tag-ashby.js';
-import { R1_MEET_BOOKED_TAG_MAX_APPLICATIONS } from '../lib/r1/meet/ashby-booked-tag-store.js';
-import { R1_MEET_BOOKING_STATUSES } from '../lib/r1/meet/bookings-read.js';
+import { R1_MEET_BOOKED_TAG_MAX_APPLICATIONS, type R1MeetBookedTagReason } from '../lib/r1/meet/ashby-booked-tag-store.js';
+import { R1_MEET_BOOKING_STATUSES, type R1MeetBookingStatus } from '../lib/r1/meet/bookings-read.js';
 import { R1_MEET_DEFINITIONS, createR1MeetDispatcher } from '../lib/r1/meet/dispatcher.js';
 import {
   R1MeetJobError,
@@ -47,7 +57,7 @@ import {
   type R1MeetJobResult,
 } from '../lib/r1/meet/jobs.js';
 import { R1_MEET_ALERTS, type R1MeetLogMeta } from '../lib/r1/meet/recall-actions.js';
-import { R1_MEET_LIVE_STATUSES } from '../lib/r1/meet/runtime-store.js';
+import { R1_MEET_CAP_REASONS, R1_MEET_LIVE_STATUSES } from '../lib/r1/meet/runtime-store.js';
 import {
   ASHBY_TAG_LANE_PATHS,
   ASHBY_TAG_SENTINELS,
@@ -169,14 +179,35 @@ function person(w: R1MeetAshbyTagWorld, options: SeedPersonOptions & { readonly 
 const BEFORE_START = { startAt: iso(NOW_MS + 24 * HOUR_MS), updatedAt: HARNESS_NOW } as const;
 const AFTER_START = { startAt: iso(NOW_MS - HOUR_MS), updatedAt: HARNESS_NOW } as const;
 const AT_START = { startAt: HARNESS_NOW, updatedAt: HARNESS_NOW } as const;
+/** Maintenance fails a booking that never got a bot `in_past` 30 minutes after its slot ENDS. */
+const AFTER_SLOT_END = { startAt: iso(NOW_MS - 2 * HOUR_MS), updatedAt: HARNESS_NOW } as const;
+
+/** One reason per status that keeps the time rule (a `failed` booking whose bot was sent: no_show). */
+const TIME_RULE_REASON: Readonly<Record<R1MeetBookingStatus, R1MeetBookedTagReason>> = Object.freeze({
+  pending: 'eligible',
+  unmatched_application: 'application_unknown',
+  unmapped_scheduler: 'scheduler_unmapped',
+  blocked: 'bot_cap_reached',
+  bot_scheduled: 'eligible',
+  bot_joining: 'eligible',
+  human_present: 'eligible',
+  in_call: 'eligible',
+  completed: 'attempt_settled',
+  cancelled: 'cancelled',
+  failed: 'no_show',
+  drained: 'flag_off',
+});
+/** The `failed` reasons that follow a bot sent to the interview: they keep the time rule. */
+const BOT_SENT_FAILURES = Object.freeze(['no_show', 'bot_fatal', 'admission_refused', 'multiple_humans'] as const);
 
 // ── The rule itself ─────────────────────────────────────────────────────────
 
 describe('r1MeetBookedTagWanted (D-S11-2, the per-application rule)', () => {
   it('wants the tag for every live status and completed; never for cancelled; failed and drained by the start', () => {
     for (const status of R1_MEET_BOOKING_STATUSES) {
-      const before = r1MeetBookedTagWanted({ status, ...BEFORE_START });
-      const after = r1MeetBookedTagWanted({ status, ...AFTER_START });
+      const reason = TIME_RULE_REASON[status];
+      const before = r1MeetBookedTagWanted({ status, reason, ...BEFORE_START });
+      const after = r1MeetBookedTagWanted({ status, reason, ...AFTER_START });
       if ((R1_MEET_LIVE_STATUSES as readonly string[]).includes(status) || status === 'completed') {
         expect([status, before, after]).toEqual([status, true, true]);
       } else if (status === 'failed' || status === 'drained') {
@@ -189,14 +220,53 @@ describe('r1MeetBookedTagWanted (D-S11-2, the per-application rule)', () => {
 
   it('counts updated_at == start_at as after the start, one millisecond before as before', () => {
     for (const status of ['failed', 'drained'] as const) {
-      expect(r1MeetBookedTagWanted({ status, ...AT_START })).toBe(true);
-      expect(r1MeetBookedTagWanted({ status, startAt: HARNESS_NOW, updatedAt: iso(NOW_MS - 1) })).toBe(false);
+      const reason = TIME_RULE_REASON[status];
+      expect(r1MeetBookedTagWanted({ status, reason, ...AT_START })).toBe(true);
+      expect(r1MeetBookedTagWanted({ status, reason, startAt: HARNESS_NOW, updatedAt: iso(NOW_MS - 1) })).toBe(false);
     }
   });
 
   it('fails closed on an instant that does not parse', () => {
-    expect(r1MeetBookedTagWanted({ status: 'failed', startAt: 'not-a-time', updatedAt: HARNESS_NOW })).toBe(false);
-    expect(r1MeetBookedTagWanted({ status: 'drained', startAt: HARNESS_NOW, updatedAt: '' })).toBe(false);
+    expect(r1MeetBookedTagWanted({ status: 'failed', reason: 'no_show', startAt: 'not-a-time', updatedAt: HARNESS_NOW })).toBe(false);
+    expect(r1MeetBookedTagWanted({ status: 'drained', reason: 'flag_off', startAt: HARNESS_NOW, updatedAt: '' })).toBe(false);
+  });
+
+  // PR #453 review S11-R1. Owner decision 5: the tag goes when the booking "fails before the
+  // interview". A booking that never got a bot is failed `in_past` 30 minutes after its slot ENDS,
+  // so `updated_at >= start_at` holds; it must still lose the tag.
+  it('a failure that was never an interview never wants the tag: before, at or long after the start', () => {
+    expect(R1_MEET_BOOKED_TAG_PRE_INTERVIEW_REASONS).toEqual(['in_past', 'bot_create_failed', 'round_expired', 'invite_undeliverable']);
+    expect(Object.isFrozen(R1_MEET_BOOKED_TAG_PRE_INTERVIEW_REASONS)).toBe(true);
+    for (const reason of R1_MEET_BOOKED_TAG_PRE_INTERVIEW_REASONS) {
+      for (const timing of [BEFORE_START, AT_START, AFTER_START, AFTER_SLOT_END]) {
+        expect(r1MeetBookedTagWanted({ status: 'failed', reason, ...timing }), `${reason} ${timing.startAt}`).toBe(false);
+      }
+    }
+  });
+
+  it('a failure after a bot was sent to the interview keeps the time rule', () => {
+    for (const reason of BOT_SENT_FAILURES) {
+      expect(r1MeetBookedTagWanted({ status: 'failed', reason, ...BEFORE_START }), reason).toBe(false);
+      expect(r1MeetBookedTagWanted({ status: 'failed', reason, ...AT_START }), reason).toBe(true);
+      expect(r1MeetBookedTagWanted({ status: 'failed', reason, ...AFTER_SLOT_END }), reason).toBe(true);
+    }
+  });
+
+  it('the two lists split 0143\'s failed reasons exactly; the pre-interview ones never follow a bot', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const sql = readFileSync(path.resolve(here, '../../../supabase/migrations/0143_r1_meet_public_bookings.sql'), 'utf8')
+      .replace(/\r\n/g, '\n')
+      .replace(/--[^\n]*/g, '')
+      .replace(/\s+/g, ' ');
+    const pairing = /or \(status in \('failed'\) and reason in \(([^)]*)\)\)/.exec(sql);
+    expect(pairing).not.toBeNull();
+    const failed = pairing![1]!.split(',').map((value) => value.trim().replace(/^'|'$/g, ''));
+    expect([...R1_MEET_BOOKED_TAG_PRE_INTERVIEW_REASONS, ...BOT_SENT_FAILURES].sort()).toEqual([...failed].sort());
+    // R1_MEET_CAP_REASONS (runtime-store.ts) lists the reasons that only follow an attached bot.
+    for (const reason of R1_MEET_BOOKED_TAG_PRE_INTERVIEW_REASONS) {
+      expect((R1_MEET_CAP_REASONS as readonly string[]).includes(reason), reason).toBe(false);
+    }
+    for (const reason of BOT_SENT_FAILURES) expect((R1_MEET_CAP_REASONS as readonly string[]).includes(reason), reason).toBe(true);
   });
 });
 
@@ -303,6 +373,11 @@ describe('remove: a cancel, or a failure or drain before the start', () => {
     { name: 'a failure before the start', status: 'failed', reason: 'bot_create_failed', ...BEFORE_START },
     { name: 'a failure one millisecond before the start', status: 'failed', reason: 'bot_fatal', startAt: HARNESS_NOW, updatedAt: iso(NOW_MS - 1) },
     { name: 'a drain before the start', status: 'drained', reason: 'flag_off', ...BEFORE_START },
+    // PR #453 review S11-R1: never an interview, so removed although it failed after the start.
+    { name: 'a booking that never got a bot, failed in_past after its slot', status: 'failed', reason: 'in_past', ...AFTER_SLOT_END },
+    { name: 'a bot that could not be created, failed after the start', status: 'failed', reason: 'bot_create_failed', ...AFTER_START },
+    { name: 'a round that expired before its bot, failed after the start', status: 'failed', reason: 'round_expired', ...AFTER_START },
+    { name: 'an invite that never reached the candidate, failed after the start', status: 'failed', reason: 'invite_undeliverable', ...AFTER_START },
   ] as const;
 
   for (const c of cases) {
@@ -324,18 +399,20 @@ describe('remove: a cancel, or a failure or drain before the start', () => {
 
 describe('kept: completed, or a failure or drain at or after the start', () => {
   const cases = [
-    { name: 'completed', status: 'completed', ...AFTER_START },
-    { name: 'a no-show failure after the start', status: 'failed', ...AFTER_START },
-    { name: 'a drain after the start', status: 'drained', ...AFTER_START },
-    { name: 'a failure at exactly the start (updated_at == start_at)', status: 'failed', ...AT_START },
+    { name: 'completed', status: 'completed', reason: 'attempt_settled', ...AFTER_START },
+    { name: 'a no-show failure after the start', status: 'failed', reason: 'no_show', ...AFTER_START },
+    { name: 'a no-show failure after the slot', status: 'failed', reason: 'no_show', ...AFTER_SLOT_END },
+    { name: 'a bot failure after the start', status: 'failed', reason: 'bot_fatal', ...AFTER_START },
+    { name: 'an admission refused after the start', status: 'failed', reason: 'admission_refused', ...AFTER_START },
+    { name: 'a drain after the start', status: 'drained', reason: 'flag_off', ...AFTER_START },
+    { name: 'a failure at exactly the start (updated_at == start_at)', status: 'failed', reason: 'no_show', ...AT_START },
   ] as const;
 
   for (const c of cases) {
     for (const op of ['remove', 'add'] as const) {
       it(`keeps the tag after ${c.name} (${op} job): zero writes`, async () => {
         const w = newWorld();
-        const p = person(w, { booking: { status: c.status, startAt: c.startAt, updatedAt: c.updatedAt } });
-        if (c.status === 'failed' && c.name.includes('no-show')) p.booking.reason = 'no_show';
+        const p = person(w, { booking: { status: c.status, reason: c.reason, startAt: c.startAt, updatedAt: c.updatedAt } });
         expect(await run(w, op, p.bookingId)).toEqual(r1MeetProcessed('tag_present'));
         expect(w.writes()).toEqual([]);
         expect(tagIdsOf(w, p.candidateId)).toEqual([w.tagIds.dex]);
@@ -672,14 +749,33 @@ describe('error classes (D-S11-9)', () => {
     });
   }
 
-  it('a 503 on the add waits, and drops the cached tag id (the next run walks the catalogue again)', async () => {
+  // PR #453 review S11-R5: only a refusal can mean a dead tag id. A 429, a 5xx or a timeout keeps the
+  // cached id, so a rerun during an Ashby slowdown does not walk the catalogue again.
+  for (const step of [{ status: 503 }, { status: 429 }, 'timeout'] as const) {
+    const name = typeof step === 'string' ? step : `HTTP ${step.status}`;
+    it(`a ${name} on the add waits and KEEPS the cached tag id (the next run adds with no second walk)`, async () => {
+      const w = newWorld();
+      const p = person(w, { withDex: false });
+      w.fake.next('/candidate.addTag', step);
+      const waited = await run(w, 'add', p.bookingId);
+      expect(waited.outcome).toBe('defer');
+      expect(walks(w)).toBe(1);
+      expect(await run(w, 'add', p.bookingId, w.h.meta({ deferCount: 1 }))).toEqual(r1MeetProcessed('tag_added'));
+      expect(walks(w)).toBe(1);
+      expect(w.fake.requestsOf('/candidate.addTag').map((request) => request.body.tagId)).toEqual([w.tagIds.dex, w.tagIds.dex]);
+    });
+  }
+
+  it('a 503 on a remove keeps the cached tag id too', async () => {
     const w = newWorld();
-    const p = person(w, { withDex: false });
-    w.fake.next('/candidate.addTag', { status: 503 });
-    expect(await run(w, 'add', p.bookingId)).toEqual(r1MeetDefer('ashby_unavailable', 30));
+    const adder = person(w, { withDex: false });
+    expect(await run(w, 'add', adder.bookingId)).toEqual(r1MeetProcessed('tag_added'));
+    const p = person(w, { booking: { status: 'cancelled' } });
+    w.fake.next('/candidate.removeTag', { status: 503 });
+    expect(await run(w, 'remove', p.bookingId)).toEqual(r1MeetDefer('ashby_unavailable', 30));
+    const other = person(w, { withDex: false });
+    expect(await run(w, 'add', other.bookingId)).toEqual(r1MeetProcessed('tag_added'));
     expect(walks(w)).toBe(1);
-    expect(await run(w, 'add', p.bookingId, w.h.meta({ deferCount: 1 }))).toEqual(r1MeetProcessed('tag_added'));
-    expect(walks(w)).toBe(2);
   });
 
   const permissionCases = [
@@ -926,11 +1022,11 @@ describe('switches and wiring (D-S11-11, D-S11-12)', () => {
 });
 
 describe('the run\'s time (D-S11-8)', () => {
-  it('a clock that runs 28 s during candidate.info: the next call is not sent, wait ashby_unavailable', async () => {
+  it('a clock that runs 18 s during candidate.info: the next call is not sent, wait ashby_unavailable', async () => {
     const w = newWorld();
     const p = person(w, { withDex: false });
     w.fake.onRequest((request) => {
-      if (request.path === '/candidate.info') w.h.advance(28_000);
+      if (request.path === '/candidate.info') w.h.advance(18_000);
     });
     expect(await run(w, 'add', p.bookingId)).toEqual(r1MeetDefer('ashby_unavailable', 30));
     expect(w.fake.paths()).toEqual(['/candidate.info']);
@@ -941,11 +1037,78 @@ describe('the run\'s time (D-S11-8)', () => {
     const w = newWorld();
     const p = person(w, { booking: { status: 'cancelled' } });
     w.fake.onRequest((request) => {
-      if (request.path === '/candidate.info') w.h.advance(28_000);
+      if (request.path === '/candidate.info') w.h.advance(18_000);
     });
     expect(await run(w, 'remove', p.bookingId)).toEqual(r1MeetDefer('ashby_unavailable', 30));
     expect(w.writes()).toEqual([]);
     expect(tagIdsOf(w, p.candidateId)).toEqual([w.tagIds.dex]);
+  });
+});
+
+// PR #453 review S11-R3: the tag jobs share the r1-meet lane with the jobs of live interviews, so a
+// transient Ashby wait grows while it repeats instead of asking for a run every 30 s.
+describe('the back-off of the transient waits (S11-R3)', () => {
+  const streak = (code: string, waitedMs: number) => ({ lastDeferReason: code, deferredAt: iso(NOW_MS - waitedMs) });
+
+  it('answers the base unless the previous run ended in the same wait, then the streak so far, capped', () => {
+    const unavailable = R1_MEET_ASHBY_TAG_WAITS.unavailable;
+    const limited = R1_MEET_ASHBY_TAG_WAITS.rateLimited;
+    expect(R1_MEET_ASHBY_TAG_BACKOFF_MAX_SEC).toBe(300);
+    expect(r1MeetAshbyTagBackoffSeconds({ lastDeferReason: null, deferredAt: null }, NOW_MS, unavailable)).toBe(30);
+    expect(r1MeetAshbyTagBackoffSeconds(streak('ashby_rate_limited', 200_000), NOW_MS, unavailable)).toBe(30);
+    expect(r1MeetAshbyTagBackoffSeconds({ lastDeferReason: 'ashby_unavailable', deferredAt: null }, NOW_MS, unavailable)).toBe(30);
+    expect(r1MeetAshbyTagBackoffSeconds(streak('ashby_unavailable', 10_000), NOW_MS, unavailable)).toBe(30);
+    expect(r1MeetAshbyTagBackoffSeconds(streak('ashby_unavailable', 61_900), NOW_MS, unavailable)).toBe(61);
+    expect(r1MeetAshbyTagBackoffSeconds(streak('ashby_unavailable', 120_000), NOW_MS, unavailable)).toBe(120);
+    expect(r1MeetAshbyTagBackoffSeconds(streak('ashby_unavailable', 20 * 60_000), NOW_MS, unavailable)).toBe(300);
+    expect(r1MeetAshbyTagBackoffSeconds(streak('ashby_rate_limited', 30_000), NOW_MS, limited)).toBe(60);
+    expect(r1MeetAshbyTagBackoffSeconds(streak('ashby_rate_limited', 250_000), NOW_MS, limited)).toBe(250);
+    expect(r1MeetAshbyTagBackoffSeconds(streak('ashby_rate_limited', 3_000_000), NOW_MS, limited)).toBe(300);
+    // A streak start that does not parse, or lies ahead of the clock, is the base.
+    expect(r1MeetAshbyTagBackoffSeconds({ lastDeferReason: 'ashby_unavailable', deferredAt: 'soon' }, NOW_MS, unavailable)).toBe(30);
+    expect(r1MeetAshbyTagBackoffSeconds(streak('ashby_unavailable', -60_000), NOW_MS, unavailable)).toBe(30);
+    expect(r1MeetAshbyTagBackoffSeconds(streak('ashby_unavailable', 120_000), Number.NaN, unavailable)).toBe(30);
+  });
+
+  it('through the job: a 503 streak waits as long as it already waited; a first one waits the base', async () => {
+    const w = newWorld();
+    const p = person(w, { withDex: false });
+    w.fake.next('/candidate.info', { status: 503 });
+    expect(await run(w, 'add', p.bookingId)).toEqual(r1MeetDefer('ashby_unavailable', 30));
+    w.fake.next('/candidate.info', { status: 503 });
+    const second = w.h.meta({ deferCount: 4, ...streak('ashby_unavailable', 100_000) });
+    expect(await run(w, 'add', p.bookingId, second)).toEqual(r1MeetDefer('ashby_unavailable', 100));
+    w.fake.next('/candidate.info', 'timeout');
+    const long = w.h.meta({ deferCount: 9, ...streak('ashby_unavailable', 40 * 60_000) });
+    expect(await run(w, 'add', p.bookingId, long)).toEqual(r1MeetDefer('ashby_unavailable', 300));
+    // A wait of another kind before this one starts the base again.
+    w.fake.next('/candidate.info', { status: 503 });
+    const other = w.h.meta({ deferCount: 2, ...streak('tag_contended', 40 * 60_000) });
+    expect(await run(w, 'add', p.bookingId, other)).toEqual(r1MeetDefer('ashby_unavailable', 30));
+    expect(w.writes()).toEqual([]);
+  });
+
+  it('through the job: a 429 streak backs off from 60 s; a truncated catalogue backs off as unavailable', async () => {
+    const w = newWorld();
+    const p = person(w, { withDex: false });
+    w.fake.next('/candidate.info', { status: 429 });
+    const limited = w.h.meta({ deferCount: 3, ...streak('ashby_rate_limited', 200_000) });
+    expect(await run(w, 'add', p.bookingId, limited)).toEqual(r1MeetDefer('ashby_rate_limited', 200));
+    w.fake.next('/candidateTag.list', { status: 200, body: { success: true, results: [], moreDataAvailable: true } });
+    const truncated = w.h.meta({ deferCount: 3, ...streak('ashby_unavailable', 90_000) });
+    expect(await run(w, 'add', p.bookingId, truncated)).toEqual(r1MeetDefer('ashby_unavailable', 90));
+  });
+
+  it('the hour-long waits and tag_contended never back off, and the bound still throws', async () => {
+    const w = newWorld();
+    const p = person(w, { withDex: false });
+    w.setKeyConfigured(false);
+    const keyStreak = w.h.meta({ deferCount: 2, ...streak('ashby_key_missing', 50 * 60_000) });
+    expect(await run(w, 'add', p.bookingId, keyStreak)).toEqual(r1MeetDefer('ashby_key_missing', 3600));
+    w.setKeyConfigured(true);
+    w.fake.next('/candidate.info', { status: 503 });
+    const pastTheStreak = w.h.meta({ deferCount: 5, ...streak('ashby_unavailable', 61 * 60_000) });
+    expect((await runThrows(w, 'add', p.bookingId, pastTheStreak)).code).toBe('r1_meet_ashby_tag_unavailable');
   });
 });
 

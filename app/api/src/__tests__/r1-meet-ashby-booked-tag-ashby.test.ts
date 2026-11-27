@@ -11,7 +11,7 @@
  *   exactly ONE request), the exact write and list bodies, the five calls only and no `extra`, the
  *   metadata-only log lines, and an empty key refused before anything is built.
  * - The candidate's Dex tags and the holds rule (D-S11-6), the failure classes (D-S11-9) and the run
- *   budget (30 s, no call under 3 s).
+ *   budget (20 s, 5 s per call since PR #453 review S11-R3; no call under 3 s).
  * - Across the whole file: no request path outside the five the lane may call.
  */
 import { describe, expect, it } from 'vitest';
@@ -144,12 +144,15 @@ async function ashbyFailure(promise: Promise<unknown>): Promise<AshbyError> {
 describe('the constants of the lane', () => {
   it('pins the title, the client settings, the cache, the paging and the run budget', () => {
     expect(R1_MEET_BOOKED_TAG_TITLE).toBe('Dex R1: Booked');
-    expect(R1_MEET_ASHBY_TAG_CLIENT_SETTINGS).toEqual({ maxAttempts: 1, timeoutMs: 10_000 });
+    // PR #453 review S11-R3: 5 s per call and a 20 s run, so a slow Ashby holds a shared r1-meet
+    // lane slot for at most 20 s a run (it was 10 s and 30 s).
+    expect(R1_MEET_ASHBY_TAG_CLIENT_SETTINGS).toEqual({ maxAttempts: 1, timeoutMs: 5_000 });
     expect(Object.isFrozen(R1_MEET_ASHBY_TAG_CLIENT_SETTINGS)).toBe(true);
     expect(R1_MEET_BOOKED_TAG_CACHE_MS).toBe(5 * 60_000);
     expect(R1_MEET_BOOKED_TAG_PAGE_SIZE).toBe(100);
     expect(R1_MEET_BOOKED_TAG_MAX_PAGES).toBe(100);
-    expect(R1_MEET_ASHBY_TAG_RUN_MS).toBe(30_000);
+    expect(R1_MEET_ASHBY_TAG_RUN_MS).toBe(20_000);
+    expect(R1_MEET_ASHBY_TAG_RUN_MS).toBeLessThan(60_000); // the lane's lease (R1_MEET_LANE.leaseSeconds)
     expect(R1_MEET_ASHBY_TAG_MIN_CALL_MS).toBe(3_000);
     expect(R1_MEET_ASHBY_TAG_MAX_REMOVES).toBe(5);
   });
@@ -361,7 +364,7 @@ describe('the one-title resolver (D-S11-5)', () => {
     const spent = world();
     spent.fake.catalogue.push(dex());
     const budget = r1MeetAshbyTagBudget(() => spent.now());
-    spent.advance(27_001);
+    spent.advance(17_001);
     await expect(spent.port.resolver.resolve({ budget })).rejects.toBeInstanceOf(R1MeetAshbyTagOutOfTime);
     expect(spent.fake.requests).toHaveLength(0);
 
@@ -372,7 +375,7 @@ describe('the one-title resolver (D-S11-5)', () => {
     midWalk.fake.onRequest(() => {
       if (!advanced) {
         advanced = true;
-        midWalk.advance(28_000);
+        midWalk.advance(18_000);
       }
     });
     await expect(midWalk.port.resolver.resolve({ budget: runBudget })).rejects.toBeInstanceOf(R1MeetAshbyTagOutOfTime);
@@ -729,10 +732,10 @@ describe('the run budget (D-S11-8)', () => {
     expect(deadlineAt).toBeLessThanOrEqual(after + R1_MEET_ASHBY_TAG_RUN_MS);
   });
 
-  it('allows a call with exactly 3 s left and refuses one after 27_001 ms', () => {
+  it('allows a call with exactly 3 s left and refuses one after 17_001 ms', () => {
     let now = 0;
     const budget = r1MeetAshbyTagBudget(() => now);
-    now += 27_000;
+    now += 17_000;
     const { deadlineAt } = budget.beforeCall();
     expect(Math.abs((deadlineAt as number) - Date.now() - 3_000)).toBeLessThan(50);
     now += 1;
@@ -741,19 +744,19 @@ describe('the run budget (D-S11-8)', () => {
 
     let later = 0;
     const fresh = r1MeetAshbyTagBudget(() => later);
-    later += 27_001;
+    later += 17_001;
     expect(() => fresh.beforeCall()).toThrow(R1MeetAshbyTagOutOfTime);
   });
 
-  it('starts at creation: a budget made later has its own 30 s', () => {
+  it('starts at creation: a budget made later has its own 20 s', () => {
     let now = 0;
     const early = r1MeetAshbyTagBudget(() => now);
-    now += 20_000;
+    now += 12_000;
     const late = r1MeetAshbyTagBudget(() => now);
-    now += 8_000;
+    now += 6_000;
     expect(() => early.beforeCall()).toThrow(R1MeetAshbyTagOutOfTime);
     const { deadlineAt } = late.beforeCall();
-    expect(Math.abs((deadlineAt as number) - Date.now() - 22_000)).toBeLessThan(50);
+    expect(Math.abs((deadlineAt as number) - Date.now() - 14_000)).toBeLessThan(50);
   });
 
   it('fails closed on a clock that answers no finite time', () => {
