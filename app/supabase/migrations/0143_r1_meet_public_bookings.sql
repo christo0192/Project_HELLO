@@ -94,6 +94,17 @@ alter table screening_v2.r1_meet_bookings
 alter table screening_v2.r1_meet_bookings
   alter column ashby_scheduled_by_user_id drop not null;
 
+-- Known residual, accepted (R01 1.3, review S01-R4): the unchanged 0142 Ashby create keeps
+-- `o.ashby_interview_event_id <> p_ashby_interview_event_id` in its step 8a, and that is NULL, not
+-- true, for a public booking (no Ashby event). So if HR schedules Dex in Ashby for a candidate
+-- whose LIVE public booking sits on a lapsed, unstarted Meet round, that step expires the round
+-- under the booking and books a new round. 0142 is not redeclared to change it (D5). The public
+-- booking stays live on an expired round (counted as live for capacity and already_booked) until
+-- M034 maintenance's overdue step fails it `in_past`, 30 minutes after its slot ends; with the
+-- default grace (7200 s) that is long before the round lapses, so the gap needs maintenance to be
+-- behind or a grace under 30 minutes. 0143's own copy of step 8a uses `is distinct from` (§15).
+-- Owner of any further fix: S05 (the public runtime maintenance).
+
 -- The public columns. All NULL (move_count 0) on an Ashby row: chk_r1_meet_bookings_public_columns.
 alter table screening_v2.r1_meet_bookings
   add column if not exists google_calendar_event_id text;
@@ -426,13 +437,20 @@ $$;
 --   (decision_use_blocked_at) | already_booked | r1_completed | phone_engagement_active |
 --   phone_assessment_pending | role_not_configured | consent_template_unavailable | disabled |
 --   paused | capacity_exhausted.
+-- dsar_hold and candidate_ineligible cover the Ashby PERSON (contracts 9, S04 F2): a hold, or a
+-- block, on this candidate or on any other local candidate whose Ashby link names the same Ashby
+-- candidate id (case ignored, as S12's import matches it) refuses. A link without an Ashby
+-- candidate id matches no other candidate. Every hold is checked before any block.
 -- already_booked: a live booking of either source; or a live round that the create could neither
 -- expire (0142 step 8a: a lapsed, unstarted Meet round nothing uses) nor re-link (0142 step 10: a
 -- live, unexpired Meet round with starts and attempts left, no live session and no live booking).
 -- So a live or lapsed browser round, an in-progress lapsed Meet round and a Meet round with a live
 -- session refuse, while a Meet round after a cancel, a failed booking or HR's grant-retake (back
--- to invited) is eligible. r1_completed: a completed sales_r1 round and no round to re-link (no
--- public retake). capacity_exhausted applies only when no round is re-linked: a re-link takes no
+-- to invited) is eligible. r1_completed: no round to re-link, and a sales_r1 round of any channel
+-- that is completed OR holds a counted attempt (no public retake). The second conjunct is HR's
+-- retake round once it is cancelled (on the manage link, or by HR) or expired: it keeps its
+-- status and its count (0120), so without it a new round with a fresh attempt budget would be
+-- created. capacity_exhausted applies only when no round is re-linked: a re-link takes no
 -- new hold (0142 step 10 has no capacity check either). The notice is the newest active release
 -- for the re-linked round's consent locale, else en-IN. Read only (stable): precheck calls it, and
 -- create calls it under its candidate and day locks. Internal, no EXECUTE for any API role.
@@ -453,6 +471,7 @@ declare
   v_link_candidate uuid;
   v_link_terminal text;
   v_link_mapping uuid;
+  v_link_person text;
   v_round screening_v2.interview_rounds%rowtype;
   v_reusable boolean := true;
   v_lapsed_id uuid;
@@ -462,9 +481,9 @@ declare
   v_template screening_v2.interview_round_consent_templates%rowtype;
   v_settings screening_v2.r1_settings%rowtype;
 begin
-  -- The Ashby application link, by its verbatim id, bound to THIS candidate.
-  select l.candidate_id, l.terminal_state, l.job_mapping_id
-    into v_link_candidate, v_link_terminal, v_link_mapping
+  -- The Ashby application link, by its verbatim id, bound to THIS candidate, and its Ashby person.
+  select l.candidate_id, l.terminal_state, l.job_mapping_id, l.external_candidate_id
+    into v_link_candidate, v_link_terminal, v_link_mapping, v_link_person
     from screening_v2.ashby_application_links l
    where l.provider = 'ashby' and l.external_application_id = p_ashby_application_id;
   v_link_found := found;
@@ -487,8 +506,35 @@ begin
   ) then
     return 'dsar_hold';
   end if;
+  -- The same Ashby person held under ANOTHER local candidate (contracts 9, S04 F2): one person can
+  -- have two candidate rows (two applications imported apart), and a hold on either covers the
+  -- person. The 0130 lists, on every local candidate linked to this link's Ashby candidate id.
+  -- Both person reads scan the links table (external_candidate_id has no index, as 0134 notes):
+  -- fine at today's size; a later migration can add one on lower(external_candidate_id).
+  if v_link_person is not null and exists (
+    select 1
+      from screening_v2.ashby_application_links l2
+      join screening_v2.data_subject_requests d on d.candidate_id = l2.candidate_id
+     where l2.provider = 'ashby'
+       and lower(l2.external_candidate_id) = lower(v_link_person)
+       and d.request_type in ('correct', 'restrict', 'delete')
+       and d.request_status in ('pending', 'in_progress', 'fulfilled')
+  ) then
+    return 'dsar_hold';
+  end if;
   if not exists (select 1 from screening_v2.candidates c
                   where c.id = p_candidate_id and c.decision_use_blocked_at is null) then
+    return 'candidate_ineligible';
+  end if;
+  -- ... and the same person blocked from decisions under another local candidate.
+  if v_link_person is not null and exists (
+    select 1
+      from screening_v2.ashby_application_links l2
+      join screening_v2.candidates c on c.id = l2.candidate_id
+     where l2.provider = 'ashby'
+       and lower(l2.external_candidate_id) = lower(v_link_person)
+       and c.decision_use_blocked_at is not null
+  ) then
     return 'candidate_ineligible';
   end if;
 
@@ -536,11 +582,13 @@ begin
   if v_round.id is not null and not v_reusable and v_lapsed_id is null then
     return 'already_booked';
   end if;
-  -- One R1 per candidate: a completed round and nothing to re-link (an expirable round is not live).
+  -- One R1 per candidate: nothing to re-link (an expirable round is not live), and a round that is
+  -- completed or holds a counted attempt (HR's retake round once cancelled or expired keeps its
+  -- count). The create re-reads exactly this predicate after r1_send_round makes a new round.
   if not v_reusable
      and exists (select 1 from screening_v2.interview_rounds r
                   where r.candidate_id = p_candidate_id and r.kind = 'sales_r1'
-                    and r.status = 'completed') then
+                    and (r.status = 'completed' or r.attempts_counted > 0)) then
     return 'r1_completed';
   end if;
 
@@ -740,7 +788,10 @@ $$;
 --      unused Meet round is expired, the round is created through r1_send_round (an unusable link
 --      digest, then channel meet), or the candidate's reusable Meet round (after a cancel, a failed
 --      booking or HR's grant-retake) is re-linked with its consent re-checked against the newest
---      notice of the ROUND's audience; their refusals answer refused <code>;
+--      notice of the ROUND's audience; their refusals answer refused <code>. When r1_send_round
+--      makes a NEW round, the §12 r1_completed predicate is read again under its settings lock
+--      (§12 skips it when it finds a round to re-link, and that round can stop being live in
+--      between); a hit undoes the new round and answers refused r1_completed;
 --  10. booked (+result created | relinked, booking_id, round_id, candidate_id, start_at, end_at,
 --      version, key_attempt, round_expires_at).
 -- Refusals up to step 8 write nothing. A refusal of step 9 may leave what 0142 also leaves: the
@@ -977,16 +1028,34 @@ begin
   end if;
 
   -- 9b. The round, through r1_send_round. The digest's preimage is never stored or returned.
-  -- copied from r1_meet_create_round_from_ashby (0142) step 9
-  select c.status into v_candidate_status
-    from screening_v2.candidates c
-   where c.id = v_candidate_id;
-  v_send := screening_v2.r1_send_round(
-    v_candidate_id, v_role_id, p_created_by,
-    encode(sha256(convert_to('r1-meet-unusable:' || gen_random_uuid()::text || ':'
-                             || gen_random_uuid()::text, 'UTF8')), 'hex'),
-    v_candidate_status, v_expires, p_now);
-  v_code := v_send ->> 'status';
+  -- One R1 per candidate, read again once r1_send_round has made a NEW round: §12 skips
+  -- r1_completed when it finds a round to re-link, and that round can stop being live before
+  -- r1_send_round reads the candidate's rounds under the settings lock (HR's cancel, the sweep, a
+  -- late counted attempt), so r1_send_round answers ok. The §12 predicate is read as is (the new
+  -- round, invited with no counted attempt, matches neither conjunct). A hit raises R1M01, which
+  -- only this block raises and catches: its subtransaction undoes the new round, its hold and the
+  -- month row, and the create answers refused r1_completed. Any other error is not caught.
+  begin
+    -- copied from r1_meet_create_round_from_ashby (0142) step 9
+    select c.status into v_candidate_status
+      from screening_v2.candidates c
+     where c.id = v_candidate_id;
+    v_send := screening_v2.r1_send_round(
+      v_candidate_id, v_role_id, p_created_by,
+      encode(sha256(convert_to('r1-meet-unusable:' || gen_random_uuid()::text || ':'
+                               || gen_random_uuid()::text, 'UTF8')), 'hex'),
+      v_candidate_status, v_expires, p_now);
+    v_code := v_send ->> 'status';
+    if v_code = 'ok'
+       and exists (select 1 from screening_v2.interview_rounds r
+                    where r.candidate_id = p_candidate_id and r.kind = 'sales_r1'
+                      and (r.status = 'completed' or r.attempts_counted > 0)) then
+      raise exception 'r1_meet_create_round_from_public: the candidate already has an R1'
+        using errcode = 'R1M01';
+    end if;
+  exception when sqlstate 'R1M01' then
+    return jsonb_build_object('status', 'refused', 'code', 'r1_completed');
+  end;
   if v_code in ('disabled', 'paused', 'candidate_ineligible', 'role_not_configured',
                 'phone_engagement_active', 'phone_assessment_pending', 'capacity_exhausted') then
     return jsonb_build_object('status', 'refused', 'code', v_code);
@@ -1462,8 +1531,9 @@ $$;
 -- bot_release job when a bot is attached (0142's key, so the delete trigger's job is the same
 -- one). The §3 trigger adds the calendar cancel and the Ashby tag removal; 0142's round_cancelled
 -- trigger finds no live booking on the round (this one is already cancelled) and adds nothing.
--- A cancel is not a completed R1: the candidate may book again (a new round). The first answer
--- wins:
+-- A cancel is not a completed R1: the candidate may book again (a new round), unless the round
+-- already holds a counted attempt (HR's retake, re-linked): then §12 answers r1_completed. The
+-- first answer wins:
 --   invalid_request (+field: digest, withdraw_consent, cutoff, now). Nothing is read or written;
 --   refused not_found: the digest names no public booking, or its slot has ended;
 --   already_cancelled: the booking is already cancelled by the candidate (nothing changes);

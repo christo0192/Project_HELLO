@@ -234,9 +234,24 @@ describe('migration 0143: the sanctioned DROP NOT NULL (TST-15)', () => {
     expect(verifier).toContain("migration.startsWith('0143_r1_meet_public_bookings')");
     expect(verifier).toContain('SANCTIONED_DROP_NOT_NULL');
     // The positive fixture and every mutant of the self-tests.
-    for (const label of ['P9 ', 'N10a ', 'N10b ', 'N10c ', 'N10d ', 'N10e ', 'N10f ', 'N10g ', 'N10h ']) {
+    for (const label of [
+      'P9 ', 'N10a ', 'N10b ', 'N10c ', 'N10d ', 'N10e ', 'N10f ', 'N10g ', 'N10h ', 'N10i ', 'N10j ',
+      // S01-R5: the CHECK must survive the drops, in 0143 and in every later migration.
+      'N10k ', 'N10l ', 'N10m ', 'N11 ', 'N12 ', 'P10 ',
+    ]) {
       expect(verifier, label).toContain(`"${label}`);
     }
+    expect(verifier).toContain('function r1MeetSourceIdsGuard(statements)');
+    expect(verifier).toContain('if (R1_MEET_SOURCE_IDS_REMOVE_RE.test(stmt)) {');
+    expect(verifier).toContain('return guard.standsAtEnd && guard.check < stmtIndex && guard.validate < stmtIndex;');
+  });
+
+  it('records the 0142 step-8a residual for public rows (NULL event id) as accepted, with its owner (S01-R4)', () => {
+    expect(sql).toContain('-- Known residual, accepted (R01 1.3, review S01-R4): the unchanged 0142 Ashby create keeps');
+    expect(sql).toContain('-- Owner of any further fix: S05 (the public runtime maintenance).');
+    // ... and it really is unchanged in 0142, while 0143's own copy uses `is distinct from`.
+    expect(code0142).toContain('and o.ashby_interview_event_id <> p_ashby_interview_event_id');
+    expect(code).toContain('and o.id is distinct from p_booking_id');
   });
 });
 
@@ -554,6 +569,10 @@ const STABLE_T2 = T2_FUNCTIONS.filter((f) => f.posture.startsWith('stable ')).ma
 /** Contracts section 4 "live": every status that holds the slot (the Ashby-only pre-round statuses never do). */
 const LIVE = ['pending', 'blocked', 'bot_scheduled', 'bot_joining', 'human_present', 'in_call'] as const;
 const sqlList = (values: readonly string[]): string => `(${values.map((v) => `'${v}'`).join(', ')})`;
+/** One R1 per candidate (review S01-R1), exactly as §12 and the create's re-check read it. */
+const R1_COMPLETED_EXISTS = 'exists (select 1 from screening_v2.interview_rounds r '
+  + "where r.candidate_id = p_candidate_id and r.kind = 'sales_r1' "
+  + "and (r.status = 'completed' or r.attempts_counted > 0))";
 
 describe('migration 0143: T2 signatures, posture and privileges', () => {
   it('declares every T2 function once with its contract signature, return type and posture', () => {
@@ -778,9 +797,36 @@ describe('migration 0143: T2 helpers and RPC bodies', () => {
     expect(body).toContain("where l.provider = 'ashby' and l.external_application_id = p_ashby_application_id;");
     expect(body).toContain('if not v_link_found or v_link_candidate is distinct from p_candidate_id then');
     expect(body).toContain('if v_round.id is not null and not v_reusable and v_lapsed_id is null then return \'already_booked\';');
-    expect(body).toContain("if not v_reusable and exists (select 1 from screening_v2.interview_rounds r where r.candidate_id = p_candidate_id and r.kind = 'sales_r1' and r.status = 'completed') then return 'r1_completed';");
+    // One R1 per candidate (review S01-R1): a completed round OR any round holding a counted attempt
+    // (HR's retake round, once cancelled or expired, keeps status and count).
+    expect(body).toContain(`if not v_reusable and ${R1_COMPLETED_EXISTS} then return 'r1_completed';`);
     expect(body).toContain("if not v_reusable then if coalesce(");
     expect(body).toContain("if v_reusable then v_locale := v_round.consent_locale; end if;");
+  });
+
+  it('applies dsar_hold and candidate_ineligible to the whole Ashby person, holds before blocks (S01-R3)', () => {
+    const body = functionBody('r1_meet_public_refusal');
+    expect(body).toContain('select l.candidate_id, l.terminal_state, l.job_mapping_id, l.external_candidate_id '
+      + 'into v_link_candidate, v_link_terminal, v_link_mapping, v_link_person');
+    // The person-wide hold uses exactly the 0130 lists (pinned against 0130 above, on the candidate).
+    const hold = code0130.indexOf("v_outcome := 'subject_request_hold';");
+    const source = code0130.slice(code0130.lastIndexOf('if exists (', hold), hold);
+    const lists = through(source, 'and d.request_type in (', "'fulfilled')");
+    const personHold = 'if v_link_person is not null and exists ( select 1 from screening_v2.ashby_application_links l2 '
+      + 'join screening_v2.data_subject_requests d on d.candidate_id = l2.candidate_id '
+      + "where l2.provider = 'ashby' and lower(l2.external_candidate_id) = lower(v_link_person) "
+      + `${lists} ) then return 'dsar_hold'; end if;`;
+    const personBlock = 'if v_link_person is not null and exists ( select 1 from screening_v2.ashby_application_links l2 '
+      + 'join screening_v2.candidates c on c.id = l2.candidate_id '
+      + "where l2.provider = 'ashby' and lower(l2.external_candidate_id) = lower(v_link_person) "
+      + "and c.decision_use_blocked_at is not null ) then return 'candidate_ineligible'; end if;";
+    const localBlock = 'if not exists (select 1 from screening_v2.candidates c '
+      + "where c.id = p_candidate_id and c.decision_use_blocked_at is null) then return 'candidate_ineligible'; end if;";
+    inOrder(body, [
+      "return 'mapping_unavailable';", 'where d.candidate_id = p_candidate_id', "return 'dsar_hold';",
+      personHold, localBlock, personBlock, "and b.status in ('pending'",
+    ]);
+    for (const text of [personHold, localBlock, personBlock]) expect(body.split(text), text).toHaveLength(2);
   });
 
   it('precheck is the helper behind its field checks', () => {
@@ -1032,12 +1078,14 @@ describe('migration 0143: T3 r1_meet_create_round_from_public', () => {
     expect(runs([...body.matchAll(/'status', '([a-z_]+)'/g)].map((m) => m[1]!))).toEqual([
       'invalid_request', 'replayed', 'invalid_request', 'refused', 'replayed', 'invalid_request', 'refused', 'booked',
     ]);
-    const codes = [...body.matchAll(/'status', 'refused', 'code', (?:'([a-z_]+)'|(v_[a-z_]+))\)/g)].map((m) => m[1] ?? m[2]!);
+    // Digits allowed in a code: r1_completed is one.
+    const codes = [...body.matchAll(/'status', 'refused', 'code', (?:'([a-z0-9_]+)'|(v_[a-z_]+))\)/g)].map((m) => m[1] ?? m[2]!);
     expect(runs(codes)).toEqual([
       'in_past', 'slot_full', 'day_full', 'v_refusal', 'created_by_unknown', 'slot_too_far',
       'consent_template_unavailable', 'consent_stale', 'consent_incomplete', 'role_not_configured',
-      // r1_send_round's own refusals (a race backstop behind §12), then the re-link's.
-      'v_code', 'already_booked', 'phone_engagement_active', 'phone_assessment_pending',
+      // The one-R1 re-check of a new round (S01-R2), r1_send_round's own refusals (a race backstop
+      // behind §12), then the re-link's.
+      'r1_completed', 'v_code', 'already_booked', 'phone_engagement_active', 'phone_assessment_pending',
       'consent_template_unavailable', 'consent_stale', 'consent_incomplete',
     ]);
     // Every refusal code is a closed contract word.
@@ -1108,6 +1156,22 @@ describe('migration 0143: T3 r1_meet_create_round_from_public', () => {
     expect(copies).toHaveLength(1);
     expect(copies[0]!.startsWith(source), copies[0]!.slice(0, 600)).toBe(true);
     expect(lc.match(/\br1_send_round\(/g)).toHaveLength(1);
+  });
+
+  it('re-reads the one-R1 predicate when r1_send_round made a new round, undoing it in its own block (S01-R2)', () => {
+    const block = through(body, "begin select c.status into v_candidate_status",
+      "exception when sqlstate 'R1M01' then return jsonb_build_object('status', 'refused', 'code', 'r1_completed'); end;");
+    expect(block).toContain("v_code := v_send ->> 'status'; "
+      + `if v_code = 'ok' and ${R1_COMPLETED_EXISTS} then `
+      + "raise exception 'r1_meet_create_round_from_public: the candidate already has an R1' "
+      + "using errcode = 'R1M01'; end if; exception when");
+    // The block holds the copied step 9 and nothing that writes after the re-check.
+    expect(block.indexOf('v_send := screening_v2.r1_send_round(')).toBeLessThan(block.indexOf("if v_code = 'ok' and exists"));
+    expect(body.indexOf(block)).toBeLessThan(body.indexOf("if v_code in ('disabled'"));
+    // The only handler in the file, for the only custom SQLSTATE, raised once; never `when others`.
+    expect(lc.match(/\bexception when\b/g)).toHaveLength(1);
+    expect(lc.match(/'r1m01'/g)).toHaveLength(2);
+    expect(lc.match(/\berrcode = '(?!p0001')[^']*'/g)).toEqual(["errcode = 'r1m01'"]);
   });
 
   it('copies 0142 step 10 (the hold month, the round lock, the reuse, the expiry and the supersede)', () => {
@@ -1660,6 +1724,13 @@ describe('migration 0143: wiring and the SQL suite', () => {
       'T2-B the round HR grant-retake leaves (invited, 1 of 2 attempts, 1 start): eligible',
       'T2-B a completed R1 and an expirable lapsed round: r1_completed',
       'T2-B a completed R1 while paused: r1_completed first',
+      'T2-B a cancelled round holding a counted attempt and no live round: r1_completed',
+      'T2-B an expired browser round holding a counted attempt: r1_completed (any channel)',
+      'T2-B a cancelled round with no counted attempt is not an R1: eligible',
+      'T2-B the same Ashby person held under another local candidate (case ignored): dsar_hold',
+      'T2-B the same Ashby person blocked from decisions under another local candidate: candidate_ineligible',
+      'T2-B its own decision-use block and the person held elsewhere: dsar_hold first (every hold before any block)',
+      "T2-B another Ashby person''s hold and block hold nothing: eligible",
       'T2-B a pending phone assessment: phone_assessment_pending',
       'T2-B the newest release has no en-IN notice: consent_template_unavailable',
       'T2-B the same cap with a reusable Meet round: eligible',
@@ -1708,6 +1779,9 @@ describe('migration 0143: wiring and the SQL suite', () => {
       'T3-D a second submit of a booked candidate (new booking and request ids)',
       'T3-D the newest release has no en-IN notice: consent_template_unavailable',
       'T3-D precheck and create agree for candidate ',
+      'T3-D the same Ashby person held under another local candidate',
+      "T3-D race: the re-linkable round cancelled under r1_send_round''s settings lock, a completed R1: r1_completed",
+      'T3-D race ... the new round, its hold and its month row are undone: nothing written',
       'T3-E a consent with a field the shape does not name',
       'T3-E a 257-character user_agent',
       'T3-E an expiry one second past now + 14 days',
@@ -1717,6 +1791,8 @@ describe('migration 0143: wiring and the SQL suite', () => {
       'T3-F ... the HR-attested consent is superseded, never erased',
       'T3-F after a failed public booking a new submit re-links the same round',
       "T3-F after HR''s grant-retake the public submit re-links the round",
+      "T3-F (3b) a new submit after cancelling HR''s re-linked retake",
+      "T3-F (3c) a submit after HR''s retake round expired",
       'T3-F a re-link under a newer release the form did not show: consent_stale',
       'T3-F a staff round whose staff notice requires more than the form granted: consent_incomplete',
       'T3-F a reusable staff round with no staff notice',

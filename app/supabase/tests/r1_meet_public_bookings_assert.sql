@@ -27,7 +27,8 @@
 --        0131 effective concurrency, admits, the settings mirror and a missing settings row.
 --   T2-B r1_meet_public_precheck over r1_meet_public_refusal (§12, §14): every refusal code in
 --        order, precedence pairs, the expirable and reusable rounds that stay eligible, the field
---        refusals, and no write.
+--        refusals, and no write; the hold and block of the whole Ashby person (S01-R3) and a
+--        counted attempt on a cancelled or expired round as r1_completed (S01-R1).
 --   T2-C r1_meet_public_set_manage_digest (§16).
 --   T2-D r1_meet_public_manage_read (§17).
 --   T2-E r1_meet_public_set_calendar_state (§21).
@@ -40,11 +41,14 @@
 --   T3-B replay by request id (same candidate, another candidate or application) and the taken
 --        booking id.
 --   T3-C slot and IST-day capacity under the day lock, at the limits.
---   T3-D every precheck refusal reached through the create, nothing written.
+--   T3-D every precheck refusal reached through the create, nothing written; the person-wide
+--        hold through the create; the r1_completed re-check when r1_send_round makes a new round
+--        because the re-linkable round was cancelled under its settings lock (S01-R2).
 --   T3-E created_by_unknown, in_past, slot_too_far, consent_stale, consent_incomplete, every
 --        consent shape failure and every other field, nothing written.
 --   T3-F re-link: after an Ashby cancel, after a failed public booking, after HR's grant-retake,
---        the consent checks of a re-link, and the round audience without a notice.
+--        the consent checks of a re-link, and the round audience without a notice; HR's retake
+--        round cancelled on the manage link or expired, then a new submit: r1_completed (S01-R1).
 --   T3-G the step-8a expiry of a lapsed Meet round, and a lapsed round that still has a booking.
 --   T3-H the settings refusals through the create, the re-link under a full cap, and the catalog
 --        posture of the create.
@@ -1591,6 +1595,63 @@ begin
   perform _r1_meet_public_tests.assert('T2-B a decision-use block: candidate_ineligible',
     _r1_meet_public_tests.pre(331) = 'candidate_ineligible', _r1_meet_public_tests.pre(331));
 
+  -- 4-5 for the whole Ashby person (contracts 9, S04 F2; review S01-R3): a hold or a block on
+  -- ANOTHER local candidate linked to the same Ashby candidate id (case ignored) refuses too.
+  perform _r1_meet_public_tests.candidate(358);
+  perform _r1_meet_public_tests.candidate(359);
+  update screening_v2.ashby_application_links set external_candidate_id = 'meet-public-assert-person-358'
+   where provider = 'ashby' and external_application_id = _r1_meet_public_tests.id(22, 358)::text;
+  update screening_v2.ashby_application_links set external_candidate_id = 'MEET-PUBLIC-ASSERT-PERSON-358'
+   where provider = 'ashby' and external_application_id = _r1_meet_public_tests.id(22, 359)::text;
+  perform _r1_meet_public_tests.assert('T2-B person fixture: both candidates of one Ashby person are eligible',
+    _r1_meet_public_tests.pre(358) = 'eligible' and _r1_meet_public_tests.pre(359) = 'eligible',
+    _r1_meet_public_tests.pre(358) || ' ' || _r1_meet_public_tests.pre(359));
+  insert into screening_v2.data_subject_requests (candidate_id, request_type, requested_by)
+  values (_r1_meet_public_tests.id(10, 359), 'restrict', _r1_meet_public_tests.id(1, 1));
+  perform _r1_meet_public_tests.assert(
+    'T2-B the same Ashby person held under another local candidate (case ignored): dsar_hold',
+    _r1_meet_public_tests.pre(358) = 'dsar_hold' and _r1_meet_public_tests.pre(359) = 'dsar_hold',
+    _r1_meet_public_tests.pre(358) || ' ' || _r1_meet_public_tests.pre(359));
+  perform _r1_meet_public_tests.candidate(360);
+  perform _r1_meet_public_tests.candidate(361);
+  update screening_v2.ashby_application_links set external_candidate_id = 'meet-public-assert-person-360'
+   where provider = 'ashby'
+     and external_application_id in (_r1_meet_public_tests.id(22, 360)::text, _r1_meet_public_tests.id(22, 361)::text);
+  update screening_v2.candidates set decision_use_blocked_at = '2026-12-01 03:00:00+00'
+   where id = _r1_meet_public_tests.id(10, 361);
+  perform _r1_meet_public_tests.assert(
+    'T2-B the same Ashby person blocked from decisions under another local candidate: candidate_ineligible',
+    _r1_meet_public_tests.pre(360) = 'candidate_ineligible', _r1_meet_public_tests.pre(360));
+  perform _r1_meet_public_tests.candidate(362);
+  perform _r1_meet_public_tests.candidate(363);
+  update screening_v2.ashby_application_links set external_candidate_id = 'meet-public-assert-person-362'
+   where provider = 'ashby'
+     and external_application_id in (_r1_meet_public_tests.id(22, 362)::text, _r1_meet_public_tests.id(22, 363)::text);
+  update screening_v2.candidates set decision_use_blocked_at = '2026-12-01 03:00:00+00'
+   where id = _r1_meet_public_tests.id(10, 362);
+  insert into screening_v2.data_subject_requests (candidate_id, request_type, requested_by)
+  values (_r1_meet_public_tests.id(10, 363), 'delete', _r1_meet_public_tests.id(1, 1));
+  perform _r1_meet_public_tests.assert(
+    'T2-B its own decision-use block and the person held elsewhere: dsar_hold first (every hold before any block)',
+    _r1_meet_public_tests.pre(362) = 'dsar_hold', _r1_meet_public_tests.pre(362));
+  perform _r1_meet_public_tests.candidate(364);
+  perform _r1_meet_public_tests.candidate(365);
+  update screening_v2.ashby_application_links set external_candidate_id = 'meet-public-assert-person-364'
+   where provider = 'ashby' and external_application_id = _r1_meet_public_tests.id(22, 364)::text;
+  update screening_v2.ashby_application_links set external_candidate_id = 'meet-public-assert-person-365'
+   where provider = 'ashby' and external_application_id = _r1_meet_public_tests.id(22, 365)::text;
+  insert into screening_v2.data_subject_requests (candidate_id, request_type, requested_by)
+  values (_r1_meet_public_tests.id(10, 365), 'delete', _r1_meet_public_tests.id(1, 1));
+  update screening_v2.candidates set decision_use_blocked_at = '2026-12-01 03:00:00+00'
+   where id = _r1_meet_public_tests.id(10, 365);
+  perform _r1_meet_public_tests.assert('T2-B another Ashby person''s hold and block hold nothing: eligible',
+    _r1_meet_public_tests.pre(364) = 'eligible', _r1_meet_public_tests.pre(364));
+  perform _r1_meet_public_tests.assert(
+    'T2-B a link with no Ashby candidate id matches no other candidate (the held ones above have none): eligible',
+    (select x.external_candidate_id is null from screening_v2.ashby_application_links x
+      where x.provider = 'ashby' and x.external_application_id = _r1_meet_public_tests.id(22, 330)::text)
+    and _r1_meet_public_tests.pre(330) = 'eligible', _r1_meet_public_tests.pre(330));
+
   -- 6. already_booked.
   perform _r1_meet_public_tests.candidate(332);
   perform _r1_meet_public_tests.round(332);
@@ -1685,6 +1746,23 @@ begin
   perform _r1_meet_public_tests.assert('T2-B a completed R1 while paused: r1_completed first',
     _r1_meet_public_tests.pre(346) = 'r1_completed', _r1_meet_public_tests.pre(346));
   update screening_v2.r1_settings set paused = false where singleton;
+  -- A counted attempt on a round that is no longer completed (review S01-R1): HR's retake round
+  -- once cancelled or expired keeps its status and its count (0120), and is still an R1.
+  perform _r1_meet_public_tests.candidate(366);
+  r := _r1_meet_public_tests.round(366, 'cancelled');
+  update screening_v2.interview_rounds set attempts_counted = 1, starts_used = 1 where id = r;
+  perform _r1_meet_public_tests.assert('T2-B a cancelled round holding a counted attempt and no live round: r1_completed',
+    _r1_meet_public_tests.pre(366) = 'r1_completed', _r1_meet_public_tests.pre(366));
+  perform _r1_meet_public_tests.candidate(367);
+  r := _r1_meet_public_tests.round(367, 'expired', 'browser');
+  update screening_v2.interview_rounds set attempts_counted = 1, starts_used = 1 where id = r;
+  perform _r1_meet_public_tests.assert('T2-B an expired browser round holding a counted attempt: r1_completed (any channel)',
+    _r1_meet_public_tests.pre(367) = 'r1_completed', _r1_meet_public_tests.pre(367));
+  perform _r1_meet_public_tests.candidate(368);
+  r := _r1_meet_public_tests.round(368, 'cancelled');
+  update screening_v2.interview_rounds set starts_used = 1 where id = r;
+  perform _r1_meet_public_tests.assert('T2-B a cancelled round with no counted attempt is not an R1: eligible',
+    _r1_meet_public_tests.pre(368) = 'eligible', _r1_meet_public_tests.pre(368));
 
   -- 8. phone_engagement_active (the 0128 predicate); a terminal engagement holds nothing.
   perform _r1_meet_public_tests.candidate(349);
@@ -1795,7 +1873,7 @@ declare
   v_codes text := '';
   n integer;
 begin
-  for n in 320..357 loop
+  for n in 320..368 loop
     v_codes := v_codes || ' ' || _r1_meet_public_tests.pre(n);
   end loop;
   perform _r1_meet_public_tests.assert('T2-B the precheck writes nothing (bookings, rounds, consents, jobs, months, throttle)',
@@ -2864,6 +2942,69 @@ begin
 end;
 $$;
 
+-- T3-D (continued), review S01-R2: §12 found a round to re-link (so it skipped r1_completed), but
+-- that round stopped being live before r1_send_round read the candidate's rounds under the settings
+-- lock, so r1_send_round made a NEW round. The test-only trigger below plays HR's cancel at exactly
+-- that point: r1_send_round writes the month row after taking the settings lock and before its
+-- live-round check. Inside the create's block, so the block's rollback undoes it too.
+create function _r1_meet_public_tests.race_cancel_round() returns trigger
+language plpgsql as $$
+begin
+  update screening_v2.interview_rounds set status = 'cancelled'
+   where id = nullif(current_setting('r1_meet_public_tests.race_round', true), '')::uuid
+     and status in ('invited', 'in_progress');
+  return new;
+end;
+$$;
+
+do $$
+declare
+  res jsonb;
+  r uuid;
+  v_before jsonb;
+begin
+  -- The person-wide hold through the create (review S01-R3): candidate 544's Ashby person is held
+  -- under another local candidate, 545.
+  perform _r1_meet_public_tests.candidate(544);
+  perform _r1_meet_public_tests.candidate(545);
+  update screening_v2.ashby_application_links set external_candidate_id = 'meet-public-assert-person-544'
+   where provider = 'ashby'
+     and external_application_id in (_r1_meet_public_tests.id(22, 544)::text, _r1_meet_public_tests.id(22, 545)::text);
+  insert into screening_v2.data_subject_requests (candidate_id, request_type, requested_by)
+  values (_r1_meet_public_tests.id(10, 545), 'correct', _r1_meet_public_tests.id(1, 1));
+  perform _r1_meet_public_tests.expect('T3-D the same Ashby person held under another local candidate', 544,
+    '{}'::jsonb, 'refused:dsar_hold');
+  perform _r1_meet_public_tests.assert('T3-D precheck and create agree for a person-wide hold',
+    _r1_meet_public_tests.pre(544) = 'dsar_hold', _r1_meet_public_tests.pre(544));
+
+  -- The race backstop: a completed R1 (1543) and a re-linkable Meet round of candidate 543.
+  perform _r1_meet_public_tests.candidate(543);
+  perform _r1_meet_public_tests.round_of(1543, 543, 'completed');
+  r := _r1_meet_public_tests.round(543);
+  perform _r1_meet_public_tests.assert('T3-D race fixture: a completed R1 and a re-linkable Meet round: eligible',
+    _r1_meet_public_tests.pre(543) = 'eligible', _r1_meet_public_tests.pre(543));
+  perform set_config('r1_meet_public_tests.race_round', r::text, true);
+  create trigger r1_meet_public_tests_race before insert on screening_v2.r1_budget_month
+    for each row execute function _r1_meet_public_tests.race_cancel_round();
+  v_before := _r1_meet_public_tests.counts();
+  res := _r1_meet_public_tests.create(543);
+  drop trigger r1_meet_public_tests_race on screening_v2.r1_budget_month;
+  perform set_config('r1_meet_public_tests.race_round', '', true);
+  perform _r1_meet_public_tests.assert(
+    'T3-D race: the re-linkable round cancelled under r1_send_round''s settings lock, a completed R1: r1_completed',
+    _r1_meet_public_tests.outcome(res) = 'refused:r1_completed', res::text);
+  perform _r1_meet_public_tests.assert(
+    'T3-D race ... the new round, its hold and its month row are undone: nothing written',
+    _r1_meet_public_tests.counts() = v_before
+    and (select count(*) = 2 from screening_v2.interview_rounds x where x.candidate_id = _r1_meet_public_tests.id(10, 543)),
+    res::text);
+  perform _r1_meet_public_tests.assert(
+    'T3-D race ... and without the race the same submit re-links the round',
+    _r1_meet_public_tests.outcome(_r1_meet_public_tests.create(543)) = 'booked:relinked'
+    and (select x.round_id = r from screening_v2.r1_meet_bookings x where x.id = _r1_meet_public_tests.id(40, 543)));
+end;
+$$;
+
 -- =============================================================================================
 -- T3-E. created_by_unknown, in_past, slot_too_far, the consent checks, the consent shape and
 -- every other field, nothing written.
@@ -3139,6 +3280,56 @@ begin
                 and x.attempts_counted = 1 and x.status = 'invited'
            from screening_v2.interview_rounds x where x.id = r)
     and _r1_meet_public_tests.form_consent_ok(_r1_meet_public_tests.live_consent(r), tpl, p_now), res::text);
+
+  -- (3b) Review S01-R1: the candidate cancels that booking on the manage link, which cancels HR's
+  -- retake round with its counted attempt. A new submit is r1_completed (no public retake: a new
+  -- round would carry a fresh attempt budget), and nothing is written.
+  res := screening_v2.r1_meet_public_set_manage_digest(_r1_meet_public_tests.id(40, 538),
+           _r1_meet_public_tests.digest('t3f-manage-538'), p_now);
+  perform _r1_meet_public_tests.assert('T3-F (3b) fixture: the re-linked booking has its manage digest',
+    res ->> 'status' = 'ok', res::text);
+  res := screening_v2.r1_meet_public_cancel_booking(_r1_meet_public_tests.digest('t3f-manage-538'), false, 900, t5);
+  perform _r1_meet_public_tests.assert(
+    'T3-F (3b) the candidate cancels on the manage link: the retake round is cancelled and keeps its count',
+    res ->> 'status' = 'cancelled'
+    and (select x.status = 'cancelled' and x.attempts_counted = 1 from screening_v2.interview_rounds x where x.id = r),
+    res::text);
+  perform _r1_meet_public_tests.assert('T3-F (3b) ... so the precheck answers r1_completed',
+    _r1_meet_public_tests.pre(538, t5) = 'r1_completed', _r1_meet_public_tests.pre(538, t5));
+  perform _r1_meet_public_tests.expect('T3-F (3b) a new submit after cancelling HR''s re-linked retake', 538,
+    jsonb_build_object('booking_id', _r1_meet_public_tests.id(40, 5381), 'request_id', _r1_meet_public_tests.id(41, 5381),
+                       'now', t5),
+    'refused:r1_completed');
+
+  -- (3c) The same retake round left to expire (the sweep, or r1_transition_round expire): still an R1.
+  perform _r1_meet_public_tests.candidate(542);
+  r := _r1_meet_public_tests.round(542, 'completed', 'meet', '2026-12-01 03:00:00+00');
+  update screening_v2.interview_rounds set attempts_counted = 1, starts_used = 1 where id = r;
+  insert into screening_v2.call_sessions
+    (id, candidate_id, role_id, mode, provider, external_call_id, status, interview_round_id, owner_id)
+  values (_r1_meet_public_tests.id(12, 542), _r1_meet_public_tests.id(10, 542), _r1_meet_public_tests.id(2, 1),
+          'browser', 'livekit', 'screening-' || _r1_meet_public_tests.id(12, 542)::text, 'created', r,
+          _r1_meet_public_tests.id(1, 1));
+  update screening_v2.call_sessions set status = 'failed', terminal_reason = 'worker_crash'
+   where id = _r1_meet_public_tests.id(12, 542);
+  insert into screening_v2.interview_round_attempts
+    (session_id, round_id, attempt_number, persona_id, counted, nonce_digest)
+  values (_r1_meet_public_tests.id(12, 542), r, 1, 'p1_career_switcher', true,
+          _r1_meet_public_tests.digest('attempt-542'));
+  res := screening_v2.r1_transition_round(r, 'grant-retake',
+    (select x.version from screening_v2.interview_rounds x where x.id = r), null, '2026-12-01 04:30:00+00', p_now);
+  perform _r1_meet_public_tests.assert('T3-F (3c) fixture: HR grants the retake and the candidate is eligible',
+    res ->> 'status' = 'ok' and _r1_meet_public_tests.pre(542) = 'eligible', res::text);
+  res := screening_v2.r1_transition_round(r, 'expire',
+    (select x.version from screening_v2.interview_rounds x where x.id = r), null, null, t5);
+  perform _r1_meet_public_tests.assert('T3-F (3c) the retake round expires unused and keeps its count',
+    res ->> 'status' = 'ok'
+    and (select x.status = 'expired' and x.attempts_counted = 1 from screening_v2.interview_rounds x where x.id = r),
+    res::text);
+  perform _r1_meet_public_tests.expect('T3-F (3c) a submit after HR''s retake round expired', 542,
+    jsonb_build_object('now', t5), 'refused:r1_completed');
+  perform _r1_meet_public_tests.assert('T3-F (3c) precheck and create agree',
+    _r1_meet_public_tests.pre(542, t5) = 'r1_completed', _r1_meet_public_tests.pre(542, t5));
 
   -- (4) A re-link under a newer release: the form's older notice is stale; the newest one books.
   perform _r1_meet_public_tests.candidate(539);
