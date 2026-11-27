@@ -716,6 +716,79 @@ application and the phone-screen card; nothing goes to any other party.
   nothing in Ashby: a card already posted is part of the candidate's Ashby record, and a DSAR
   erasure in this system does not remove it there.
 
+### R1 Meet public bookings (0143, M035)
+
+`0143_r1_meet_public_bookings.sql` lets a candidate who is already in Ashby book R1 over Google
+Meet on one public link (D-M035-8). It adds seven columns to `r1_meet_bookings`, one table
+(`r1_meet_public_throttle`), two trigger functions, three internal helpers and eleven
+service-role RPCs. Everything is service-role only: the throttle table has RLS on with no policy
+and no browser grant, anon and authenticated may execute none of the RPCs, and no API role
+(service_role included) may execute the helpers. The migration is dark: nothing calls it until
+S06 ships behind `R1_MEET_PUBLIC_BOOKING_ENABLED` (default off) on top of `R1_MEET_ENABLED`.
+
+What is stored stays PII-minimal: opaque ids, slot times, closed state words, counters and
+digests. A public booking row (`source = 'public_page'`) has no Ashby interview event, schedule or
+scheduler id: those three columns are NULL on it, and `ashby_application_id` stays set on every
+row ("only people already in Ashby can take it"). The booking `reason` list grows from 32 to 34
+closed codes (`candidate_cancelled`, `invite_undeliverable`). No name, email or phone is stored
+by 0143 or passed to any 0143 RPC: the API matches the form to the candidate in memory and
+passes only the candidate id and the Ashby application id.
+
+#### `screening_v2.r1_meet_bookings` (0143 columns)
+
+| Column | Classification | Notes |
+|--------|---------------|-------|
+| `source` | Internal | `ashby` (default, every existing row and every row the Ashby path writes) or `public_page`. `chk_r1_meet_bookings_source_ids` ties the three Ashby ids to it, both ways |
+| `google_calendar_event_id` | Internal | `public_page` only. The id of the event on Dex's Google calendar, always the booking UUID without dashes (pinned by `chk_r1_meet_bookings_calendar_event_id`), so it reveals nothing the booking id does not |
+| `calendar_state` | Internal | `public_page` only: `created`, `invited`, `cancelled` or `purged`, written by S05 through `r1_meet_public_set_calendar_state` |
+| `invite_sent_at` | Internal | `public_page` only: the first time the calendar invite went to the candidate's on-file email. The email itself is not stored here |
+| `public_request_id` | Internal | `public_page` only: the submit's request id (unique), so a resubmit of the same form answers the booking it already made |
+| `move_count` | Internal | How many times the candidate moved the slot through the manage link (0..10). Always 0 on an Ashby row |
+| `manage_token_digest` | **Secret** | `public_page` only: HMAC-SHA256 hex of the candidate's manage token (move, cancel, re-consent). The raw token is never stored, no RPC answer returns the digest, and the token is dead at slot end or once the booking is terminal |
+
+#### `screening_v2.r1_meet_public_throttle`
+
+Hit counters of the public routes, one row per key and window bucket. Written only by
+`r1_meet_public_throttle_hit`.
+
+| Column | Classification | Notes |
+|--------|---------------|-------|
+| `key_digest` | **Confidential** | Keyed HMAC-SHA256 hex of the throttled subject: an IP address, a normalised email, a phone number or a global key. Never the plaintext. The key is held by the API, so a digest cannot be reversed by hashing guesses, but within its window it is a stable pseudonym of a person's identifier |
+| `bucket_start` | Internal | The start of the window bucket (`p_now` floored to the window) |
+| `hits` | Internal | Hits of this key in this bucket, capped at 1000000000 |
+
+**Consent.** The public form writes the candidate's own consent as a `candidate_web` row of
+`interview_round_consents`, exactly like the browser consent page: the HR-attestation columns
+(`attested_by_external_id`, `attested_at`, `india_location_attested`) stay NULL, and `consents`
+is the template's required set. Its `proof` (**Confidential PII**, as for every consent row)
+holds the decision, the capture time, the template version and locale, the minimised IP prefix
+(`ip_prefix`, never the full address), the user agent (`user_agent`, at most 256 characters),
+`source: 'r1_public_booking'`, `channel: 'meet'` and `india_location_confirmed: true` (the
+candidate ticked "I am in India"; no address or location is recorded). A re-consent through the
+manage link supersedes the live row and writes a new one; a withdrawal on cancel queues the
+existing `r1.recording.erase` job.
+
+**DSAR.** Public bookings cascade with the candidate and with the round
+(`ON DELETE CASCADE`, as in 0142), and their consent rows cascade with the round. A deleted
+public booking whose calendar event still exists (`calendar_state` `created` or `invited`)
+queues one `r1-meet` job in the same transaction through the AFTER DELETE trigger
+`enqueue_r1_meet_calendar_purge`: payload `{kind: 'calendar_sync', op: 'purge', booking_id}`,
+dedup key `r1-meet:calendar:<booking id>:purge`, 10 attempts. The payload holds ids only, and
+the event id is derived from the booking id, so nothing personal outlives the row to make the
+purge possible. It runs beside 0142's `enqueue_r1_meet_bot_release`, so a deleted booking that
+still holds a bot also has its bot released. Throttle rows hold no candidate id and are not
+reached by the cascade; they age out (Retention).
+
+**Retention.** Throttle buckets are deleted by `r1_meet_public_throttle_prune(p_older_than_sec,
+p_limit, p_now)`, oldest first, in batches of at most 5000. It refuses an age under 1 hour or
+over 365 days; S05/S06 maintenance calls it and picks the age. A public booking lives as long
+as its round (it cascades with it), like an Ashby booking with a round.
+
+**Job payloads.** Every job 0143 writes is an `r1-meet` job whose payload holds ids, ops and
+closed words only: `ensure_bot`, `calendar_sync` (`invite`, `move`, `cancel`, `purge`),
+`ashby_booked_tag` (`add`, `remove`) and `bot_release`. No payload carries the Meet URL, a
+digest, a request id, an IP prefix, a user agent, a name, an email or a phone number.
+
 ## Classification summary
 
 | Level | Count | Examples |

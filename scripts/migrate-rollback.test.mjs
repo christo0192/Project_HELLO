@@ -206,6 +206,49 @@ function tableFromCreate(stmt) {
   return m ? parseQualified(m[1]) : null;
 }
 
+// 0143 (M035 S01): chk_r1_meet_bookings_source_ids, the CHECK behind the three sanctioned DROP NOT
+// NULLs of r1_meet_bookings (every Ashby row keeps its three Ashby ids, a public row has none).
+// Matched per COMMENT-STRIPPED statement (`splitStatements`): the whole CHECK statement, both
+// branches, all three columns and nothing else (the 0095/0112 idea), so an extra `or ...` cannot
+// widen it and a comment cannot fake it.
+const R1_MEET_SOURCE_IDS_CHECK_RE = new RegExp(
+  '^alter\\s+table\\s+screening_v2\\.r1_meet_bookings\\s+add\\s+constraint\\s+' +
+  'chk_r1_meet_bookings_source_ids\\s+check\\s*\\(\\s*' +
+  "\\(\\s*source\\s*=\\s*'ashby'" +
+  '\\s+and\\s+ashby_interview_event_id\\s+is\\s+not\\s+null' +
+  '\\s+and\\s+ashby_schedule_id\\s+is\\s+not\\s+null' +
+  '\\s+and\\s+ashby_scheduled_by_user_id\\s+is\\s+not\\s+null\\s*\\)' +
+  "\\s*or\\s*\\(\\s*source\\s*=\\s*'public_page'" +
+  '\\s+and\\s+ashby_interview_event_id\\s+is\\s+null' +
+  '\\s+and\\s+ashby_schedule_id\\s+is\\s+null' +
+  '\\s+and\\s+ashby_scheduled_by_user_id\\s+is\\s+null\\s*\\)' +
+  '\\s*\\)\\s*(?:not\\s+valid\\s*)?$',
+  'i',
+);
+const R1_MEET_SOURCE_IDS_VALIDATE_RE =
+  /^alter\s+table\s+screening_v2\.r1_meet_bookings\s+validate\s+constraint\s+chk_r1_meet_bookings_source_ids\s*$/i;
+/** A statement that drops or renames the CHECK (also as one subcommand among several). */
+const R1_MEET_SOURCE_IDS_REMOVE_RE =
+  /\b(?:drop|rename)\s+constraint\s+(?:if\s+exists\s+)?"?chk_r1_meet_bookings_source_ids"?(?![a-z0-9_])/i;
+
+/**
+ * Where chk_r1_meet_bookings_source_ids stands in one file's statements: the index of its LAST
+ * exact add, its LAST validation and the LAST statement that drops or renames it (-1 for none).
+ * `standsAtEnd`: added, validated after that, and never dropped or renamed after that add, so the
+ * file leaves the CHECK in force (S01-R5).
+ */
+function r1MeetSourceIdsGuard(statements) {
+  let check = -1;
+  let validate = -1;
+  let removed = -1;
+  statements.forEach((s, i) => {
+    if (R1_MEET_SOURCE_IDS_CHECK_RE.test(s)) check = i;
+    if (R1_MEET_SOURCE_IDS_VALIDATE_RE.test(s)) validate = i;
+    if (R1_MEET_SOURCE_IDS_REMOVE_RE.test(s)) removed = i;
+  });
+  return { check, validate, removed, standsAtEnd: check >= 0 && validate > check && removed < check };
+}
+
 // ===================================================================
 // Schema contract model + analyzer
 // ===================================================================
@@ -246,7 +289,7 @@ function analyzeMigrations(files) {
     const sql = String(file.sql ?? "");
     const statements = splitStatements(sql);
 
-    for (const stmt of statements) {
+    for (const [stmtIndex, stmt] of statements.entries()) {
       const low = lowerTokens(stmt);
       const first = firstKw(stmt);
 
@@ -301,6 +344,19 @@ function analyzeMigrations(files) {
           continue;
         }
         const tableColumns = model.tables.get(tblName);
+        // 0143 (M035 S01) chk_r1_meet_bookings_source_ids carries the three sanctioned DROP NOT
+        // NULLs below, so it must survive them: a statement that drops or renames it (one
+        // subcommand among several included) is RED unless the SAME file afterwards re-adds it
+        // exactly and validates it, with nothing removing it again (r1MeetSourceIdsGuard). That
+        // holds in 0143 itself (its guarded swap: drop if exists, add, validate) and in every later
+        // migration. A DROP CONSTRAINT IF EXISTS of a CHECK is otherwise REPLACEABLE, not RED.
+        if (R1_MEET_SOURCE_IDS_REMOVE_RE.test(stmt)) {
+          const guard = r1MeetSourceIdsGuard(statements);
+          if (!(guard.standsAtEnd && guard.check > stmtIndex)) {
+            red(migration, stmt, "DESTRUCTIVE_DROP_CONSTRAINT", "chk_r1_meet_bookings_source_ids keeps every Ashby booking's three Ashby ids (0143's nullable columns): it may be dropped or renamed only when the same file re-adds it exactly and validates it afterwards");
+            continue;
+          }
+        }
         // ALTER COLUMN ... TYPE → destructive (type change is not reversible)
         if (/alter\s+column\s+"?[a-z0-9_.-]+"?\s+type\b/.test(low)) {
           red(migration, stmt, "DESTRUCTIVE_ALTER_COLUMN_TYPE", "ALTER COLUMN TYPE changes existing column semantics; no reverse SQL");
@@ -308,6 +364,38 @@ function analyzeMigrations(files) {
         }
         // ALTER COLUMN ... DROP NOT NULL → contract narrowing
         if (/alter\s+column\s+"?[a-z0-9_.-]+"?\s+drop\s+not\s+null\b/.test(low)) {
+          // 0143 (M035 S01) lets a PUBLIC booking (the candidate booked on our page, not HR in
+          // Ashby) have no Ashby interview event, schedule or scheduler id. It drops the NOT NULL
+          // of exactly those three r1_meet_bookings columns, and only after it has added
+          // chk_r1_meet_bookings_source_ids, which keeps every `source = 'ashby'` row exactly as
+          // strict as the NOT NULLs did (all three ids set) and requires all three NULL on a
+          // `source = 'public_page'` row; ashby_application_id stays NOT NULL. So no row the old
+          // chain accepted is lost and no Ashby row can ever lack an id.
+          //
+          // Exact and migration-local, like 0057/0109/0112. Every conjunct is evaluated on
+          // COMMENT-STRIPPED SQL (`splitStatements` drops `--` and `/* */`), so a CHECK quoted in a
+          // comment proves nothing; the marker alone is read from the raw text, because it IS a
+          // comment. Refused (stays RED): no marker, another migration, another table or column
+          // (ashby_application_id included), two subcommands in one statement, a CHECK that comes
+          // after the drop or lacks either branch, a CHECK never validated, a CHECK dropped or
+          // renamed again after it was added (review S01-R5: the guard must SURVIVE the drops). The
+          // self-tests below build each of those mutants.
+          const sanctionedPublicIds =
+            migration.startsWith('0143_r1_meet_public_bookings') &&
+            tblName === 'r1_meet_bookings' &&
+            /R1-MEET-PUBLIC-IDS SANCTION/.test(sql) &&
+            // Exactly ONE subcommand on one of the three columns: the statement is nothing else.
+            /^alter\s+table\s+(?:screening_v2\.)?r1_meet_bookings\s+alter\s+column\s+(?:ashby_interview_event_id|ashby_schedule_id|ashby_scheduled_by_user_id)\s+drop\s+not\s+null\s*$/i.test(stmt) &&
+            (() => {
+              // Order, by statement index: the exact CHECK and its validation both come BEFORE this
+              // drop, and nothing drops or renames the CHECK after its (last) add, to the file end.
+              const guard = r1MeetSourceIdsGuard(statements);
+              return guard.standsAtEnd && guard.check < stmtIndex && guard.validate < stmtIndex;
+            })();
+          if (sanctionedPublicIds) {
+            ok(migration, stmt, "SANCTIONED_DROP_NOT_NULL", "0143 public-booking Ashby ids: nullable only behind chk_r1_meet_bookings_source_ids, added and validated first (every Ashby row stays as strict)");
+            continue;
+          }
           red(migration, stmt, "DESTRUCTIVE_DROP_NOT_NULL", "Dropping a NOT NULL constraint is a contract change without reverse SQL");
           continue;
         }
@@ -899,6 +987,94 @@ function runSelfTests() {
     ];
     for (const [label, name, sql] of mutants) {
       check(`${label} → RED`, dropIsRed(scan(name, sql)), "expected DESTRUCTIVE_DROP_INDEX");
+    }
+  }
+
+  // ── 0143 (M035 S01) public-booking Ashby ids: exact, comment-proof, ordered ──
+  // A base chain with the three NOT NULL Ashby id columns the way 0142 created them, so a DROP NOT
+  // NULL of any of them is DESTRUCTIVE_DROP_NOT_NULL unless the 0143 branch sanctions it.
+  {
+    const base = [
+      { name: "0001_base.sql", sql: "create table screening_v2.candidates (id uuid primary key, email text not null);" },
+      { name: "0142_r1_meet_bookings.sql", sql: "create table if not exists screening_v2.r1_meet_bookings (ashby_interview_event_id uuid not null, ashby_schedule_id text not null, ashby_application_id text not null, ashby_scheduled_by_user_id text not null, id uuid primary key);" },
+    ];
+    const T = "alter table screening_v2.r1_meet_bookings\n  ";
+    const HEAD = "set local lock_timeout = '10s';\n" +
+      T + "add column if not exists source text not null default 'ashby'\n  constraint chk_r1_meet_bookings_source\n  check (source in ('ashby', 'public_page'));\n" +
+      T + "drop constraint if exists chk_r1_meet_bookings_source_ids;\n";
+    const ASHBY = "(source = 'ashby'\n      and ashby_interview_event_id is not null\n      and ashby_schedule_id is not null\n      and ashby_scheduled_by_user_id is not null)";
+    const PUBLIC = "(source = 'public_page'\n      and ashby_interview_event_id is null\n      and ashby_schedule_id is null\n      and ashby_scheduled_by_user_id is null)";
+    const checkOf = (body) => T + `add constraint chk_r1_meet_bookings_source_ids check (\n    ${body}\n  ) not valid;\n`;
+    const CHECK = checkOf(`${ASHBY}\n    or ${PUBLIC}`);
+    const VALIDATE = T + "validate constraint chk_r1_meet_bookings_source_ids;\n";
+    const MARKER = "-- R1-MEET-PUBLIC-IDS SANCTION: prose only; public rows have no Ashby event, schedule or scheduler.\n";
+    const dropOf = (col) => T + `alter column ${col} drop not null;\n`;
+    const DROPS = dropOf("ashby_interview_event_id") + dropOf("ashby_schedule_id") + dropOf("ashby_scheduled_by_user_id");
+    const FILE = "0143_r1_meet_public_bookings.sql";
+    const scan = (name, sql) => runScannerOn([...base, { name, sql }]);
+    const dropIsRed = ({ reds }) => reds.some((r) => r.rule === "DESTRUCTIVE_DROP_NOT_NULL");
+
+    {
+      const res = scan(FILE, HEAD + CHECK + VALIDATE + MARKER + DROPS);
+      check("P9 0143 three Ashby id drops behind the validated source_ids CHECK → not RED", res.reds.length === 0, `unexpected reds: ${JSON.stringify(res.reds.map((r) => r.rule))}`);
+      const sanctioned = res.findings.filter((f) => f.migration === FILE && f.rule === "SANCTIONED_DROP_NOT_NULL");
+      check("P9 0143 exactly three drops tracked as SANCTIONED_DROP_NOT_NULL", sanctioned.length === 3, `got ${sanctioned.length}`);
+    }
+    const mutants = [
+      ["N10a no sanction marker", FILE, HEAD + CHECK + VALIDATE + DROPS],
+      ["N10b different migration (0144_x.sql)", "0144_x.sql", HEAD + CHECK + VALIDATE + MARKER + DROPS],
+      ["N10c ashby_application_id dropped too", FILE, HEAD + CHECK + VALIDATE + MARKER + DROPS + dropOf("ashby_application_id")],
+      ["N10d the CHECK placed after the drops", FILE, HEAD + MARKER + DROPS + CHECK + VALIDATE],
+      ["N10e the CHECK only inside a -- comment",
+        FILE,
+        HEAD + "-- " + CHECK.replace(/\n/g, " ") + "\n" + VALIDATE + MARKER + DROPS],
+      ["N10f another table's NOT NULL dropped in the 0143 file",
+        FILE,
+        HEAD + CHECK + VALIDATE + MARKER + DROPS + "alter table screening_v2.candidates alter column email drop not null;\n"],
+      ["N10g the CHECK lacks the public_page branch", FILE, HEAD + checkOf(ASHBY) + VALIDATE + MARKER + DROPS],
+      ["N10h two columns in one statement",
+        FILE,
+        HEAD + CHECK + VALIDATE + MARKER + T + "alter column ashby_interview_event_id drop not null,\n  alter column ashby_schedule_id drop not null;\n"],
+      ["N10i the CHECK is never validated", FILE, HEAD + CHECK + MARKER + DROPS],
+      ["N10j the CHECK widened by a trailing OR", FILE, HEAD + checkOf(`${ASHBY}\n    or ${PUBLIC}\n    or source = 'other'`) + VALIDATE + MARKER + DROPS],
+      // S01-R5: the CHECK must SURVIVE the drops, to the end of the file.
+      ["N10k the CHECK dropped again after the drops", FILE,
+        HEAD + CHECK + VALIDATE + MARKER + DROPS + T + "drop constraint if exists chk_r1_meet_bookings_source_ids;\n"],
+      ["N10l the CHECK renamed after the drops", FILE,
+        HEAD + CHECK + VALIDATE + MARKER + DROPS + T + "rename constraint chk_r1_meet_bookings_source_ids to chk_x_old;\n"],
+      ["N10m the CHECK dropped as the second subcommand of a statement", FILE,
+        HEAD + CHECK + VALIDATE + MARKER + DROPS + T + "drop constraint if exists chk_x_other,\n  drop constraint if exists chk_r1_meet_bookings_source_ids;\n"],
+    ];
+    for (const [label, name, sql] of mutants) {
+      check(`${label} → RED`, dropIsRed(scan(name, sql)), "expected DESTRUCTIVE_DROP_NOT_NULL");
+    }
+    const guardIsRed = ({ reds }) => reds.some((r) => r.rule === "DESTRUCTIVE_DROP_CONSTRAINT" && /chk_r1_meet_bookings_source_ids/.test(r.stmt));
+    for (const [label, name, sql] of mutants.filter(([label]) => /^N10[klm] /.test(label))) {
+      check(`${label} → the guard removal itself is RED`, guardIsRed(scan(name, sql)), "expected DESTRUCTIVE_DROP_CONSTRAINT on the guard");
+    }
+    {
+      const res = scan(FILE, HEAD + CHECK + VALIDATE + MARKER + DROPS);
+      check("P9 0143 the guarded swap's drop if exists (before the add) is not RED",
+        !guardIsRed(res), `unexpected reds: ${JSON.stringify(res.reds.map((r) => r.rule))}`);
+    }
+    // A LATER migration (after the sanctioned 0143) may drop the guard only to re-add it exactly.
+    const chain0143 = [...base, { name: FILE, sql: HEAD + CHECK + VALIDATE + MARKER + DROPS }];
+    {
+      const res = runScannerOn([...chain0143, { name: "0144_x.sql", sql: T + "drop constraint if exists chk_r1_meet_bookings_source_ids;\n" }]);
+      check("N11 a later migration drops chk_r1_meet_bookings_source_ids → RED",
+        res.reds.some((r) => r.migration === "0144_x.sql" && r.rule === "DESTRUCTIVE_DROP_CONSTRAINT"),
+        `got ${JSON.stringify(res.reds.map((r) => `${r.migration}:${r.rule}`))}`);
+    }
+    {
+      const res = runScannerOn([...chain0143, { name: "0144_x.sql", sql: T + "drop constraint if exists chk_r1_meet_bookings_source_ids;\n" + checkOf(`${ASHBY}\n    or ${PUBLIC}\n    or source = 'other'`) + VALIDATE }]);
+      check("N12 a later migration re-adds the guard widened → RED",
+        res.reds.some((r) => r.migration === "0144_x.sql" && r.rule === "DESTRUCTIVE_DROP_CONSTRAINT"),
+        `got ${JSON.stringify(res.reds.map((r) => `${r.migration}:${r.rule}`))}`);
+    }
+    {
+      const res = runScannerOn([...chain0143, { name: "0144_x.sql", sql: T + "drop constraint if exists chk_r1_meet_bookings_source_ids;\n" + CHECK + VALIDATE }]);
+      check("P10 a later migration that drops the guard and re-adds it exactly, validated → not RED",
+        res.reds.length === 0, `unexpected reds: ${JSON.stringify(res.reds.map((r) => `${r.migration}:${r.rule}`))}`);
     }
   }
 

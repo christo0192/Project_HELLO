@@ -601,6 +601,67 @@ service-role RPCs and four trigger functions. Data classification:
   `R1_MEET_ENABLED=false`: the flag alone does not cancel bots already scheduled in Recall (see
   "Meet webhook receivers", Rollback). Never drop the tables while a booking still holds a bot.
 
+### Deploying 0143 (M035 S01, public bookings, dark)
+
+0143 is the database half of the one public R1 booking link: a candidate who is already in Ashby
+books R1 over Google Meet on `/book`, and Dex joins that Meet. It adds seven columns to
+`r1_meet_bookings` (`source`, `google_calendar_event_id`, `calendar_state`, `invite_sent_at`,
+`public_request_id`, `manage_token_digest`, `move_count`), the table `r1_meet_public_throttle`, two
+trigger functions, three internal helpers and eleven service-role RPCs. Data classification:
+`docs/data-classification.md`, "R1 Meet public bookings (0143, M035)".
+
+- **Additive and dark.** Nothing calls any 0143 object until S06 ships the public routes behind
+  `R1_MEET_PUBLIC_BOOKING_ENABLED` (default off) on top of `R1_MEET_ENABLED`. No queue, route or
+  env variable is added. Every existing booking is an Ashby row: it reads `source = 'ashby'` and
+  `move_count = 0`, every other new column is NULL, and no existing row is changed. No existing
+  function is redeclared, so the Ashby path and the browser path run exactly as before. The two
+  new triggers fire only for `public_page` rows, so Ashby bookings never queue anything new.
+- **The one sanctioned DROP NOT NULL.** 0143 drops NOT NULL on `ashby_interview_event_id`,
+  `ashby_schedule_id` and `ashby_scheduled_by_user_id`, because a public booking has no Ashby
+  event, schedule or scheduler. It is safe: right before the drops the same migration adds and
+  validates `chk_r1_meet_bookings_source_ids`, which keeps every Ashby row exactly as strict (all
+  three ids set) and requires all three NULL on a public row. `ashby_application_id` stays NOT
+  NULL on every row. The TST-15 verifier (`scripts/migrate-rollback.test.mjs`) allows these three
+  statements only, in this file only, and only with that CHECK in place first; every other DROP
+  NOT NULL stays red.
+- **Locks.** The ALTERs and the five guarded CHECK swaps (`drop constraint if exists`, add
+  `not valid`, `validate constraint`) take short locks on `r1_meet_bookings`, a table that is
+  empty or tiny while M034 is dark. The whole file runs under `set local lock_timeout = '10s'`: if
+  a long transaction holds the table, the migration fails with a lock timeout instead of queueing
+  behind it, and nothing of 0143 is applied. Find the blocker in `pg_stat_activity`, let it end,
+  and re-run the deploy.
+- **Merge window.** Merging applies 0143 to production at once (deploy-fly runs
+  `supabase db push` before any app deploy). Merge it in the window of the merge and deploy gate
+  above (07:00-08:30 IST), with R1 paused, and right before the merge check that the live-R1 count
+  is 0 with the 0142 note's query:
+
+  ```sql
+  select count(*) from screening_v2.call_sessions
+   where interview_round_id is not null
+     and status in ('created', 'waiting', 'in_progress');
+  ```
+
+- **Check after the deploy (read-only).** While dark, expect:
+
+  ```sql
+  select source, count(*) from screening_v2.r1_meet_bookings group by 1;   -- ashby only (or no row)
+  select count(*) from screening_v2.r1_meet_public_throttle;               -- 0
+  select count(*) from screening_v2.job_queue
+   where name = 'r1-meet'
+     and payload ->> 'kind' in ('calendar_sync', 'ashby_booked_tag');      -- 0
+  select conname, convalidated from pg_constraint
+   where conrelid = 'screening_v2.r1_meet_bookings'::regclass
+     and conname in ('chk_r1_meet_bookings_source_ids', 'chk_r1_meet_bookings_calendar_event_id',
+                     'chk_r1_meet_bookings_public_columns', 'chk_r1_meet_bookings_reason',
+                     'chk_r1_meet_bookings_status_reason')
+   order by 1;                                                              -- five rows, all true
+  ```
+
+- **Rollback.** None: 0143 is forward-only, and there is no rollback SQL. While dark, the objects
+  simply stay unused. Once public bookings are live, `R1_MEET_PUBLIC_BOOKING_ENABLED` is the
+  switch for new bookings; S05 and S06 own the notes for the bookings already made. Never restore
+  the three NOT NULLs while a public row exists.
+
 ### Meet webhook receivers (M034 S03, dark)
 
 S03 adds the inbound half of R1 over Google Meet: two Recall.ai receivers
