@@ -2,7 +2,8 @@
  * The R1-over-Meet create-bot builder and the Ashby-event Idempotency-Key (M034 S01 T7): the exact
  * section 4 body and its variants, every failure reason in check order without echoing the input,
  * the deep-frozen PII-free body, a round trip through the Recall client against the shared fake,
- * and the key's format and refusals.
+ * and the key's format and refusals. M035 S09 T1: the exact guest body (no `google_meet`), the
+ * late-joiner notice (`chat.on_participant_join`) and the explicit, inert-by-name bot detection.
  *
  * Deterministic: no clock (the builder has none), no network (the fake Recall transport), synthetic
  * ids only. Fixture keys are low-entropy.
@@ -10,7 +11,7 @@
 import { describe, expect, it } from 'vitest';
 import { RecallClient } from '../integrations/recall/client.js';
 import { RECALL_IDEMPOTENCY_KEY_RE } from '../integrations/recall/settings.js';
-import { R1_MEET_DEFAULT_PROFILE_ID } from '../lib/r1/meet/profiles.js';
+import { R1_MEET_DEFAULT_PROFILE_ID, R1_MEET_MEET_CHAT_MAX_CHARS } from '../lib/r1/meet/profiles.js';
 import {
   R1_MEET_CREATE_BOT_FAILURES,
   R1_MEET_MAX_JOIN_LEAD_SEC,
@@ -48,6 +49,10 @@ const SECTION_4_BODY = {
     everyone_left_timeout: { timeout: 90 },
     in_call_not_recording_timeout: 900,
     in_call_recording_timeout: 2700,
+    bot_detection: {
+      using_participant_events: { timeout: 600, activate_after: 1200 },
+      using_participant_names: { matches: ['notetaker', 'recorder', 'assistant'], timeout: 600, activate_after: 7200 },
+    },
   },
   recording_config: {
     transcript: null,
@@ -70,8 +75,61 @@ const SECTION_4_BODY = {
       message: 'Dex is an AI interviewer from Interview Kickstart. This call is recorded.',
       pin: true,
     },
+    on_participant_join: {
+      message: 'Dex is an AI interviewer from Interview Kickstart. This call is recorded.',
+      exclude_host: false,
+    },
   },
   google_meet: { google_login_group_id: '7d3c2b1a-0f9e-4d8c-9b7a-6f5e4d3c2b1a' },
+  metadata: { booking_id: '0f1e2d3c-4b5a-4968-8778-695a4b3c2d1e', profile: 'r1_dex_sales' },
+};
+
+/**
+ * The exact GUEST body (M035 S09, D-S09-1): no login group configured, the default for Dex's own
+ * Workspace. Identical to the signed-in literal except that there is no `google_meet` key at all.
+ */
+const GUEST_BODY = {
+  meeting_url: 'https://meet.google.com/abc-defg-hij',
+  bot_name: 'Dex',
+  join_at: '2026-12-01T10:28:00.000Z',
+  variant: { google_meet: 'web_4_core' },
+  automatic_leave: {
+    waiting_room_timeout: 600,
+    noone_joined_timeout: 900,
+    everyone_left_timeout: { timeout: 90 },
+    in_call_not_recording_timeout: 900,
+    in_call_recording_timeout: 2700,
+    bot_detection: {
+      using_participant_events: { timeout: 600, activate_after: 1200 },
+      using_participant_names: { matches: ['notetaker', 'recorder', 'assistant'], timeout: 600, activate_after: 7200 },
+    },
+  },
+  recording_config: {
+    transcript: null,
+    video_mixed_mp4: null,
+    meeting_metadata: null,
+    participant_events: {},
+    start_recording_on: 'participant_join',
+    retention: { type: 'timed', hours: 1 },
+    realtime_endpoints: [
+      {
+        type: 'webhook',
+        url: 'https://hello.example.test/api/integrations/recall/realtime',
+        events: ['participant_events.join', 'participant_events.leave'],
+      },
+    ],
+  },
+  chat: {
+    on_bot_join: {
+      send_to: 'everyone',
+      message: 'Dex is an AI interviewer from Interview Kickstart. This call is recorded.',
+      pin: true,
+    },
+    on_participant_join: {
+      message: 'Dex is an AI interviewer from Interview Kickstart. This call is recorded.',
+      exclude_host: false,
+    },
+  },
   metadata: { booking_id: '0f1e2d3c-4b5a-4968-8778-695a4b3c2d1e', profile: 'r1_dex_sales' },
 };
 
@@ -127,9 +185,12 @@ describe('buildR1MeetCreateBotRequest: the section 4 body', () => {
     expect(result).toStrictEqual({ ok: true, body: SECTION_4_BODY, joinAt: '2026-12-01T10:28:00.000Z' });
   });
 
-  it('uses the profile disclosure as a pinned notice to everyone, and the R1 constants', () => {
+  it('uses the profile disclosure as a pinned notice to everyone, re-sent at each join, and the R1 constants', () => {
     const body = bodyOf(build());
-    expect(body.chat).toStrictEqual({ on_bot_join: { send_to: 'everyone', message: DISCLOSURE, pin: true } });
+    expect(body.chat).toStrictEqual({
+      on_bot_join: { send_to: 'everyone', message: DISCLOSURE, pin: true },
+      on_participant_join: { message: DISCLOSURE, exclude_host: false },
+    });
     expect(body.variant).toStrictEqual({ google_meet: R1_MEET_RECALL_VARIANT });
     expect(body.recording_config?.realtime_endpoints?.[0]?.events).toStrictEqual([...R1_MEET_REALTIME_EVENTS]);
     expect(Object.isFrozen(R1_MEET_REALTIME_EVENTS)).toBe(true);
@@ -148,11 +209,58 @@ describe('buildR1MeetCreateBotRequest: the section 4 body', () => {
     expect('output_media' in bodyOf(build())).toBe(false);
   });
 
-  it('leaves google_meet out when no login group is configured (the bot joins signed out)', () => {
+  it('builds exactly the guest literal when no login group is configured (the bot joins signed out)', () => {
     const { google_meet: _signedIn, ...signedOut } = SECTION_4_BODY;
-    const body = bodyOf(build({}, { googleLoginGroupId: null }));
-    expect(body).toStrictEqual(signedOut);
+    const result = build({}, { googleLoginGroupId: null });
+    expect(result).toStrictEqual({ ok: true, body: GUEST_BODY, joinAt: '2026-12-01T10:28:00.000Z' });
+    expect(GUEST_BODY).toStrictEqual(signedOut);
+    const body = bodyOf(result);
     expect('google_meet' in body).toBe(false);
+    expect(JSON.stringify(body)).not.toContain('google_login_group_id');
+    // An absent login group is the guest bot too.
+    const { googleLoginGroupId: _absent, ...withoutGroup } = settings();
+    const absent = buildR1MeetCreateBotRequest(R1_MEET_DEFAULT_PROFILE_ID, booking(), withoutGroup as R1MeetBotSettings);
+    expect(absent).toStrictEqual({ ok: true, body: GUEST_BODY, joinAt: '2026-12-01T10:28:00.000Z' });
+  });
+
+  it.each([
+    ['guest', null],
+    ['signed-in', LOGIN_GROUP_ID],
+  ])('the %s body sends the notice on bot join (pinned) and on every participant join, host included', (_mode, group) => {
+    const chat = bodyOf(build({}, { googleLoginGroupId: group })).chat!;
+    expect(Object.keys(chat).sort()).toStrictEqual(['on_bot_join', 'on_participant_join']);
+    expect(chat.on_participant_join).toStrictEqual({ message: DISCLOSURE, exclude_host: false });
+    expect(chat.on_participant_join!.message).toBe(chat.on_bot_join!.message);
+    expect(chat.on_bot_join).toStrictEqual({ send_to: 'everyone', message: DISCLOSURE, pin: true });
+    expect(chat.on_participant_join!.message.length).toBeLessThanOrEqual(R1_MEET_MEET_CHAT_MAX_CHARS);
+  });
+
+  it.each([
+    ['guest', null],
+    ['signed-in', LOGIN_GROUP_ID],
+  ])('the %s body pins explicit bot detection whose name heuristic can never fire during a stay', (_mode, group) => {
+    const leave = bodyOf(build({}, { googleLoginGroupId: group })).automatic_leave!;
+    expect(leave.bot_detection).toStrictEqual({
+      using_participant_events: { timeout: 600, activate_after: 1200 },
+      using_participant_names: { matches: ['notetaker', 'recorder', 'assistant'], timeout: 600, activate_after: 7200 },
+    });
+    const names = leave.bot_detection!.using_participant_names!;
+    // A candidate named "...assistant..." never makes Dex leave: the heuristic activates after the
+    // longest the bot can stay (the not-recording window plus the recorded-call cap).
+    expect(names.activate_after).toBeGreaterThan(leave.in_call_not_recording_timeout! + leave.in_call_recording_timeout!);
+    // Recall's limits: timeout >= 10, activate_after >= 1, matches items at least one character.
+    const events = leave.bot_detection!.using_participant_events!;
+    for (const value of [names.timeout, names.activate_after, events.timeout!, events.activate_after!]) {
+      expect(Number.isSafeInteger(value)).toBe(true);
+    }
+    expect(names.timeout).toBeGreaterThanOrEqual(10);
+    expect(events.timeout!).toBeGreaterThanOrEqual(10);
+    expect(names.activate_after).toBeGreaterThanOrEqual(1);
+    expect(events.activate_after!).toBeGreaterThanOrEqual(1);
+    expect(names.matches.length).toBeGreaterThan(0);
+    for (const match of names.matches) expect(match.length).toBeGreaterThanOrEqual(1);
+    // No silence detection block: its Recall default cannot fire before the recorded-call cap.
+    expect('silence_detection' in leave).toBe(false);
   });
 
   it('lower-cases an upper-case login group id', () => {
@@ -190,6 +298,33 @@ describe('buildR1MeetCreateBotRequest: the section 4 body', () => {
     expect(() => {
       (body.metadata as Record<string, string>).email = 'x';
     }).toThrow(TypeError);
+  });
+
+  it('freezes the bot-detection and chat blocks, including the matches array, in both modes', () => {
+    for (const group of [null, LOGIN_GROUP_ID]) {
+      const body = bodyOf(build({}, { googleLoginGroupId: group }));
+      expectDeepFrozen(body);
+      const detection = body.automatic_leave!.bot_detection!;
+      expect(Object.isFrozen(detection)).toBe(true);
+      expect(Object.isFrozen(detection.using_participant_events)).toBe(true);
+      expect(Object.isFrozen(detection.using_participant_names)).toBe(true);
+      expect(Object.isFrozen(detection.using_participant_names!.matches)).toBe(true);
+      expect(Object.isFrozen(body.chat)).toBe(true);
+      expect(Object.isFrozen(body.chat!.on_participant_join)).toBe(true);
+      expect(() => {
+        (detection.using_participant_names!.matches as string[]).push('candidate');
+      }).toThrow(TypeError);
+      expect(() => {
+        (body.chat!.on_participant_join as { exclude_host: boolean }).exclude_host = true;
+      }).toThrow(TypeError);
+    }
+  });
+
+  it('copies the profile word list: two bodies never share the matches array', () => {
+    const first = bodyOf(build()).automatic_leave!.bot_detection!.using_participant_names!.matches;
+    const second = bodyOf(build()).automatic_leave!.bot_detection!.using_participant_names!.matches;
+    expect(first).toStrictEqual(second);
+    expect(first).not.toBe(second);
   });
 
   it('carries no candidate data: metadata is the booking id and the profile only', () => {
@@ -375,6 +510,16 @@ describe('buildR1MeetCreateBotRequest: round trip through RecallClient.createBot
       'r1-meet-4e5f6a7b-8c9d-4e0f-a1b2-c3d4e5f6a7b8-v1-k1',
     ]);
     expect(fake.bots.has(bot.id)).toBe(true);
+  });
+
+  it('sends exactly the guest body when no login group is configured', async () => {
+    const fake = createFakeRecall();
+    const client = new RecallClient({ apiKey: FAKE_RECALL_API_KEY, transport: fake.transport });
+    const body = bodyOf(build({}, { googleLoginGroupId: null }));
+    await client.createBot(body, { idempotencyKey: r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, 0, 0) });
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0].body).toStrictEqual(GUEST_BODY);
+    expect('google_meet' in (fake.calls[0].body as Record<string, unknown>)).toBe(false);
   });
 
   it('passes the client checks with output media armed at creation', async () => {

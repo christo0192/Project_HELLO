@@ -18,7 +18,18 @@
  *    residency plus its no-show wait;
  *  - in-call-not-recording 900 s: the bot counts as "not recording" until a human joins (recording
  *    starts on participant join), so this is the "nobody came" window after admission;
- *  - waiting room 600 s: the Google Meet maximum Recall allows.
+ *  - waiting room 600 s: the Google Meet maximum Recall allows;
+ *  - bot detection (M035 S09), sent explicitly instead of Recall's defaults: the name heuristic
+ *    keeps Recall's own word list (`notetaker`, `recorder`, `assistant`; the field is required) but
+ *    activates only after 7200 s, longer than any stay the other timers allow (in-call-not-recording
+ *    900 + in-call-recording 2700), so it is inert and a candidate whose Meet name contains one of
+ *    those words never makes Dex leave; the no-speech heuristic keeps Recall's defaults (active
+ *    after 1200 s, leave after 600 s), now explicit: a candidate who speaks is never taken for a bot.
+ *
+ * The disclosure is pinned in the chat when the bot joins and re-sent to everyone each time a
+ * participant joins (M035 S09), so a candidate who joins after the bot still sees it even when the
+ * Workspace's continuous chat hides the pin. Google Meet caps a chat message at
+ * `R1_MEET_MEET_CHAT_MAX_CHARS` (500) characters.
  *
  * Consent (D-M034-9 / D-M034-11): HR takes the candidate's verbal consent when they speak to them
  * directly, and scheduling the interview in Ashby with "Dex (AI Interviewer)" as an interviewer is
@@ -30,12 +41,31 @@
  * Reads no environment, performs no I/O and does not log.
  */
 
+/** Google Meet's limit on one chat message, in characters. Every disclosure fits in it. */
+export const R1_MEET_MEET_CHAT_MAX_CHARS = 500;
+
+/**
+ * Recall's bot-detection heuristics (`automatic_leave.bot_detection`). `activateAfterSec` counts
+ * from recording start; Recall requires every `timeoutSec` >= 10 and every `activateAfterSec` >= 1.
+ */
+export interface R1MeetBotDetection {
+  /** A participant whose name contains any of `matches` (case-insensitive) is taken for a bot. */
+  readonly participantNames: {
+    readonly matches: readonly string[];
+    readonly activateAfterSec: number;
+    readonly timeoutSec: number;
+  };
+  /** A participant with no audio or screenshare activity for the whole call is taken for a bot. */
+  readonly participantEvents: { readonly activateAfterSec: number; readonly timeoutSec: number };
+}
+
 export interface R1MeetAutomaticLeave {
   readonly waitingRoomTimeoutSec: number;
   readonly nooneJoinedTimeoutSec: number;
   readonly everyoneLeftTimeoutSec: number;
   readonly inCallNotRecordingTimeoutSec: number;
   readonly inCallRecordingTimeoutSec: number;
+  readonly botDetection: R1MeetBotDetection;
 }
 
 /**
@@ -57,7 +87,10 @@ export interface R1MeetObjectiveProfile {
   /** The bot's `join_at` is this many seconds before the booked slot starts. */
   readonly botJoinLeadSec: number;
   readonly automaticLeave: R1MeetAutomaticLeave;
-  /** Posted (pinned) in the meeting chat to everyone when the bot joins: a notice, never consent. */
+  /**
+   * Posted (pinned) in the meeting chat to everyone when the bot joins, and re-sent to everyone each
+   * time a participant joins: a notice, never consent. At most `R1_MEET_MEET_CHAT_MAX_CHARS` long.
+   */
   readonly disclosureChatMessage: string;
   readonly participantMetadataRetentionHours: number;
 }
@@ -77,6 +110,14 @@ const R1_DEX_SALES: R1MeetObjectiveProfile = Object.freeze({
     everyoneLeftTimeoutSec: 90,
     inCallNotRecordingTimeoutSec: 900,
     inCallRecordingTimeoutSec: 2700,
+    botDetection: Object.freeze({
+      participantNames: Object.freeze({
+        matches: Object.freeze(['notetaker', 'recorder', 'assistant'] as const),
+        activateAfterSec: 7200,
+        timeoutSec: 600,
+      }),
+      participantEvents: Object.freeze({ activateAfterSec: 1200, timeoutSec: 600 }),
+    }),
   }),
   disclosureChatMessage: 'Dex is an AI interviewer from Interview Kickstart. This call is recorded.',
   participantMetadataRetentionHours: 1,

@@ -34,18 +34,33 @@
  *       only; always null for participant events);
  *     - `participant`: null for status events; for participant events always `{ id, is_host, is_bot }`
  *       with `id` a non-negative safe integer or null and the two flags a boolean or null. Recall
- *       documents NO `is_bot` field (`docs_real-time-event-payloads.md`): it stays null unless Recall
- *       ever sends a boolean.
+ *       documents NO `is_bot` field (`docs_real-time-event-payloads.md`), so `is_bot` is `true` when
+ *       Recall itself sends `is_bot: true` OR (M035 S09, D-S09-6) when a JOIN's display name equals
+ *       this bot's own display name; otherwise Recall's boolean, or null. When Recall itself sends
+ *       `is_bot: true`, `id` is null (PR #449 review S09-R3): Recall's verdict stays apart from the
+ *       name evidence, so the handler ignores that participant outright and never counts it.
  *
- * Dropped, never read (data-classification "Job payloads"): the participant's name, email,
- * platform and `extra_data`, and the `realtime_endpoint`, `recording` and `participant_events`
- * artifacts. Only the fields above are accessed.
+ * The bot's own display name (M035 S09): `options.botNameOverride` (the route passes
+ * `R1_MEET_BOT_NAME` as configured when the event is received) when it is a string of 1 to
+ * `R1_MEET_BOT_NAME_MAX_LENGTH` characters, else the `botDisplayName` of the objective profile
+ * named in `data.bot.metadata.profile`, else none (no name rule). `r1MeetSameDisplayName` compares
+ * the two in memory (NFKC, whitespace runs to one space, trimmed, lower-cased); the participant's
+ * name is read at most once, only for a join, and is never kept, stored, logged, queued or returned:
+ * only the boolean survives. The mark is EVIDENCE, not a verdict: a candidate named like the bot is
+ * marked too, and the event handler decides which marked join is the bot's own (UNVERIFIED until
+ * the live spike S0c shows how Recall reports the bot's own join).
+ *
+ * Dropped, never read (data-classification "Job payloads"): the participant's email, platform and
+ * `extra_data`, its name on a leave (or when no own name is known), and the `realtime_endpoint`,
+ * `recording` and `participant_events` artifacts. Only the fields above, and a join's name, are
+ * accessed.
  *
  * Pure: no environment, no I/O, no clock, no logging.
  */
 import { isRecallIsoDateTime } from '../../../integrations/recall/client.js';
 import type { RecallRealtimeEvent } from '../../../integrations/recall/types.js';
-import { R1_MEET_RECALL_REALTIME_PATH } from './config.js';
+import { R1_MEET_BOT_NAME_MAX_LENGTH, R1_MEET_RECALL_REALTIME_PATH } from './config.js';
+import { getR1MeetProfile } from './profiles.js';
 import { R1_MEET_REALTIME_EVENTS } from './recall-bot.js';
 
 // ── Contract constants ──────────────────────────────────────────────────────
@@ -87,12 +102,26 @@ export const R1_MEET_RECALL_EVENT_FAILURES = Object.freeze(['ignored_event', 'ma
 
 export type R1MeetRecallEventFailure = (typeof R1_MEET_RECALL_EVENT_FAILURES)[number];
 
-/** A participant of a real-time participant event: no name, email, platform or extra data. */
+/**
+ * A participant of a real-time participant event: no name, email, platform or extra data.
+ * `is_bot` is true when Recall says so or when a JOIN's display name equals this bot's own display
+ * name (compared in memory and dropped, M035 S09); otherwise Recall's boolean, or null. `id` is
+ * null when Recall says so (PR #449 review S09-R3: never counted, never the bot's own).
+ */
 export type R1MeetRecallParticipant = {
   readonly id: number | null;
   readonly is_host: boolean | null;
   readonly is_bot: boolean | null;
 };
+
+/** What the caller knows about the bot beyond the body (M035 S09). */
+export interface R1MeetRecallEventOptions {
+  /**
+   * `R1_MEET_BOT_NAME` (the enabled Meet config's `botNameOverride`): the display name the bot
+   * shows instead of its profile's. Used only when it is a string of 1 to 100 characters.
+   */
+  readonly botNameOverride?: string | null;
+}
 
 /** The `recall_event` job payload (contract §2), in this exact key order. */
 export type R1MeetRecallEventPayload = {
@@ -175,16 +204,69 @@ function canonicalInstant(value: unknown): string | null {
   return CANONICAL_ISO_RE.test(iso) ? iso : null;
 }
 
-function participantOf(raw: unknown): R1MeetRecallParticipant {
+// ── The bot's own display name (M035 S09, D-S09-6) ──────────────────────────
+
+/** A display name longer than this never matches (Meet names are far shorter). */
+const MAX_COMPARED_NAME_CHARS = 256;
+
+/** NFKC, every whitespace run to one space, trimmed, lower-cased. */
+function foldDisplayName(value: string): string {
+  return value.normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/**
+ * Whether a participant's display name is the bot's own display name `own`: both sides NFKC,
+ * whitespace runs collapsed to one space, trimmed and lower-cased, then compared exactly. A name
+ * that is not a string or is longer than 256 characters never matches, nor does anything against
+ * an own name that folds to nothing. Pure; never throws; keeps nothing.
+ */
+export function r1MeetSameDisplayName(name: unknown, own: string): boolean {
+  try {
+    if (typeof name !== 'string' || typeof own !== 'string') return false;
+    if (name.length > MAX_COMPARED_NAME_CHARS || own.length > MAX_COMPARED_NAME_CHARS) return false;
+    const ownFolded = foldDisplayName(own);
+    return ownFolded.length > 0 && foldDisplayName(name) === ownFolded;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The display name this bot shows: the override when it is a 1..100-character string, else the
+ * profile named in the bot's metadata, else null (no name rule).
+ */
+function ownDisplayNameOf(options: R1MeetRecallEventOptions | undefined, metadata: unknown): string | null {
+  const override = options?.botNameOverride;
+  if (typeof override === 'string' && override.length >= 1 && override.length <= R1_MEET_BOT_NAME_MAX_LENGTH) {
+    return override;
+  }
+  const profile = getR1MeetProfile(isPlainObject(metadata) ? metadata.profile : undefined);
+  return profile === null ? null : profile.botDisplayName;
+}
+
+/**
+ * The participant object. `ownName` is non-null only for a JOIN with a known own name: then the
+ * display name is read exactly once into a local, compared in memory and dropped.
+ *
+ * A participant Recall ITSELF calls a bot (`is_bot: true`) keeps NO id (PR #449 review S09-R3): the
+ * payload has one `is_bot` for both marks and `jobs.ts` reads only these three keys, so the id is
+ * the one place that keeps Recall's verdict apart from the name evidence. With no id it can be
+ * neither counted nor taken for the bot's own participant: the handler ignores it outright, as
+ * M034 ignored every participant Recall flagged. Its name is never read.
+ */
+function participantOf(raw: unknown, ownName: string | null): R1MeetRecallParticipant {
   if (!isPlainObject(raw)) return Object.freeze({ id: null, is_host: null, is_bot: null });
-  // Only these three fields are read: never the name, email, platform or extra data.
+  // Only id, is_host and is_bot are kept, plus (a join only) one in-memory read of the display
+  // name: never the email, platform or extra data.
   const id = raw.id;
   const isHost = raw.is_host;
   const isBot = raw.is_bot;
+  const recallSaysBot = isBot === true;
+  const namedLikeBot = !recallSaysBot && ownName !== null && r1MeetSameDisplayName(raw.name, ownName);
   return Object.freeze({
-    id: typeof id === 'number' && Number.isSafeInteger(id) && id >= 0 ? id + 0 : null,
+    id: !recallSaysBot && typeof id === 'number' && Number.isSafeInteger(id) && id >= 0 ? id + 0 : null,
     is_host: typeof isHost === 'boolean' ? isHost : null,
-    is_bot: typeof isBot === 'boolean' ? isBot : null,
+    is_bot: recallSaysBot || namedLikeBot ? true : typeof isBot === 'boolean' ? isBot : null,
   });
 }
 
@@ -192,9 +274,14 @@ function participantOf(raw: unknown): R1MeetRecallParticipant {
 
 /**
  * The `recall_event` job for a verified Recall body received on `endpoint`, or why there is none.
- * Pure and frozen; never throws.
+ * `options.botNameOverride` is the bot's configured display name (see the header). Pure and
+ * frozen; never throws.
  */
-export function buildR1MeetRecallEventJob(body: unknown, endpoint: R1MeetRecallEndpoint): R1MeetRecallEventJob {
+export function buildR1MeetRecallEventJob(
+  body: unknown,
+  endpoint: R1MeetRecallEndpoint,
+  options: R1MeetRecallEventOptions = {},
+): R1MeetRecallEventJob {
   try {
     if (!isPlainObject(body)) return MALFORMED;
     const event = body.event;
@@ -220,7 +307,9 @@ export function buildR1MeetRecallEventJob(body: unknown, endpoint: R1MeetRecallE
     if (participantEvent) {
       const timestamp = inner === null ? undefined : inner.timestamp;
       occurredAt = isPlainObject(timestamp) ? canonicalInstant(timestamp.absolute) : null;
-      participant = participantOf(inner === null ? undefined : inner.participant);
+      // The own-name rule applies to a join only: a leave never reads the name.
+      const ownName = event === 'participant_events.join' ? ownDisplayNameOf(options, metadata) : null;
+      participant = participantOf(inner === null ? undefined : inner.participant, ownName);
     } else if (inner !== null) {
       occurredAt = canonicalInstant(inner.updated_at);
       const rawSubCode = inner.sub_code;

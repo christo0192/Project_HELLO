@@ -129,7 +129,7 @@ export function createR1MeetHarness(options: HarnessOptions = {}): R1MeetHarness
   const hot: number[] = [];
   const sleeps: number[] = [];
   const db = createR1MeetFakeDb({ timeline, now: () => nowMs });
-  const recall = createFakeRecall();
+  const recall = createFakeRecall({ now: () => new Date(nowMs) });
   const interceptors: Array<{ match: (req: RecallTransportRequest, op: RecallOp) => boolean; response: InterceptResponse }> = [];
   const requests: R1MeetHarness['requests'] = [];
 

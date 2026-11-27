@@ -9,7 +9,9 @@
  * signatures; the Ashby dedupe-space guard; body bounds; accepted, duplicate, ignored, malformed and
  * every failure answer; one receipt call per accepted delivery with the exact contract payload; no
  * secret, signature or webhook id in any response or log line; not in `lib/auth.ts` PUBLIC_ROUTES;
- * and `createApp()` with the default environment answers 200 `disabled`.
+ * and `createApp()` with the default environment answers 200 `disabled`. M035 S09 T2: a join named
+ * like the bot (the profile's `Dex`, or `R1_MEET_BOT_NAME` when set) is marked `is_bot: true`, and the
+ * name never reaches a receipt, a job or a log line.
  *
  * gitleaks: the workspace secret is generated at run time (`makeRecallWebhookSecret`), the spec
  * vector's secret is assembled from parts, and the Recall API value is joined from parts.
@@ -46,6 +48,10 @@ const BOOKING_ID = BOOKING_ID_UPPER.toLowerCase();
 const MSG_ID = 'msg_s03fixtureRecallRoute01';
 
 const PARTICIPANT_NAME = 'Example Person';
+/** The bot's own display names used here: the profile's, and an `R1_MEET_BOT_NAME` override. */
+const PROFILE_BOT_NAME = 'Dex';
+const OVERRIDE_BOT_NAME = 'Dex (AI Interviewer)';
+const BOT_NAME_FIXTURES = [PROFILE_BOT_NAME, OVERRIDE_BOT_NAME, 'AI Interviewer'];
 const PARTICIPANT_EMAIL = 'person@example.invalid';
 const PARTICIPANT_PLATFORM = 'desktop_fixture_platform';
 const EXTRA_MARKER = 'extra_fixture_marker';
@@ -54,13 +60,14 @@ const RECALL_API_VALUE = ['fixture', 'recall', 'api', 'value'].join('-');
 const signingText = makeRecallWebhookSecret();
 const otherSigningText = makeRecallWebhookSecret();
 
-function meetEnabled(webhookText: string = signingText): R1MeetConfig {
+function meetEnabled(webhookText: string = signingText, extra: Record<string, string> = {}): R1MeetConfig {
   return getR1MeetConfig({
     R1_MEET_ENABLED: 'true',
     RECALL_API_KEY: RECALL_API_VALUE,
     RECALL_WEBHOOK_SECRET: webhookText,
     R1_MEET_ASHBY_DEX_USER_ID: FIXTURE_DEX_USER_ID,
     WEB_ORIGIN: 'https://hello.example.test',
+    ...extra,
   });
 }
 
@@ -77,14 +84,14 @@ function statusBody(event = 'bot.in_call_recording', bot: Record<string, unknown
   });
 }
 
-function participantBody(event = 'participant_events.join'): string {
+function participantBody(event = 'participant_events.join', name: string = PARTICIPANT_NAME): string {
   return JSON.stringify({
     event,
     data: {
       data: {
         participant: {
           id: 100,
-          name: PARTICIPANT_NAME,
+          name,
           is_host: false,
           platform: PARTICIPANT_PLATFORM,
           extra_data: { google_meet: { static_participant_id: EXTRA_MARKER } },
@@ -248,7 +255,7 @@ beforeEach(() => {
 
 afterEach(() => {
   for (const line of logLines) {
-    for (const value of [...forbidden, BOT_ID, BOOKING_ID, PARTICIPANT_EMAIL, PARTICIPANT_NAME]) {
+    for (const value of [...forbidden, BOT_ID, BOOKING_ID, PARTICIPANT_EMAIL, PARTICIPANT_NAME, ...BOT_NAME_FIXTURES]) {
       expect(line, 'log line leaks a forbidden value').not.toContain(value);
     }
   }
@@ -538,10 +545,68 @@ describe('accepted and duplicate deliveries', () => {
       participant: { id: 100, is_host: false, is_bot: null },
     });
     expect(Object.keys(call.payload)).toEqual(PAYLOAD_KEYS);
+    expectNoParticipantTrace(h, PARTICIPANT_NAME);
+  });
+
+  /** Receipts, jobs and record calls hold no name, email, platform or extra data (any case). */
+  function expectNoParticipantTrace(h: Harness, name: string): void {
     const seen = JSON.stringify({ calls: h.fake.calls, jobs: h.fake.jobs(), receipts: h.fake.receipts() });
-    for (const value of [PARTICIPANT_NAME, PARTICIPANT_EMAIL, PARTICIPANT_PLATFORM, EXTRA_MARKER, '@', 'example.invalid', 'platform', 'extra_data']) {
-      expect(seen, value).not.toContain(value);
+    for (const value of [name, PARTICIPANT_EMAIL, PARTICIPANT_PLATFORM, EXTRA_MARKER, '@', 'example.invalid', 'platform', 'extra_data', '"name"']) {
+      expect(seen.toLowerCase(), value).not.toContain(value.toLowerCase());
     }
+    for (const value of BOT_NAME_FIXTURES) expect(seen.toLowerCase(), value).not.toContain(value.toLowerCase());
+  }
+
+  it("a join named like the bot (default config: the profile's Dex) is marked is_bot true, and the name is kept nowhere", async () => {
+    const h = makeHarness();
+    const body = participantBody('participant_events.join', PROFILE_BOT_NAME);
+    const res = await send(h.app, 'realtime', body, signed(body));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, status: 'accepted' });
+    expect(h.fake.calls).toHaveLength(1);
+    expect(h.fake.calls[0]!.payload).toEqual({
+      kind: 'recall_event',
+      event_type: 'participant_events.join',
+      recall_bot_id: BOT_ID,
+      booking_id: BOOKING_ID,
+      occurred_at: '2026-12-01T10:32:05.250Z',
+      sub_code: null,
+      participant: { id: 100, is_host: false, is_bot: true },
+    });
+    expect(Object.keys(h.fake.calls[0]!.payload)).toEqual(PAYLOAD_KEYS);
+    expect(h.fake.jobs()).toHaveLength(1);
+    expect(h.fake.jobs()[0]!.payload).toMatchObject({ participant: { id: 100, is_host: false, is_bot: true } });
+    expectNoParticipantTrace(h, PROFILE_BOT_NAME);
+    for (const line of logLines) expect(line.toLowerCase()).not.toContain('dex');
+  });
+
+  it('with R1_MEET_BOT_NAME set, only that name is marked: the profile name is then a person', async () => {
+    const meet = meetEnabled(signingText, { R1_MEET_BOT_NAME: OVERRIDE_BOT_NAME });
+    expect(meet.enabled && meet.botNameOverride).toBe(OVERRIDE_BOT_NAME);
+    const h = makeHarness({ meet });
+    const cases: Array<[string, boolean | null]> = [
+      [PROFILE_BOT_NAME, null],
+      [OVERRIDE_BOT_NAME, true],
+      [PARTICIPANT_NAME, null],
+    ];
+    for (const [index, [name, isBot]] of cases.entries()) {
+      const body = participantBody('participant_events.join', name);
+      const res = await send(h.app, 'realtime', body, signed(body, { id: `msg_s09fixtureOwnName${index}` }));
+      expect(res.body, name).toEqual({ ok: true, status: 'accepted' });
+      expect(h.fake.calls[index]!.payload.participant, name).toEqual({ id: 100, is_host: false, is_bot: isBot });
+    }
+    expect(h.fake.jobs()).toHaveLength(3);
+    for (const [name] of cases) expectNoParticipantTrace(h, name);
+    for (const line of logLines) expect(line.toLowerCase()).not.toContain('dex');
+  });
+
+  it('a leave named like the bot is never marked by name', async () => {
+    const h = makeHarness();
+    const body = participantBody('participant_events.leave', PROFILE_BOT_NAME);
+    const res = await send(h.app, 'realtime', body, signed(body));
+    expect(res.body).toEqual({ ok: true, status: 'accepted' });
+    expect(h.fake.calls[0]!.payload.participant).toEqual({ id: 100, is_host: false, is_bot: null });
+    expectNoParticipantTrace(h, PROFILE_BOT_NAME);
   });
 
   it('participant_events.leave on /realtime is accepted too', async () => {

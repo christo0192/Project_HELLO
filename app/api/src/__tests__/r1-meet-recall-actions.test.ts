@@ -304,3 +304,32 @@ describe('the Recall client logger adapter', () => {
     expect(JSON.stringify(h.logs)).not.toContain(bot);
   });
 });
+
+describe('R1_MEET_ALERTS: closed words, append-only (plan 2.6, M035 S09 D-S09-4)', () => {
+  it('the 16 M034 words in their order, then the three S09 ones; frozen; every word a logger safe identifier', () => {
+    expect(Object.entries(R1_MEET_ALERTS)).toEqual([
+      ['botCapReached', 'r1_meet_bot_cap_reached'],
+      ['botCreateFailed', 'r1_meet_bot_create_failed'],
+      ['generationExhausted', 'r1_meet_generation_exhausted'],
+      ['recallRejected', 'r1_meet_recall_rejected'],
+      ['strayBot', 'r1_meet_stray_bot'],
+      ['botInUse', 'r1_meet_bot_in_use'],
+      ['releaseOwed', 'r1_meet_release_owed'],
+      ['armRefused', 'r1_meet_arm_refused'],
+      ['outputMediaRefused', 'r1_meet_output_media_refused'],
+      ['bridgeGaveUp', 'r1_meet_bridge_gave_up'],
+      ['multipleHumans', 'r1_meet_multiple_humans'],
+      ['profileUnknown', 'r1_meet_profile_unknown'],
+      ['drainFailed', 'r1_meet_drain_failed'],
+      ['malformedPayload', 'r1_meet_malformed_payload'],
+      ['unknownKind', 'r1_meet_unknown_kind'],
+      ['jobFailed', 'r1_meet_job_failed'],
+      ['botWaitingRoom', 'r1_meet_bot_waiting_room'],
+      ['botAdmissionBlocked', 'r1_meet_bot_admission_blocked'],
+      ['botSignInFailed', 'r1_meet_bot_sign_in_failed'],
+    ]);
+    expect(Object.isFrozen(R1_MEET_ALERTS)).toBe(true);
+    // Copied from lib/logger.ts:111 (SAFE_IDENT_RE): an error_category that fails it is dropped.
+    for (const word of Object.values(R1_MEET_ALERTS)) expect(word).toMatch(/^[a-zA-Z0-9_:.\-]{1,64}$/);
+  });
+});

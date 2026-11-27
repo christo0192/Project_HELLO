@@ -23,24 +23,59 @@
  *  - decideBridgeCheck, every row and boundary, and the handler's recheck / rearm / give-up;
  *  - the kill points of the arm and the outcome, and the hot-window hints;
  *  - no name, email, Meet URL, ticket or digest in any log line or job payload.
+ *
+ * M035 S09 T3 (D-S09-2..4), the guest-bot hardening:
+ *  - the three frozen sub-code lists (admission, sign-in, fatal = M034's six first), each entry a
+ *    logger safe identifier that survives the real logger as `error_type`;
+ *  - `r1MeetBotAlertFor` and `r1MeetPreCallVerdict` (a `fatal` status, a fatal sub-code, or never in
+ *    the call = the bot failed; the oldest listed sub-code is the alert's);
+ *  - every listed sub-code on `bot.fatal` and `bot.call_ended` from `bot_scheduled` / `bot_joining`
+ *    is `failed/bot_fatal` with exactly one alert, never `no_show`; an event that alone says no-show
+ *    reads the bot ONCE before the move (Recall first), so an out-of-order `bot.done` of a refused
+ *    bot is a bot failure too, a 503 defers before the move and a 404 keeps the event's reason;
+ *  - a `bot.in_waiting_room` of a live booking's bot alerts once per run that ends (PR #449 review
+ *    S09-R1: a re-run alerts too, a run that throws or defers before its end never does, so the
+ *    alert is never lost), never for a terminal booking, and the status mapping is unchanged.
+ *
+ * M035 S09 T4 (D-S09-6, UNVERIFIED until the live spike S0c), the bot's own participant:
+ *  - `r1MeetBotInCallAtMs` (the oldest `in_call_*` time) and `r1MeetBotParticipantId` (the EARLIEST
+ *    marked join with an id, and only within 15 s of that time, inclusive) as tables;
+ *  - `countHumans` excludes null ids and that one id only: every other id counts, marked or not;
+ *  - through the real client: the bot's own join never arms or counts (H1); a candidate's join is the
+ *    human signal with no recount; a later name-alike is a person (one recount; `end` ends the call,
+ *    `observe` only warns); a marked join NEVER moves or arms the booking (PR #449 review S09-R4: a
+ *    lone name-alike counts and `bot.in_call_recording` arms (H3); the bot's own join that misses
+ *    the bound, or has no readable time, arms nothing); a participant Recall itself calls a bot
+ *    reaches the handler with no id and is ignored outright (S09-R3); a marked join with no id is
+ *    ignored; a Recall failure of the bound defers a marked join, `attempt_ended` and the check
+ *    before any write, and only drops the bound at the human-present recount.
  */
 
 import { describe, expect, it } from 'vitest';
+import { createLogger } from '../lib/logger.js';
 import { armBridge } from '../lib/r1/meet/arm.js';
 import { ensureBot } from '../lib/r1/meet/bot-flow.js';
 import {
+  R1_MEET_ADMISSION_SUB_CODES,
+  R1_MEET_BOT_JOIN_SLACK_MS,
   R1_MEET_EVENT_DEFINITIONS,
   R1_MEET_FATAL_SUB_CODES,
+  R1_MEET_SIGN_IN_SUB_CODES,
   countHumans,
   decideBridgeCheck,
   r1MeetAttemptEndedDefinition,
+  r1MeetBotAlertFor,
+  r1MeetBotInCallAtMs,
+  r1MeetBotParticipantId,
   r1MeetBridgeCheckDefinition,
   r1MeetMultiHumanCheckDefinition,
+  r1MeetPreCallVerdict,
   r1MeetRecallEventDefinition,
   type R1MeetBridgeCheckFacts,
 } from '../lib/r1/meet/event-handler.js';
 import { r1MeetJobMeta, type R1MeetJobMeta, type R1MeetJobResult } from '../lib/r1/meet/jobs.js';
 import type { R1MeetFlowDeps, R1MeetJobDefinition } from '../lib/r1/meet/recall-actions.js';
+import { buildR1MeetRecallEventJob } from '../lib/r1/meet/recall-event.js';
 import { r1MeetBotReleaseDefinition } from '../lib/r1/meet/schedule-handler.js';
 import { R1_MEET_TICKET_PATTERN, r1MeetTicketDigest } from '../lib/r1/meet/ticket.js';
 import {
@@ -79,6 +114,8 @@ const done = (receipt: 'processed' | 'ignored', code: string) => ({ outcome: 'do
 const deferred = (code: string, delaySeconds: number) => ({ outcome: 'defer', code, delaySeconds });
 const outputMedia = (h: R1MeetHarness) => h.requests.filter((request) => request.op === 'output_media');
 const recallOps = (h: R1MeetHarness) => h.requests.map((request) => request.op);
+/** The error lines (alerts) with their whole meta, so a test pins `error_type` too. */
+const errorLines = (h: R1MeetHarness) => h.logs.filter((line) => line.level === 'error');
 /** The timeline without the test's own enqueue of the event row (what S03 does). */
 const steps = (h: R1MeetHarness) => h.timeline.filter((step) => step !== 'queue:recall_event');
 const pageUrlOf = (request: { body: unknown }) => (request.body as { camera: { config: { url: string } } }).camera.config.url;
@@ -196,6 +233,8 @@ interface Delivery {
   readonly subCode?: string | null;
   readonly participantId?: number | null;
   readonly isBot?: boolean | null;
+  /** The event's `occurred_at`: omitted = now; `null` = Recall's time could not be read. */
+  readonly occurredAt?: string | null;
   /** `null` = the bot's metadata named no booking; omitted = the booking's id. */
   readonly bookingId?: string | null;
   readonly botId?: string;
@@ -214,7 +253,7 @@ function event(h: R1MeetHarness, b: Pick<Booked, 'id' | 'botId'> | null, type: s
     event_type: type,
     recall_bot_id: d.botId ?? b!.botId,
     booking_id: d.bookingId === undefined ? b!.id : d.bookingId,
-    occurred_at: iso(h.now()),
+    occurred_at: d.occurredAt === undefined ? iso(h.now()) : d.occurredAt,
     sub_code: d.subCode ?? null,
     participant: type.startsWith('participant_events.')
       ? { id: d.participantId === undefined ? 101 : d.participantId, is_host: null, is_bot: d.isBot ?? null }
@@ -268,7 +307,7 @@ describe('the definitions', () => {
 
 // ── countHumans ─────────────────────────────────────────────────────────────
 
-describe('countHumans (D-S06-28)', () => {
+describe('countHumans (D-S06-28, M035 S09 D-S09-6)', () => {
   const join = (id: number | null, isBot: boolean | null = null) => ({ type: 'join' as const, participantId: id, isBot });
   const leave = (id: number | null, isBot: boolean | null = null) => ({ type: 'leave' as const, participantId: id, isBot });
 
@@ -283,14 +322,234 @@ describe('countHumans (D-S06-28)', () => {
 
   it('a rejoin (leave, then a NEW id) is one human', () => {
     expect(countHumans([join(2), leave(1), join(1)])).toBe(1);
+    expect(countHumans([join(2), leave(1), join(1)], 7)).toBe(1);
   });
 
-  it('ignores null ids and every id any row marks as a bot', () => {
+  it('ignores null ids, with or without a bot id', () => {
     expect(countHumans([join(null), join(null), join(1)])).toBe(1);
-    expect(countHumans([join(7, true), join(1)])).toBe(1);
-    // The leave is unmarked but the id was a bot's: still not a human.
-    expect(countHumans([join(7, true), leave(7), join(7), join(1)])).toBe(1);
-    expect(countHumans([join(1, false), join(2, false)])).toBe(2);
+    expect(countHumans([join(null, true), leave(null), join(1)], 7)).toBe(1);
+    expect(countHumans([join(null)], null)).toBe(0);
+  });
+
+  it('excludes the bot\'s own participant id and ONLY that one: every other id counts, marked or not', () => {
+    // A mark is evidence for r1MeetBotParticipantId, not a verdict here: only the named id is the bot.
+    expect(countHumans([join(7, true), join(1)], 7)).toBe(1);
+    expect(countHumans([join(7, true), join(1)])).toBe(2);
+    expect(countHumans([join(7, true), join(1)], null)).toBe(2);
+    // A second marked id (a candidate named like the bot) is a person.
+    expect(countHumans([join(7, true), join(8, true), join(1)], 7)).toBe(2);
+    // The bot's own leave and rejoin rows never count either, marked or not.
+    expect(countHumans([join(7, true), leave(7), join(7), join(1)], 7)).toBe(1);
+    // The bot alone; an id that is not in the rows changes nothing.
+    expect(countHumans([join(7, true)], 7)).toBe(0);
+    expect(countHumans([join(1), join(2)], 99)).toBe(2);
+    expect(countHumans([join(1, false), join(2, false)], 1)).toBe(1);
+  });
+});
+
+// ── The bot's own participant: the pure rule (M035 S09 D-S09-6) ────────────
+
+describe('r1MeetBotInCallAtMs (M035 S09 D-S09-6)', () => {
+  const T0 = Date.parse('2030-01-01T10:00:00.000Z');
+  const at = (code: string, when: number | string) => ({ code, createdAt: typeof when === 'string' ? when : iso(when) });
+
+  const cases: ReadonlyArray<readonly [label: string, changes: ReadonlyArray<{ code: string; createdAt: string }>, expected: number | null]> = [
+    ['no history', [], null],
+    ['ready, joining_call, in_waiting_room only: not in the call', [at('ready', T0), at('joining_call', T0 + SEC), at('in_waiting_room', T0 + 2 * SEC)], null],
+    ['refused at the door: not in the call', [at('joining_call', T0), at('fatal', T0 + SEC), at('done', T0 + 2 * SEC)], null],
+    ['in_call_not_recording', [at('ready', T0), at('joining_call', T0 + SEC), at('in_call_not_recording', T0 + 5 * SEC)], T0 + 5 * SEC],
+    ['in_call_recording alone', [at('ready', T0), at('in_call_recording', T0 + 9 * SEC)], T0 + 9 * SEC],
+    ['the oldest of either in-call code', [at('in_call_not_recording', T0 + 5 * SEC), at('in_call_recording', T0 + MIN)], T0 + 5 * SEC],
+    ['the oldest by time, whatever the array order', [at('in_call_recording', T0 + MIN), at('in_call_not_recording', T0 + 5 * SEC)], T0 + 5 * SEC],
+    ['a later end changes nothing', [at('in_call_not_recording', T0), at('call_ended', T0 + 10 * MIN), at('done', T0 + 11 * MIN)], T0],
+    ['an unreadable time is skipped', [at('in_call_not_recording', 'not a time'), at('in_call_recording', T0 + 30 * SEC)], T0 + 30 * SEC],
+    ['only unreadable in-call times: null', [at('in_call_not_recording', ''), at('in_call_recording', 'nope')], null],
+  ];
+
+  it.each(cases)('%s', (_label, changes, expected) => {
+    expect(r1MeetBotInCallAtMs(changes)).toBe(expected);
+  });
+});
+
+describe('r1MeetBotParticipantId (M035 S09 D-S09-6)', () => {
+  const T0 = Date.parse('2030-01-01T10:00:00.000Z');
+  type Row = { type: 'join' | 'leave'; participantId: number | null; isBot: boolean | null; occurredAt: string | null };
+  const time = (when: number | string | null): string | null => (when === null || typeof when === 'string' ? when : iso(when));
+  /** A join the receiver marked `is_bot`. */
+  const marked = (id: number | null, when: number | string | null): Row => ({ type: 'join', participantId: id, isBot: true, occurredAt: time(when) });
+  const person = (id: number | null, when: number | string | null, isBot: boolean | null = null): Row => ({
+    type: 'join',
+    participantId: id,
+    isBot,
+    occurredAt: time(when),
+  });
+  const markedLeave = (id: number, when: number): Row => ({ type: 'leave', participantId: id, isBot: true, occurredAt: time(when) });
+
+  it('the slack is 15 s', () => {
+    expect(R1_MEET_BOT_JOIN_SLACK_MS).toBe(15_000);
+  });
+
+  const cases: ReadonlyArray<readonly [label: string, rows: readonly Row[], botInCallAtMs: number | null, expected: number | null]> = [
+    ['no rows', [], T0, null],
+    ['no rows, no bound', [], null, null],
+    ['no marked join (unmarked, or Recall said false)', [person(1, T0), person(2, T0, false)], T0, null],
+    ['no marked join, no bound', [person(1, T0)], null, null],
+    ['the one marked join, at the in-call time', [marked(7, T0)], T0, 7],
+    ['the earliest marked join wins (rows newest first, as the store answers)', [marked(9, T0 + 5 * SEC), marked(8, T0 + 3 * SEC), person(1, T0 + SEC)], T0, 8],
+    ['equal times: the smallest id', [marked(9, T0), marked(4, T0), marked(6, T0)], T0, 4],
+    ['the bound is inclusive at +15 000 ms', [marked(7, T0 + 15_000)], T0, 7],
+    ['one ms past the bound: a person, not the bot', [marked(7, T0 + 15_001)], T0, null],
+    ['stamped before the in-call time: the bot', [marked(7, T0 - 30 * SEC)], T0, 7],
+    ['no bound (not in the call yet, or unknown): the earliest marked join, however late', [marked(9, T0 + 10 * MIN), marked(8, T0 + 5 * MIN)], null, 8],
+    ['a null time sorts last', [marked(3, null), marked(9, T0 + 2 * SEC)], T0, 9],
+    ['a null time sorts last with no bound too', [marked(3, null), marked(9, T0 + 2 * SEC)], null, 9],
+    ['only null times, with a bound: never the bot', [marked(3, null), marked(2, null)], T0, null],
+    ['only null times, no bound: the smallest id', [marked(5, null), marked(3, null)], null, 3],
+    ['an unreadable time sorts last, like null', [marked(3, 'not a time'), marked(9, T0 + 2 * SEC)], T0, 9],
+    ['an unreadable time alone, with a bound: never the bot', [marked(3, 'not a time')], T0, null],
+    ['a marked join with a null id is never chosen', [marked(null, T0 - SEC), marked(7, T0 + SEC)], T0, 7],
+    ['only marked joins with null ids: null', [marked(null, T0)], null, null],
+    ['a marked leave is never chosen', [markedLeave(5, T0 - SEC), marked(7, T0 + SEC)], T0, 7],
+    ['only a marked leave: null', [markedLeave(5, T0)], null, null],
+    ['the earliest marked join missed the bound: null, never the next one', [marked(8, T0 + MIN), marked(7, T0 + 20 * SEC)], T0, null],
+    ['the earliest missed the bound, a later one has no time: still null', [marked(7, T0 + 20 * SEC), marked(8, null)], T0, null],
+    ['a later name-alike never displaces the bot', [marked(8, T0 + 2 * MIN), person(1, T0 + MIN), marked(7, T0)], T0, 7],
+  ];
+
+  it.each(cases)('%s', (_label, rows, botInCallAtMs, expected) => {
+    expect(r1MeetBotParticipantId(rows, botInCallAtMs)).toBe(expected);
+  });
+});
+
+// ── The sub-code lists and the refused-bot verdict (M035 S09 D-S09-2..4) ───
+
+/**
+ * Copied from `lib/logger.ts:111` (`SAFE_IDENT_RE`): an `error_type` that fails it is silently DROPPED
+ * by the logger, so a sub-code that failed it would alert without saying which refusal it was.
+ */
+const SAFE_IDENT_RE = /^[a-zA-Z0-9_:.\-]{1,64}$/;
+
+const M034_FATAL = [
+  'call_ended_by_platform_waiting_room_timeout',
+  'timeout_exceeded_waiting_room',
+  'bot_kicked_from_call',
+  'bot_kicked_from_waiting_room',
+  'meeting_not_started',
+  'timeout_exceeded_recording_permission_denied',
+];
+const ADMISSION = [
+  'call_ended_by_platform_waiting_room_timeout',
+  'timeout_exceeded_waiting_room',
+  'bot_kicked_from_waiting_room',
+  'meeting_not_started',
+  'google_meet_bot_blocked',
+  'google_meet_knocking_disabled',
+  'google_meet_sign_in_missing_login_credentials',
+  'google_meet_organisation_restricted',
+];
+const SIGN_IN = [
+  'google_meet_sso_sign_in_failed',
+  'google_meet_sign_in_failed',
+  'sso_not_configured',
+  'google_meet_login_not_available',
+  'google_meet_sign_in_captcha_failed',
+  'google_meet_sign_in_missing_recovery_credentials',
+  'google_meet_sso_sign_in_missing_login_credentials',
+  'google_meet_sso_sign_in_missing_totp_secret',
+  'sso_login_account_disabled',
+  'sso_login_invalid_recipient',
+];
+const ADMISSION_WORD = 'r1_meet_bot_admission_blocked';
+const SIGN_IN_WORD = 'r1_meet_bot_sign_in_failed';
+
+describe('the sub-code lists (M035 S09 D-S09-2)', () => {
+  it('exact contents and order, frozen: fatal = the M034 six, the new admission codes, the sign-in codes', () => {
+    expect(R1_MEET_ADMISSION_SUB_CODES).toEqual(ADMISSION);
+    expect(R1_MEET_SIGN_IN_SUB_CODES).toEqual(SIGN_IN);
+    expect(R1_MEET_FATAL_SUB_CODES).toEqual([
+      ...M034_FATAL,
+      'google_meet_bot_blocked',
+      'google_meet_knocking_disabled',
+      'google_meet_sign_in_missing_login_credentials',
+      'google_meet_organisation_restricted',
+      ...SIGN_IN,
+    ]);
+    expect(R1_MEET_FATAL_SUB_CODES).toHaveLength(20);
+    // M034's six keep their place at the front.
+    expect(R1_MEET_FATAL_SUB_CODES.slice(0, 6)).toEqual(M034_FATAL);
+    for (const list of [R1_MEET_ADMISSION_SUB_CODES, R1_MEET_SIGN_IN_SUB_CODES, R1_MEET_FATAL_SUB_CODES]) {
+      expect(Object.isFrozen(list)).toBe(true);
+    }
+  });
+
+  it('no duplicates; the alert lists are disjoint and both inside the fatal list', () => {
+    const fatal = new Set<string>(R1_MEET_FATAL_SUB_CODES);
+    for (const list of [R1_MEET_ADMISSION_SUB_CODES, R1_MEET_SIGN_IN_SUB_CODES, R1_MEET_FATAL_SUB_CODES]) {
+      expect(new Set<string>(list).size).toBe(list.length);
+    }
+    const admission = new Set<string>(R1_MEET_ADMISSION_SUB_CODES);
+    for (const code of R1_MEET_SIGN_IN_SUB_CODES) expect(admission.has(code), code).toBe(false);
+    for (const code of [...R1_MEET_ADMISSION_SUB_CODES, ...R1_MEET_SIGN_IN_SUB_CODES]) expect(fatal.has(code), code).toBe(true);
+  });
+
+  it('every entry is a logger safe identifier (at most 64 chars) and survives the real logger as error_type', () => {
+    const lines: string[] = [];
+    const logger = createLogger('r1-meet', { writer: (line) => lines.push(line) });
+    for (const code of R1_MEET_FATAL_SUB_CODES) {
+      expect(code, code).toMatch(SAFE_IDENT_RE);
+      expect(code.length, code).toBeLessThanOrEqual(64);
+      logger.error('unknown_event', { error_category: r1MeetBotAlertFor(code) ?? 'r1_meet_bot_fatal', error_type: code });
+    }
+    const logged = lines.map((line) => JSON.parse(line) as { error_category?: string; error_type?: string });
+    // Nothing was dropped by the value defences (an email, a token, a long digit run, a path).
+    expect(logged.map((line) => line.error_type)).toEqual([...R1_MEET_FATAL_SUB_CODES]);
+    expect(new Set(logged.map((line) => line.error_category))).toEqual(new Set([ADMISSION_WORD, SIGN_IN_WORD, 'r1_meet_bot_fatal']));
+  });
+});
+
+describe('r1MeetBotAlertFor (M035 S09 D-S09-4)', () => {
+  it.each([
+    ...ADMISSION.map((code) => [code, ADMISSION_WORD] as const),
+    ...SIGN_IN.map((code) => [code, SIGN_IN_WORD] as const),
+    // Fatal, but neither a refusal at the door nor a sign-in failure: no new alert.
+    ['bot_kicked_from_call', null],
+    ['timeout_exceeded_recording_permission_denied', null],
+    // Not fatal, unknown, empty, none.
+    ['timeout_exceeded_noone_joined', null],
+    ['bot_received_leave_call', null],
+    ['a_sub_code_recall_added_later.v2', null],
+    ['GOOGLE_MEET_BOT_BLOCKED', null],
+    ['', null],
+    [null, null],
+  ] as const)('%s -> %s', (subCode, word) => {
+    expect(r1MeetBotAlertFor(subCode)).toBe(word);
+  });
+});
+
+describe('r1MeetPreCallVerdict (M035 S09 D-S09-3)', () => {
+  const at = (code: string, subCode: string | null = null) => ({ code, subCode });
+  const ready = at('ready');
+  const joining = at('joining_call');
+
+  it.each([
+    ['a fatal status', [ready, joining, at('fatal')], true, null],
+    ['a fatal status with a listed sub-code', [ready, joining, at('fatal', 'google_meet_bot_blocked'), at('done')], true, 'google_meet_bot_blocked'],
+    ['a sign-in failure', [ready, joining, at('fatal', 'google_meet_sign_in_failed')], true, 'google_meet_sign_in_failed'],
+    ['never in the call (no sub-code)', [ready, joining, at('call_ended'), at('done')], true, null],
+    ['never in the call (a no-show sub-code)', [ready, joining, at('call_ended', 'timeout_exceeded_noone_joined')], true, null],
+    ['never in the call (an unknown sub-code)', [ready, joining, at('call_ended', 'a_sub_code_recall_added_later.v2')], true, null],
+    ['the waiting room, then its timeout', [ready, joining, at('in_waiting_room'), at('call_ended', 'timeout_exceeded_waiting_room')], true, 'timeout_exceeded_waiting_room'],
+    ['in the call, then a kick (fatal, not listed)', [ready, joining, at('in_call_not_recording'), at('call_ended', 'bot_kicked_from_call')], true, null],
+    ['in the call, then a fatal status', [ready, joining, at('in_call_recording'), at('fatal')], true, null],
+    ['in the call, then nobody joined', [ready, joining, at('in_call_not_recording'), at('call_ended', 'timeout_exceeded_noone_joined')], false, null],
+    ['in the call (recording), then an unknown sub-code', [ready, joining, at('in_call_recording'), at('call_ended', 'a_sub_code_recall_added_later.v2')], false, null],
+    ['in the call, still live', [ready, joining, at('in_call_not_recording')], false, null],
+    ['two listed sub-codes: the oldest', [joining, at('fatal', 'google_meet_sso_sign_in_failed'), at('done', 'google_meet_bot_blocked')], true, 'google_meet_sso_sign_in_failed'],
+    ['no history at all', [], true, null],
+  ] as const)('%s', (_label, changes, botFailed, alertSubCode) => {
+    const verdict = r1MeetPreCallVerdict(changes);
+    expect(verdict).toEqual({ botFailed, alertSubCode });
+    expect(Object.isFrozen(verdict)).toBe(true);
   });
 });
 
@@ -332,8 +591,12 @@ const quiet = (code: string): Record<Start, Cell> => ({
   failed_released: STRAY_LIVE,
 });
 const ENDED_ROW: Record<Start, Cell> = {
-  bot_scheduled: ['failed_no_show', 'failed', 'no_show'],
-  bot_joining: ['failed_no_show', 'failed', 'no_show'],
+  // M035 S09 D-S09-3: these fixture bots never reported an `in_call_*` status (their Recall history is
+  // `ready`, maybe `joining_call`, then the terminal event), so the one read before the move says the
+  // BOT never got in: a bot failure, not a candidate no-show. The in-call no-show is pinned in
+  // "terminal events" below.
+  bot_scheduled: ['failed_bot_fatal', 'failed', 'bot_fatal'],
+  bot_joining: ['failed_bot_fatal', 'failed', 'bot_fatal'],
   human_present: ['failed_bot_fatal', 'failed', 'bot_fatal'],
   in_call: ['failed_admission_refused', 'failed', 'admission_refused'],
   in_call_session: ['attempt_decides', 'in_call', 'eligible'],
@@ -370,13 +633,15 @@ const STARTS: readonly Start[] = [
   'failed_owed',
   'failed_released',
 ];
+/** The starts whose booking holds its bot live (the waiting-room alert's scope, D-S09-4). */
+const LIVE_STARTS: ReadonlySet<Start> = new Set<Start>(['bot_scheduled', 'bot_joining', 'human_present', 'in_call', 'in_call_session']);
 
 describe('recall_event: every event from every booking status (D-S06-24)', () => {
   const cases = MATRIX.flatMap(([label, type, row, delivery]) =>
     STARTS.map((start) => [label, start, type, row[start], delivery] as const),
   );
 
-  it.each(cases)('%s on %s', async (_label, start, type, [code, status, reason], delivery) => {
+  it.each(cases)('%s on %s', async (label, start, type, [code, status, reason], delivery) => {
     const h = world();
     const b = await booked(h, start);
     const result = await deliver(h, b, type, delivery);
@@ -395,7 +660,13 @@ describe('recall_event: every event from every booking status (D-S06-24)', () =>
       expect(releases[0]!.payload).toEqual({ kind: 'bot_release', recall_bot_id: b.botId, booking_id: b.id });
       expect(recallOps(h)).toEqual([]);
     }
-    expect(h.alerts()).toEqual(code === 'stray_bot' ? ['r1_meet_stray_bot'] : []);
+    // A stray alerts as such; a live booking's own bot in the waiting room alerts at once (M035 S09).
+    const alerts = code === 'stray_bot'
+      ? ['r1_meet_stray_bot']
+      : label === 'bot.in_waiting_room' && LIVE_STARTS.has(start)
+        ? ['r1_meet_bot_waiting_room']
+        : [];
+    expect(h.alerts()).toEqual(alerts);
     // Never a create, never a PATCH; a release is at most one GET then one command.
     expect(recallOps(h)).not.toContain('create');
     expect(h.requests.map((request) => request.method)).not.toContain('PATCH');
@@ -461,18 +732,18 @@ describe('recall_event: order, duplicates and the booking match (D-S06-22)', () 
 
 // ── Strays (D-S06-23) ───────────────────────────────────────────────────────
 
-describe('recall_event: stray bots (D-S06-23)', () => {
-  /** A bot created at Recall whose attach never happened: the booking stays `pending`. */
-  async function unattached(h: R1MeetHarness): Promise<{ id: string; botId: string }> {
-    const created = await h.createBooking({ startAt: iso(h.now() + 30 * MIN) });
-    h.db.failNext('r1_meet_set_bot');
-    await expect(ensureBot(h.deps, created.bookingId, h.meta())).rejects.toThrow('r1_meet_db_error');
-    const botId = [...h.recall.bots.keys()].at(-1)!;
-    expect(h.db.booking(created.bookingId)).toMatchObject({ status: 'pending', recall_bot_id: null });
-    reset(h);
-    return { id: created.bookingId, botId };
-  }
+/** A bot created at Recall whose attach never happened: the booking stays `pending`. */
+async function unattached(h: R1MeetHarness): Promise<{ id: string; botId: string }> {
+  const created = await h.createBooking({ startAt: iso(h.now() + 30 * MIN) });
+  h.db.failNext('r1_meet_set_bot');
+  await expect(ensureBot(h.deps, created.bookingId, h.meta())).rejects.toThrow('r1_meet_db_error');
+  const botId = [...h.recall.bots.keys()].at(-1)!;
+  expect(h.db.booking(created.bookingId)).toMatchObject({ status: 'pending', recall_bot_id: null });
+  reset(h);
+  return { id: created.bookingId, botId };
+}
 
+describe('recall_event: stray bots (D-S06-23)', () => {
   it('pending, then attached: the event waits, and once attached it is the current bot', async () => {
     const h = world();
     const s = await unattached(h);
@@ -715,38 +986,67 @@ describe('recall_event: arm at create (D-S06-26)', () => {
 
 // ── Terminal events: sub-codes, our own leave, the release ──────────────────
 
-describe('recall_event: terminal events (D-S06-24)', () => {
-  const subCodeCases: ReadonlyArray<readonly [type: string, subCode: string | null, reason: string]> = [
-    ...R1_MEET_FATAL_SUB_CODES.map((code) => ['bot.call_ended', code, 'bot_fatal'] as const),
-    ...R1_MEET_FATAL_SUB_CODES.map((code) => ['bot.done', code, 'bot_fatal'] as const),
-    ['bot.call_ended', null, 'no_show'],
-    ['bot.call_ended', 'timeout_exceeded_noone_joined', 'no_show'],
-    ['bot.call_ended', 'timeout_exceeded_everyone_left', 'no_show'],
-    ['bot.call_ended', 'call_ended_by_host', 'no_show'],
-    ['bot.call_ended', 'a_sub_code_recall_added_later.v2', 'no_show'],
-    ['bot.done', null, 'no_show'],
-    ['bot.fatal', null, 'bot_fatal'],
-    ['bot.fatal', 'google_meet_sign_in_failed', 'bot_fatal'],
-    ['bot.fatal', 'a_sub_code_recall_added_later.v2', 'bot_fatal'],
+describe('recall_event: terminal events (D-S06-24, M035 S09 D-S09-3)', () => {
+  /**
+   * `inCall`: Recall's history of the bot holds `in_call_not_recording` before the terminal event (it
+   * got into the call). The expected alert is `r1MeetBotAlertFor(subCode)` (pinned in its own table).
+   */
+  const subCodeCases: ReadonlyArray<readonly [type: string, subCode: string | null, inCall: boolean, reason: string]> = [
+    // A fatal sub-code is a bot failure from the event alone (no read before the move).
+    ...R1_MEET_FATAL_SUB_CODES.map((code) => ['bot.call_ended', code, false, 'bot_fatal'] as const),
+    ...R1_MEET_FATAL_SUB_CODES.map((code) => ['bot.done', code, false, 'bot_fatal'] as const),
+    ['bot.call_ended', 'bot_kicked_from_call', true, 'bot_fatal'],
+    ['bot.call_ended', 'timeout_exceeded_recording_permission_denied', true, 'bot_fatal'],
+    // In the call, nobody came: a no-show, whatever other sub-code (unknown ones unchanged).
+    ['bot.call_ended', null, true, 'no_show'],
+    ['bot.call_ended', 'timeout_exceeded_noone_joined', true, 'no_show'],
+    ['bot.call_ended', 'timeout_exceeded_everyone_left', true, 'no_show'],
+    ['bot.call_ended', 'call_ended_by_host', true, 'no_show'],
+    ['bot.call_ended', 'a_sub_code_recall_added_later.v2', true, 'no_show'],
+    ['bot.done', null, true, 'no_show'],
+    // Never in the call: the bot failed, whatever the event's sub-code (no alert: none is listed).
+    ['bot.call_ended', null, false, 'bot_fatal'],
+    ['bot.call_ended', 'timeout_exceeded_noone_joined', false, 'bot_fatal'],
+    ['bot.call_ended', 'a_sub_code_recall_added_later.v2', false, 'bot_fatal'],
+    ['bot.done', null, false, 'bot_fatal'],
+    // bot.fatal is a bot failure from the event alone.
+    ['bot.fatal', null, false, 'bot_fatal'],
+    ['bot.fatal', null, true, 'bot_fatal'],
+    ['bot.fatal', 'google_meet_sign_in_failed', false, 'bot_fatal'],
+    ['bot.fatal', 'a_sub_code_recall_added_later.v2', false, 'bot_fatal'],
   ];
 
   it.each(subCodeCases.flatMap((entry) => (['bot_scheduled', 'bot_joining'] as const).map((start) => [...entry, start] as const)))(
-    '%s with sub-code %s -> failed/%s (from %s)',
-    async (type, subCode, reason, start) => {
+    '%s with sub-code %s (in the call before: %s) -> failed/%s (from %s)',
+    async (type, subCode, inCall, reason, start) => {
       const h = world();
       const b = await booked(h, start);
+      if (inCall) h.recall.setStatus(b.botId, 'in_call_not_recording');
       expect(await deliver(h, b, type, { subCode })).toEqual(done('processed', `failed_${reason}`));
       expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason, recall_bot_id: null });
-      expect(h.alerts()).toEqual([]);
+      const alert = r1MeetBotAlertFor(subCode);
+      expect(errorLines(h)).toEqual(alert === null ? [] : [{ level: 'error', meta: { error_category: alert, error_type: subCode } }]);
+      // The terminal event of a bot that is over: at most the one GET, never a leave.
+      expect(recallOps(h)).toEqual(['get']);
+      expectNoPii(h);
     },
   );
 
-  it('after a terminal move the bot is released: the GET says ended, nothing else is sent, then set_bot release', async () => {
+  it('a no-show: Recall first (ONE GET before the move, which says ended), then the move, then the release mark', async () => {
     const h = world();
     const b = await booked(h, 'bot_joining');
+    h.recall.setStatus(b.botId, 'in_call_not_recording');
     expect(await deliver(h, b, 'bot.call_ended', { subCode: 'timeout_exceeded_noone_joined' })).toEqual(
       done('processed', 'failed_no_show'),
     );
+    expect(steps(h)).toEqual(['recall:get', 'db:transition:failed', 'db:set_bot:release']);
+    expect(h.alerts()).toEqual([]);
+  });
+
+  it('a bot failure the event alone decides: the move, then the release GET (says ended), then the mark', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    expect(await deliver(h, b, 'bot.fatal', { subCode: 'google_meet_knocking_disabled' })).toEqual(done('processed', 'failed_bot_fatal'));
     expect(steps(h)).toEqual(['db:transition:failed', 'recall:get', 'db:set_bot:release']);
   });
 
@@ -758,9 +1058,10 @@ describe('recall_event: terminal events (D-S06-24)', () => {
     expect(h.db.booking(b.id)).toMatchObject({ recall_bot_id: null });
   });
 
-  it('our own leave (bot_received_leave_call) waits once, 60 s, then maps on a fresh read', async () => {
+  it('our own leave (bot_received_leave_call) waits once, 60 s (no Recall read), then maps on a fresh read', async () => {
     const h = world();
     const b = await booked(h, 'bot_joining');
+    h.recall.setStatus(b.botId, 'in_call_not_recording');
     const payload = event(h, b, 'bot.call_ended', { subCode: 'bot_received_leave_call' });
     expect(await run(h, payload)).toEqual(deferred('own_leave', 60));
     expect(h.requests).toEqual([]);
@@ -793,14 +1094,276 @@ describe('recall_event: terminal events (D-S06-24)', () => {
     expect(h.db.booking(b.id)).toMatchObject({ recall_bot_id: null });
   });
 
-  it('Recall down at the release after the move: deferred within the bound, the move stays', async () => {
+  it('Recall down at the read before the move: deferred BEFORE the move (the booking stays live, no alert); the re-run maps', async () => {
     const h = world();
     const b = await booked(h, 'bot_joining');
+    h.recall.setStatus(b.botId, 'in_call_not_recording');
     const payload = event(h, b, 'bot.call_ended');
     h.intercept('get', { status: 503 });
     expect(await run(h, payload)).toMatchObject({ outcome: 'defer', code: 'r1_meet_recall_unavailable' });
+    expect(steps(h)).toEqual(['recall:get']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', reason: 'eligible', recall_bot_id: b.botId });
+    expect(h.alerts()).toEqual([]);
+    expect(await run(h, payload, h.meta({ deferCount: 1, deferredAt: iso(h.now()) }))).toEqual(done('processed', 'failed_no_show'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'no_show', recall_bot_id: null });
+  });
+
+  it('Recall down at the read, past the deferral bound: the job throws, still before the move', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_scheduled');
+    h.intercept('get', 'network');
+    await expect(deliver(h, b, 'bot.done', {}, h.meta({ deferCount: 30, deferredAt: iso(h.now()) }))).rejects.toThrow('r1_meet_recall_network');
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_scheduled', recall_bot_id: b.botId });
+    expect(h.alerts()).toEqual([]);
+  });
+
+  it('Recall no longer knows the bot (404 on the read): the event\'s own reason, released with no further Recall call', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    h.intercept('get', { status: 404 });
+    expect(await deliver(h, b, 'bot.call_ended', { subCode: 'timeout_exceeded_noone_joined' })).toEqual(done('processed', 'failed_no_show'));
+    expect(steps(h)).toEqual(['recall:get', 'db:transition:failed', 'db:set_bot:release']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'no_show', recall_bot_id: null });
+    expect(h.alerts()).toEqual([]);
+  });
+
+  it('out of order on a would-be no-show: Recall still reports the bot live in the call: GET, move, GET, leave', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    h.recall.setStatus(b.botId, 'in_call_not_recording');
+    expect(await deliver(h, b, 'bot.call_ended', { mirror: false })).toEqual(done('processed', 'failed_no_show'));
+    expect(steps(h)).toEqual(['recall:get', 'db:transition:failed', 'recall:get', 'recall:leave', 'db:set_bot:release']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'no_show', recall_bot_id: null });
+  });
+
+  it('Recall down at the release after the move (the bot still live in the call): deferred, the move stays; the re-run releases', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    h.recall.setStatus(b.botId, 'in_call_not_recording');
+    const payload = event(h, b, 'bot.call_ended', { mirror: false });
+    let gets = 0;
+    // The read before the move answers; the release's own GET after it does not.
+    h.intercept((_req, op) => op === 'get' && ++gets === 2, { status: 503 });
+    expect(await run(h, payload)).toMatchObject({ outcome: 'defer', code: 'r1_meet_recall_unavailable' });
+    expect(steps(h)).toEqual(['recall:get', 'db:transition:failed', 'recall:get']);
     expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'no_show', recall_bot_id: b.botId });
-    expect(await run(h, payload, h.meta({ deferCount: 1, deferredAt: iso(h.now()) }))).toEqual(done('processed', 'released_ended'));
+    expect(await run(h, payload, h.meta({ deferCount: 1, deferredAt: iso(h.now()) }))).toEqual(done('processed', 'released_left'));
+    expect(h.db.booking(b.id)).toMatchObject({ recall_bot_id: null });
+    expect(h.alerts()).toEqual([]);
+  });
+});
+
+// ── A refused bot (M035 S09 D-S09-3/4) ──────────────────────────────────────
+
+describe('recall_event: a bot held, denied, blocked or unable to sign in fails the bot, never a candidate no-show (M035 S09)', () => {
+  const listed = [
+    ...R1_MEET_ADMISSION_SUB_CODES.map((code) => [code, ADMISSION_WORD] as const),
+    ...R1_MEET_SIGN_IN_SUB_CODES.map((code) => [code, SIGN_IN_WORD] as const),
+  ];
+  const cases = listed.flatMap(([code, word]) =>
+    (['bot.fatal', 'bot.call_ended'] as const).flatMap((type) =>
+      (['bot_scheduled', 'bot_joining'] as const).map((start) => [code, type, start, word] as const),
+    ),
+  );
+
+  it.each(cases)('%s on %s from %s: failed/bot_fatal and exactly one alert naming it', async (code, type, start, word) => {
+    const h = world();
+    const b = await booked(h, start);
+    expect(await deliver(h, b, type, { subCode: code })).toEqual(done('processed', 'failed_bot_fatal'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'bot_fatal', recall_bot_id: null });
+    expect(errorLines(h)).toEqual([{ level: 'error', meta: { error_category: word, error_type: code } }]);
+    // The event alone decides: no read before the move; the one GET is the release's (it says ended).
+    expect(steps(h)).toEqual(['db:transition:failed', 'recall:get', 'db:set_bot:release']);
+    expectNoPii(h);
+  });
+
+  it.each(['bot_scheduled', 'bot_joining'] as const)(
+    'out of order (from %s): bot.done first while Recall already holds fatal/google_meet_bot_blocked -> bot_fatal, one alert; the later bot.fatal adds none',
+    async (start) => {
+      const h = world();
+      const b = await booked(h, start);
+      // Recall's real order is fatal, then done; Svix delivers done first.
+      h.recall.setStatus(b.botId, 'fatal', 'google_meet_bot_blocked');
+      expect(await deliver(h, b, 'bot.done')).toEqual(done('processed', 'failed_bot_fatal'));
+      expect(steps(h)).toEqual(['recall:get', 'db:transition:failed', 'db:set_bot:release']);
+      expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'bot_fatal', recall_bot_id: null });
+      expect(errorLines(h)).toEqual([{ level: 'error', meta: { error_category: ADMISSION_WORD, error_type: 'google_meet_bot_blocked' } }]);
+      // The bot.fatal that was sent first arrives now: the bot is released, so it needs nothing.
+      expect(await deliver(h, b, 'bot.fatal', { subCode: 'google_meet_bot_blocked', mirror: false })).toEqual(done('ignored', 'stray_ended'));
+      expect(h.alerts()).toEqual([ADMISSION_WORD]);
+      expectNoPii(h);
+    },
+  );
+
+  it('out of order with the release mark lost: the later bot.fatal finishes the owed release, and adds no alert', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    h.recall.setStatus(b.botId, 'fatal', 'google_meet_sso_sign_in_failed');
+    h.db.failNext('r1_meet_set_bot');
+    await expect(deliver(h, b, 'bot.done')).rejects.toThrow('r1_meet_db_error');
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'bot_fatal', recall_bot_id: b.botId });
+    expect(await deliver(h, b, 'bot.fatal', { subCode: 'google_meet_sso_sign_in_failed', mirror: false })).toEqual(
+      done('processed', 'released_ended'),
+    );
+    expect(h.db.booking(b.id)).toMatchObject({ recall_bot_id: null });
+    expect(errorLines(h)).toEqual([{ level: 'error', meta: { error_category: SIGN_IN_WORD, error_type: 'google_meet_sso_sign_in_failed' } }]);
+  });
+
+  it.each(['bot_scheduled', 'bot_joining'] as const)('never in the call (from %s): bot.done with no sub-code -> failed/bot_fatal, no alert', async (start) => {
+    const h = world();
+    const b = await booked(h, start);
+    expect(await deliver(h, b, 'bot.done')).toEqual(done('processed', 'failed_bot_fatal'));
+    expect(steps(h)).toEqual(['recall:get', 'db:transition:failed', 'db:set_bot:release']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'bot_fatal', recall_bot_id: null });
+    expect(h.alerts()).toEqual([]);
+  });
+
+  it('the waiting room, then Recall\'s timeout of it on call_ended: bot_fatal with the admission alert', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_scheduled');
+    expect(await deliver(h, b, 'bot.in_waiting_room')).toEqual(done('processed', 'bot_joining'));
+    h.advance(10 * MIN);
+    expect(await deliver(h, b, 'bot.call_ended', { subCode: 'timeout_exceeded_waiting_room' })).toEqual(done('processed', 'failed_bot_fatal'));
+    expect(errorLines(h).map((line) => line.meta)).toEqual([
+      { error_category: 'r1_meet_bot_waiting_room' },
+      { error_category: ADMISSION_WORD, error_type: 'timeout_exceeded_waiting_room' },
+    ]);
+    expectNoPii(h);
+  });
+
+  it('a move lost to another job (it ended the booking first) never alerts: one alert per booking', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    let raced = false;
+    const deps: R1MeetFlowDeps = {
+      ...h.deps,
+      store: {
+        ...h.deps.store,
+        transition: async (input) => {
+          if (!raced && input.to === 'failed') {
+            raced = true;
+            // Another job's move wins first (and alerts, if it is the one that owns it).
+            expect((await h.deps.store.transition({ ...input, reason: 'bot_fatal' })).status).toBe('ok');
+          }
+          return h.deps.store.transition(input);
+        },
+      },
+    };
+    const payload = event(h, b, 'bot.fatal', { subCode: 'google_meet_bot_blocked' });
+    expect(await runJob(h, r1MeetRecallEventDefinition, payload, h.meta(), deps)).toEqual(done('processed', 'released_ended'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'bot_fatal', recall_bot_id: null });
+    expect(h.alerts()).toEqual([]);
+  });
+});
+
+// ── The waiting room (M035 S09 D-S09-4(b)) ──────────────────────────────────
+
+describe('recall_event: a bot held in the waiting room alerts at once (M035 S09)', () => {
+  const WAITING_ROOM = { level: 'error', meta: { error_category: 'r1_meet_bot_waiting_room' } };
+
+  it('bot_scheduled: -> bot_joining (unchanged mapping) and one alert, no Recall call', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_scheduled');
+    expect(await deliver(h, b, 'bot.in_waiting_room')).toEqual(done('processed', 'bot_joining'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', reason: 'eligible' });
+    expect(errorLines(h)).toEqual([WAITING_ROOM]);
+    expect(h.requests).toEqual([]);
+    expectNoPii(h);
+  });
+
+  it('bot_joining: no change and one alert', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    expect(await deliver(h, b, 'bot.in_waiting_room')).toEqual(done('ignored', 'no_change'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining' });
+    expect(errorLines(h)).toEqual([WAITING_ROOM]);
+  });
+
+  it('a run that is a re-run (attempts 2) still alerts: one line per run that ends (PR #449 review S09-R1)', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_scheduled');
+    expect(await deliver(h, b, 'bot.in_waiting_room', {}, h.meta({ attempts: 2 }))).toEqual(done('processed', 'bot_joining'));
+    expect(errorLines(h)).toEqual([WAITING_ROOM]);
+  });
+
+  it('the first attempt dies at the booking read: no alert; its retry (attempts 2) alerts once', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_scheduled');
+    const payload = event(h, b, 'bot.in_waiting_room');
+    h.db.failNext('r1_meet_bookings');
+    await expect(run(h, payload)).rejects.toThrow('r1_meet_db_error');
+    expect(h.alerts()).toEqual([]);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_scheduled' });
+    expect(await run(h, payload, h.meta({ attempts: 2 }))).toEqual(done('processed', 'bot_joining'));
+    expect(errorLines(h)).toEqual([WAITING_ROOM]);
+  });
+
+  it('the status step fails (a database error): that run writes no alert, its retry writes the one line', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_scheduled');
+    const payload = event(h, b, 'bot.in_waiting_room');
+    h.db.failNext('r1_meet_transition_booking');
+    await expect(run(h, payload)).rejects.toThrow('r1_meet_db_error');
+    expect(h.alerts()).toEqual([]);
+    expect(await run(h, payload, h.meta({ attempts: 2 }))).toEqual(done('processed', 'bot_joining'));
+    expect(errorLines(h)).toEqual([WAITING_ROOM]);
+  });
+
+  it('the event of a bot a pending booking is attaching: deferred with no alert; the re-run against the attached booking alerts once', async () => {
+    const h = world();
+    const s = await unattached(h);
+    const payload = event(h, s, 'bot.in_waiting_room');
+    expect(await run(h, payload)).toEqual(deferred('stray_pending', 30));
+    expect(h.alerts()).toEqual([]);
+    expect(await ensureBot(h.deps, s.id, h.meta())).toMatchObject({ code: 'bot_scheduled' });
+    h.advance(30 * SEC);
+    reset(h);
+    expect(await run(h, payload, h.meta({ deferCount: 1, deferredAt: iso(h.now() - 30 * SEC) }))).toEqual(
+      done('processed', 'bot_joining'),
+    );
+    expect(errorLines(h)).toEqual([WAITING_ROOM]);
+    expect(h.db.jobs('bot_release')).toEqual([]);
+    expectNoPii(h);
+  });
+
+  it('a compare-and-set lost and retried within the run: still one alert', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_scheduled');
+    let lost = false;
+    const deps: R1MeetFlowDeps = {
+      ...h.deps,
+      store: {
+        ...h.deps.store,
+        transition: async (input) => {
+          if (!lost) {
+            lost = true;
+            return { status: 'status_conflict' } as Awaited<ReturnType<R1MeetFlowDeps['store']['transition']>>;
+          }
+          return h.deps.store.transition(input);
+        },
+      },
+    };
+    expect(await runJob(h, r1MeetRecallEventDefinition, event(h, b, 'bot.in_waiting_room'), h.meta(), deps)).toEqual(
+      done('processed', 'bot_joining'),
+    );
+    expect(errorLines(h)).toEqual([WAITING_ROOM]);
+  });
+
+  it('a terminal booking (an owed release) queues the release and raises no waiting-room alert', async () => {
+    const h = world();
+    const b = await booked(h, 'failed_owed');
+    expect(await deliver(h, b, 'bot.in_waiting_room')).toEqual(done('processed', 'release_queued'));
+    expect(h.alerts()).toEqual([]);
+  });
+
+  it('a stray or a bot that is not ours raises only what it raised before', async () => {
+    const h = world();
+    const b = await booked(h, 'failed_released');
+    expect(await deliver(h, b, 'bot.in_waiting_room')).toEqual(done('processed', 'stray_bot'));
+    expect(await deliver(h, { id: fixtureId(), botId: fixtureId() }, 'bot.in_waiting_room', { bookingId: null })).toEqual(
+      done('ignored', 'unknown_bot'),
+    );
+    expect(h.alerts()).toEqual(['r1_meet_stray_bot']);
   });
 });
 
@@ -935,6 +1498,351 @@ describe('multiple humans (D-S06-28)', () => {
     expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', recall_bot_id: b.botId });
     expect(await check(h, b, h.meta({ attempts: 2 }))).toEqual(done('processed', 'released_ended'));
     expect(h.db.booking(b.id)).toMatchObject({ recall_bot_id: null });
+  });
+});
+
+// ── The bot's own participant is never a human (M035 S09 D-S09-6) ──────────
+
+describe('the bot\'s own participant is never a human (M035 S09 D-S09-6, UNVERIFIED until S0c)', () => {
+  /** Participant ids: the bot's own join, the candidate, a candidate named like the bot. */
+  const BOT = 50;
+  const CANDIDATE = 1;
+  const NAME_ALIKE = 51;
+  /** A join the receiver marked `is_bot` (Recall said so, or the display name was the bot's own). */
+  const marked = (id: number | null): Delivery => ({ participantId: id, isBot: true });
+  const checkPayload = (b: Booked) => ({ kind: 'multi_human_check', booking_id: b.id, version: 0 });
+  const check = (h: R1MeetHarness, b: Booked, meta?: R1MeetJobMeta) =>
+    runJob(h, r1MeetMultiHumanCheckDefinition, checkPayload(b), meta ?? h.meta());
+
+  /** A `bot_joining` booking whose bot Recall reports in the call from now (T0). */
+  async function inCall(h: R1MeetHarness): Promise<Booked> {
+    const b = await booked(h, 'bot_joining');
+    h.recall.setStatus(b.botId, 'in_call_not_recording');
+    return b;
+  }
+
+  it('H1: the bot\'s own join (marked, at its in-call time) is ignored; the candidate\'s join arms, with no recount', async () => {
+    const h = world();
+    const b = await inCall(h);
+    expect(await deliver(h, b, 'participant_events.join', marked(BOT))).toEqual(done('ignored', 'bot_participant'));
+    // One GET for the bound; nothing moves, nothing is armed or shown.
+    expect(steps(h)).toEqual(['recall:get']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', reason: 'eligible', ticket_arms: 0 });
+    expect(outputMedia(h)).toHaveLength(0);
+
+    h.advance(60 * SEC);
+    reset(h);
+    expect(await deliver(h, b, 'participant_events.join', { participantId: CANDIDATE })).toEqual(done('processed', 'armed'));
+    // The recount reads the bound (the bot's row is marked), then the normal arm.
+    expect(steps(h)).toEqual([
+      'db:transition:human_present',
+      'recall:get',
+      'recall:get',
+      'db:arm_ticket',
+      'queue:bridge_check',
+      'recall:output_media',
+    ]);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', ticket_arms: 1 });
+    expect(outputMedia(h)).toHaveLength(1);
+    expect(h.db.jobs('multi_human_check')).toEqual([]);
+    expect(h.alerts()).toEqual([]);
+    expectNoPii(h, lastTicket(h), digestOf(lastTicket(h)));
+  });
+
+  it('the candidate already present, then the bot\'s own join 2 s after it got in: ignored, no recount', async () => {
+    const h = world();
+    const b = await inCall(h);
+    expect(await deliver(h, b, 'participant_events.join', { participantId: CANDIDATE })).toEqual(done('processed', 'armed'));
+    const ticket = lastTicket(h);
+    h.advance(2 * SEC);
+    reset(h);
+    expect(await deliver(h, b, 'participant_events.join', marked(BOT))).toEqual(done('ignored', 'bot_participant'));
+    expect(steps(h)).toEqual(['recall:get']);
+    expect(h.db.jobs('multi_human_check')).toEqual([]);
+    expect(outputMedia(h)).toHaveLength(0);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', ticket_arms: 1 });
+    expect(h.alerts()).toEqual([]);
+    expectNoPii(h, ticket, digestOf(ticket));
+  });
+
+  /** H1, then the candidate at +60 s, then a second marked join (a candidate named like the bot) at +120 s. */
+  async function nameAlikeCall(h: R1MeetHarness): Promise<Booked> {
+    const b = await inCall(h);
+    expect(await deliver(h, b, 'participant_events.join', marked(BOT))).toEqual(done('ignored', 'bot_participant'));
+    h.advance(60 * SEC);
+    expect(await deliver(h, b, 'participant_events.join', { participantId: CANDIDATE })).toEqual(done('processed', 'armed'));
+    expect(h.db.jobs('multi_human_check')).toEqual([]);
+    h.advance(60 * SEC);
+    reset(h);
+    // Not the bot's own: the earliest marked join (the bot's) already took that place. A person, so it
+    // is counted (the recount), but a marked join never moves or arms the booking.
+    expect(await deliver(h, b, 'participant_events.join', marked(NAME_ALIKE))).toEqual(done('ignored', 'marked_participant'));
+    expect(steps(h)).toEqual(['recall:get', 'queue:multi_human_check']);
+    expect(h.db.jobs('multi_human_check')).toEqual([
+      expect.objectContaining({ payload: checkPayload(b), scheduled_at: iso(h.now() + 120 * SEC) }),
+    ]);
+    expect(outputMedia(h)).toHaveLength(0);
+    return b;
+  }
+
+  it('a later name-alike is a person: ONE recount; at the check, policy end ends the call failed/multiple_humans', async () => {
+    const h = world();
+    const b = await nameAlikeCall(h);
+    expectNoPii(h);
+    h.advance(120 * SEC);
+    reset(h);
+    expect(await check(h, b)).toEqual(done('processed', 'multiple_humans'));
+    // The bound's GET, then the leave (its own GET first), then the mark.
+    expect(steps(h)).toEqual(['recall:get', 'recall:get', 'recall:leave', 'db:transition:failed', 'db:set_bot:release']);
+    expect(h.alerts()).toEqual(['r1_meet_multiple_humans']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'multiple_humans', recall_bot_id: null });
+    expectNoPii(h);
+  });
+
+  it('a later name-alike, policy observe (the default): only the warning, the call goes on', async () => {
+    const h = world({ config: { multiHumanPolicy: 'observe' } });
+    const b = await nameAlikeCall(h);
+    h.advance(120 * SEC);
+    reset(h);
+    expect(await check(h, b)).toEqual(done('ignored', 'observed'));
+    // The bound's GET logs its own info line; the flow itself only warns.
+    expect(h.logs.filter((line) => line.level !== 'info')).toEqual([
+      { level: 'warn', meta: { error_category: 'r1_meet_multi_human_observed' } },
+    ]);
+    expect(recallOps(h)).toEqual(['get']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', recall_bot_id: b.botId });
+    expectNoPii(h);
+  });
+
+  it('H3: no join row of the bot; a lone name-alike 120 s after the bot got in counts, and bot.in_call_recording arms', async () => {
+    const h = world();
+    const b = await inCall(h);
+    h.advance(120 * SEC);
+    // A person (past the bound), one human: no recount, and a marked join never arms (S09-R4).
+    expect(await deliver(h, b, 'participant_events.join', marked(NAME_ALIKE))).toEqual(done('ignored', 'marked_participant'));
+    expect(steps(h)).toEqual(['recall:get']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', ticket_arms: 0 });
+    expect(h.db.jobs('multi_human_check')).toEqual([]);
+    // Recall starts recording when the first participant joins: that is the candidate's human signal.
+    reset(h);
+    expect(await deliver(h, b, 'bot.in_call_recording')).toEqual(done('processed', 'armed'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', ticket_arms: 1 });
+    expect(outputMedia(h)).toHaveLength(1);
+    expectNoPii(h, lastTicket(h), digestOf(lastTicket(h)));
+  });
+
+  it("the bot's own join stamped 20 s after it got in (it misses the bound): never a move or an arm (S09-R4)", async () => {
+    const h = world();
+    const b = await inCall(h);
+    h.advance(20 * SEC);
+    expect(await deliver(h, b, 'participant_events.join', marked(BOT))).toEqual(done('ignored', 'marked_participant'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', reason: 'eligible', ticket_arms: 0 });
+    expect(outputMedia(h)).toHaveLength(0);
+    // The candidate's own join is the human signal as usual: one arm. The missed bot join now counts
+    // as a person, so this join also queues the recount (the known limit pinned below).
+    h.advance(60 * SEC);
+    expect(await deliver(h, b, 'participant_events.join', { participantId: CANDIDATE })).toEqual(done('processed', 'armed'));
+    expect(outputMedia(h)).toHaveLength(1);
+    expect(h.db.jobs('multi_human_check')).toHaveLength(1);
+    expect(h.alerts()).toEqual([]);
+  });
+
+  it('a marked join with no readable time, while the bot is in the call: never a move or an arm (S09-R4)', async () => {
+    const h = world();
+    const b = await inCall(h);
+    h.advance(2 * SEC);
+    expect(await deliver(h, b, 'participant_events.join', { ...marked(BOT), occurredAt: null })).toEqual(
+      done('ignored', 'marked_participant'),
+    );
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', ticket_arms: 0 });
+    expect(outputMedia(h)).toHaveLength(0);
+  });
+
+  it('a participant Recall itself calls a bot (no id after the receiver) is ignored outright and never counted (S09-R3)', async () => {
+    const h = world();
+    const b = await inCall(h);
+    // What the receiver makes of Recall's own `is_bot: true` (a notetaker, say), 60 s after the bot got in.
+    const notetaker = buildR1MeetRecallEventJob(
+      {
+        event: 'participant_events.join',
+        data: {
+          bot: { id: b.botId, metadata: { booking_id: b.id, profile: 'r1_dex_sales' } },
+          data: { participant: { id: 8, is_host: false, is_bot: true }, timestamp: { absolute: iso(h.now() + 60 * SEC) } },
+        },
+      },
+      'realtime',
+    );
+    expect(notetaker.ok && notetaker.payload.participant).toStrictEqual({ id: null, is_host: false, is_bot: true });
+    // Delivered exactly as the receiver wrote it.
+    const written = notetaker.ok ? notetaker.payload.participant! : { id: 8, is_bot: true };
+    h.advance(60 * SEC);
+    const flagged: Delivery = { participantId: written.id, isBot: written.is_bot };
+    expect(await deliver(h, b, 'participant_events.join', flagged)).toEqual(done('ignored', 'bot_participant'));
+    expect(h.requests).toEqual([]);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', ticket_arms: 0 });
+    // The candidate arms; a second flagged bot after the candidate is not a second human either.
+    expect(await deliver(h, b, 'participant_events.join', { participantId: CANDIDATE })).toEqual(done('processed', 'armed'));
+    expect(await deliver(h, b, 'participant_events.join', flagged)).toEqual(done('ignored', 'bot_participant'));
+    expect(h.db.jobs('multi_human_check')).toEqual([]);
+    reset(h);
+    expect(await check(h, b)).toEqual(done('ignored', 'one_human'));
+    expectNoPii(h);
+  });
+
+  it('the same lone marked join before the bot is in the call (no bound): the bot\'s own, ignored', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_joining');
+    h.advance(120 * SEC);
+    expect(await deliver(h, b, 'participant_events.join', marked(NAME_ALIKE))).toEqual(done('ignored', 'bot_participant'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', ticket_arms: 0 });
+    // A real person is still seen through bot.in_call_recording.
+    expect(await deliver(h, b, 'bot.in_call_recording')).toEqual(done('processed', 'armed'));
+  });
+
+  it('a marked join with a null id: ignored, no Recall call, no arm', async () => {
+    const h = world();
+    const b = await inCall(h);
+    h.advance(120 * SEC);
+    expect(await deliver(h, b, 'participant_events.join', marked(null))).toEqual(done('ignored', 'bot_participant'));
+    expect(h.requests).toEqual([]);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', ticket_arms: 0 });
+    expect(h.db.jobs('multi_human_check')).toEqual([]);
+  });
+
+  it('Recall down at the bound of a marked join: deferred before any write; the re-run decides', async () => {
+    const h = world();
+    const b = await inCall(h);
+    h.advance(120 * SEC);
+    const payload = event(h, b, 'participant_events.join', marked(NAME_ALIKE));
+    h.intercept('get', { status: 503 });
+    expect(await run(h, payload)).toMatchObject({ outcome: 'defer', code: 'r1_meet_recall_unavailable' });
+    expect(steps(h)).toEqual(['recall:get']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', reason: 'eligible', ticket_arms: 0 });
+    expect(h.alerts()).toEqual([]);
+    // Past the deferral bound: thrown, still before any write.
+    h.intercept('get', 'network');
+    await expect(run(h, payload, h.meta({ deferCount: 30, deferredAt: iso(h.now()) }))).rejects.toThrow('r1_meet_recall_network');
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', ticket_arms: 0 });
+    // Recall answers: a mark 120 s after the bot got in is a person (counted, never an arm).
+    expect(await run(h, payload, h.meta({ deferCount: 1, deferredAt: iso(h.now()) }))).toEqual(
+      done('ignored', 'marked_participant'),
+    );
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', ticket_arms: 0 });
+  });
+
+  it('Recall no longer knows the bot (404 at the bound): no bound, so the earliest marked join is the bot\'s', async () => {
+    const h = world();
+    const b = await inCall(h);
+    h.advance(120 * SEC);
+    h.intercept('get', { status: 404 });
+    expect(await deliver(h, b, 'participant_events.join', marked(NAME_ALIKE))).toEqual(done('ignored', 'bot_participant'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', ticket_arms: 0 });
+    expect(h.alerts()).toEqual([]);
+  });
+
+  it('Recall down at the recount of a candidate\'s join: no throw, the arm still happens, the count had no bound', async () => {
+    /** The bot in the call at T0, a marked join durable at T0+60 s (not run), the candidate at T0+60 s. */
+    const setUp = async (h: R1MeetHarness) => {
+      const b = await inCall(h);
+      h.advance(60 * SEC);
+      event(h, b, 'participant_events.join', marked(NAME_ALIKE));
+      return { b, candidate: event(h, b, 'participant_events.join', { participantId: CANDIDATE }) };
+    };
+    const h = world();
+    const { b, candidate } = await setUp(h);
+    h.intercept('get', { status: 503 });
+    expect(await run(h, candidate)).toEqual(done('processed', 'armed'));
+    expect(steps(h)).toEqual([
+      'db:transition:human_present',
+      'recall:get',
+      'recall:get',
+      'db:arm_ticket',
+      'queue:bridge_check',
+      'recall:output_media',
+    ]);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', ticket_arms: 1 });
+    // No bound: the earliest marked join counted as the bot's, so one human and no recount.
+    expect(h.db.jobs('multi_human_check')).toEqual([]);
+    expect(h.alerts()).toEqual([]);
+
+    // The same call with Recall up: the mark came 60 s after the bot got in, so two people, one recount.
+    const up = world();
+    const other = await setUp(up);
+    expect(await run(up, other.candidate)).toEqual(done('processed', 'armed'));
+    expect(up.db.jobs('multi_human_check')).toHaveLength(1);
+  });
+
+  it('attempt_ended: the bot\'s own join and a candidate who left: nobody to interview, failed/no_show (not a re-arm)', async () => {
+    const h = world();
+    // In the call from T0 (`in_call_recording`), an attempt bound, then failed and not counted.
+    const b = await booked(h, 'in_call_session', { sessionStatus: 'failed' });
+    h.db.addAttempt({ session_id: b.sessionId!, round_id: b.roundId, outcome: 'provider_error', counted: false });
+    event(h, b, 'participant_events.join', marked(BOT));
+    event(h, b, 'participant_events.join', { participantId: CANDIDATE });
+    event(h, b, 'participant_events.leave', { participantId: CANDIDATE });
+    const payload = { kind: 'attempt_ended', booking_id: b.id, session_id: b.sessionId };
+
+    // Recall down at the bound: deferred before any write.
+    h.intercept('get', { status: 503 });
+    expect(await runJob(h, r1MeetAttemptEndedDefinition, payload)).toMatchObject({ outcome: 'defer', code: 'r1_meet_recall_unavailable' });
+    expect(steps(h)).toEqual(['recall:get']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'in_call', recall_bot_id: b.botId, ticket_arms: 1 });
+
+    reset(h);
+    expect(await runJob(h, r1MeetAttemptEndedDefinition, payload, h.meta({ deferCount: 1, deferredAt: iso(h.now()) }))).toEqual(
+      done('processed', 'failed_no_show'),
+    );
+    expect(steps(h)).toEqual(['recall:get', 'recall:get', 'recall:leave', 'db:transition:failed', 'db:set_bot:release']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'no_show', recall_bot_id: null, ticket_arms: 1 });
+  });
+
+  // The known limit of a missed own join (PR #449 fix check, S09-R4 round 2; M034 behaviour, the
+  // `markedJoin` docstring and contracts §9): it never STARTS the bridge (above), but it is counted
+  // as a person wherever `countHumans` runs, until the live spike S0c settles the bound.
+  it('known limit: the bot\'s own join past the bound still counts, so attempt_ended re-arms in an empty call (not failed/no_show)', async () => {
+    const h = world();
+    // In the call from T0 (`in_call_recording`), an attempt bound, then failed and not counted.
+    const b = await booked(h, 'in_call_session', { sessionStatus: 'failed' });
+    h.db.addAttempt({ session_id: b.sessionId!, round_id: b.roundId, outcome: 'provider_error', counted: false });
+    // Reported 20 s after the bot got in (a listing lag): past the 15 s bound, so not the bot's own.
+    h.advance(20 * SEC);
+    event(h, b, 'participant_events.join', marked(BOT));
+    event(h, b, 'participant_events.join', { participantId: CANDIDATE });
+    event(h, b, 'participant_events.leave', { participantId: CANDIDATE });
+    const payload = { kind: 'attempt_ended', booking_id: b.id, session_id: b.sessionId };
+    expect(await runJob(h, r1MeetAttemptEndedDefinition, payload)).toEqual(done('processed', 'rearmed'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'in_call', recall_bot_id: b.botId, ticket_arms: 2 });
+    expect(outputMedia(h)).toHaveLength(1);
+    expectNoPii(h);
+  });
+
+  it('known limit: the bot\'s own join past the bound and one candidate are two humans; policy end ends the call', async () => {
+    const h = world();
+    const b = await inCall(h);
+    h.advance(20 * SEC);
+    expect(await deliver(h, b, 'participant_events.join', marked(BOT))).toEqual(done('ignored', 'marked_participant'));
+    expect(await deliver(h, b, 'participant_events.join', { participantId: CANDIDATE })).toEqual(done('processed', 'armed'));
+    expect(h.db.jobs('multi_human_check')).toHaveLength(1);
+    h.advance(120 * SEC);
+    reset(h);
+    expect(await check(h, b)).toEqual(done('processed', 'multiple_humans'));
+    expect(h.alerts()).toEqual(['r1_meet_multiple_humans']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'multiple_humans', recall_bot_id: null });
+    expectNoPii(h);
+  });
+
+  it('multi_human_check: the bot\'s own join and one candidate is one human; Recall down there defers', async () => {
+    const h = world();
+    const b = await inCall(h);
+    expect(await deliver(h, b, 'participant_events.join', marked(BOT))).toEqual(done('ignored', 'bot_participant'));
+    expect(await deliver(h, b, 'participant_events.join', { participantId: CANDIDATE })).toEqual(done('processed', 'armed'));
+    reset(h);
+    expect(await check(h, b)).toEqual(done('ignored', 'one_human'));
+    expect(steps(h)).toEqual(['recall:get']);
+    h.intercept('get', { status: 503 });
+    expect(await check(h, b)).toMatchObject({ outcome: 'defer', code: 'r1_meet_recall_unavailable' });
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', recall_bot_id: b.botId });
+    expect(h.alerts()).toEqual([]);
   });
 });
 

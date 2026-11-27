@@ -662,8 +662,14 @@ The receipt RPC adds `receipt_id` and `source` to each job.
   `event_type`, `recall_bot_id`, `booking_id`, `occurred_at`, `sub_code`, `participant`.
   `participant` is null for a bot status event. For a participant join or leave it is
   `{ id, is_host, is_bot }`: `id` is Recall's integer participant id for that call, and the two
-  flags are booleans or null. All of it is Internal. Recall's participant name, email, `platform`
-  and `extra_data` are never read, and neither are the bot's recording or endpoint artifacts.
+  flags are booleans or null. All of it is Internal. For a JOIN only (M035 S09), Recall's
+  participant name is read once, compared in memory with the bot's own display name
+  (`R1_MEET_BOT_NAME`, else the profile's) and dropped: only the boolean `is_bot` is kept (true
+  when Recall says the participant is a bot or the names match). When Recall itself says the
+  participant is a bot, `id` is null (never counted) and the name is not read. The name is never stored, logged,
+  queued, put in an error or returned, and a leave never reads it. Recall's participant email,
+  `platform` and `extra_data` are never read, and neither are the bot's recording or endpoint
+  artifacts.
 - `ashby_schedule` (source `ashby`). There is one job per Dex interview event, or one per
   schedule when no event has Dex or the schedule is cancelled. Keys, in order: `kind`, `scope`,
   `ashby_interview_event_id`, `ashby_schedule_id`, `ashby_application_id`,

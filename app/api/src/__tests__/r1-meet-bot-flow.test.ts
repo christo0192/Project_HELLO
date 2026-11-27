@@ -4,7 +4,9 @@
  *
  * Pinned (D-S06-13..16):
  *  - the create body: canonical Meet URL, join_at = start - 120 s, web_4_core, automatic_leave
- *    600/900/90/900/2700, participant events only, metadata = booking id + profile, no name or email;
+ *    600/900/90/900/2700 plus explicit bot detection (M035 S09), participant events only, the
+ *    disclosure pinned at bot join and re-sent at each participant join (M035 S09), no
+ *    `google_meet` for the default guest bot, metadata = booking id + profile, no name or email;
  *  - the Idempotency-Key `r1-meet-<event>-v<version>-k<key_attempt>` from the booking as the LAST RPC
  *    left it;
  *  - a lost answer retried returns the SAME bot under the SAME key; a cached 500, 400 or 402 is
@@ -69,6 +71,10 @@ describe('ensureBot: the happy path', () => {
         everyone_left_timeout: { timeout: 90 },
         in_call_not_recording_timeout: 900,
         in_call_recording_timeout: 2700,
+        bot_detection: {
+          using_participant_events: { timeout: 600, activate_after: 1200 },
+          using_participant_names: { matches: ['notetaker', 'recorder', 'assistant'], timeout: 600, activate_after: 7200 },
+        },
       },
       recording_config: {
         transcript: null,
@@ -87,9 +93,15 @@ describe('ensureBot: the happy path', () => {
           message: 'Dex is an AI interviewer from Interview Kickstart. This call is recorded.',
           pin: true,
         },
+        on_participant_join: {
+          message: 'Dex is an AI interviewer from Interview Kickstart. This call is recorded.',
+          exclude_host: false,
+        },
       },
       metadata: { booking_id: b.id, profile: 'r1_dex_sales' },
     });
+    // The default (guest) bot: no login group, so no google_meet block at all.
+    expect('google_meet' in (create!.body as Record<string, unknown>)).toBe(false);
     // No candidate data in the body: no email, no candidate or round id.
     const text = JSON.stringify(create!.body);
     expect(text).not.toContain('@');
