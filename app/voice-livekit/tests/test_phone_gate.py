@@ -1423,7 +1423,8 @@ class TestPhoneGate(unittest.IsolatedAsyncioTestCase):
 
     async def test_disclosure_text_is_fixed_and_complete(self):
         text = phone.PHONE_DISCLOSURE_TEXT.lower()
-        self.assertIn("ai voice assistant", text)   # identity
+        self.assertIn("christy from", text)         # identity (owner 2026-11-27: no "AI voice assistant")
+        self.assertNotIn("ai voice assistant", text)
         self.assertIn("job application", text)      # purpose
         self.assertIn("recorded", text)             # recording notice
         self.assertIn("okay to continue", text)     # consent question

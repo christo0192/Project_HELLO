@@ -14148,8 +14148,10 @@ async def _run_phone_session(
             )
         else:
             greeting_clause = (
-                "Greet the candidate warmly and briefly by voice. You MUST "
-                "include this exact sentence "
+                "Greet the candidate warmly and briefly by voice and introduce "
+                f"yourself simply as Christy from {phone._COMPANY}: do NOT call "
+                "yourself an AI, a bot, a voice assistant or an assistant. You "
+                "MUST include this exact sentence "
             )
         opening_instructions = (
             f"You are Christy, an AI voice assistant calling from {phone._COMPANY} "

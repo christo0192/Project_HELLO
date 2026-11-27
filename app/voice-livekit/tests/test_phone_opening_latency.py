@@ -37,7 +37,7 @@ import phone  # noqa: E402
 
 NAME = "Taylor Example"
 IDENTITY_LINE = (
-    f"Hi, this is Christy, an AI voice assistant calling from {phone._COMPANY} "
+    f"Hi, this is Christy from {phone._COMPANY} "
     "about your job application. Am I speaking with Taylor?"
 )
 #: A valid composed consent line after the identity turn (no introduction).
@@ -47,7 +47,7 @@ CONSENT_DRAFT = (
 )
 #: A valid composed consent line as the FIRST line (deterministic flow).
 OPENING_DRAFT = (
-    f"Hello, I'm Christy, an AI voice assistant from {phone._COMPANY} "
+    f"Hello, I'm Christy from {phone._COMPANY} "
     "about your application. " + phone.PHONE_DISCLOSURE_RECORDING_SENTENCE
     + " Are you okay to continue?"
 )
@@ -316,9 +316,11 @@ class TestRejectedDraftsAreLogged(unittest.IsolatedAsyncioTestCase):
             "   ": "empty",
             IDENTITY_LINE + " " + "x" * 700: "too_long",
             "Hi Taylor. Is this Taylor? Can we talk?": "question_count",
-            f"Hi, this is Christy, an AI voice assistant from {phone._COMPANY}. "
+            f"Hi, this is Christy from {phone._COMPANY}. "
             "Is it okay to continue?": "no_identity_ask",
-            "Hi there, am I speaking with Taylor?": "no_ai_introduction",
+            "Hi there, am I speaking with Taylor?": "no_introduction",
+            f"Hi, this is Christy, an AI assistant from {phone._COMPANY}. "
+            "Am I speaking to Taylor?": "ai_label",
         }
         for draft, reason in cases.items():
             with self.subTest(reason=reason):
@@ -336,7 +338,10 @@ class TestRejectedDraftsAreLogged(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(phone.phone_opening_draft_rejection(
             CONSENT_DRAFT, identity_done=True))
         self.assertEqual(phone.phone_opening_draft_rejection(
-            CONSENT_DRAFT, identity_done=False), "no_ai_introduction")
+            CONSENT_DRAFT, identity_done=False), "no_introduction")
+        self.assertEqual(phone.phone_opening_draft_rejection(
+            OPENING_DRAFT.replace("Christy from", "Christy, an AI voice assistant from")),
+            "ai_label")
         self.assertEqual(phone.phone_opening_draft_rejection(None), "empty")
         self.assertEqual(phone.phone_opening_draft_rejection(
             "We record calls. Is it okay to continue?", identity_done=True),

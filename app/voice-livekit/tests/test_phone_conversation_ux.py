@@ -143,7 +143,7 @@ class ConversationGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spoken.count(phone.PHONE_DISCLOSURE_TEXT), 1)
 
     async def test_valid_draft_is_spoken_once(self):
-        draft = (f"Hello, I'm Christy, an AI voice assistant from {phone._COMPANY} "
+        draft = (f"Hello, I'm Christy from {phone._COMPANY} "
                  "about your application. " + phone.PHONE_DISCLOSURE_RECORDING_SENTENCE +
                  " Are you okay to continue?")
         _, _, spoken, _, _ = await self.gate(["No thanks"], draft=draft)

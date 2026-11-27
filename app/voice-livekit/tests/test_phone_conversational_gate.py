@@ -556,13 +556,13 @@ class TestGateIdentityFlow(unittest.IsolatedAsyncioTestCase):
 
     async def test_the_consent_line_does_not_introduce_us_a_second_time(self):
         # THE DOUBLE-HI, one turn earlier than #279 found it. The identity turn
-        # has just said "Hi, this is Christy, an AI voice assistant …"; the full
+        # has just said "Hi, this is Christy from …"; the full
         # `PHONE_DISCLOSURE_TEXT` would say it again in the very next breath.
         # Found by this test, not by reading.
         h = _GateHarness(replies=["Yes, this is Priya."], verdicts=["self"])
         await self._gate(h)
         self.assertEqual(
-            sum(1 for line in h.spoken if "AI voice assistant" in line), 1,
+            sum(1 for line in h.spoken if "this is Christy" in line), 1,
             f"introduced twice: {h.spoken!r}",
         )
         # …and the recording notice and the consent question are still intact.
@@ -1092,7 +1092,7 @@ class TestGateWindowLeakVeto(unittest.IsolatedAsyncioTestCase):
                 return _gen()
 
         agent = phone.phone_agent_class(BaseAgent)(
-            "You are Christy, an AI voice assistant calling from the company "
+            "You are Christy from the company "
             "about the candidate's job application.",
             client=None, attempt_id="a1", say=None,
             on_user_turn=lambda *a, **k: None, native_turns=True,
@@ -1117,7 +1117,7 @@ class TestGateWindowLeakVeto(unittest.IsolatedAsyncioTestCase):
         # from") because the prompt is what tells the bot to say them. Scanned
         # against the prompt it was vetoed — silently replacing every authored
         # line with the fixed one.
-        line = ("Hi, this is Christy, an AI voice assistant calling from the "
+        line = ("Hi, this is Christy from the "
                 "company about your job application. Am I speaking to Priya?")
         self.assertEqual(await self._spoken([line]), line)
 
@@ -1396,7 +1396,7 @@ class TestGateLeakVetoAtTokenGranularity(TestGateWindowLeakVeto):
                 return _gen()
 
         agent = phone.phone_agent_class(BaseAgent)(
-            "You are Christy, an AI voice assistant calling from the company.",
+            "You are Christy from the company.",
             client=None, attempt_id="a1", say=None,
             on_user_turn=lambda *a, **k: None, native_turns=True,
         )
