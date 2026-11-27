@@ -6,6 +6,7 @@
  * THE S09 SEAM. The registry is built from a list (`R1_MEET_DEFINITIONS`); a kind may appear once only,
  * and a duplicate throws at construction, so a second definition can never silently shadow the first.
  * S09 registers its `scorecard_feedback` definition (`feedback.ts`) LAST in that list, and nothing else.
+ * M035 S11 registers `ashby_booked_tag` (`ashby-booked-tag.ts`) after it.
  *
  * CLOSED FAILURES (D-S06-5). A payload whose kind this build does not know throws `r1_meet_unknown_kind`
  * (a kind a rolling deploy has not shipped yet survives a few retries), and one its parser refuses
@@ -28,6 +29,7 @@
 
 import type { QueueHandlerResult } from '../../queue/runner.js';
 import type { QueueJob } from '../../queue/types.js';
+import { r1MeetAshbyBookedTagDefinition } from './ashby-booked-tag.js';
 import { r1MeetDrainDefinition } from './drain.js';
 import { R1_MEET_EVENT_DEFINITIONS } from './event-handler.js';
 import { r1MeetScorecardFeedbackDefinition } from './feedback.js';
@@ -52,6 +54,8 @@ export const R1_MEET_DEFINITIONS: readonly R1MeetJobDefinition[] = Object.freeze
   r1MeetMaintenanceDefinition as R1MeetJobDefinition,
   r1MeetDrainDefinition as R1MeetJobDefinition,
   r1MeetScorecardFeedbackDefinition as R1MeetJobDefinition,
+  // M035 S11: the Dex R1 Booked tag lane, registered after S09's kind, so it is now the last.
+  r1MeetAshbyBookedTagDefinition as R1MeetJobDefinition,
 ]);
 
 /** The deferral of a job claimed just before Meet turned off. */

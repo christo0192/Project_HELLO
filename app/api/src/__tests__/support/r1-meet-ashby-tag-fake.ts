@@ -47,14 +47,40 @@
  *                URL, a ticket digest, the calendar and manage columns) and
  *                `link({ applicationId, candidateId })` (provider `ashby`, lifecycle `imported`).
  *
+ * T4 adds the WORLD composer (`createR1MeetAshbyTagWorld()`): the S06 harness (clock, logs, `meta()`),
+ * the Ashby fake and the tables above, the REAL booked-tag store and the REAL tag port over them, the
+ * `ashbyTag` port group (switches and key settable), the flow deps, the REAL dispatcher, and seeds for
+ * a person (an Ashby candidate with tags, an application, its link and a public booking). The
+ * catalogue starts with the Dex tag, a Christy tag and a Referral tag.
+ *
  * Ids are fixture ids (`7f000000-0000-4000-8000-…`); the key is built at run time and never looks
  * like a real credential. Never shipped: `tsconfig.build.json` excludes `src/__tests__`.
  */
 
 import type { AshbyTransport, AshbyTransportRequest, AshbyTransportResponse } from '../../integrations/ashby/client.js';
+import type { QueueHandlerResult } from '../../lib/queue/runner.js';
+import type { QueueJob } from '../../lib/queue/types.js';
+import { runR1MeetAshbyBookedTag, type R1MeetAshbyTagDeps } from '../../lib/r1/meet/ashby-booked-tag.js';
+import {
+  R1_MEET_BOOKED_TAG_TITLE,
+  createR1MeetAshbyTagPort,
+  type R1MeetAshbyTagPort,
+} from '../../lib/r1/meet/ashby-booked-tag-ashby.js';
+import { createR1MeetBookedTagStore, type R1MeetBookedTagStore } from '../../lib/r1/meet/ashby-booked-tag-store.js';
 import type { R1MeetBookingStatus } from '../../lib/r1/meet/bookings-read.js';
+import { createR1MeetDispatcher, type R1MeetDispatcher } from '../../lib/r1/meet/dispatcher.js';
+import {
+  R1_MEET_JOB_MAX_ATTEMPTS,
+  R1_MEET_QUEUE,
+  parseAshbyBookedTagJob,
+  r1MeetJobs,
+  type R1MeetAshbyTagOp,
+  type R1MeetJobMeta,
+  type R1MeetJobResult,
+} from '../../lib/r1/meet/jobs.js';
+import type { R1MeetFlowDeps } from '../../lib/r1/meet/recall-actions.js';
 import type { supabase } from '../../lib/supabase.js';
-import { HARNESS_NOW, MEET_URL, fixtureId } from './r1-meet-harness.js';
+import { HARNESS_NOW, MEET_URL, createR1MeetHarness, fixtureId, type R1MeetHarness } from './r1-meet-harness.js';
 
 /** The five paths the lane may ever call. */
 export const ASHBY_TAG_LANE_PATHS = Object.freeze([
@@ -526,5 +552,179 @@ export function createBookedTagTables(): BookedTagTables {
       return row;
     },
     callsOf: (table: BookedTagTable) => calls.filter((call) => call.table === table),
+  };
+}
+
+// ── The world composer (T4): everything the job runs with, real where it matters ──
+
+/** The Christy and Referral titles the catalogue also holds (the lane must never touch them). */
+export const OTHER_TAG_TITLES = Object.freeze({ christy: 'Christy: Select', referral: 'Referral' });
+
+export type AshbyTagWorldLink = 'with_candidate' | 'without_candidate' | 'none';
+
+export interface SeedPersonOptions {
+  /** The candidate's tags at the start (copied). Default: none. */
+  readonly tags?: readonly FakeTag[];
+  /** The application's link: with the Ashby candidate id (default), without it, or no link at all. */
+  readonly link?: AshbyTagWorldLink;
+  /** The booking (default: a live `pending` public booking, slot 24 h after `HARNESS_NOW`). */
+  readonly booking?: Omit<PublicBookingSeed, 'applicationId'>;
+}
+
+export interface AshbyTagWorldPerson {
+  readonly candidateId: string;
+  readonly applicationId: string;
+  readonly bookingId: string;
+  /** The stored booking row (a test may change it in place). */
+  readonly booking: BookedTagRow;
+}
+
+export interface R1MeetAshbyTagWorld {
+  readonly h: R1MeetHarness;
+  readonly fake: FakeAshbyTags;
+  readonly tables: BookedTagTables;
+  readonly store: R1MeetBookedTagStore;
+  readonly port: R1MeetAshbyTagPort;
+  readonly ashbyTag: R1MeetAshbyTagDeps;
+  readonly deps: R1MeetFlowDeps;
+  readonly dispatcher: R1MeetDispatcher;
+  /** The catalogue's tag ids (fixture ids). */
+  readonly tagIds: { readonly dex: string; readonly christy: string; readonly referral: string };
+  /** Every fixture id the world seeded (bookings, applications, candidates, tags): for the PII scans. */
+  readonly ids: string[];
+  /** Ashby's own write switches: on, off, or a switch that throws. */
+  setAshbyActive(value: boolean | 'throw'): void;
+  /** Whether a usable Ashby key exists (`ashby()` answers the port or null). */
+  setKeyConfigured(configured: boolean): void;
+  /** The catalogue's Dex entry as a candidate tag (the shape `candidate.info` answers). */
+  dexTag(over?: Partial<FakeTag>): FakeTag;
+  christyTag(): FakeTag;
+  referralTag(): FakeTag;
+  /** A fresh fixture id, recorded in `ids`. */
+  newId(): string;
+  /** An Ashby candidate with these tags; answers its id. */
+  seedCandidate(tags?: readonly FakeTag[]): string;
+  /** An Ashby application of the candidate (known to `application.info`) and its link; answers its id. */
+  seedApplication(candidateId: string, link?: AshbyTagWorldLink): string;
+  /** A booking row of the application (public by default). */
+  seedBooking(applicationId: string, seed?: Omit<PublicBookingSeed, 'applicationId'>): BookedTagRow;
+  /** A candidate, an application, its link and one booking. */
+  seedPerson(options?: SeedPersonOptions): AshbyTagWorldPerson;
+  /** A claimed `r1-meet` queue job of this payload (attempts 1 of 10 unless overridden). */
+  queueJob(payload: unknown, over?: Partial<QueueJob<unknown>>): QueueJob<unknown>;
+  /** Run the job directly, as the builder's payload parses (a first run unless `meta` says otherwise). */
+  run(op: R1MeetAshbyTagOp, bookingId: string, meta?: R1MeetJobMeta): Promise<R1MeetJobResult>;
+  /** Run a payload through the REAL dispatcher. */
+  dispatch(payload: unknown, over?: Partial<QueueJob<unknown>>): Promise<QueueHandlerResult>;
+  /** The `candidate.addTag` and `candidate.removeTag` requests, in order. */
+  writes(): FakeAshbyRequest[];
+}
+
+export function createR1MeetAshbyTagWorld(): R1MeetAshbyTagWorld {
+  const h = createR1MeetHarness();
+  const fake = createFakeAshbyTags();
+  const tables = createBookedTagTables();
+  const ids: string[] = [];
+  const newId = (): string => {
+    const id = fixtureId();
+    ids.push(id);
+    return id;
+  };
+
+  const tagIds = Object.freeze({ dex: newId(), christy: newId(), referral: newId() });
+  fake.catalogue.push(
+    { id: tagIds.christy, title: OTHER_TAG_TITLES.christy, isArchived: false },
+    { id: tagIds.referral, title: OTHER_TAG_TITLES.referral, isArchived: false },
+    { id: tagIds.dex, title: R1_MEET_BOOKED_TAG_TITLE, isArchived: false },
+  );
+
+  const store = createR1MeetBookedTagStore(tables.client);
+  const port = createR1MeetAshbyTagPort({
+    apiKey: fakeAshbyTagKey(),
+    log: h.deps.log,
+    transport: fake.transport,
+    nowMs: () => h.now(),
+  });
+  let active: boolean | 'throw' = true;
+  let keyConfigured = true;
+  const ashbyTag: R1MeetAshbyTagDeps = Object.freeze({
+    store,
+    ashbyActive: () => {
+      if (active === 'throw') throw new Error('unreadable switch');
+      return active;
+    },
+    ashby: () => (keyConfigured ? port : null),
+  });
+  const deps: R1MeetFlowDeps = { ...h.deps, ashbyTag };
+  const dispatcher = createR1MeetDispatcher({ flowDeps: () => deps, active: () => true });
+
+  const queueJob = (payload: unknown, over: Partial<QueueJob<unknown>> = {}): QueueJob<unknown> => ({
+    id: fixtureId(),
+    name: R1_MEET_QUEUE,
+    payload,
+    status: 'active',
+    attempts: 1,
+    maxAttempts: R1_MEET_JOB_MAX_ATTEMPTS.ashby_booked_tag,
+    priority: 0,
+    scheduledAt: HARNESS_NOW,
+    createdAt: HARNESS_NOW,
+    deferCount: 0,
+    ...over,
+  });
+
+  const seedCandidate = (tags: readonly FakeTag[] = []): string => {
+    const id = newId();
+    fake.candidates.set(id, tags.map((tag) => ({ ...tag })));
+    return id;
+  };
+  const seedApplication = (candidateId: string, link: AshbyTagWorldLink = 'with_candidate'): string => {
+    const id = newId();
+    fake.applications.set(id, candidateId);
+    if (link !== 'none') tables.link({ applicationId: id, candidateId: link === 'with_candidate' ? candidateId : null });
+    return id;
+  };
+  const seedBooking = (applicationId: string, seed: Omit<PublicBookingSeed, 'applicationId'> = {}): BookedTagRow => {
+    const row = tables.publicBooking({ ...seed, applicationId, id: seed.id ?? newId() });
+    return row;
+  };
+
+  return {
+    h,
+    fake,
+    tables,
+    store,
+    port,
+    ashbyTag,
+    deps,
+    dispatcher,
+    tagIds,
+    ids,
+    setAshbyActive(value) {
+      active = value;
+    },
+    setKeyConfigured(configured) {
+      keyConfigured = configured;
+    },
+    dexTag: (over = {}) => ({ id: tagIds.dex, title: R1_MEET_BOOKED_TAG_TITLE, isArchived: false, ...over }),
+    christyTag: () => ({ id: tagIds.christy, title: OTHER_TAG_TITLES.christy, isArchived: false }),
+    referralTag: () => ({ id: tagIds.referral, title: OTHER_TAG_TITLES.referral, isArchived: false }),
+    newId,
+    seedCandidate,
+    seedApplication,
+    seedBooking,
+    seedPerson(options = {}) {
+      const candidateId = seedCandidate(options.tags ?? []);
+      const applicationId = seedApplication(candidateId, options.link ?? 'with_candidate');
+      const booking = seedBooking(applicationId, options.booking ?? {});
+      return { candidateId, applicationId, bookingId: booking.id as string, booking };
+    },
+    queueJob,
+    async run(op, bookingId, meta) {
+      const job = parseAshbyBookedTagJob(r1MeetJobs.ashbyBookedTag(op, bookingId).payload);
+      if (job === null) throw new Error('ashby tag world: the builder payload did not parse');
+      return runR1MeetAshbyBookedTag(deps, job, meta ?? h.meta());
+    },
+    dispatch: (payload, over = {}) => dispatcher.handle(queueJob(payload, over)),
+    writes: () => fake.requests.filter((request) => request.path === '/candidate.addTag' || request.path === '/candidate.removeTag'),
   };
 }
