@@ -94,7 +94,7 @@ describe('ensureBot: the happy path', () => {
           pin: true,
         },
         on_participant_join: {
-          message: 'Dex is an AI interviewer from Interview Kickstart. This call is recorded.',
+          message: 'Lexy is an AI interviewer from Interview Kickstart. This call is recorded.',
           exclude_host: false,
         },
       },
@@ -116,12 +116,12 @@ describe('ensureBot: the happy path', () => {
 
   it('a signed-in login group and a bot name override reach the body', async () => {
     const h = createR1MeetHarness({
-      config: { botNameOverride: 'Dex (AI)', recall: { googleLoginGroupId: '7f000000-0000-4000-8000-0000000000aa' } },
+      config: { botNameOverride: 'Lexy (AI)', recall: { googleLoginGroupId: '7f000000-0000-4000-8000-0000000000aa' } },
     });
     const b = await pendingBooking(h);
     await ensureBot(h.deps, b.id, h.meta());
     expect(creates(h)[0]!.body).toMatchObject({
-      bot_name: 'Dex (AI)',
+      bot_name: 'Lexy (AI)',
       google_meet: { google_login_group_id: '7f000000-0000-4000-8000-0000000000aa' },
     });
   });

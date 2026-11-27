@@ -10,7 +10,7 @@
  * every failure answer; one receipt call per accepted delivery with the exact contract payload; no
  * secret, signature or webhook id in any response or log line; not in `lib/auth.ts` PUBLIC_ROUTES;
  * and `createApp()` with the default environment answers 200 `disabled`. M035 S09 T2: a join named
- * like the bot (the profile's `Dex`, or `R1_MEET_BOT_NAME` when set) is marked `is_bot: true`, and the
+ * like the bot (the profile's `Lexy`, or `R1_MEET_BOT_NAME` when set) is marked `is_bot: true`, and the
  * name never reaches a receipt, a job or a log line.
  *
  * gitleaks: the workspace secret is generated at run time (`makeRecallWebhookSecret`), the spec
@@ -49,8 +49,8 @@ const MSG_ID = 'msg_s03fixtureRecallRoute01';
 
 const PARTICIPANT_NAME = 'Example Person';
 /** The bot's own display names used here: the profile's, and an `R1_MEET_BOT_NAME` override. */
-const PROFILE_BOT_NAME = 'Dex';
-const OVERRIDE_BOT_NAME = 'Dex (AI Interviewer)';
+const PROFILE_BOT_NAME = 'Lexy';
+const OVERRIDE_BOT_NAME = 'Lexy (AI Interviewer)';
 const BOT_NAME_FIXTURES = [PROFILE_BOT_NAME, OVERRIDE_BOT_NAME, 'AI Interviewer'];
 const PARTICIPANT_EMAIL = 'person@example.invalid';
 const PARTICIPANT_PLATFORM = 'desktop_fixture_platform';
@@ -557,7 +557,7 @@ describe('accepted and duplicate deliveries', () => {
     for (const value of BOT_NAME_FIXTURES) expect(seen.toLowerCase(), value).not.toContain(value.toLowerCase());
   }
 
-  it("a join named like the bot (default config: the profile's Dex) is marked is_bot true, and the name is kept nowhere", async () => {
+  it("a join named like the bot (default config: the profile's Lexy) is marked is_bot true, and the name is kept nowhere", async () => {
     const h = makeHarness();
     const body = participantBody('participant_events.join', PROFILE_BOT_NAME);
     const res = await send(h.app, 'realtime', body, signed(body));
@@ -577,7 +577,7 @@ describe('accepted and duplicate deliveries', () => {
     expect(h.fake.jobs()).toHaveLength(1);
     expect(h.fake.jobs()[0]!.payload).toMatchObject({ participant: { id: 100, is_host: false, is_bot: true } });
     expectNoParticipantTrace(h, PROFILE_BOT_NAME);
-    for (const line of logLines) expect(line.toLowerCase()).not.toContain('dex');
+    for (const line of logLines) expect(line.toLowerCase()).not.toContain('lexy');
   });
 
   it('with R1_MEET_BOT_NAME set, only that name is marked: the profile name is then a person', async () => {
@@ -597,7 +597,7 @@ describe('accepted and duplicate deliveries', () => {
     }
     expect(h.fake.jobs()).toHaveLength(3);
     for (const [name] of cases) expectNoParticipantTrace(h, name);
-    for (const line of logLines) expect(line.toLowerCase()).not.toContain('dex');
+    for (const line of logLines) expect(line.toLowerCase()).not.toContain('lexy');
   });
 
   it('a leave named like the bot is never marked by name', async () => {
