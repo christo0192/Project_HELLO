@@ -229,3 +229,52 @@
   .r1-meet-tile .r1-phase__label { font-size: 20px; }
   .r1-meet-tile .r1-scenario { width: 100%; }
 }
+
+/* Public booking (M035 S07): /book and /book/manage. A card form (details, an IST slot picker,
+   the notice and its boxes) and the result cards. Only `--c-*` colours and the radius tokens;
+   nothing moves (no animation, no transition); the chosen and unpickable chips differ by border
+   width and style and by a word, never by colour alone. The honeypot sits off-screen (not
+   `display: none`, which some form fillers skip): it is aria-hidden and out of the Tab order. */
+.r1-book { margin: 24px auto 0; padding: 34px; }
+.r1-book h1 { margin: 8px 0; font-size: 24px; font-weight: 600; letter-spacing: -.01em; line-height: 32px; }
+.r1-book__section { margin: 28px 0 0; padding: 0; border: 0; min-width: 0; }
+.r1-book__section > legend, .r1-book__section > h2, .r1-book__section > h3 { margin: 0 0 4px; padding: 0; color: var(--c-ink); font-size: 16px; font-weight: 600; line-height: 24px; }
+.r1-book__section .r1-notice__body h3, .r1-book__section .r1-notice__body h4 { margin: 18px 0 6px; color: var(--c-ink); font-size: 14px; font-weight: 600; }
+.r1-book__section .r1-notice__body h3:first-child, .r1-book__section .r1-notice__body h4:first-child { margin-top: 0; }
+.r1-book__field { margin: 16px 0 0; padding: 0; border: 0; min-width: 0; }
+.r1-book__field > .candidate-field-label { margin-top: 0; }
+.r1-book__hint { margin: 4px 0 0; color: var(--c-ink-muted); font-size: 12px; line-height: 16px; }
+.r1-book__field-error { margin: 6px 0 0; color: var(--c-negative); font-size: 13px; line-height: 1.5; }
+/* 16px text, so a phone does not zoom into the field. */
+.r1-book__input { width: 100%; min-height: 48px; padding: 0 14px; border: 1px solid var(--c-control-border); border-radius: var(--radius-control); background: var(--c-surface); color: var(--c-ink); font: inherit; font-size: 16px; }
+.r1-book__input:focus-visible { outline: 2px solid var(--c-ink); outline-offset: 2px; }
+.r1-book__input[aria-invalid="true"] { border-color: var(--c-negative); }
+.r1-book__chips { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; }
+.r1-book__chip { display: flex; min-height: 44px; flex-direction: column; justify-content: center; gap: 2px; padding: 8px 12px; border: 1px solid var(--c-control-border); border-radius: var(--radius-control); background: var(--c-surface); color: var(--c-ink); font-size: 14px; line-height: 20px; cursor: pointer; }
+/* One pixel less padding for the 2px border: the chip keeps its size when it is chosen. */
+.r1-book__chip[data-checked="true"] { padding: 7px 11px; border: 2px solid var(--c-ink); font-weight: 600; }
+.r1-book__chip[data-disabled="true"] { border-style: dashed; background: var(--c-border-light); color: var(--c-ink-muted); cursor: not-allowed; }
+.r1-book__chip:focus-within { outline: 2px solid var(--c-ink); outline-offset: 2px; }
+.r1-book__chip small { color: var(--c-ink-muted); font-size: 12px; font-weight: 400; line-height: 16px; }
+.r1-book__summary { margin: 20px 0 0; padding: 16px 18px; border: 1px solid var(--c-negative); border-radius: var(--radius-card); background: var(--c-negative-light); color: var(--c-ink); }
+.r1-book__summary:focus-visible { outline: 2px solid var(--c-ink); outline-offset: 2px; }
+.r1-book__summary h2 { margin: 0 0 6px; color: var(--c-ink); font-size: 16px; font-weight: 600; line-height: 24px; }
+.r1-book__summary ul { margin: 0; padding-left: 20px; list-style: disc; }
+.r1-book__summary li { margin: 4px 0 0; }
+.r1-book__summary button { padding: 2px 0; border: 0; background: transparent; color: var(--c-ink); font: inherit; font-size: 14px; line-height: 20px; text-align: left; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+.r1-book__summary button:focus-visible { outline: 2px solid var(--c-ink); outline-offset: 2px; }
+.r1-book__notice { margin: 16px 0 0; padding: 10px 14px; border: 1px solid var(--c-border); border-radius: var(--radius-control); background: var(--c-border-light); color: var(--c-ink-secondary); font-size: 14px; line-height: 1.5; }
+.r1-book__trap { position: absolute; left: -10000px; width: 1px; height: 1px; overflow: hidden; }
+.r1-book__when { margin: 0 0 12px; color: var(--c-ink); font-size: 20px; font-weight: 600; line-height: 28px; }
+.r1-book__actions { display: grid; gap: 10px; margin-top: 20px; }
+.r1-book__actions .candidate-primary-cta, .r1-book__actions .r1-secondary-cta { width: 100%; margin-top: 0; }
+@media (max-width: 760px) {
+  .r1-book { padding: 24px 18px; }
+  .r1-book__chips { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (forced-colors: active) {
+  .r1-book__chip, .r1-book__summary, .r1-book__notice { background: Canvas; border: 1px solid CanvasText; }
+  .r1-book__chip[data-checked="true"] { border: 2px solid Highlight; }
+  .r1-book__chip[data-disabled="true"] { border: 1px dashed GrayText; color: GrayText; }
+  .r1-book__chip[data-disabled="true"] small { color: GrayText; }
+}
