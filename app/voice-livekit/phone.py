@@ -407,7 +407,7 @@ PHONE_DISCLOSURE_RECORDING_SENTENCE = (
 )
 
 PHONE_DISCLOSURE_TEXT = (
-    f"Hi, this is Christy, an AI voice assistant calling from {_COMPANY} "
+    f"Hi, this is Christy from {_COMPANY}, calling "
     "about your job application. This call is recorded so the hiring team can "
     "review it. Is it okay to continue?"
 )
@@ -416,8 +416,8 @@ PHONE_DISCLOSURE_TEXT = (
 #:
 #: `PHONE_DISCLOSURE_TEXT` opens by introducing Christy, which is correct when it
 #: is the first thing the candidate hears. Under `PHONE_GATE_FLOW=conversational`
-#: it is NOT: the identity turn has already said "Hi, this is Christy, an AI
-#: voice assistant calling from …". Speaking the full disclosure on top
+#: it is NOT: the identity turn has already said "Hi, this is Christy from …"
+#: Speaking the full disclosure on top
 #: introduces us twice in consecutive turns — the "double-Hi" that #279 fixed at
 #: Q1, arriving here instead. A test drives the real gate and counts the
 #: introductions, because this was found by that test and not by reading.
@@ -555,17 +555,15 @@ PHONE_CONSENT_REASK_AFTER_ANSWER_TEXT = (
 
 
 def phone_ai_identity_sentence() -> str:
-    """The VERBATIM first sentence of `phone_identity_text`.
+    """The fixed, truthful answer to "is this an AI?" before consent.
 
-    "Hi, this is Christy, an AI voice assistant calling from <company>." It is
-    derived from the identity line itself, never re-typed, so the answer to
-    "is this an AI?" can only ever be words the owner already approved.
+    Owner decision 2026-11-27: the opener no longer calls Christy an AI voice
+    assistant ("Hi, this is Christy from <company>."). This answer used to
+    repeat the opener's first sentence; the opener now carries no AI label, so
+    the answer is its own fixed line and still says plainly that the caller is
+    an AI. Never claim to be human.
     """
-    line = phone_identity_text(None)
-    end = line.find(f"{_COMPANY}.")
-    if end < 0:  # pragma: no cover — pinned by a test
-        return line
-    return line[: end + len(_COMPANY) + 1]
+    return f"Yes, I'm an AI voice assistant calling from {_COMPANY}."
 
 
 def _consent_faq_role_text(role_title: Any) -> str:
@@ -696,11 +694,11 @@ def phone_identity_text(candidate_name: Any) -> str:
     # the answer says we reached them.
     if not first:
         return (
-            f"Hi, this is Christy, an AI voice assistant calling from {_COMPANY}. "
+            f"Hi, this is Christy from {_COMPANY}. "
             "Am I speaking to the right person?"
         )
     return (
-        f"Hi, this is Christy, an AI voice assistant calling from {_COMPANY}. "
+        f"Hi, this is Christy from {_COMPANY}. "
         f"Am I speaking to {first}?"
     )
 
@@ -763,6 +761,8 @@ def phone_identity_instruction(candidate_name: Any) -> str:
         f"{_COMPANY}. This is the very first thing you say on the call. Greet "
         "them warmly in ONE short sentence, say who you are and which company "
         f"you are calling from, and then ask whether you are speaking to {who}. "
+        f"Introduce yourself simply as Christy from {_COMPANY}: do NOT call "
+        "yourself an AI, a bot, a voice assistant or an assistant in this line. "
         "Do NOT say why you are calling and do NOT mention a job, an "
         "application, a role, a company they work for, or anything from their "
         "background — you have not yet confirmed who is on the line. "
@@ -7895,6 +7895,14 @@ def _opening_is_verified(text: Any) -> bool:
     return True
 
 
+#: Owner decision 2026-11-27: a composed (model-authored) gate line never labels
+#: Christy as an AI, a bot or an assistant, and neither does the fixed opener. A
+#: draft that does is rejected and the fixed line is spoken instead. The only
+#: gate line that says "AI" is the fixed answer to "is this an AI?"
+#: (`phone_ai_identity_sentence`), which is not a draft.
+_GATE_AI_LABEL_RE = re.compile(r"\b(?:AI|bot|assistant)\b", re.IGNORECASE)
+
+
 def phone_opening_draft_rejection(
     text: Any, *, identity_done: bool = False,
 ) -> Optional[str]:
@@ -7927,10 +7935,11 @@ def phone_opening_draft_rejection(
     if _OPENING_IDENTITY_CUE_RE.search(clean):
         return "identity_question"
     if not identity_done and not (
-        "christy" in clean.lower() and "ai" in clean.lower().split()
-        and _COMPANY.lower() in clean.lower()
+        "christy" in clean.lower() and _COMPANY.lower() in clean.lower()
     ):
-        return "no_ai_introduction"
+        return "no_introduction"
+    if _GATE_AI_LABEL_RE.search(clean):
+        return "ai_label"
     if any(token in clean for token in ("```", "**", "<", ">")):
         return "markup"
     return None
@@ -7972,11 +7981,11 @@ def phone_identity_draft_rejection(text: Any, *, introduced: bool) -> Optional[s
     if not _identity_line_asks_identity(text):
         return "no_identity_ask"
     if not introduced and not (
-        "christy" in text.lower()
-        and re.search(r"\bAI\b", text, re.IGNORECASE)
-        and _COMPANY.lower() in text.lower()
+        "christy" in text.lower() and _COMPANY.lower() in text.lower()
     ):
-        return "no_ai_introduction"
+        return "no_introduction"
+    if _GATE_AI_LABEL_RE.search(text):
+        return "ai_label"
     return None
 
 

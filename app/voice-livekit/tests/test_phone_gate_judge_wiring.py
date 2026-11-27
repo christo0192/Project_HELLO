@@ -382,7 +382,7 @@ class TestSplitConsentLine(unittest.TestCase):
 
     def test_a_draft_with_the_question_before_the_sentence_is_rejected(self):
         sentence = phone.PHONE_DISCLOSURE_RECORDING_SENTENCE
-        draft = (f"Hi, this is Christy, an AI voice assistant calling from {phone._COMPANY}. "
+        draft = (f"Hi, this is Christy from {phone._COMPANY}. "
                  f"Is it okay to continue? {sentence}")
         self.assertFalse(phone.phone_opening_draft_verified(draft))
         # The order check itself, reached past the end-on-the-question check.
@@ -393,7 +393,7 @@ class TestSplitConsentLine(unittest.TestCase):
                 mock.patch.object(phone, "_log", logger):
             self.assertFalse(phone.phone_opening_draft_verified(draft))
         self.assertIn("rejected_order", [f.get("error_category") for f in sink])
-        good = (f"Hi, this is Christy, an AI voice assistant calling from {phone._COMPANY}. "
+        good = (f"Hi, this is Christy from {phone._COMPANY}. "
                 f"{sentence} Is it okay to continue?")
         self.assertTrue(phone.phone_opening_draft_verified(good))
 
@@ -454,7 +454,7 @@ class TestRunPhoneGateSpeaksTheSplitLine(unittest.IsolatedAsyncioTestCase):
     async def test_a_composed_line_is_split_too(self):
         gate = _SplitGate()
         sentence = phone.PHONE_DISCLOSURE_RECORDING_SENTENCE
-        draft = (f"Hello! This is Christy, an AI voice assistant calling from {phone._COMPANY}. "
+        draft = (f"Hello! This is Christy from {phone._COMPANY}. "
                  f"{sentence} Is it okay to continue?")
 
         async def compose():
@@ -502,16 +502,17 @@ class TestConsentQuestionsGetFixedAnswers(unittest.TestCase):
                       phone.PHONE_CONSENT_REASK_AFTER_ANSWER_TEXT)
         self.assertEqual([c[0] for c in result.judge_transport.calls], ["consent", "consent_retry"])
 
-    def test_is_this_an_ai_reuses_the_verbatim_identity_sentence(self):
+    def test_is_this_an_ai_gets_a_truthful_fixed_yes(self):
+        # Owner 2026-11-27: the opener no longer says "AI voice assistant", so
+        # "is this an AI?" gets its own fixed, truthful answer.
         result = self._run("is_ai", question="Is this an AI?")
         reasks = [line.text for line in result.spoken if line.kind == "reask"]
         sentence = phone.phone_ai_identity_sentence()
         self.assertEqual(reasks[0], sentence)
-        self.assertTrue(phone.phone_identity_text(None).startswith(sentence))
-        self.assertTrue(phone.phone_identity_text("Asha").startswith(sentence))
         self.assertEqual(
             sentence,
-            f"Hi, this is Christy, an AI voice assistant calling from {phone._COMPANY}.")
+            f"Yes, I'm an AI voice assistant calling from {phone._COMPANY}.")
+        self.assertNotIn("AI", phone.phone_identity_text("Asha"))
 
     def test_what_role_names_the_server_role_only(self):
         result = self._run("what_role", question="Which role is this?",

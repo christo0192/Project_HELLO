@@ -1,5 +1,12 @@
 """M013 S01 T12: the AI-disclosure wording is pinned to origin/main (6fec38a).
 
+UPDATED 2026-11-27 with owner approval: the opener drops "an AI voice
+assistant" ("Hi, this is Christy from <company>."), a composed gate line may not
+label Christy an AI/bot/assistant, and "is this an AI?" now gets its own fixed,
+truthful answer ("Yes, I'm an AI voice assistant calling from <company>.").
+The recording sentence, the continuation and the prompting.py AI line are
+unchanged.
+
 Owner constraint 2: S01 must not change the AI-disclosure wording. That covers
 `PHONE_DISCLOSURE_TEXT`, `phone_identity_text`,
 `PHONE_DISCLOSURE_RECORDING_SENTENCE`, `PHONE_DISCLOSURE_CONTINUATION_TEXT`,
@@ -70,7 +77,7 @@ _RECORDING_SENTENCE = "This call is recorded so the hiring team can review it."
 _RECORDING_SENTENCE_SRC = '"This call is recorded so the hiring team can review it."'
 
 _DISCLOSURE_SRC = (
-    'f"Hi, this is Christy, an AI voice assistant calling from {_COMPANY} "\n'
+    'f"Hi, this is Christy from {_COMPANY}, calling "\n'
     '    "about your job application. This call is recorded so the hiring team can "\n'
     '    "review it. Is it okay to continue?"'
 )
@@ -86,9 +93,9 @@ _CONTINUATION_SRC = (
 
 #: The two `return` expressions of `phone_identity_text`, as written.
 _IDENTITY_RETURNS_SRC = (
-    'f"Hi, this is Christy, an AI voice assistant calling from {_COMPANY}. "\n'
+    'f"Hi, this is Christy from {_COMPANY}. "\n'
     '        f"Am I speaking to {first}?"',
-    'f"Hi, this is Christy, an AI voice assistant calling from {_COMPANY}. "\n'
+    'f"Hi, this is Christy from {_COMPANY}. "\n'
     '            "Am I speaking to the right person?"',
 )
 
@@ -103,14 +110,16 @@ _PROMPT_AI_LINE = (
 
 #: The consent-draft AI check of `phone_opening_draft_verified` on origin/main.
 _OPENING_AI_CHECK = (
-    'if not identity_done and not ( "christy" in clean.lower() and "ai" in '
-    'clean.lower().split() and _COMPANY.lower() in clean.lower() ):'
+    'if not identity_done and not ( "christy" in clean.lower() and '
+    '_COMPANY.lower() in clean.lower() ): return "no_introduction" '
+    'if _GATE_AI_LABEL_RE.search(clean): return "ai_label"'
 )
 #: The identity-draft AI check (inline in `run_phone_gate` on origin/main; T08a
 #: moved it, unchanged, into `phone_identity_draft_rejection`).
 _IDENTITY_AI_CHECK = (
-    '"christy" in text.lower() and re.search(r"\\bAI\\b", text, re.IGNORECASE) '
-    'and _COMPANY.lower() in text.lower()'
+    'if not introduced and not ( "christy" in text.lower() and '
+    '_COMPANY.lower() in text.lower() ): return "no_introduction" '
+    'if _GATE_AI_LABEL_RE.search(text): return "ai_label"'
 )
 
 #: Every non-docstring string literal that says "AI" in the files that produce
@@ -119,7 +128,10 @@ _IDENTITY_AI_CHECK = (
 #: its prompt goes to the reply judge, never to the candidate.)
 _AI_LITERALS = collections.Counter({
     ("agent.py", "You are Christy, an AI voice assistant calling from "): 1,
-    ("phone.py", "Hi, this is Christy, an AI voice assistant calling from "): 3,
+    ('agent.py', ': do NOT call yourself an AI, a bot, a voice assistant or an assistant. You MUST include this exact sentence '): 1,
+    ('phone.py', '\\b(?:AI|bot|assistant)\\b'): 1,
+    ('phone.py', "Yes, I'm an AI voice assistant calling from "): 1,
+    ('phone.py', ': do NOT call yourself an AI, a bot, a voice assistant or an assistant in this line. Do NOT say why you are calling and do NOT mention a job, an application, a role, a company they work for, or anything from their background — you have not yet confirmed who is on the line. Do NOT use a time-of-day greeting: no "good morning", "good afternoon" or "good evening". You do not know the local time. Open with a plain greeting such as "Hi" or "Hello". Ask EXACTLY ONE question and it MUST be that identity question — your reply MUST END with it so a simple yes or no answers it. Do NOT mention recording. Do NOT ask for permission or consent to continue — that is the NEXT turn. Do NOT ask anything about their application, their experience or their availability. Two short sentences at most. Speakable plain text: no markdown, no emoji, no stage directions.'): 1,
     ("phone.py", "You are Christy, an AI voice assistant calling from "): 1,
     ("prompting.py",
      ". Do not proactively mention being an AI, bot, or automated assistant. "
@@ -148,7 +160,7 @@ class TestDisclosureLiteralsArePinned(unittest.TestCase):
 
     def test_disclosure_text(self):
         expected = (
-            f"Hi, this is Christy, an AI voice assistant calling from {phone._COMPANY} "
+            f"Hi, this is Christy from {phone._COMPANY}, calling "
             "about your job application. This call is recorded so the hiring team can "
             "review it. Is it okay to continue?"
         )
@@ -166,8 +178,8 @@ class TestDisclosureLiteralsArePinned(unittest.TestCase):
         )
         self.assertEqual(
             rendered,
-            "Hi, this is Christy, an AI voice assistant calling from Interview "
-            "Kickstart about your job application. This call is recorded so the "
+            "Hi, this is Christy from Interview Kickstart, calling "
+            "about your job application. This call is recorded so the "
             "hiring team can review it. Is it okay to continue?",
         )
 
@@ -189,12 +201,12 @@ class TestIdentityLineIsPinned(unittest.TestCase):
         company = phone._COMPANY
         self.assertEqual(
             phone.phone_identity_text(_NAME),
-            f"Hi, this is Christy, an AI voice assistant calling from {company}. "
+            f"Hi, this is Christy from {company}. "
             f"Am I speaking to {_NAME}?",
         )
         self.assertEqual(
             phone.phone_identity_text(None),
-            f"Hi, this is Christy, an AI voice assistant calling from {company}. "
+            f"Hi, this is Christy from {company}. "
             "Am I speaking to the right person?",
         )
 
@@ -207,22 +219,25 @@ class TestIdentityLineIsPinned(unittest.TestCase):
         )
         self.assertEqual(returns, sorted(_IDENTITY_RETURNS_SRC))
 
-    def test_the_is_ai_answer_reuses_the_identity_sentence_verbatim(self):
-        # T05: "is this an AI?" before consent is answered with the first
-        # sentence of the identity line, never with new wording.
+    def test_the_is_ai_answer_is_a_truthful_fixed_yes(self):
+        # Owner 2026-11-27: the opener carries no AI label, so "is this an
+        # AI?" before consent gets its own fixed line that says it plainly.
         sentence = phone.phone_ai_identity_sentence()
         self.assertEqual(
             sentence,
-            f"Hi, this is Christy, an AI voice assistant calling from {phone._COMPANY}.",
+            f"Yes, I'm an AI voice assistant calling from {phone._COMPANY}.",
         )
-        self.assertTrue(phone.phone_identity_text(None).startswith(sentence))
         self.assertEqual(phone.phone_consent_faq_text(phone.CONSENT_FAQ_IS_AI), sentence)
+        for line in (phone.phone_identity_text(None), phone.phone_identity_text(_NAME),
+                     phone.PHONE_DISCLOSURE_TEXT):
+            self.assertNotRegex(line, r"(?i)\b(AI|bot|assistant)\b")
 
 
 class TestDraftAiChecksArePinned(unittest.TestCase):
     """The AI checks that gate a composed (model-authored) gate line."""
 
-    _NO_AI = (" an AI voice assistant", " a voice assistant")
+    #: Turns an approved line into one that labels Christy an AI.
+    _ADD_AI = ("Christy from", "Christy, an AI voice assistant from")
 
     def test_consent_draft_check_source(self):
         src = _source("phone.py")
@@ -233,15 +248,19 @@ class TestDraftAiChecksArePinned(unittest.TestCase):
         self.assertIn("phone_opening_draft_rejection(",
                       ast.get_source_segment(src, verified) or "")
 
-    def test_consent_draft_needs_the_ai_introduction(self):
+    def test_consent_draft_never_labels_an_ai(self):
         good = phone.PHONE_DISCLOSURE_TEXT
         self.assertTrue(phone.phone_opening_draft_verified(good))
-        no_ai = good.replace(*self._NO_AI)
-        self.assertNotEqual(no_ai, good)
-        self.assertFalse(phone.phone_opening_draft_verified(no_ai))
-        self.assertEqual(phone.phone_opening_draft_rejection(no_ai), "no_ai_introduction")
-        # Waived only after the identity line already introduced the AI.
-        self.assertTrue(phone.phone_opening_draft_verified(no_ai, identity_done=True))
+        with_ai = good.replace(*self._ADD_AI)
+        self.assertNotEqual(with_ai, good)
+        self.assertFalse(phone.phone_opening_draft_verified(with_ai))
+        self.assertEqual(phone.phone_opening_draft_rejection(with_ai), "ai_label")
+        self.assertEqual(
+            phone.phone_opening_draft_rejection(with_ai, identity_done=True), "ai_label")
+        # The introduction itself is still required on the first line.
+        no_intro = good.replace("Christy from", "someone from")
+        self.assertEqual(phone.phone_opening_draft_rejection(no_intro), "no_introduction")
+        self.assertTrue(phone.phone_opening_draft_verified(no_intro, identity_done=True))
         # The continuation line (spoken after the identity turn) passes then.
         self.assertTrue(phone.phone_opening_draft_verified(
             phone.PHONE_DISCLOSURE_CONTINUATION_TEXT, identity_done=True))
@@ -251,16 +270,21 @@ class TestDraftAiChecksArePinned(unittest.TestCase):
         node = _function(src, "phone_identity_draft_rejection")
         self.assertIn(_IDENTITY_AI_CHECK, _squash(ast.get_source_segment(src, node) or ""))
 
-    def test_identity_draft_needs_the_ai_introduction(self):
+    def test_identity_draft_never_labels_an_ai(self):
         good = phone.phone_identity_text(_NAME)
         self.assertIsNone(phone.phone_identity_draft_rejection(good, introduced=False))
-        no_ai = good.replace(*self._NO_AI)
-        self.assertNotEqual(no_ai, good)
+        with_ai = good.replace(*self._ADD_AI)
+        self.assertNotEqual(with_ai, good)
         self.assertEqual(
-            phone.phone_identity_draft_rejection(no_ai, introduced=False),
-            "no_ai_introduction",
+            phone.phone_identity_draft_rejection(with_ai, introduced=False), "ai_label")
+        self.assertEqual(
+            phone.phone_identity_draft_rejection(with_ai, introduced=True), "ai_label")
+        no_intro = good.replace("Christy from", "someone from")
+        self.assertEqual(
+            phone.phone_identity_draft_rejection(no_intro, introduced=False),
+            "no_introduction",
         )
-        self.assertIsNone(phone.phone_identity_draft_rejection(no_ai, introduced=True))
+        self.assertIsNone(phone.phone_identity_draft_rejection(no_intro, introduced=True))
 
 
 class TestPromptAiLineIsPinned(unittest.TestCase):
