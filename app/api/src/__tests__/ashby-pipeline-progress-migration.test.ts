@@ -87,12 +87,14 @@ describe('0138 shape', () => {
     // follows that. All by exact name, in that order.
     // 0142_r1_meet_bookings.sql (M034 S02, R1 Meet bookings) touches none of these tables.
     // 0143_r1_meet_public_bookings.sql (M035 S01, public R1 Meet bookings) touches none of these tables.
+    // 0144_r1_meet_public_import.sql (M035 S12) widens the links' intake CHECK and lifts the profile claim and the impact view with one marked hunk each; it touches none of these tables.
     expect(files.slice(files.indexOf(FILE) + 1)).toEqual([
       '0139_ashby_progress_worker.sql',
       '0140_ashby_business_impact.sql',
       '0141_ashby_progress_nudge.sql',
       '0142_r1_meet_bookings.sql',
       '0143_r1_meet_public_bookings.sql',
+      '0144_r1_meet_public_import.sql',
     ]);
   });
 
