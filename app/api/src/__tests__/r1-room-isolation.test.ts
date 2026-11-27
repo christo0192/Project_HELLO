@@ -268,6 +268,12 @@ function sourceFiles(directory: string): string[] {
 const meetVendorDirs = ['recall', 'google-meet', 'google'].map((name) => path.join(src, 'integrations', name));
 const meetVendorSources = meetVendorDirs.flatMap((directory) => sourceFiles(directory));
 /**
+ * What phone-only code may never name: lib/r1, the R1 routes and the Meet vendor modules. `recall`
+ * and `google-meet` keep M034's prefix match; only the M035 `google` folder carries the look-ahead,
+ * so a look-alike such as `integrations/google-sheets` is not R1 code.
+ */
+const PHONE_FORBIDDEN_R1_PATH = /lib\/r1\/|routes\/r1|r1-candidate|integrations\/(?:recall|google-meet|google(?![\w-]))/;
+/**
  * The Meet routes (routes/, outside lib/r1, but R1 code: critic C6): the Recall webhook receivers
  * (M034 S03) and the HR read of the Meet bookings (M034 S05).
  */
@@ -409,9 +415,29 @@ describe('R1 source fences', () => {
     expect(phoneFiles.length).toBeGreaterThan(0);
     for (const file of phoneFiles) {
       // M034: nor the R1-over-Meet vendor modules (M035 S03: the Google client for Dex too).
-      expect(readFileSync(file, 'utf8'), file).not.toMatch(
-        /lib\/r1\/|routes\/r1|r1-candidate|integrations\/(?:recall|google-meet|google)(?![\w-])/,
-      );
+      expect(readFileSync(file, 'utf8'), file).not.toMatch(PHONE_FORBIDDEN_R1_PATH);
+    }
+  });
+
+  it('the phone fence pattern keeps the M034 prefix matches and adds integrations/google exactly', () => {
+    // M034's prefix matches stay: anything starting with recall or google-meet is still R1 code.
+    for (const text of [
+      "from '../lib/r1/meet/config.js'",
+      "from '../routes/r1.js'",
+      "from './r1-candidate.js'",
+      "from '../integrations/recall/client.js'",
+      "from '../integrations/recall-utils/x.js'",
+      "from '../integrations/google-meet/url.js'",
+      "from '../integrations/google-meet-x/y.js'",
+      // M035 S03: the Google client for Dex, by folder name only.
+      "from '../integrations/google/client.js'",
+      'const file = `../integrations/google/${name}.js`;',
+    ]) {
+      expect(PHONE_FORBIDDEN_R1_PATH.test(text), text).toBe(true);
+    }
+    // A look-alike folder (a future, non-R1 Google module) does not trip the fence.
+    for (const text of ["from '../integrations/google-sheets/x.js'", "from '../integrations/googleish/x.js'"]) {
+      expect(PHONE_FORBIDDEN_R1_PATH.test(text), text).toBe(false);
     }
   });
 

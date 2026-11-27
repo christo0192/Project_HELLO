@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   CONSENT_DEFAULT_TIMEOUT_MS,
   CONSENT_ENV_NAME,
+  CONSENT_FAIL_WORDS,
   CONSENT_FLY_APP,
   runConsent,
   type ConsentDeps,
@@ -40,6 +41,7 @@ import {
 
 const API_ROOT = path.resolve(fileURLToPath(new URL('../../', import.meta.url)));
 const SCRIPT = path.join(API_ROOT, 'scripts', 'm035-google-oauth-consent.ts');
+const RUNBOOK = path.resolve(API_ROOT, '..', '..', 'docs', 'runbooks', 'r1-operations.md');
 const TWO_SCOPES = [GOOGLE_SCOPES.calendarEventsOwned, GOOGLE_SCOPES.meetSpaceSettings];
 const THREE_SCOPES = [...TWO_SCOPES, GOOGLE_SCOPES.meetSpaceCreated];
 /** Listener tests do real loopback I/O (a refused connect can take ~2 s on Windows). */
@@ -259,6 +261,16 @@ describe('m035-google-oauth-consent: the happy path', () => {
       expect(text).toContain(`Get-Content -Raw '${outFile}' | fly secrets import -a ${CONSENT_FLY_APP}`);
       expect(text).toContain(`fly secrets import -a ${CONSENT_FLY_APP} < '${outFile}'`);
       expect(text).toContain(`Remove-Item '${outFile}'`);
+      // The helper cannot see which account consented: the spike's organizer check comes BEFORE any import.
+      const firstImport = lines.findIndex((line) => line.includes('fly secrets import'));
+      const check = lines.findIndex((line) => line.includes('cannot tell which Google account') && line.includes('PASS organizer'));
+      const spike = lines.findIndex((line) => line.includes('npx tsx scripts/m035-google-spike.ts --live'));
+      expect(check).toBeGreaterThan(-1);
+      expect(spike).toBeGreaterThan(check);
+      expect(firstImport).toBeGreaterThan(spike);
+      for (const line of lines.filter((item) => item.includes('fly secrets import'))) expect(line).toContain('After PASS organizer');
+      expect(lines[spike]).not.toContain('--space');
+      expect(text).toContain(`Get-Content '${outFile}' | ForEach-Object`);
       expect(text).not.toContain('accounts.google.com');
       expect(text).not.toMatch(/^FAIL/m);
       expectNoSecrets(lines, fake, browser.visits.code);
@@ -287,6 +299,8 @@ describe('m035-google-oauth-consent: the happy path', () => {
       const flag = rig();
       expect(await runConsent([`--out=${flag.outFile}`, '--space'], flag.deps)).toBe(0);
       expect(flag.browser.visits.consent!.searchParams.get('scope')).toBe(THREE_SCOPES.join(' '));
+      // The check the helper asks for runs the spike in space mode too.
+      expect(flag.lines.some((line) => line.includes('npx tsx scripts/m035-google-spike.ts --live --space'))).toBe(true);
       await expectListenerClosed(flag.browser.visits.redirect);
 
       const env = rig();
@@ -484,17 +498,55 @@ describe('m035-google-oauth-consent: failures write nothing', () => {
   }
 
   it(
-    'a state that does not match (same length or not) is refused before any exchange',
+    'a state that does not match (same length or not) is ignored, never exchanged, and a run that then times out says state_mismatch',
     async () => {
+      const short = (deps: ConsentDeps) => {
+        deps.timeoutMs = 300;
+      };
       const flipped = await expectFailure(
         { state: (sent) => (sent[0] === 'A' ? 'B' : 'A') + sent.slice(1) },
         'FAIL state_mismatch',
+        short,
       );
       expect(exchangeCalls(flipped.fake)).toHaveLength(0);
-      const longer = await expectFailure({ state: (sent) => `${sent}x` }, 'FAIL state_mismatch');
+      // The browser got the fixed "ignored" page, not the "received" one.
+      expect(flipped.browser.visits.replyStatus).toBe(400);
+      expect(flipped.browser.visits.replyBody).not.toContain('Return to the terminal');
+      const longer = await expectFailure({ state: (sent) => `${sent}x` }, 'FAIL state_mismatch', short);
       expect(exchangeCalls(longer.fake)).toHaveLength(0);
+      const denied = await expectFailure({ error: 'access_denied', state: () => 'forged' }, 'FAIL state_mismatch', short);
+      expect(denied.browser.visits.replyStatus).toBe(400);
     },
-    LISTENER_TEST_MS * 2,
+    LISTENER_TEST_MS * 3,
+  );
+
+  it(
+    'a stray or forged callback with another state cannot end the run: the real redirect still completes it',
+    async () => {
+      const r = rig();
+      const forged: number[] = [];
+      const inner = r.browser.openUrl.getMockImplementation()!;
+      r.deps.openUrl = async (url) => {
+        const redirect = new URL(url).searchParams.get('redirect_uri') as string;
+        // Another local process or page found the port first: an error and a planted code, wrong state.
+        for (const query of ['?error=access_denied&state=forged', '?code=planted&state=forged', '?code=planted']) {
+          const reply = await fetch(`${redirect}/${query}`);
+          forged.push(reply.status);
+          expect(await reply.text()).not.toContain('Return to the terminal');
+        }
+        await inner(url);
+        return true;
+      };
+      expect(await runConsent([`--out=${r.outFile}`], r.deps)).toBe(0);
+      expect(forged).toEqual([400, 400, 400]);
+      expect(r.lines.filter((line) => line.startsWith('FAIL'))).toEqual([]);
+      expect(readFileSync(r.outFile, 'utf8')).toBe(`${CONSENT_ENV_NAME}=${FAKE_GOOGLE_REFRESH_TOKEN}\n`);
+      // Only the real code was exchanged.
+      expect(exchangeCalls(r.fake)).toHaveLength(1);
+      expect((exchangeCalls(r.fake)[0]!.body as Record<string, string>).code).toBe(r.browser.visits.code);
+      await expectListenerClosed(r.browser.visits.redirect);
+    },
+    LISTENER_TEST_MS,
   );
 
   it(
@@ -721,5 +773,26 @@ describe('m035-google-oauth-consent: what the script may do', () => {
   it('writes the refresh-token variable the API reads, which is a public-booking secret', () => {
     expect(R1_MEET_PUBLIC_SECRET_VARIABLES).toContain(CONSENT_ENV_NAME);
     expect(CONSENT_ENV_NAME.endsWith('_REFRESH_TOKEN')).toBe(true);
+  });
+
+  it('prints only FAIL words of the closed list', () => {
+    const thrown = [...source.matchAll(/new ConsentFailure\(\s*'([a-z_]+)'/g), ...source.matchAll(/refused: '([a-z_]+)'/g)].map(
+      (match) => match[1]!,
+    );
+    expect(thrown.length).toBeGreaterThanOrEqual(12);
+    for (const word of thrown) expect(CONSENT_FAIL_WORDS, word).toContain(word);
+    expect(new Set(CONSENT_FAIL_WORDS).size).toBe(CONSENT_FAIL_WORDS.length);
+  });
+
+  it("the runbook's minting section explains every FAIL word the helper can print", () => {
+    const runbook = readFileSync(RUNBOOK, 'utf8');
+    const start = runbook.indexOf("### Minting Dex's refresh token (owner, once per grant)");
+    const end = runbook.indexOf('### The Google half of the live spike', start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const section = runbook.slice(start, end);
+    for (const word of CONSENT_FAIL_WORDS) expect(section, word).toContain(`\`FAIL ${word}`);
+    // And it says to import only after the spike proved the grant is Dex's.
+    expect(section).toContain('PASS organizer');
   });
 });

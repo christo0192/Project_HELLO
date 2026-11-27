@@ -396,6 +396,7 @@ const MISSING_REASON: Readonly<Record<(typeof R1_MEET_REQUIRED_VARIABLES)[number
   R1_MEET_ASHBY_DEX_USER_ID: 'R1_MEET_ASHBY_DEX_USER_ID is required when R1_MEET_ENABLED is "true"',
 };
 
+/** The twelve M034 Meet variables and WEB_ORIGIN: what `getR1MeetConfig` reads. No M035 name. */
 function readProcessEnv(): R1MeetEnvSource {
   return {
     R1_MEET_ENABLED: process.env.R1_MEET_ENABLED,
@@ -410,7 +411,18 @@ function readProcessEnv(): R1MeetEnvSource {
     R1_MEET_ASHBY_FEEDBACK_FORM_ID: process.env.R1_MEET_ASHBY_FEEDBACK_FORM_ID,
     RECALL_API_KEY: process.env.RECALL_API_KEY,
     RECALL_WEBHOOK_SECRET: process.env.RECALL_WEBHOOK_SECRET,
-    // M035 public booking link: read only by the public readers below, never by getR1MeetConfig.
+    WEB_ORIGIN: process.env.WEB_ORIGIN,
+  };
+}
+
+/**
+ * Every Meet variable (the twelve M034 ones, the twenty-three M035 public booking ones) and
+ * WEB_ORIGIN. Used ONLY by `getR1MeetPublicConfig`, so the Google secrets are copied into a plain
+ * object only on the public path, never on the M034 Meet readers' hot path.
+ */
+function readPublicProcessEnv(): R1MeetEnvSource {
+  return {
+    ...readProcessEnv(),
     R1_MEET_PUBLIC_BOOKING_ENABLED: process.env.R1_MEET_PUBLIC_BOOKING_ENABLED,
     R1_MEET_GOOGLE_AUTH_MODE: process.env.R1_MEET_GOOGLE_AUTH_MODE,
     R1_MEET_GOOGLE_OAUTH_CLIENT_ID: process.env.R1_MEET_GOOGLE_OAUTH_CLIENT_ID,
@@ -434,7 +446,6 @@ function readProcessEnv(): R1MeetEnvSource {
     R1_MEET_PUBLIC_REQUIRE_R1_STAGE: process.env.R1_MEET_PUBLIC_REQUIRE_R1_STAGE,
     R1_MEET_PUBLIC_CALENDAR_RETENTION_DAYS: process.env.R1_MEET_PUBLIC_CALENDAR_RETENTION_DAYS,
     R1_MEET_PUBLIC_PRESLOT_RECHECK: process.env.R1_MEET_PUBLIC_PRESLOT_RECHECK,
-    WEB_ORIGIN: process.env.WEB_ORIGIN,
   };
 }
 
@@ -539,7 +550,7 @@ export function getR1MeetFeedbackConfig(
   source?: Pick<R1MeetEnvSource, 'R1_MEET_ASHBY_FEEDBACK_FORM_ID'>,
 ): R1MeetFeedbackConfig {
   try {
-    const env = source ?? readProcessEnv();
+    const env = source ?? { R1_MEET_ASHBY_FEEDBACK_FORM_ID: process.env.R1_MEET_ASHBY_FEEDBACK_FORM_ID };
     const formDefinitionId: unknown = env.R1_MEET_ASHBY_FEEDBACK_FORM_ID;
     if (!present(formDefinitionId)) return FEEDBACK_OFF;
     if (typeof formDefinitionId !== 'string' || !UUID.test(formDefinitionId) || formDefinitionId === NIL_UUID) {
@@ -1026,7 +1037,7 @@ function publicInvalid(reason: string): R1MeetPublicConfig {
  */
 export function getR1MeetPublicConfig(source?: R1MeetEnvSource): R1MeetPublicConfig {
   try {
-    const env: R1MeetEnvSource = source ?? readProcessEnv();
+    const env: R1MeetEnvSource = source ?? readPublicProcessEnv();
 
     // Same strict rule as R1_MEET_ENABLED: only the exact text "true" turns it on.
     const flag: unknown = env.R1_MEET_PUBLIC_BOOKING_ENABLED;

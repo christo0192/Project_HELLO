@@ -36,6 +36,7 @@ import {
   R1_MEET_PUBLIC_SLOT_STEP_MINUTES_CHOICES,
   R1_MEET_PUBLIC_SLOT_STEP_MINUTES_DEFAULT,
   getR1MeetConfig,
+  getR1MeetFeedbackConfig,
   getR1MeetGoogleOAuthClientInputs,
   getR1MeetPublicConfig,
   getR1MeetPublicDrainConfig,
@@ -1213,6 +1214,36 @@ describe('M035 public booking configuration: process.env', () => {
   it('is off by default: the flag blank in process.env', () => {
     stubAll({ R1_MEET_PUBLIC_BOOKING_ENABLED: '' });
     expect(getR1MeetPublicConfig()).toStrictEqual({ status: 'off' });
+  });
+
+  it('the M034 Meet readers never read a public variable (so never copy a Google secret); only the public reader does', () => {
+    stubAll();
+    const real = process.env;
+    const reads = new Set<string>();
+    process.env = new Proxy(real, {
+      get(target, key) {
+        if (typeof key === 'string') reads.add(key);
+        return Reflect.get(target, key) as unknown;
+      },
+    });
+    try {
+      const publicNames = new Set<string>(R1_MEET_PUBLIC_ENV_VARIABLES);
+      const publicReads = (): string[] => [...reads].filter((name) => publicNames.has(name));
+
+      expect(getR1MeetConfig().enabled).toBe(true);
+      expect(publicReads()).toEqual([]);
+      expect(reads.size).toBeGreaterThan(0);
+
+      reads.clear();
+      expect(getR1MeetFeedbackConfig().status).toBe('off');
+      expect([...reads]).toEqual(['R1_MEET_ASHBY_FEEDBACK_FORM_ID']);
+
+      reads.clear();
+      expect(getR1MeetPublicConfig().status).toBe('on');
+      for (const name of R1_MEET_PUBLIC_SECRET_VARIABLES) expect(reads.has(name), name).toBe(true);
+    } finally {
+      process.env = real;
+    }
   });
 
   it.each([

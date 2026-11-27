@@ -24,17 +24,25 @@
  * consent page opens with `access_type=offline`, `prompt=consent` (so Google always returns a refresh
  * token), `login_hint` = Dex and the two scopes `calendar.events.owned` + `meetings.space.settings`
  * (+ `meetings.space.created` with `--space` or `R1_MEET_GOOGLE_MEET_MODE=space`). The consent URL
- * holds no secret; it is printed ONLY when no browser could be opened. Exactly one `GET /` carrying
- * `code` or `error` is accepted, its `state` compared in constant time; the browser gets a fixed page
- * that echoes nothing. The code is exchanged at the token endpoint with the verifier; the answer must
- * carry a refresh token and every requested scope (granular consent can drop one). The file gets ONE
- * line `R1_MEET_GOOGLE_OAUTH_REFRESH_TOKEN=<token>`, created exclusively (`wx`) with mode 0600.
+ * holds no secret; it is printed ONLY when no browser could be opened. A `GET /` carrying `code` or
+ * `error` is taken only when its `state` matches (compared in constant time); one with another state
+ * is answered 400 and IGNORED, so a stray or forged request cannot end the run (the wait goes on, and
+ * a run that then times out says `state_mismatch`). Exactly one matching callback is accepted; the
+ * browser gets a fixed page that echoes nothing. The code is exchanged at the token endpoint with the
+ * verifier; the answer must carry a refresh token and every requested scope (granular consent can
+ * drop one). The file gets ONE line `R1_MEET_GOOGLE_OAUTH_REFRESH_TOKEN=<token>`, created
+ * exclusively (`wx`) with mode 0600.
  *
- * Output: a waiting line, the written path, the next commands (`fly secrets import` in PowerShell and
- * bash, then delete the file), or `FAIL <closed word>` lines. NEVER the refresh token, the
- * authorization code, the client secret, the PKCE verifier or an access token, and never an error
- * message. The listener is closed in every case. Exit 0 = written, 1 = the consent or the exchange
- * failed, 2 = usage, a refused `--out` or an invalid input. Never run in CI and never by the API.
+ * The helper CANNOT tell which Google account consented (`login_hint` is only a hint, and the two
+ * scopes carry no identity). So its next steps put the check first: run the live spike with the token
+ * and import it only after `PASS organizer` (the event's organizer is the Dex email).
+ *
+ * Output: a waiting line, the written path, the next commands (load the token into the shell, the
+ * spike, `fly secrets import` in PowerShell and bash, then delete the file), or one
+ * `FAIL <word>` line, the word from `CONSENT_FAIL_WORDS`. NEVER the refresh token, the authorization
+ * code, the client secret, the PKCE verifier or an access token, and never an error message. The
+ * listener is closed in every case. Exit 0 = written, 1 = the consent or the exchange failed, 2 =
+ * usage, a refused `--out` or an invalid input. Never run in CI and never by the API.
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -48,7 +56,7 @@ import {
   getR1MeetGoogleOAuthClientInputs,
   type R1MeetGoogleOAuthClientInputs,
 } from '../src/lib/r1/meet/config.js';
-import { isGoogleError } from '../src/integrations/google/errors.js';
+import { isGoogleError, type GoogleErrorCode } from '../src/integrations/google/errors.js';
 import { GOOGLE_TOKEN_URL, sendGoogleRequest, type GoogleTransport } from '../src/integrations/google/http.js';
 import { GOOGLE_OAUTH_AUTHORIZE_URL, GOOGLE_SCOPES } from '../src/integrations/google/token.js';
 
@@ -82,6 +90,52 @@ export const CONSENT_DEFAULT_TIMEOUT_MS = 300_000;
 const MIN_TIMEOUT_SEC = 30;
 const MAX_TIMEOUT_SEC = 900;
 const SCOPE_PREFIX = 'https://www.googleapis.com/auth/';
+
+/**
+ * Every word a `FAIL <word>` line of this helper can carry, closed (the runbook explains each one;
+ * a test pins that). `scope_missing` is followed by the short name of the scope that was not granted.
+ */
+export const CONSENT_FAIL_WORDS = Object.freeze([
+  'out_parent_missing',
+  'out_exists',
+  'out_inside_git',
+  'out_inside_repo',
+  'invalid_client_id',
+  'invalid_client_secret',
+  'invalid_dex_email',
+  'listener',
+  'timeout',
+  'state_mismatch',
+  'consent_access_denied',
+  'consent_error',
+  'exchange_auth_revoked',
+  'exchange_setup_forbidden',
+  'exchange_quota',
+  'exchange_unavailable',
+  'exchange_timeout',
+  'exchange_malformed_response',
+  'exchange_invalid_request',
+  'no_refresh_token',
+  'scope_missing',
+  'write_failed',
+  'unexpected',
+] as const);
+export type ConsentFailWord = (typeof CONSENT_FAIL_WORDS)[number];
+
+/**
+ * What the token endpoint's answer to the code exchange becomes (the Google client's token-context
+ * map: `invalid_grant` = auth_revoked, any other 4xx = setup_forbidden). Any other code, or a non-Google
+ * failure, is `exchange_unavailable`.
+ */
+const EXCHANGE_FAIL_WORDS: Readonly<Partial<Record<GoogleErrorCode, ConsentFailWord>>> = Object.freeze({
+  auth_revoked: 'exchange_auth_revoked',
+  setup_forbidden: 'exchange_setup_forbidden',
+  quota: 'exchange_quota',
+  unavailable: 'exchange_unavailable',
+  timeout: 'exchange_timeout',
+  malformed_response: 'exchange_malformed_response',
+  invalid_request: 'exchange_invalid_request',
+});
 
 const USAGE =
   'usage: npx tsx scripts/m035-google-oauth-consent.ts --out=<file outside any git checkout> ' +
@@ -183,7 +237,7 @@ function realDirectory(directory: string): string | null {
 }
 
 /** The absolute target path, or the closed word of the refusal (R13). Touches nothing. */
-function checkOutPath(raw: string, repoRoot: string | null): { path: string } | { refused: string } {
+function checkOutPath(raw: string, repoRoot: string | null): { path: string } | { refused: ConsentFailWord } {
   const target = path.resolve(raw);
   const parent = path.dirname(target);
   const realParent = realDirectory(parent);
@@ -264,17 +318,20 @@ type ConsentCallback =
 interface Listener {
   server: Server;
   port: number;
-  /** Resolves with the first `GET /` that carries `code` or `error`. */
+  /** Resolves with the first `GET /` that carries `code` or `error` AND the expected `state`. */
   callback: Promise<ConsentCallback>;
+  /** Whether a callback with another `state` was answered and ignored. */
+  sawStateMismatch(): boolean;
 }
 
-function startListener(): Promise<Listener> {
+function startListener(expectedState: string): Promise<Listener> {
   let settle: (value: ConsentCallback) => void = () => {};
   const callback = new Promise<ConsentCallback>((resolve) => {
     settle = resolve;
   });
   let expectedHost = '';
   let accepted = false;
+  let mismatched = false;
 
   const handle = (req: IncomingMessage, res: ServerResponse): void => {
     const reply = (status: number, html: string): void => {
@@ -297,8 +354,13 @@ function startListener(): Promise<Listener> {
       const error = url.searchParams.get('error');
       if (code === null && error === null) return reply(400, PAGE_IGNORED);
       if (accepted) return reply(409, PAGE_ALREADY);
-      accepted = true;
+      // Not Google's answer to THIS run: ignored, so it cannot end the run (the wait goes on).
       const state = url.searchParams.get('state') ?? '';
+      if (!sameState(expectedState, state)) {
+        mismatched = true;
+        return reply(400, PAGE_IGNORED);
+      }
+      accepted = true;
       if (error !== null) {
         reply(200, PAGE_NOT_COMPLETED);
         settle({ kind: 'error', error, state });
@@ -318,7 +380,7 @@ function startListener(): Promise<Listener> {
       server.off('error', reject);
       const port = (server.address() as AddressInfo).port;
       expectedHost = `127.0.0.1:${port}`;
-      resolve({ server, port, callback });
+      resolve({ server, port, callback, sawStateMismatch: () => mismatched });
     });
   });
 }
@@ -352,13 +414,19 @@ function resolveTimeoutMs(args: ConsentArgs, deps: ConsentDeps): number {
 
 // ── The run ─────────────────────────────────────────────────────────────────
 
-/** A closed outcome word; the run prints `FAIL <word>` and returns the exit code. */
+/** A closed outcome word; the run prints `FAIL <word>[ <detail>]` and returns the exit code. */
 class ConsentFailure extends Error {
   constructor(
-    readonly word: string,
+    readonly word: ConsentFailWord,
     readonly exitCode: 1 | 2,
+    /** Only for `scope_missing`: the short name of the scope (no secret, no value). */
+    readonly detail: string | null = null,
   ) {
     super('consent_failure');
+  }
+
+  get line(): string {
+    return this.detail === null ? `FAIL ${this.word}` : `FAIL ${this.word} ${this.detail}`;
   }
 }
 
@@ -383,7 +451,7 @@ export async function runConsent(argv: string[], deps: ConsentDeps = {}): Promis
   try {
     return await consent(args, deps, target.path, out);
   } catch (error) {
-    out(`FAIL ${error instanceof ConsentFailure ? error.word : 'unexpected'}`);
+    out(error instanceof ConsentFailure ? error.line : 'FAIL unexpected');
     return error instanceof ConsentFailure ? error.exitCode : 1;
   }
 }
@@ -434,10 +502,13 @@ async function consent(
 
   let listener: Listener;
   try {
-    listener = await startListener();
+    listener = await startListener(state);
   } catch {
     throw new ConsentFailure('listener', 1);
   }
+  // A run that times out after ignoring a callback with another state says so.
+  const timedOutFailure = (): ConsentFailure =>
+    new ConsentFailure(listener.sawStateMismatch() ? 'state_mismatch' : 'timeout', 1);
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const redirectUri = `http://127.0.0.1:${listener.port}`;
@@ -466,7 +537,7 @@ async function consent(
         .then(() => openUrl(consentUrl))
         .then((value) => value === true, () => false);
       const result = await Promise.race([attempt, timedOut]);
-      if (result === 'timeout') throw new ConsentFailure('timeout', 1);
+      if (result === 'timeout') throw timedOutFailure();
       opened = result;
     }
     if (opened) {
@@ -478,7 +549,8 @@ async function consent(
     out(`Waiting up to ${Math.ceil(timeoutMs / 1000)} s for Google to return to 127.0.0.1 ...`);
 
     const answer = await Promise.race([listener.callback, timedOut]);
-    if (answer === 'timeout') throw new ConsentFailure('timeout', 1);
+    if (answer === 'timeout') throw timedOutFailure();
+    // The listener only settles on the expected state; checked again here, in constant time.
     if (!sameState(state, answer.state)) throw new ConsentFailure('state_mismatch', 1);
     if (answer.kind === 'error') {
       throw new ConsentFailure(answer.error === 'access_denied' ? 'consent_access_denied' : 'consent_error', 1);
@@ -509,9 +581,23 @@ async function consent(
     }
 
     out(`Wrote the Dex refresh token (one ${CONSENT_ENV_NAME} line) to: ${outFile}`);
-    out(`Next, PowerShell: Get-Content -Raw ${psQuote(outFile)} | fly secrets import -a ${CONSENT_FLY_APP}`);
-    out(`Next, bash: fly secrets import -a ${CONSENT_FLY_APP} < ${shQuote(outFile)}`);
-    out(`Then delete the file: Remove-Item ${psQuote(outFile)} (bash: rm -f ${shQuote(outFile)})`);
+    // login_hint is only a hint: the grant may belong to whoever was signed in. Check before import.
+    out(
+      'Check it FIRST: this helper cannot tell which Google account gave consent. Run the live spike with this token ' +
+        '(runbook: "The Google half of the live spike") and import it ONLY after the spike prints PASS organizer.',
+    );
+    out(
+      `1. Load it into this shell without printing it, PowerShell: Get-Content ${psQuote(outFile)} | ` +
+        `ForEach-Object { $n, $v = $_ -split '=', 2; Set-Item "env:$n" $v } (bash: set -a; . ${shQuote(outFile)}; set +a); ` +
+        'the spike also needs the client secret in the shell, typed without echo (runbook)',
+    );
+    out(
+      `2. With M035_GOOGLE_SPIKE_LIVE=yes: npx tsx scripts/m035-google-spike.ts --live${args.space || inputs.meetMode === 'space' ? ' --space' : ''} ` +
+        '(FAIL organizer mismatch = not Dex: delete the file and run this helper again, signed in as Dex)',
+    );
+    out(`3. After PASS organizer, PowerShell: Get-Content -Raw ${psQuote(outFile)} | fly secrets import -a ${CONSENT_FLY_APP}`);
+    out(`   After PASS organizer, bash: fly secrets import -a ${CONSENT_FLY_APP} < ${shQuote(outFile)}`);
+    out(`4. Then delete the file: Remove-Item ${psQuote(outFile)} (bash: rm -f ${shQuote(outFile)})`);
     return 0;
   } finally {
     if (timer !== undefined) clearTimeout(timer);
@@ -559,7 +645,7 @@ async function exchange(input: ExchangeInput): Promise<string> {
     );
     json = result.json;
   } catch (error) {
-    throw new ConsentFailure(`exchange_${isGoogleError(error) ? error.code : 'unavailable'}`, 1);
+    throw new ConsentFailure((isGoogleError(error) ? EXCHANGE_FAIL_WORDS[error.code] : undefined) ?? 'exchange_unavailable', 1);
   }
   const answer = typeof json === 'object' && json !== null && !Array.isArray(json) ? (json as Record<string, unknown>) : {};
   const refreshToken = answer.refresh_token;
@@ -568,7 +654,7 @@ async function exchange(input: ExchangeInput): Promise<string> {
   }
   const granted = new Set(typeof answer.scope === 'string' ? answer.scope.split(/\s+/).filter((item) => item !== '') : []);
   for (const scope of input.scopes) {
-    if (!granted.has(scope)) throw new ConsentFailure(`scope_missing ${shortScope(scope)}`, 1);
+    if (!granted.has(scope)) throw new ConsentFailure('scope_missing', 1, shortScope(scope));
   }
   return refreshToken;
 }

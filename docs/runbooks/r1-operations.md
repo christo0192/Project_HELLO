@@ -4432,9 +4432,12 @@ OAuth grant. No domain-wide delegation in the company Workspace: it could act as
   configuration reads `on`, which also needs `R1_ENABLED`, `R1_MEET_ENABLED` and
   `R1_MEET_SERVICE_USER_ID`. `R1_MEET_GOOGLE_LOGIN_GROUP_ID` is NOT required: unset means the guest bot,
   the default.
-- **Nothing reads the new variables at runtime** until S05/S06 ship. A bad value only makes the public
-  configuration `invalid`; it never changes what the Meet configuration answers, so it never stops bots
-  for existing bookings.
+- **Nothing reads the new variables at runtime** until S05/S06 ship: only the public reader
+  (`getR1MeetPublicConfig`) and the Google drain reader read them, and nothing calls those yet. The M034
+  Meet readers (`getR1MeetConfig`, the feedback reader) read none of them, so the Google secrets are never
+  copied on the path of existing Meet bookings. A bad value only makes the public configuration
+  `invalid`; it never changes what the Meet configuration answers, so it never stops bots for existing
+  bookings.
 - **Three new Fly secrets** on `project-hello-api` only: `R1_MEET_GOOGLE_OAUTH_CLIENT_SECRET`,
   `R1_MEET_GOOGLE_OAUTH_REFRESH_TOKEN` and, for the alternative mode only, `R1_MEET_GOOGLE_SA_KEY_B64`.
   Nobody pastes a value into a chat, a ticket, a PR, a test or a log; `.env.example` keeps `replace_me`.
@@ -4502,21 +4505,54 @@ npx tsx scripts/m035-google-oauth-consent.ts --out="$HOME/Downloads/dex-google.e
   secret).
 - In the browser: sign in as Dex if asked, and allow both permissions. A consent page that offers
   checkboxes must have every box ticked, or the helper answers `FAIL scope_missing <scope>`.
-- The helper prints only the file path, the import commands and the delete command, or one
-  `FAIL <word>` line. It never prints the token, the code, the client secret or an access token. The
-  file holds ONE line, `R1_MEET_GOOGLE_OAUTH_REFRESH_TOKEN=<token>`, mode 600 where the system has it.
-- `FAIL consent_access_denied`: the user pressed Cancel. `FAIL state_mismatch` or `FAIL consent_error`:
-  start again. `FAIL exchange_setup_forbidden`: a wrong client id or secret, or API controls block the
-  client. `FAIL no_refresh_token`: run it again (it always asks with `prompt=consent`). `FAIL timeout`:
-  nobody came back within 5 minutes (`--timeout-sec=30..900`).
+- **The helper cannot tell which Google account gave consent.** `login_hint` only pre-selects Dex, and
+  the two scopes carry no identity: if the browser profile is signed in as someone else and that account
+  is picked, the token is that person's grant. So the token is checked with the spike (step 1 below)
+  BEFORE it goes to Fly, and imported only after `PASS organizer`.
+- The helper prints only the file path, the check-first line and the next commands (load, spike, import,
+  delete), or one `FAIL <word>` line. It never prints the token, the code, the client secret or an access
+  token. The file holds ONE line, `R1_MEET_GOOGLE_OAUTH_REFRESH_TOKEN=<token>`, mode 600 where the system
+  has it.
+- Only Google's answer to THIS run is taken: a request to the helper's port with another `state` (a stale
+  tab, another program) is answered "Not found." and ignored, and the helper keeps waiting.
+
+Every `FAIL` word the helper can print (exit 2 = fix the command or the input; exit 1 = the consent or
+the exchange failed; nothing is written in either case):
+
+| Line | Meaning and what to do |
+|---|---|
+| `FAIL out_parent_missing` | The folder of `--out` does not exist: create it or pick another. |
+| `FAIL out_exists` | `--out` already exists (file or folder): pick a new name; the existing one is not touched. |
+| `FAIL out_inside_git` / `FAIL out_inside_repo` | `--out` lies inside a git checkout (or this repository): use a folder outside every checkout, such as Downloads. |
+| `FAIL invalid_client_id` / `FAIL invalid_client_secret` / `FAIL invalid_dex_email` | The value from the shell or the prompt is missing, `replace_me` or malformed (the API's own rules): set or type it again. |
+| `FAIL listener` | The helper could not listen on 127.0.0.1: close what blocks loopback ports and run again. |
+| `FAIL timeout` | Google did not come back within 5 minutes (`--timeout-sec=30..900`): run again and finish the consent page. |
+| `FAIL state_mismatch` | The only answers that came back belonged to another run (an old consent tab): close old tabs and run again. |
+| `FAIL consent_access_denied` | Cancel was pressed on the consent page: run again and allow access. |
+| `FAIL consent_error` | Google returned an error instead of a code (or an unusable code): run again. |
+| `FAIL exchange_auth_revoked` | Google refused THIS authorization code (`invalid_grant`): it was already used, it expired (codes live minutes), or the PKCE check failed. Dex's existing grant is NOT affected: just run the helper again. |
+| `FAIL exchange_setup_forbidden` | A wrong client id or secret, a client that is not a Desktop app, or API controls block the client for the Dex unit: fix that, then run again. |
+| `FAIL exchange_unavailable` / `FAIL exchange_timeout` / `FAIL exchange_quota` | Google's token endpoint was down, slow or busy: wait a minute and run again. |
+| `FAIL exchange_malformed_response` | The token endpoint answered something unreadable (often a proxy or captive portal): check the network and run again. |
+| `FAIL exchange_invalid_request` | The helper refused its own request before sending it: a bug, tell the team. |
+| `FAIL no_refresh_token` | Google sent no refresh token: run it again (it always asks with `prompt=consent`). |
+| `FAIL scope_missing <scope>` | A permission box was left unticked: run again and allow every permission. |
+| `FAIL write_failed` | The file could not be created (permissions, disk, or it appeared meanwhile): pick another `--out` and run again. |
+| `FAIL unexpected` | Anything else: run again; if it repeats, tell the team. |
 
 Next, in this order:
 
-1. Run the Google half of the live spike with this token (next section), from the same shell. To load
-   the token into the shell without echoing it:
-   PowerShell `Get-Content '<file>' | ForEach-Object { $n, $v = $_ -split '=', 2; Set-Item "env:$n" $v }`;
-   bash `set -a; . '<file>'; set +a`.
-2. In the deploy window, import the token into Fly from the file:
+1. **Prove the token is Dex's before anything else**: run the Google half of the live spike with this
+   token (next section), from the same shell, and go on ONLY after it prints `PASS organizer`.
+   `FAIL organizer mismatch` = the grant belongs to whoever was signed in: delete the file, and run the
+   helper again in a browser profile signed in as Dex. To load the token into the shell without echoing
+   it: PowerShell `Get-Content '<file>' | ForEach-Object { $n, $v = $_ -split '=', 2; Set-Item "env:$n" $v }`;
+   bash `set -a; . '<file>'; set +a`. The spike also needs the client secret in the shell, typed without
+   echo: PowerShell
+   `$env:R1_MEET_GOOGLE_OAUTH_CLIENT_SECRET = [Net.NetworkCredential]::new('', (Read-Host -AsSecureString 'client secret')).Password`;
+   bash `read -rs R1_MEET_GOOGLE_OAUTH_CLIENT_SECRET; export R1_MEET_GOOGLE_OAUTH_CLIENT_SECRET` (type it
+   and press Enter; nothing is shown).
+2. Only after `PASS organizer`, in the deploy window, import the token into Fly from the file:
    PowerShell `Get-Content -Raw '<file>' | fly secrets import -a project-hello-api`;
    bash `fly secrets import -a project-hello-api < '<file>'`.
 3. Set the other values the way the M034 secrets are set (R1 over Google Meet, `### Secrets` above):
@@ -4586,7 +4622,9 @@ unused for 6 months, when the account passes 100 live tokens for this client, or
 blocks the scopes (`admin_policy_enforced`). The API then fails closed: Google answers `invalid_grant`,
 the client reports `auth_revoked` (alert `r1_meet_public_google_auth_failed`), bookings answer
 "temporarily unavailable", existing events are not touched, and the token endpoint is not retried in a
-loop (one try a minute at most).
+loop: one try a minute at most per API machine, however many bookings and jobs arrive, because the API
+holds ONE process-wide Google client (`getR1MeetGoogle`) whose token cache and 60 s refusal window every
+request and job share.
 
 1. Mint a new token with the helper (above), signed in as Dex.
 2. Run the spike dry, then live, with the new token from the local shell.

@@ -15,8 +15,13 @@
  */
 import { generateKeyPairSync } from 'node:crypto';
 import { inspect } from 'node:util';
-import { describe, expect, it } from 'vitest';
-import { createR1MeetGoogle, r1MeetGoogleScopes } from '../integrations/google/client.js';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import {
+  createR1MeetGoogle,
+  getR1MeetGoogle,
+  r1MeetGoogleScopes,
+  resetR1MeetGoogleCache,
+} from '../integrations/google/client.js';
 import { GoogleError } from '../integrations/google/errors.js';
 import {
   GOOGLE_CALENDAR_EVENTS_URL,
@@ -27,7 +32,11 @@ import {
   type GoogleTransport,
   type GoogleTransportRequest,
 } from '../integrations/google/http.js';
-import { GOOGLE_JWT_BEARER_GRANT_TYPE, GOOGLE_SCOPES } from '../integrations/google/token.js';
+import {
+  GOOGLE_JWT_BEARER_GRANT_TYPE,
+  GOOGLE_SCOPES,
+  GOOGLE_TOKEN_REFUSAL_WINDOW_MS,
+} from '../integrations/google/token.js';
 import {
   getR1MeetPublicDrainConfig,
   type R1MeetGoogleEnvSource,
@@ -70,13 +79,13 @@ const saKeyB64 = (): string =>
     }),
   ).toString('base64');
 
-function oauthSettings(): R1MeetGoogleSettings {
+function oauthSettings(refreshToken: string = FAKE_GOOGLE_REFRESH_TOKEN): R1MeetGoogleSettings {
   const source: R1MeetGoogleEnvSource = {
     R1_MEET_GOOGLE_DEX_EMAIL: FAKE_GOOGLE_DEX_EMAIL,
     R1_MEET_GOOGLE_OAUTH_CLIENT_ID: FAKE_GOOGLE_CLIENT_ID,
   };
   source['R1_MEET_GOOGLE_OAUTH_CLIENT_SECRET'] = FAKE_GOOGLE_CLIENT_SECRET;
-  source['R1_MEET_GOOGLE_OAUTH_REFRESH_TOKEN'] = FAKE_GOOGLE_REFRESH_TOKEN;
+  source['R1_MEET_GOOGLE_OAUTH_REFRESH_TOKEN'] = refreshToken;
   const drain = getR1MeetPublicDrainConfig(source);
   if (!drain.available || drain.google.authMode !== 'oauth_refresh') throw new Error('expected oauth settings');
   return drain.google;
@@ -350,6 +359,132 @@ describe('createR1MeetGoogle: end to end against the fake (calendar mode)', () =
     const space = await google.meet.getSpace(event.conferenceId!);
     expect(space).not.toBeNull();
     expect(fake.tokensIssued).toHaveLength(2);
+  });
+});
+
+describe('getR1MeetGoogle: one process-wide instance, so the token cache and the refusal window hold per process', () => {
+  beforeEach(() => resetR1MeetGoogleCache());
+  afterEach(() => resetR1MeetGoogleCache());
+
+  /** What S05/S06 do: stable module-level seams, and settings read afresh per request or job. */
+  function processRig() {
+    const clock = { t: T0 };
+    const fake = createFakeGoogle({
+      serviceAccount: { clientEmail: FAKE_GOOGLE_SA_EMAIL, publicKey: PAIR.publicKey },
+      grantedScopes: SPACE_SCOPES,
+      now: () => clock.t,
+    });
+    const requests: GoogleTransportRequest[] = [];
+    const transport = recording(fake, requests);
+    const now = () => clock.t;
+    const logs: GoogleLogRecord[] = [];
+    const logger = { event: (record: GoogleLogRecord) => logs.push(record) };
+    const get = (settings: R1MeetGoogleSettings, meetMode: 'calendar' | 'space' = 'calendar') =>
+      getR1MeetGoogle({ settings, meetMode, transport, now, logger });
+    const tokenCalls = () => requests.filter((req) => req.url === GOOGLE_TOKEN_URL).length;
+    return { clock, fake, requests, logs, transport, now, logger, get, tokenCalls };
+  }
+
+  it('fresh settings per request give back the SAME instance: many bookings mint one token', async () => {
+    for (const build of [oauthSettings, serviceAccountSettings]) {
+      resetR1MeetGoogleCache();
+      const r = processRig();
+      const first = r.get(build());
+      expect(r.get(build())).toBe(first);
+      expect(r.requests).toHaveLength(0);
+      for (let booking = 0; booking < 5; booking += 1) {
+        expect(await r.get(build()).calendar.getEvent(EVENT_ID)).toBeNull();
+      }
+      expect(r.fake.tokensIssued).toHaveLength(1);
+      expect(r.tokenCalls()).toBe(1);
+    }
+  });
+
+  it('a dead grant costs ONE token-endpoint call (and one failure record) a minute for the whole process', async () => {
+    const r = processRig();
+    r.fake.revokeRefreshToken();
+    for (let booking = 0; booking < 10; booking += 1) {
+      const error = await rejection(r.get(oauthSettings()).calendar.getEvent(EVENT_ID));
+      expect(error.code).toBe('auth_revoked');
+    }
+    expect(r.tokenCalls()).toBe(1);
+    expect(r.requests).toHaveLength(1);
+    expect(r.logs.filter((record) => record.operation === 'token.refresh')).toHaveLength(1);
+
+    // A minute later the process tries once more, and only once.
+    r.clock.t += GOOGLE_TOKEN_REFUSAL_WINDOW_MS;
+    for (let booking = 0; booking < 3; booking += 1) {
+      expect((await rejection(r.get(oauthSettings()).meet.getSpace('abc-defg-hij'))).code).toBe('auth_revoked');
+    }
+    expect(r.tokenCalls()).toBe(2);
+  });
+
+  it('createR1MeetGoogle, by contrast, builds a new cache on every call (owner scripts and tests only)', async () => {
+    const r = processRig();
+    r.fake.revokeRefreshToken();
+    for (let booking = 0; booking < 3; booking += 1) {
+      const google = createR1MeetGoogle({ settings: oauthSettings(), meetMode: 'calendar', transport: r.transport, now: r.now });
+      expect((await rejection(google.calendar.getEvent(EVENT_ID))).code).toBe('auth_revoked');
+    }
+    expect(r.tokenCalls()).toBe(3);
+  });
+
+  it('another credential, Meet mode or seam gives a new instance; the one slot keeps only the latest', () => {
+    const r = processRig();
+    const calendar = r.get(oauthSettings());
+    const space = r.get(oauthSettings(), 'space');
+    expect(space).not.toBe(calendar);
+    expect(r.get(oauthSettings(), 'space')).toBe(space);
+    // One slot: the calendar-mode instance was replaced, so asking again builds a new one.
+    const again = r.get(oauthSettings());
+    expect(again).not.toBe(calendar);
+    expect(r.get(oauthSettings())).toBe(again);
+
+    const rotated = r.get(oauthSettings('rt-' + 'q'.repeat(40)));
+    expect(rotated).not.toBe(again);
+    expect(r.get(serviceAccountSettings())).not.toBe(rotated);
+
+    const settings = oauthSettings();
+    const base = r.get(settings);
+    expect(getR1MeetGoogle({ settings, meetMode: 'calendar', transport: r.transport, now: r.now })).not.toBe(base);
+    const otherTransport = recording(r.fake, []);
+    const withOther = getR1MeetGoogle({ settings, meetMode: 'calendar', transport: otherTransport, now: r.now, logger: r.logger });
+    expect(withOther).not.toBe(base);
+    expect(getR1MeetGoogle({ settings, meetMode: 'calendar', transport: otherTransport, now: r.now, logger: r.logger, timeoutMs: 5_000 })).not.toBe(
+      withOther,
+    );
+    expect(r.requests).toHaveLength(0);
+  });
+
+  it('refuses what createR1MeetGoogle refuses, synchronously and with zero calls, and keeps the cached instance', () => {
+    const r = processRig();
+    const kept = r.get(oauthSettings());
+    const oauth = oauthSettings();
+    for (const bad of [
+      undefined,
+      null,
+      { settings: { ...oauth }, meetMode: 'calendar', transport: r.transport },
+      { settings: JSON.parse(JSON.stringify(serviceAccountSettings())), meetMode: 'calendar', transport: r.transport },
+      { settings: { ...oauth, authMode: 'dwd' }, meetMode: 'calendar', transport: r.transport },
+      { settings: oauth, meetMode: 'both', transport: r.transport, now: r.now, logger: r.logger },
+      { settings: oauth, meetMode: 'calendar', transport: 'fetch', now: r.now, logger: r.logger },
+    ] as unknown[]) {
+      expect(() => getR1MeetGoogle(bad as never)).toThrow(GoogleError);
+    }
+    expect(r.get(oauthSettings())).toBe(kept);
+    expect(r.requests).toHaveLength(0);
+  });
+
+  it('the process-wide instance shows no secret', async () => {
+    const r = processRig();
+    const google = r.get(oauthSettings());
+    await google.calendar.getEvent(EVENT_ID);
+    const texts = [inspect(google, { depth: 5, showHidden: true }), JSON.stringify(google), JSON.stringify(r.logs)];
+    for (const text of texts) {
+      for (const canary of [FAKE_GOOGLE_CLIENT_SECRET, FAKE_GOOGLE_REFRESH_TOKEN, ...r.fake.tokensIssued]) {
+        expect(text).not.toContain(canary);
+      }
+    }
   });
 });
 

@@ -18,11 +18,18 @@
  * - Scopes: `calendar.events.owned` + `meetings.space.settings` in calendar mode, plus
  *   `meetings.space.created` in space mode, for BOTH auth modes. The refresh grant sends no scope (it
  *   gets what the refresh token was granted); its answer must list every one, else `setup_forbidden`.
- * - ONE token source is shared by the Calendar and the Meet clients, so a booking mints one token.
+ * - ONE token source is shared by the Calendar and the Meet clients of one instance.
+ * - The token cache and the 60 s refusal window live in that ONE instance. The API therefore uses
+ *   `getR1MeetGoogle` (S05/S06 MUST): one process-wide instance per credential set, so every request
+ *   and job of the process shares one cached token, and a dead grant costs at most one token-endpoint
+ *   call (and one `r1_meet_public_google_auth_failed` alert) a minute per process, however many
+ *   bookings or jobs arrive. `createR1MeetGoogle` builds a NEW cache on every call: for the owner's
+ *   scripts and tests only.
  * - Construction makes no network call and mints no token; a bad setting throws
  *   `GoogleError('invalid_request')` synchronously.
  */
 
+import { createHash } from 'node:crypto';
 import type { R1MeetGoogleSettings } from '../../lib/r1/meet/config.js';
 import { createGoogleCalendarClient, type GoogleCalendarClient } from './calendar.js';
 import { GoogleError } from './errors.js';
@@ -126,4 +133,73 @@ export function createR1MeetGoogle(o: R1MeetGoogleOptions): R1MeetGoogle {
     calendar: createGoogleCalendarClient(shared),
     meet: createGoogleMeetClient({ ...shared, meetMode }),
   });
+}
+
+// ── The process-wide instance (what the API uses) ───────────────────────────
+
+interface SharedR1MeetGoogle {
+  signature: string;
+  transport: GoogleTransport | undefined;
+  now: (() => number) | undefined;
+  logger: GoogleClientLogger | undefined;
+  google: R1MeetGoogle;
+}
+
+let processWide: SharedR1MeetGoogle | null = null;
+
+/**
+ * A hash of everything that shapes an instance: the auth mode, Dex's email, the chosen mode's
+ * credentials, the Meet mode and the two bounds. The secrets are hashed, so they are never held in a
+ * second place or compared as text (the `lib/r1/recording/store-factory.ts` rule). Null when the
+ * options are not usable; then `createR1MeetGoogle` refuses them.
+ */
+function signatureOf(o: R1MeetGoogleOptions): string | null {
+  if (typeof o !== 'object' || o === null) return null;
+  const raw: unknown = o.settings;
+  if (typeof raw !== 'object' || raw === null) return null;
+  const settings = raw as Readonly<Record<string, unknown>>;
+  const parts: unknown[] = [settings.authMode, settings.dexEmail, o.meetMode, o.timeoutMs ?? null, o.maxResponseBytes ?? null];
+  if (settings.authMode === 'oauth_refresh') {
+    parts.push(settings.clientId, settings.clientSecret, settings.refreshToken);
+  } else if (settings.authMode === 'service_account') {
+    parts.push(settings.clientEmail, settings.privateKeyId, settings.privateKey);
+  } else {
+    return null;
+  }
+  if (!parts.every((part) => part === null || typeof part === 'string' || typeof part === 'number')) return null;
+  return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+}
+
+/**
+ * The process-wide Google client for Dex. S05/S06 call THIS on every request or job (with
+ * `getR1MeetPublicConfig().google` or the drain config's), never `createR1MeetGoogle`: the same
+ * credentials, Meet mode, bounds and seams give back the SAME instance, so one token is cached and the
+ * 60 s refusal window after `auth_revoked` / `setup_forbidden` holds for the whole process.
+ *
+ * One slot: a different credential set (a rotated secret: in production a Fly secret change, which
+ * restarts the machine anyway) replaces the instance, so an old secret is never kept. The seams
+ * (`transport`, `now`, `logger`) are compared by identity: pass stable, module-level functions (a
+ * per-request logger closure would rebuild the instance on every call and lose the cache). Throws
+ * `GoogleError('invalid_request')` synchronously, with zero network, exactly like `createR1MeetGoogle`.
+ */
+export function getR1MeetGoogle(o: R1MeetGoogleOptions): R1MeetGoogle {
+  const signature = signatureOf(o);
+  if (
+    signature !== null &&
+    processWide !== null &&
+    processWide.signature === signature &&
+    processWide.transport === o.transport &&
+    processWide.now === o.now &&
+    processWide.logger === o.logger
+  ) {
+    return processWide.google;
+  }
+  const google = createR1MeetGoogle(o);
+  if (signature !== null) processWide = { signature, transport: o.transport, now: o.now, logger: o.logger, google };
+  return google;
+}
+
+/** Test seam: forget the process-wide instance. */
+export function resetR1MeetGoogleCache(): void {
+  processWide = null;
 }
