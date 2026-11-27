@@ -1,7 +1,7 @@
 /**
  * Offline checks for the public booking pages (M035 S07): `/book`, the one link the hiring team
- * sends every candidate to register and book a first-round interview with Dex on Google Meet,
- * and `/book/manage#m=<token>`, the link in Dex's invite to move, cancel or agree again.
+ * sends every candidate to register and book a first-round interview with Lexy on Google Meet,
+ * and `/book/manage#m=<token>`, the link in Lexy's invite to move, cancel or agree again.
  *
  * The app under test is the REAL app on the Vite dev server, signed OUT like a candidate's
  * browser. Only the booking API is faked (fixtures/r1-book-api.ts, the shapes and words of
@@ -39,7 +39,7 @@ import {
   bookSlotStart,
 } from './fixtures/r1-book-api';
 
-const FORM_TITLE = 'Book your interview with Dex';
+const FORM_TITLE = 'Book your interview with Lexy';
 const BOOKED_TITLE = 'Your interview is booked';
 /** One submit waits up to 3.5 s for the grid's minimum age before it posts. */
 const AFTER_SUBMIT = { timeout: 15_000 };
@@ -190,7 +190,7 @@ test.describe('the booking page (/book)', () => {
     await expect(page.locator('.r1-book__when')).toContainText('10:00–10:45 IST');
     await expect(
       page.getByText(
-        "Dex's calendar invite is on its way to the email address on your application. It has the Google Meet link for your interview.",
+        "Lexy's calendar invite is on its way to the email address on your application. It has the Google Meet link for your interview.",
       ),
     ).toBeVisible();
     await expect(page.getByText('If you do not see it soon, check your spam or junk folder.')).toBeVisible();
@@ -283,7 +283,7 @@ test.describe('the manage page (/book/manage)', () => {
   test('the link opens the booking, strips itself, and cancels with the consent withdrawn', async ({ book }, testInfo) => {
     const { page } = book;
     await openManage(book);
-    await expect(heading(page, 'Your interview with Dex')).toBeVisible();
+    await expect(heading(page, 'Your interview with Lexy')).toBeVisible();
     // The token left the address bar at once and travelled in one body only.
     expect(page.url()).toMatch(/\/book\/manage$/);
     expect(requestLines(book)).toEqual([`POST ${ROUTES.manage}`]);

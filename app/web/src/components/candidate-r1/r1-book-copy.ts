@@ -1,5 +1,5 @@
 /**
- * Wording for the public Dex booking pages, `/book` and `/book/manage` (M035 S07, decision
+ * Wording for the public Lexy booking pages, `/book` and `/book/manage` (M035 S07, decision
  * D-S07-M22; the exact strings of S07-PLAN.md section 5).
  *
  * Reviewed copy, plain English, sentence case. It:
@@ -45,13 +45,13 @@ const FIELD_ERRORS: Readonly<Record<BookFieldError, string>> = Object.freeze({
 /** `/book`: register and book a slot. */
 export const R1_BOOK_COPY = Object.freeze({
   /** The browser tab (WCAG 2.4.2): never the recruiter tool's title. */
-  pageTitle: 'Book your interview with Dex · Interview Kickstart',
+  pageTitle: 'Book your interview with Lexy · Interview Kickstart',
   form: Object.freeze({
     eyebrow: 'Interview booking',
-    title: 'Book your interview with Dex',
+    title: 'Book your interview with Lexy',
     intro:
-      "Dex is Interview Kickstart's AI interviewer. Pick a time for your first-round interview "
-      + 'on Google Meet. Dex will send a calendar invite with the Meet link to the email address '
+      "Lexy is Interview Kickstart's AI interviewer. Pick a time for your first-round interview "
+      + 'on Google Meet. Lexy will send a calendar invite with the Meet link to the email address '
       + 'on your application.',
     detailsLegend: 'Your details',
     detailsHint: 'Use the details from your application so we can find it.',
@@ -115,7 +115,7 @@ export const R1_BOOK_COPY = Object.freeze({
       eyebrow: 'Interview booked',
       title: 'Your interview is booked',
       body:
-        "Dex's calendar invite is on its way to the email address on your application. It has "
+        "Lexy's calendar invite is on its way to the email address on your application. It has "
         + 'the Google Meet link for your interview.',
       spam: 'If you do not see it soon, check your spam or junk folder.',
       change: 'To change or cancel your interview, use the link in the invite.',
@@ -123,7 +123,7 @@ export const R1_BOOK_COPY = Object.freeze({
     alreadyBooked: card({
       eyebrow: 'Already booked',
       title: 'You already have an interview booked',
-      body: 'To change or cancel it, use the link in your calendar invite from Dex.',
+      body: 'To change or cancel it, use the link in your calendar invite from Lexy.',
     }),
     notFound: card({
       eyebrow: 'Interview booking',
@@ -143,14 +143,14 @@ export const R1_BOOK_COPY = Object.freeze({
     }),
     /**
      * An outcome the server may have acted on (a dropped request, a gateway error, a malformed
-     * answer): the booking may be made and Dex's invite on its way, so never say it failed.
+     * answer): the booking may be made and Lexy's invite on its way, so never say it failed.
      * "Try again" with the same details replays the first booking instead of making a second.
      */
     uncertain: card({
       eyebrow: 'Interview booking',
       title: 'We could not confirm your booking',
       body:
-        'Your interview may already be booked. Check for an invite from Dex at the email address '
+        'Your interview may already be booked. Check for an invite from Lexy at the email address '
         + 'on your application before you try again.',
       action: 'Try again',
       back: 'Back to my details',
@@ -161,19 +161,19 @@ export const R1_BOOK_COPY = Object.freeze({
 /** `/book/manage`: move, cancel or re-consent from the link in the invite. */
 export const R1_BOOK_MANAGE_COPY = Object.freeze({
   /** The browser tab (WCAG 2.4.2): never the recruiter tool's title. */
-  pageTitle: 'Manage your interview with Dex · Interview Kickstart',
+  pageTitle: 'Manage your interview with Lexy · Interview Kickstart',
   loading: 'Loading your interview…',
   inactive: card({
     eyebrow: 'Manage your interview',
     title: 'This link is no longer active',
     body:
       'It may have been replaced by a newer invite, or the interview has already taken place. '
-      + 'Use the link in your most recent invite from Dex, or reply to the email from the hiring '
+      + 'Use the link in your most recent invite from Lexy, or reply to the email from the hiring '
       + 'team.',
   }),
   view: Object.freeze({
     eyebrow: 'Manage your interview',
-    title: 'Your interview with Dex',
+    title: 'Your interview with Lexy',
     join: 'Join from the Google Meet link in your calendar invite.',
     move: 'Change the time',
     cancel: 'Cancel my interview',
@@ -194,7 +194,7 @@ export const R1_BOOK_MANAGE_COPY = Object.freeze({
   moved: card({
     eyebrow: 'Interview moved',
     title: 'Your interview has moved',
-    body: 'Dex will send an updated calendar invite to the email address on your application.',
+    body: 'Lexy will send an updated calendar invite to the email address on your application.',
     next: 'Use the link in that invite if you need to make another change.',
   }),
   cancelPanel: Object.freeze({
@@ -240,7 +240,7 @@ export const R1_BOOK_MANAGE_COPY = Object.freeze({
   uncertain: card({
     eyebrow: 'Temporarily unavailable',
     title: 'We could not confirm your change',
-    body: 'Check your email for an update from Dex before you try again.',
+    body: 'Check your email for an update from Lexy before you try again.',
     action: 'Try again',
   }),
 });

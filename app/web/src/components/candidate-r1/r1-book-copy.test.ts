@@ -34,8 +34,8 @@ const PROPER_NOUNS = [
   'Interview Kickstart',
   'India Standard Time',
   'Google Meet',
-  "Dex's",
-  'Dex',
+  "Lexy's",
+  'Lexy',
   'Meet',
   'India',
 ];
@@ -93,9 +93,9 @@ describe('the public booking copy', () => {
   });
 
   it('NEGATIVE CONTROL: the sentence-case check catches title case and shouting', () => {
-    expect(sentenceCaseProblems('Book Your Interview With Dex')).toEqual(['Your', 'Interview', 'With']);
+    expect(sentenceCaseProblems('Book Your Interview With Lexy')).toEqual(['Your', 'Interview', 'With']);
     expect(sentenceCaseProblems('Please check the OTP.')).toEqual(['OTP']);
-    expect(sentenceCaseProblems('Dex is the AI interviewer. Pick a time (India Standard Time).')).toEqual([]);
+    expect(sentenceCaseProblems('Lexy is the AI interviewer. Pick a time (India Standard Time).')).toEqual([]);
   });
 
   it('never uses the old interviewer name', () => {
@@ -140,7 +140,7 @@ describe('the public booking copy', () => {
   it('sends the invite to the email on the application, and never shows or names "your email"', () => {
     const booked = strings(R1_BOOK_COPY.states.booked, 'booked');
     expect(R1_BOOK_COPY.states.booked.body).toContain('the email address on your application');
-    expect(R1_BOOK_COPY.states.booked.body).toContain("Dex's calendar invite is on its way");
+    expect(R1_BOOK_COPY.states.booked.body).toContain("Lexy's calendar invite is on its way");
     for (const [path, text] of booked) {
       expect(text, path).not.toMatch(/your email/i);
       // The link is in the invite; the page has none to click.
@@ -168,13 +168,13 @@ describe('the public booking copy', () => {
   });
 
   it('pins the lines the pages and the owner decisions depend on', () => {
-    expect(R1_BOOK_COPY.form.title).toBe('Book your interview with Dex');
+    expect(R1_BOOK_COPY.form.title).toBe('Book your interview with Lexy');
     expect(R1_BOOK_COPY.form.indiaLabel).toBe('I confirm I am located in India.');
     expect(R1_BOOK_COPY.form.purposesLegend).toBe('Please agree to each purpose separately');
     expect(R1_BOOK_COPY.form.slotLegend).toBe('Pick a time (India Standard Time)');
     expect(R1_BOOK_COPY.states.notOpen.title).toBe('Booking is not open yet');
     expect(R1_BOOK_COPY.states.alreadyBooked.body).toBe(
-      'To change or cancel it, use the link in your calendar invite from Dex.',
+      'To change or cancel it, use the link in your calendar invite from Lexy.',
     );
     expect(R1_BOOK_COPY.states.loading).toBe(R1_BOOK_COPY.live.loading);
     expect(R1_BOOK_MANAGE_COPY.inactive.title).toBe('This link is no longer active');
@@ -183,8 +183,8 @@ describe('the public booking copy', () => {
   });
 
   it('names each page in the browser tab, never with the recruiter tool name', () => {
-    expect(R1_BOOK_COPY.pageTitle).toBe('Book your interview with Dex · Interview Kickstart');
-    expect(R1_BOOK_MANAGE_COPY.pageTitle).toBe('Manage your interview with Dex · Interview Kickstart');
+    expect(R1_BOOK_COPY.pageTitle).toBe('Book your interview with Lexy · Interview Kickstart');
+    expect(R1_BOOK_MANAGE_COPY.pageTitle).toBe('Manage your interview with Lexy · Interview Kickstart');
     for (const title of [R1_BOOK_COPY.pageTitle, R1_BOOK_MANAGE_COPY.pageTitle]) {
       expect(title).not.toMatch(/hello|talent workspace|mission control/i);
     }
@@ -199,7 +199,7 @@ describe('the public booking copy', () => {
     // A dropped request or a gateway error: the server may have booked and sent the invite.
     expect(uncertain.title).toBe('We could not confirm your booking');
     expect(uncertain.body).toBe(
-      'Your interview may already be booked. Check for an invite from Dex at the email address on '
+      'Your interview may already be booked. Check for an invite from Lexy at the email address on '
         + 'your application before you try again.',
     );
     for (const [path, text] of strings(uncertain, 'uncertain')) {
