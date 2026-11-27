@@ -21,6 +21,7 @@ import {
   getR1MeetGoogle,
   r1MeetGoogleScopes,
   resetR1MeetGoogleCache,
+  setR1MeetGoogleTestSeams,
 } from '../integrations/google/client.js';
 import { GoogleError } from '../integrations/google/errors.js';
 import {
@@ -362,11 +363,14 @@ describe('createR1MeetGoogle: end to end against the fake (calendar mode)', () =
   });
 });
 
-describe('getR1MeetGoogle: one process-wide instance, so the token cache and the refusal window hold per process', () => {
+describe('getR1MeetGoogle: ONE process-wide token source, so the token cache and the refusal window hold per process', () => {
   beforeEach(() => resetR1MeetGoogleCache());
   afterEach(() => resetR1MeetGoogleCache());
 
-  /** What S05/S06 do: stable module-level seams, and settings read afresh per request or job. */
+  /**
+   * What S05/S06 do: settings read afresh per request or job, each caller with its own logger and
+   * bounds, and the transport and clock set once for the process (tests only).
+   */
   function processRig() {
     const clock = { t: T0 };
     const fake = createFakeGoogle({
@@ -376,21 +380,21 @@ describe('getR1MeetGoogle: one process-wide instance, so the token cache and the
     });
     const requests: GoogleTransportRequest[] = [];
     const transport = recording(fake, requests);
-    const now = () => clock.t;
+    setR1MeetGoogleTestSeams({ transport, now: () => clock.t });
     const logs: GoogleLogRecord[] = [];
     const logger = { event: (record: GoogleLogRecord) => logs.push(record) };
     const get = (settings: R1MeetGoogleSettings, meetMode: 'calendar' | 'space' = 'calendar') =>
-      getR1MeetGoogle({ settings, meetMode, transport, now, logger });
+      getR1MeetGoogle({ settings, meetMode, logger });
     const tokenCalls = () => requests.filter((req) => req.url === GOOGLE_TOKEN_URL).length;
-    return { clock, fake, requests, logs, transport, now, logger, get, tokenCalls };
+    return { clock, fake, requests, logs, transport, logger, get, tokenCalls };
   }
 
-  it('fresh settings per request give back the SAME instance: many bookings mint one token', async () => {
+  it('fresh settings per request share ONE token: many bookings mint once, and building calls nothing', async () => {
     for (const build of [oauthSettings, serviceAccountSettings]) {
       resetR1MeetGoogleCache();
       const r = processRig();
-      const first = r.get(build());
-      expect(r.get(build())).toBe(first);
+      r.get(build());
+      r.get(build());
       expect(r.requests).toHaveLength(0);
       for (let booking = 0; booking < 5; booking += 1) {
         expect(await r.get(build()).calendar.getEvent(EVENT_ID)).toBeNull();
@@ -419,63 +423,131 @@ describe('getR1MeetGoogle: one process-wide instance, so the token cache and the
     expect(r.tokenCalls()).toBe(2);
   });
 
+  it('S05 jobs and S06 routes with their OWN loggers and bounds, interleaved, still share the token and the refusal window', async () => {
+    const r = processRig();
+    const jobLogs: GoogleLogRecord[] = [];
+    const routeLogs: GoogleLogRecord[] = [];
+    // Each slice's own module-level adapter, as S05 and S06 would naturally write them.
+    const jobLogger = { event: (record: GoogleLogRecord) => jobLogs.push(record) };
+    const routeLogger = { event: (record: GoogleLogRecord) => routeLogs.push(record) };
+    const job = () => getR1MeetGoogle({ settings: oauthSettings(), meetMode: 'calendar', logger: jobLogger, timeoutMs: 8_000 });
+    const route = () => getR1MeetGoogle({ settings: oauthSettings(), meetMode: 'calendar', logger: routeLogger });
+    const unlogged = () => getR1MeetGoogle({ settings: oauthSettings(), meetMode: 'calendar', maxResponseBytes: 64 * 1024 });
+
+    for (let turn = 0; turn < 6; turn += 1) {
+      const caller = [route, job, unlogged][turn % 3]!;
+      expect(await caller().calendar.getEvent(EVENT_ID)).toBeNull();
+    }
+    expect(r.tokenCalls()).toBe(1);
+    // The mint logged once, to the caller whose call started it (the route); each call logged to its own caller.
+    expect(routeLogs.map((record) => record.operation)).toEqual(['token.refresh', 'calendar.get', 'calendar.get']);
+    expect(jobLogs.map((record) => record.operation)).toEqual(['calendar.get', 'calendar.get']);
+
+    // After a revocation, switching between the callers costs nothing more: one call a minute in all.
+    r.fake.revokeRefreshToken();
+    r.clock.t += 2 * 3_600_000; // the cached token has expired: the next call mints
+    for (let turn = 0; turn < 9; turn += 1) {
+      const caller = [job, route, unlogged][turn % 3]!;
+      expect((await rejection(caller().calendar.getEvent(EVENT_ID))).code).toBe('auth_revoked');
+    }
+    expect(r.tokenCalls()).toBe(2);
+    const refreshRecords = [...jobLogs, ...routeLogs].filter((record) => record.operation === 'token.refresh');
+    expect(refreshRecords).toHaveLength(2);
+    expect(jobLogs.filter((record) => record.operation === 'token.refresh')).toEqual([
+      expect.objectContaining({ outcome: 'failure', code: 'auth_revoked' }),
+    ]);
+    // The rig's own logger was never given to these callers, and saw nothing.
+    expect(r.logs).toHaveLength(0);
+  });
+
+  it('both Meet modes keep their own token source (the scopes differ); neither evicts the other', async () => {
+    const r = processRig();
+    for (let turn = 0; turn < 3; turn += 1) {
+      await r.get(oauthSettings(), 'calendar').calendar.getEvent(EVENT_ID);
+      await r.get(oauthSettings(), 'space').meet.getSpace('abc-defg-hij');
+    }
+    expect(r.tokenCalls()).toBe(2);
+  });
+
+  it('a rotated credential replaces the cached token sources: the old secret is not kept', async () => {
+    const r = processRig();
+    const rotated = 'rt-' + 'q'.repeat(40);
+    await r.get(oauthSettings()).calendar.getEvent(EVENT_ID);
+    await r.get(oauthSettings()).calendar.getEvent(EVENT_ID);
+    expect(r.tokenCalls()).toBe(1);
+    // The fake accepts one refresh token, so the rotated one is refused; it still replaces the old set.
+    expect((await rejection(r.get(oauthSettings(rotated)).calendar.getEvent(EVENT_ID))).code).toBe('auth_revoked');
+    expect(r.tokenCalls()).toBe(2);
+    await r.get(oauthSettings()).calendar.getEvent(EVENT_ID);
+    expect(r.tokenCalls()).toBe(3);
+    await r.get(serviceAccountSettings()).calendar.getEvent(EVENT_ID);
+    expect(r.tokenCalls()).toBe(4);
+  });
+
   it('createR1MeetGoogle, by contrast, builds a new cache on every call (owner scripts and tests only)', async () => {
     const r = processRig();
     r.fake.revokeRefreshToken();
     for (let booking = 0; booking < 3; booking += 1) {
-      const google = createR1MeetGoogle({ settings: oauthSettings(), meetMode: 'calendar', transport: r.transport, now: r.now });
+      const google = createR1MeetGoogle({ settings: oauthSettings(), meetMode: 'calendar', transport: r.transport, now: () => r.clock.t });
       expect((await rejection(google.calendar.getEvent(EVENT_ID))).code).toBe('auth_revoked');
     }
     expect(r.tokenCalls()).toBe(3);
   });
 
-  it('another credential, Meet mode or seam gives a new instance; the one slot keeps only the latest', () => {
+  it('refuses what createR1MeetGoogle refuses, and any transport or clock, synchronously with zero calls, keeping the cached token', async () => {
     const r = processRig();
-    const calendar = r.get(oauthSettings());
-    const space = r.get(oauthSettings(), 'space');
-    expect(space).not.toBe(calendar);
-    expect(r.get(oauthSettings(), 'space')).toBe(space);
-    // One slot: the calendar-mode instance was replaced, so asking again builds a new one.
-    const again = r.get(oauthSettings());
-    expect(again).not.toBe(calendar);
-    expect(r.get(oauthSettings())).toBe(again);
-
-    const rotated = r.get(oauthSettings('rt-' + 'q'.repeat(40)));
-    expect(rotated).not.toBe(again);
-    expect(r.get(serviceAccountSettings())).not.toBe(rotated);
-
-    const settings = oauthSettings();
-    const base = r.get(settings);
-    expect(getR1MeetGoogle({ settings, meetMode: 'calendar', transport: r.transport, now: r.now })).not.toBe(base);
-    const otherTransport = recording(r.fake, []);
-    const withOther = getR1MeetGoogle({ settings, meetMode: 'calendar', transport: otherTransport, now: r.now, logger: r.logger });
-    expect(withOther).not.toBe(base);
-    expect(getR1MeetGoogle({ settings, meetMode: 'calendar', transport: otherTransport, now: r.now, logger: r.logger, timeoutMs: 5_000 })).not.toBe(
-      withOther,
-    );
-    expect(r.requests).toHaveLength(0);
-  });
-
-  it('refuses what createR1MeetGoogle refuses, synchronously and with zero calls, and keeps the cached instance', () => {
-    const r = processRig();
-    const kept = r.get(oauthSettings());
+    await r.get(oauthSettings()).calendar.getEvent(EVENT_ID);
+    expect(r.tokenCalls()).toBe(1);
     const oauth = oauthSettings();
     for (const bad of [
       undefined,
       null,
-      { settings: { ...oauth }, meetMode: 'calendar', transport: r.transport },
-      { settings: JSON.parse(JSON.stringify(serviceAccountSettings())), meetMode: 'calendar', transport: r.transport },
-      { settings: { ...oauth, authMode: 'dwd' }, meetMode: 'calendar', transport: r.transport },
-      { settings: oauth, meetMode: 'both', transport: r.transport, now: r.now, logger: r.logger },
-      { settings: oauth, meetMode: 'calendar', transport: 'fetch', now: r.now, logger: r.logger },
+      { settings: { ...oauth }, meetMode: 'calendar' },
+      { settings: JSON.parse(JSON.stringify(serviceAccountSettings())), meetMode: 'calendar' },
+      { settings: { ...oauth, authMode: 'dwd' }, meetMode: 'calendar' },
+      { settings: oauth, meetMode: 'both', logger: r.logger },
+      { settings: oauth, meetMode: 'calendar', logger: null },
+      { settings: oauth, meetMode: 'calendar', logger: { event: 'log' } },
+      // A per-caller transport or clock would split the cache: refused, never silently ignored.
+      { settings: oauth, meetMode: 'calendar', transport: r.transport },
+      { settings: oauth, meetMode: 'calendar', now: () => r.clock.t },
+      { settings: oauth, meetMode: 'calendar', transport: undefined },
     ] as unknown[]) {
       expect(() => getR1MeetGoogle(bad as never)).toThrow(GoogleError);
     }
-    expect(r.get(oauthSettings())).toBe(kept);
-    expect(r.requests).toHaveLength(0);
+    // A malformed credential (refused before any network) leaves the cached set in place.
+    const malformed = Object.defineProperties(
+      { ...oauth, clientId: 'not a client id' },
+      {
+        clientSecret: { value: FAKE_GOOGLE_CLIENT_SECRET, enumerable: false },
+        refreshToken: { value: FAKE_GOOGLE_REFRESH_TOKEN, enumerable: false },
+      },
+    );
+    expect(() => getR1MeetGoogle({ settings: malformed, meetMode: 'calendar' })).toThrow(GoogleError);
+    await r.get(oauthSettings()).calendar.getEvent(EVENT_ID);
+    // One mint and the two reads: the refused calls made no request of any kind.
+    expect(r.tokenCalls()).toBe(1);
+    expect(r.requests).toHaveLength(3);
   });
 
-  it('the process-wide instance shows no secret', async () => {
+  it('setR1MeetGoogleTestSeams validates its seams and forgets the token sources built with the previous ones', async () => {
+    const r = processRig();
+    await r.get(oauthSettings()).calendar.getEvent(EVENT_ID);
+    for (const bad of [null, undefined, { transport: 'fetch' }, { now: 5 }] as unknown[]) {
+      expect(() => setR1MeetGoogleTestSeams(bad as never)).toThrow(GoogleError);
+    }
+    // The refused seams changed nothing.
+    await r.get(oauthSettings()).calendar.getEvent(EVENT_ID);
+    expect(r.tokenCalls()).toBe(1);
+
+    const other: GoogleTransportRequest[] = [];
+    setR1MeetGoogleTestSeams({ transport: recording(r.fake, other), now: () => r.clock.t });
+    await r.get(oauthSettings()).calendar.getEvent(EVENT_ID);
+    expect(other.filter((req) => req.url === GOOGLE_TOKEN_URL)).toHaveLength(1);
+    expect(r.tokenCalls()).toBe(1);
+  });
+
+  it('the process-wide client shows no secret', async () => {
     const r = processRig();
     const google = r.get(oauthSettings());
     await google.calendar.getEvent(EVENT_ID);

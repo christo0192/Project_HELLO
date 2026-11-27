@@ -41,6 +41,11 @@
  *      and pinned to the exact set of its files that write the verb; the Recall rule stays, and the
  *      Calendar V2 ban covers every Meet folder, google included.
  *  (f) loading every Meet module performs no network call, and an empty environment is `disabled`.
+ *  (g) M035 S03 (review S03-R1): runtime code takes Dex's Google client from `getR1MeetGoogle` only.
+ *      The factories that build a NEW token cache (`createR1MeetGoogle`, the two token sources, the
+ *      Calendar and Meet client constructors) and the process cache's test seams are named only
+ *      inside integrations/google, the owner scripts (app/api/scripts) and the test tree. One token
+ *      source per process is what holds a revoked grant to one token-endpoint call a minute.
  *
  * Each walker has a control that feeds it a synthetic violation, so the pin cannot pass by matching
  * nothing. Comments are NOT stripped before scanning: a false positive fails loudly and is fixed by
@@ -271,6 +276,19 @@ const MEET_PATH_TEXT = new RegExp(
 
 const read = (file: string): string => readFileSync(file, 'utf8');
 
+/** (g) The Google names that build a fresh token cache, or reach the process cache's test seams. */
+const GOOGLE_FRESH_CACHE_NAMES = [
+  'createR1MeetGoogle',
+  'createGoogleOAuthRefreshTokenSource',
+  'createGoogleDwdTokenSource',
+  'createGoogleCalendarClient',
+  'createGoogleMeetClient',
+  'setR1MeetGoogleTestSeams',
+  'resetR1MeetGoogleCache',
+] as const;
+const GOOGLE_FRESH_CACHE_TEXT = new RegExp(String.raw`\b(?:${GOOGLE_FRESH_CACHE_NAMES.join('|')})\b`);
+const API_SCRIPTS_DIR = path.join(API_ROOT, 'scripts');
+
 describe('M034 S01: the Meet modules are dark libraries', () => {
   it('finds the runtime tree and the Meet modules', () => {
     expect(RUNTIME_FILES.length).toBeGreaterThan(100);
@@ -493,6 +511,38 @@ describe('M034 S01: the Meet modules are dark libraries', () => {
     // Compile-time pin: adding PATCH to the transport union turns this type into `true` and fails tsc.
     const patchIsATransportMethod: 'PATCH' extends RecallTransportRequest['method'] ? true : false = false;
     expect(patchIsATransportMethod).toBe(false);
+  });
+
+  it('(g) runtime code builds no fresh Google token cache: only getR1MeetGoogle outside integrations/google, the scripts and tests', () => {
+    const checked = RUNTIME_FILES.filter((file) => !inside(file, GOOGLE_DIR) && !inside(file, API_SCRIPTS_DIR));
+    expect(checked.length).toBeGreaterThan(100);
+    expect(checked).toContain(MEET_CONFIG);
+    const offenders = checked.filter((file) => GOOGLE_FRESH_CACHE_TEXT.test(read(file))).map(rel);
+    expect(offenders).toEqual([]);
+  });
+
+  it('(g) control: every banned name is a real export of integrations/google, a script may use one, and an S05/S06-style call is caught', () => {
+    const googleText = walk(GOOGLE_DIR).map(read).join('\n');
+    for (const name of GOOGLE_FRESH_CACHE_NAMES) {
+      expect(googleText, name).toMatch(new RegExp(String.raw`export function ${name}\(`));
+    }
+    expect(googleText).toMatch(/export function getR1MeetGoogle\(/);
+    expect(GOOGLE_FRESH_CACHE_TEXT.test(read(path.join(API_SCRIPTS_DIR, 'm035-google-spike.ts')))).toBe(true);
+    for (const caught of [
+      'const google = createR1MeetGoogle({ settings: config.google, meetMode: config.meetMode });',
+      "import { createGoogleOAuthRefreshTokenSource } from '../../../integrations/google/token.js';",
+      'const calendar = createGoogleCalendarClient({ tokenSource });',
+      'resetR1MeetGoogleCache();',
+    ]) {
+      expect(GOOGLE_FRESH_CACHE_TEXT.test(caught), caught).toBe(true);
+    }
+    for (const allowed of [
+      'const google = getR1MeetGoogle({ settings: config.google, meetMode: config.meetMode, logger });',
+      'const inputs = getR1MeetGoogleOAuthClientInputs();',
+      'type T = R1MeetGoogleProcessOptions;',
+    ]) {
+      expect(GOOGLE_FRESH_CACHE_TEXT.test(allowed), allowed).toBe(false);
+    }
   });
 });
 

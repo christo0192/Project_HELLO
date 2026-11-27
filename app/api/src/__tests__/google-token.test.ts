@@ -605,6 +605,54 @@ describe('createGoogleDwdTokenSource', () => {
   });
 });
 
+// ── Per-call logger (the process-wide source of getR1MeetGoogle, S03-R1) ────
+
+describe('accessToken({ logger }): a mint logs to the caller that started it', () => {
+  it('the per-call logger replaces the built one; cache hits, joined flights and refusal replays log nothing', async () => {
+    for (const harness of [refreshHarness, dwdHarness]) {
+      const { source, logs, clock, fake } = harness();
+      const routeLogs: GoogleLogRecord[] = [];
+      const jobLogs: GoogleLogRecord[] = [];
+      const route = { logger: { event: (record: GoogleLogRecord) => routeLogs.push(record) } };
+      const job = { logger: { event: (record: GoogleLogRecord) => jobLogs.push(record) } };
+
+      // Two concurrent callers: the route starts the mint, the job joins it.
+      const [a, b] = await Promise.all([source.accessToken(route), source.accessToken(job)]);
+      expect(a).toBe(b);
+      expect(routeLogs).toHaveLength(1);
+      expect(routeLogs[0]).toMatchObject({ outcome: 'success', httpStatus: 200 });
+      expect(jobLogs).toHaveLength(0);
+      expect(logs).toHaveLength(0);
+      await source.accessToken(job);
+      expect(jobLogs).toHaveLength(0);
+
+      // No per-call logger: the built one is the fallback.
+      source.invalidate();
+      await source.accessToken();
+      expect(logs).toHaveLength(1);
+
+      // A refusal is logged once, by the caller whose mint met it; the 60 s replay logs nothing.
+      fake.failNext({ status: 400, body: JSON.stringify({ error: 'invalid_grant' }) });
+      clock.t += 3_600_000;
+      expect((await failure(source.accessToken(job))).code).toBe('auth_revoked');
+      expect(jobLogs).toEqual([expect.objectContaining({ outcome: 'failure', code: 'auth_revoked' })]);
+      expect((await failure(source.accessToken(route))).code).toBe('auth_revoked');
+      expect(routeLogs).toHaveLength(1);
+      expect(logs).toHaveLength(1);
+    }
+  });
+
+  it('a broken per-call logger never breaks a mint', async () => {
+    const { source, fake } = refreshHarness();
+    const throwing = { event: () => { throw new Error('logger down'); } };
+    await expect(source.accessToken({ logger: throwing })).resolves.toBe(fake.tokensIssued[0]);
+    source.invalidate();
+    await expect(source.accessToken({ logger: {} as never })).resolves.toBe(fake.tokensIssued[1]);
+    source.invalidate();
+    await expect(source.accessToken(null as never)).resolves.toBe(fake.tokensIssued[2]);
+  });
+});
+
 // ── Secret canary ───────────────────────────────────────────────────────────
 
 describe('token secret canary', () => {

@@ -4623,8 +4623,8 @@ blocks the scopes (`admin_policy_enforced`). The API then fails closed: Google a
 the client reports `auth_revoked` (alert `r1_meet_public_google_auth_failed`), bookings answer
 "temporarily unavailable", existing events are not touched, and the token endpoint is not retried in a
 loop: one try a minute at most per API machine, however many bookings and jobs arrive, because the API
-holds ONE process-wide Google client (`getR1MeetGoogle`) whose token cache and 60 s refusal window every
-request and job share.
+holds ONE process-wide Google token source (`getR1MeetGoogle`) whose token cache and 60 s refusal window
+every request and job share, whatever logger each passes.
 
 1. Mint a new token with the helper (above), signed in as Dex.
 2. Run the spike dry, then live, with the new token from the local shell.

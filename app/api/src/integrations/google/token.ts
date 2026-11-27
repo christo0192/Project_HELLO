@@ -25,7 +25,10 @@
  * access token live only in ES private fields or local variables; none is ever logged, put into an
  * error or visible through `Object.keys`, a spread, `JSON.stringify` or `util.inspect`. Logging is
  * one metadata-only record per mint attempt (`token.refresh` / `token.jwt_bearer`); a cache hit or
- * a refusal served from the 60 s window makes no request and logs nothing.
+ * a refusal served from the 60 s window makes no request and logs nothing. The record goes to the
+ * logger of the `accessToken({ logger })` call that started the mint when one is given (the
+ * process-wide source of `getR1MeetGoogle` is built without a logger and serves every caller), else to
+ * the logger the source was built with.
  */
 
 import { createPrivateKey, createSign, type KeyObject } from 'node:crypto';
@@ -65,9 +68,18 @@ export const GOOGLE_TOKEN_REFUSAL_WINDOW_MS = 60_000;
 /** The DWD assertion lifetime: `exp = iat + 3600` (Google's maximum). */
 export const GOOGLE_JWT_LIFETIME_SECONDS = 3600;
 
+/** Per-call options of `accessToken`. */
+export interface GoogleAccessTokenOptions {
+  /**
+   * Receives the record of a mint this call starts (a cache hit, a joined in-flight mint and a
+   * refusal-window replay log nothing), instead of the logger the source was built with.
+   */
+  logger?: GoogleClientLogger;
+}
+
 export interface GoogleTokenSource {
   /** A Bearer access token for the configured scopes; cached, single-flight. */
-  accessToken(): Promise<string>;
+  accessToken(options?: GoogleAccessTokenOptions): Promise<string>;
   /** Drop the cached token (after a 401), so the next `accessToken()` mints a new one. */
   invalidate(): void;
 }
@@ -167,6 +179,20 @@ function validateCommon(o: GoogleTokenSourceCommonOptions, refuse: () => GoogleE
   if (o.maxResponseBytes !== undefined) send.maxResponseBytes = o.maxResponseBytes;
   if (o.logger !== undefined) send.logger = o.logger;
   return { scopes, now, logger: o.logger, send };
+}
+
+/** The logger of one mint: the caller's when given, else the source's own. */
+function mintLogger(settings: CommonSettings, options: GoogleAccessTokenOptions | undefined): GoogleClientLogger | undefined {
+  const perCall = typeof options === 'object' && options !== null ? options.logger : undefined;
+  return perCall ?? settings.logger;
+}
+
+/** The send options of one mint, carrying exactly that mint's logger. */
+function mintSendOptions(settings: CommonSettings, logger: GoogleClientLogger | undefined): GoogleSendOptions {
+  const send: GoogleSendOptions = { ...settings.send };
+  delete send.logger;
+  if (logger !== undefined) send.logger = logger;
+  return send;
 }
 
 // ── Token response ──────────────────────────────────────────────────────────
@@ -314,15 +340,16 @@ class GoogleOAuthRefreshTokenSource implements GoogleTokenSource {
     this.#cache = new TokenCache(this.#settings.now, 'token.refresh');
   }
 
-  accessToken(): Promise<string> {
-    return this.#cache.get(() => this.#mint());
+  accessToken(options?: GoogleAccessTokenOptions): Promise<string> {
+    const logger = mintLogger(this.#settings, options);
+    return this.#cache.get(() => this.#mint(logger));
   }
 
   invalidate(): void {
     this.#cache.invalidate();
   }
 
-  async #mint(): Promise<MintedToken> {
+  async #mint(logger: GoogleClientLogger | undefined): Promise<MintedToken> {
     const operation: GoogleOperation = 'token.refresh';
     const body = new URLSearchParams({
       grant_type: 'refresh_token',
@@ -332,7 +359,7 @@ class GoogleOAuthRefreshTokenSource implements GoogleTokenSource {
     }).toString();
     return sendGoogleRequest(
       { operation, context: 'token', method: 'POST', url: GOOGLE_TOKEN_URL, headers: FORM_HEADERS, body },
-      this.#settings.send,
+      mintSendOptions(this.#settings, logger),
       (result) => parseTokenResponse(operation, result, this.#settings.scopes),
     );
   }
@@ -379,8 +406,9 @@ class GoogleDwdTokenSource implements GoogleTokenSource {
     this.#cache = new TokenCache(this.#settings.now, 'token.jwt_bearer');
   }
 
-  accessToken(): Promise<string> {
-    return this.#cache.get(() => this.#mint());
+  accessToken(options?: GoogleAccessTokenOptions): Promise<string> {
+    const logger = mintLogger(this.#settings, options);
+    return this.#cache.get(() => this.#mint(logger));
   }
 
   invalidate(): void {
@@ -400,12 +428,12 @@ class GoogleDwdTokenSource implements GoogleTokenSource {
     return this.#signingKey === false ? null : this.#signingKey;
   }
 
-  async #mint(): Promise<MintedToken> {
+  async #mint(logger: GoogleClientLogger | undefined): Promise<MintedToken> {
     const operation: GoogleOperation = 'token.jwt_bearer';
     const startedAt = Date.now();
     const localFailure = () => {
       const error = new GoogleError('setup_forbidden', { operation });
-      emitGoogleLog(this.#settings.logger, { operation, startedAt, error });
+      emitGoogleLog(logger, { operation, startedAt, error });
       return error;
     };
     const key = this.#key();
@@ -436,7 +464,7 @@ class GoogleDwdTokenSource implements GoogleTokenSource {
     }).toString();
     return sendGoogleRequest(
       { operation, context: 'token', method: 'POST', url: GOOGLE_TOKEN_URL, headers: FORM_HEADERS, body },
-      this.#settings.send,
+      mintSendOptions(this.#settings, logger),
       (result) => parseTokenResponse(operation, result, this.#settings.scopes),
     );
   }
