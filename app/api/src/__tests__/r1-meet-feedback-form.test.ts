@@ -735,6 +735,32 @@ describe('r1MeetFeedbackRequest', () => {
     });
   });
 
+  // M035 S02: a public-page booking has no interview event; its card is general application feedback.
+  it('without an interview event (a public-page booking): exactly four keys, no interviewEventId key at all', () => {
+    const bound = bind();
+    if (!bound.ok) throw new Error('fixture refused');
+    const input = {
+      applicationId: APPLICATION_ID,
+      formDefinitionId: FORM_ID,
+      dexUserId: DEX_USER_ID,
+      fieldSubmissions: bound.fieldSubmissions,
+    };
+    const general = r1MeetFeedbackRequest({ ...input, interviewEventId: null });
+    expect(Object.keys(general)).toEqual(['applicationId', 'formDefinitionId', 'feedbackForm', 'userId']);
+    expect('interviewEventId' in general).toBe(false);
+    expect(general).not.toHaveProperty('extra');
+    // The same card as the event request, minus the event key.
+    const { interviewEventId, ...rest } = request();
+    expect(interviewEventId).toBe(EVENT_ID);
+    expect(general).toStrictEqual(rest);
+    expect(JSON.stringify(general)).toBe(JSON.stringify(rest));
+
+    // A string keeps today's five keys in today's order.
+    const event = r1MeetFeedbackRequest({ ...input, interviewEventId: EVENT_ID });
+    expect(Object.keys(event)).toEqual(['applicationId', 'formDefinitionId', 'feedbackForm', 'userId', 'interviewEventId']);
+    expect(JSON.stringify(event)).toBe(JSON.stringify(request()));
+  });
+
   it('carries none of the PII sentinels planted in the row', () => {
     const json = JSON.stringify(request());
     for (const sentinel of Object.values(PII)) expect(json).not.toContain(sentinel);

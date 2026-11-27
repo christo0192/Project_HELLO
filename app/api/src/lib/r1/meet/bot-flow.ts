@@ -17,7 +17,9 @@
  *      last slot can overshoot by one: the count is a read, not a lock (stated in the PR);
  *   5. the S01 builder's body. When its `join_at` is less than 5 s ahead the same body is sent WITHOUT
  *      it (D-S06-15: Recall reads an absent join_at as "join now"; a past one is undocumented);
- *   6. `createBot` under `r1-meet-<event>-v<version>-k<key_attempt>`;
+ *   6. `createBot` under the booking's key, by its source (`r1MeetBookingIdempotencyKey`): an Ashby
+ *      booking `r1-meet-<event>-v<version>-k<key_attempt>`, a public-page one (M035)
+ *      `r1-meet-pb-<booking>-v<version>-k<key_attempt>`; everything else here is the same for both;
  *   7. `set_bot('attach')` with the same two counters.
  *
  * FAILURES OF THE CREATE (KNOWLEDGE 2026-11-21: Recall caches a keyed 4xx/5xx answer for an hour):
@@ -64,7 +66,7 @@ import {
   r1MeetRecallRejected,
   type R1MeetFlowDeps,
 } from './recall-actions.js';
-import { buildR1MeetCreateBotRequest, r1MeetCreateBotIdempotencyKey } from './recall-bot.js';
+import { buildR1MeetCreateBotRequest, r1MeetBookingIdempotencyKey } from './recall-bot.js';
 import {
   r1MeetIstDay,
   type R1MeetBooking,
@@ -230,7 +232,7 @@ export async function ensureBot(
     throw new R1MeetJobError('r1_meet_bot_body_invalid');
   }
   const body = Date.parse(built.joinAt) - nowMs >= R1_MEET_MIN_JOIN_AT_LEAD_MS ? built.body : joinNow(built.body);
-  const idempotencyKey = r1MeetCreateBotIdempotencyKey(booking.eventId, booking.version, booking.keyAttempt);
+  const idempotencyKey = r1MeetBookingIdempotencyKey(booking);
 
   let bot: RecallBot;
   try {

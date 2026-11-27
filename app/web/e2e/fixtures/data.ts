@@ -1623,6 +1623,7 @@ export function r1MeetBooking(n: number, over: Partial<R1MeetBooking>): R1MeetBo
     created_at: ago(2 * DAY),
     updated_at: ago(2 * DAY),
     version: 0,
+    source: 'ashby',
     ...over,
   };
 }

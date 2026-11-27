@@ -7,15 +7,17 @@
  * Invariants:
  *   - The server decides whether Meet is on. While it is off the answer is `meet_enabled: false`,
  *     and that always reads as an empty page here, whatever came with it.
- *   - A row is copied field by field, exactly the ten fields of the contract. A field the API should
+ *   - A row is copied field by field, exactly the eleven fields of the contract. A field the API should
  *     never send (a Meet URL, a bot id, an attester) cannot reach the page through this file.
  *   - A body that is not in the contract shape is refused whole as `r1_meet_bookings_malformed`.
  *     A status or reason this file does not know is not malformed: an API ahead of this page keeps
  *     its row, in words that never print the code (D-S10-10).
+ *   - A booking's source (M035) is not like that: it is required and one of its two values, so an
+ *     absent one, or any other, refuses the page.
  *   - Every day and time is India time, named at each conversion (`ist-datetime`), never the host's.
  *
- * `r1-meet-bookings.test.ts` compares the two vocabularies and the ten fields with openapi.yaml, so
- * a change on the API side goes red there.
+ * `r1-meet-bookings.test.ts` compares the three vocabularies and the eleven fields with openapi.yaml,
+ * so a change on the API side goes red there.
  */
 
 import type { TagTone } from '../components/design/Tag';
@@ -32,10 +34,11 @@ import {
   istDayStartUtcIso,
 } from './ist-datetime';
 import type { IstDate } from './ist-datetime';
-import { R1_MEET_BOOKING_STATUSES } from './r1-meet-bookings-types';
+import { R1_MEET_BOOKING_SOURCES, R1_MEET_BOOKING_STATUSES } from './r1-meet-bookings-types';
 import type {
   R1MeetBooking,
   R1MeetBookingReason,
+  R1MeetBookingSource,
   R1MeetBookingStatus,
   R1MeetBookingsBody,
   R1MeetBookingsQuery,
@@ -43,10 +46,11 @@ import type {
 
 // The wire shapes live in a module with no runtime import, so the e2e harness can type its fixture
 // against them; every caller keeps reading them from here.
-export { R1_MEET_BOOKING_REASONS, R1_MEET_BOOKING_STATUSES } from './r1-meet-bookings-types';
+export { R1_MEET_BOOKING_REASONS, R1_MEET_BOOKING_SOURCES, R1_MEET_BOOKING_STATUSES } from './r1-meet-bookings-types';
 export type {
   R1MeetBooking,
   R1MeetBookingReason,
+  R1MeetBookingSource,
   R1MeetBookingStatus,
   R1MeetBookingsBody,
   R1MeetBookingsQuery,
@@ -85,15 +89,19 @@ const isUuidOrNull = (value: unknown): value is string | null => value === null 
 const isInstant = (value: unknown): value is string =>
   typeof value === 'string' && ZONED_INSTANT.test(value) && !Number.isNaN(Date.parse(value));
 const isWholeNumber = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
+/** Exactly one of the two, by value: no case folding, and nothing inherited from a prototype. */
+const isSource = (value: unknown): value is R1MeetBookingSource =>
+  R1_MEET_BOOKING_SOURCES.some((source) => source === value);
 
 function readBooking(row: unknown): R1MeetBooking {
   if (!isRecord(row)) malformed();
-  const { id, candidate_id, round_id, status, reason, start_at, end_at, created_at, updated_at, version } = row;
+  const { id, candidate_id, round_id, status, reason, start_at, end_at, created_at, updated_at, version, source } = row;
   if (!isUuid(id) || !isUuidOrNull(candidate_id) || !isUuidOrNull(round_id)) malformed();
   if (!isText(status) || !isText(reason)) malformed();
   if (!isInstant(start_at) || !isInstant(end_at) || !isInstant(created_at) || !isInstant(updated_at)) malformed();
   if (!isWholeNumber(version)) malformed();
-  return { id, candidate_id, round_id, status, reason, start_at, end_at, created_at, updated_at, version };
+  if (!isSource(source)) malformed();
+  return { id, candidate_id, round_id, status, reason, start_at, end_at, created_at, updated_at, version, source };
 }
 
 /**
@@ -182,6 +190,8 @@ const REASON_TEXT: Readonly<Record<R1MeetBookingReason, string | null>> = {
   multiple_humans: 'More than one person was in the meeting.',
   attempt_settled: 'The interview has ended.',
   flag_off: 'Google Meet interviews were turned off.',
+  candidate_cancelled: 'The candidate cancelled with the link in their invite.',
+  invite_undeliverable: 'Lexy’s calendar invite could not be sent.',
 };
 
 /** Why a booking is where it is, or null when there is nothing to say. Never the reason's code. */

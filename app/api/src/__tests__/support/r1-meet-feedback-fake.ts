@@ -10,14 +10,18 @@
  *    the receipt CHECKs (source and key space, `processed_at` set exactly when final), and the
  *    store's own outcome compare-and-sets. Two tables the 0142 port does not have, `assessments` and
  *    `candidates`, are kept here (`tables`), each with the reads the store makes.
- *  - The Ashby fake: a scripted `AshbyTransport` that records every request and answers the form read
- *    and the submit, under the REAL Ashby client and the REAL feedback port (`maxAttempts: 1`).
- *    `next(op, step)` queues one answer for the next request of that operation: a status and body,
- *    `network` (nothing reached Ashby), `timeout` (the client's deadline fired) or `lost` (Ashby took
- *    the submit, then the answer was lost: it is recorded as accepted, then the call fails).
+ *  - The Ashby fake: a scripted `AshbyTransport` that records every request and answers the form read,
+ *    the submit and the feedback list (M035 S02), under the REAL Ashby client and the REAL feedback
+ *    port (`maxAttempts: 1`). `next(op, step)` queues one answer for the next request of that
+ *    operation: a status and body, `network` (nothing reached Ashby), `timeout` (the client's deadline
+ *    fired) or `lost` (Ashby took the submit, then the answer was lost: it is recorded as accepted,
+ *    then the call fails). Like Ashby, every ACCEPTED submit leaves a card in `feedbackList` (an
+ *    interview-event submit updates the card of its event and user; a general submit adds a new
+ *    one), and an unscripted list answers the cards of the requested application in one page.
  *  - `completedBooking()`: a booking that its attempt settled (`completed / attempt_settled`) with its
  *    Meet round, session, candidate and final v2 assessment, and (by default) the receipt and job the
- *    scorecard-ready trigger records.
+ *    scorecard-ready trigger records. `source: 'public_page'` seeds a public-page booking instead (no
+ *    Ashby event, schedule or scheduler; M035 S02).
  *
  * Fixture ids live in `7f000000-0000-4000-8000-…` (the 0142 port's own in `…-9000-…`). The Ashby key is
  * a short synthetic literal; no name, email, phone or real id exists anywhere. The assessment row
@@ -118,7 +122,7 @@ export function finalAssessmentRow(id: string, sessionId: string, over: Partial<
 
 // ── The scripted Ashby transport ─────────────────────────────────────────────
 
-export type AshbyOp = 'form' | 'submit' | 'other';
+export type AshbyOp = 'form' | 'submit' | 'list' | 'other';
 export type AshbyStep =
   | { readonly status: number; readonly body?: unknown; readonly headers?: Record<string, string> }
   | 'network'
@@ -142,16 +146,45 @@ export interface ScriptedAshby {
   readonly requests: AshbyRequestRecord[];
   /** The definition the form read answers (replace it to break the form). */
   definition: Record<string, unknown>;
+  /**
+   * The application feedback an unscripted `applicationFeedback.list` answers, as Ashby's entries:
+   * `{ success: true, results: <the entries of the requested application>, moreDataAvailable: false }`
+   * (an entry without a string `applicationId` belongs to every application). Accepted submits add
+   * their card here; a test may set or extend it.
+   */
+  feedbackList: unknown[];
   next(op: AshbyOp, step: AshbyStep): void;
   /** The submit requests, in order. */
   submits(): AshbyRequestRecord[];
   forms(): AshbyRequestRecord[];
+  /** The `applicationFeedback.list` requests (one per page), in order. */
+  lists(): AshbyRequestRecord[];
+}
+
+export interface ScriptedAshbyOptions {
+  /** The clock of the cards accepted submits leave (`submittedAt`); default `Date.now`. */
+  readonly now?: () => number;
 }
 
 function opOf(path: string): AshbyOp {
   if (path === '/applicationFeedback.submit') return 'submit';
   if (path === '/feedbackFormDefinition.info') return 'form';
+  if (path === '/applicationFeedback.list') return 'list';
   return 'other';
+}
+
+/** The card an accepted submit leaves in Ashby, in Ashby's entry shape (the fields the reference names). */
+function cardOf(body: Record<string, unknown>, id: string, submittedAt: string): Record<string, unknown> {
+  return {
+    id,
+    applicationId: body.applicationId,
+    submittedByUser: { id: body.userId, firstName: 'Dex', lastName: 'Interviewer' },
+    creditedToUser: { id: body.userId },
+    submittedAt,
+    feedbackFormDefinitionId: body.formDefinitionId,
+    ...(typeof body.interviewEventId === 'string' ? { interviewEventId: body.interviewEventId } : {}),
+    submittedValues: { posted: true },
+  };
 }
 
 function answer(status: number, body: unknown, headers: Record<string, string> = {}): AshbyTransportResponse {
@@ -166,13 +199,35 @@ function answer(status: number, body: unknown, headers: Record<string, string> =
   };
 }
 
-export function createScriptedAshby(): ScriptedAshby {
+export function createScriptedAshby(options: ScriptedAshbyOptions = {}): ScriptedAshby {
+  const now = options.now ?? Date.now;
   const requests: AshbyRequestRecord[] = [];
   const queued = new Map<AshbyOp, AshbyStep[]>();
+  let cards = 0;
   const fake = {
     requests,
     definition: dexFormDefinition(),
-  } as ScriptedAshby;
+    feedbackList: [],
+  } as unknown as ScriptedAshby;
+
+  /** Ashby stores an accepted submit: an event submit updates its (event, user) card, a general one adds one. */
+  const store = (body: Record<string, unknown>): void => {
+    const submittedAt = new Date(now()).toISOString();
+    if (typeof body.interviewEventId === 'string') {
+      const existing = fake.feedbackList.findIndex((entry) => {
+        const card = entry as Record<string, unknown>;
+        const by = card.submittedByUser as Record<string, unknown> | undefined;
+        return card.interviewEventId === body.interviewEventId && by?.id === body.userId;
+      });
+      if (existing >= 0) {
+        const card = fake.feedbackList[existing] as Record<string, unknown>;
+        fake.feedbackList[existing] = cardOf(body, card.id as string, submittedAt);
+        return;
+      }
+    }
+    cards += 1;
+    fake.feedbackList.push(cardOf(body, `7f000000-0000-4000-8000-0000000fb${String(cards).padStart(3, '0')}`, submittedAt));
+  };
 
   const transport: AshbyTransport = async (req: AshbyTransportRequest) => {
     const path = new URL(req.url).pathname;
@@ -183,7 +238,9 @@ export function createScriptedAshby(): ScriptedAshby {
     }
     const step = queued.get(op)?.shift();
     const accepted = op === 'submit' && (step === undefined || step === 'lost' || (typeof step === 'object' && step.status < 300));
-    requests.push({ op, path, headers, raw: req.body, body: JSON.parse(req.body) as unknown, accepted });
+    const body = JSON.parse(req.body) as Record<string, unknown>;
+    requests.push({ op, path, headers, raw: req.body, body, accepted });
+    if (accepted) store(body);
     if (step === 'network' || step === 'lost') throw new Error('fake ashby network failure');
     if (step === 'timeout') {
       const error = new Error('aborted');
@@ -194,6 +251,13 @@ export function createScriptedAshby(): ScriptedAshby {
     if (op === 'form') return answer(200, { success: true, results: fake.definition });
     if (op === 'submit') {
       return answer(200, { success: true, results: { submittedFormInstance: { id: '7f000000-0000-4000-8000-00000000fa01' } } });
+    }
+    if (op === 'list') {
+      const results = fake.feedbackList.filter((entry) => {
+        const owner = (entry as Record<string, unknown> | null)?.applicationId;
+        return typeof owner !== 'string' || owner === body.applicationId;
+      });
+      return answer(200, { success: true, results, moreDataAvailable: false });
     }
     return answer(404, { success: false, errors: ['not_found'] });
   };
@@ -207,6 +271,7 @@ export function createScriptedAshby(): ScriptedAshby {
     },
     submits: () => requests.filter((request) => request.op === 'submit'),
     forms: () => requests.filter((request) => request.op === 'form'),
+    lists: () => requests.filter((request) => request.op === 'list'),
   });
 }
 
@@ -276,6 +341,9 @@ class MemoryQuery {
 
 export interface CompletedBookingOptions {
   readonly channel?: 'browser' | 'meet';
+  /** `public_page` seeds a public-page booking (M035 S02): no event, schedule or scheduler id. */
+  readonly source?: 'ashby' | 'public_page';
+  /** The Ashby interview event (an `ashby` booking only). */
   readonly eventId?: string;
   readonly applicationId?: string;
   readonly startAt?: string;
@@ -292,7 +360,8 @@ export interface CompletedBooking {
   readonly sessionId: string;
   readonly candidateId: string;
   readonly assessmentId: string;
-  readonly eventId: string;
+  /** The Ashby interview event; null for a public-page booking. */
+  readonly eventId: string | null;
   readonly applicationId: string;
   /** The feedback receipt key. */
   readonly key: string;
@@ -349,7 +418,7 @@ export function createR1MeetFeedbackWorld(): R1MeetFeedbackWorld {
     },
   };
   const store = createR1MeetFeedbackStore(client as unknown as typeof supabase);
-  const ashby = createScriptedAshby();
+  const ashby = createScriptedAshby({ now: () => h.now() });
   const port = createR1MeetAshbyFeedbackPort({ apiKey: FEEDBACK_API_KEY, log: h.deps.log, transport: ashby.transport });
 
   let config: R1MeetFeedbackConfig = Object.freeze({ status: 'on', formDefinitionId: FEEDBACK_FORM_ID });
@@ -403,18 +472,32 @@ export function createR1MeetFeedbackWorld(): R1MeetFeedbackWorld {
       tables.assessments.push(finalAssessmentRow(assessmentId, session.id, options.assessment));
       const startAt = options.startAt ?? new Date(nowMs - 2 * 3600 * 1000).toISOString();
       const endAt = options.endAt ?? new Date(Date.parse(startAt) + 45 * 60 * 1000).toISOString();
-      const eventId = options.eventId ?? fixtureId();
       const applicationId = options.applicationId ?? fixtureId();
-      const booking = h.db.seedBooking({
-        ashby_interview_event_id: eventId,
-        ashby_application_id: applicationId,
-        round_id: round.id,
-        status: 'completed',
-        reason: 'attempt_settled',
-        session_id: session.id,
-        start_at: startAt,
-        end_at: endAt,
-      });
+      let booking: Row;
+      if (options.source === 'public_page') {
+        if (options.eventId !== undefined) throw new Error('feedback world: a public-page booking has no interview event');
+        booking = h.db.seedPublicBooking({
+          ashby_application_id: applicationId,
+          round_id: round.id,
+          status: 'completed',
+          reason: 'attempt_settled',
+          session_id: session.id,
+          start_at: startAt,
+          end_at: endAt,
+        });
+      } else {
+        const eventId = options.eventId ?? fixtureId();
+        booking = h.db.seedBooking({
+          ashby_interview_event_id: eventId,
+          ashby_application_id: applicationId,
+          round_id: round.id,
+          status: 'completed',
+          reason: 'attempt_settled',
+          session_id: session.id,
+          start_at: startAt,
+          end_at: endAt,
+        });
+      }
       const key = r1MeetFeedbackReceiptKey(booking.id, assessmentId);
       let job: Row | null = null;
       if (options.record !== false) {
@@ -428,7 +511,7 @@ export function createR1MeetFeedbackWorld(): R1MeetFeedbackWorld {
         sessionId: session.id,
         candidateId: round.candidate_id,
         assessmentId,
-        eventId: booking.ashby_interview_event_id,
+        eventId: (booking.ashby_interview_event_id as string | null) ?? null,
         applicationId,
         key,
         job,

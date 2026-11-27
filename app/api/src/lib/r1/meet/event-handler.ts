@@ -28,10 +28,12 @@
  *                                  `r1_meet_bot_waiting_room` at once, one line per run whatever the
  *                                  compare-and-set retries do (the meeting is not OPEN, or nobody
  *                                  admitted Dex: HR must fix it before more candidates are
- *                                  stranded). A run that throws or defers before its end writes
- *                                  nothing, so its re-run is the one that alerts: the alert is never
- *                                  lost, and only a run killed between that line and its ack can
- *                                  repeat it (PR #449 review S09-R1);
+ *                                  stranded), with `error_type` = the booking's source: ERROR for
+ *                                  `public_page` (Dex's own Meet must be open), WARN for `ashby`
+ *                                  (HR admits Dex; M035 S02, S09-R2). A run that throws or defers
+ *                                  before its end writes nothing, so its re-run is the one that
+ *                                  alerts: the alert is never lost, and only a run killed between
+ *                                  that line and its ack can repeat it (PR #449 review S09-R1);
  *   in_call_recording, or an UNMARKED participant join
  *                                  a human is present (below);
  *   a participant join the receiver marked `is_bot`
@@ -998,7 +1000,13 @@ export const r1MeetRecallEventDefinition: R1MeetJobDefinition<R1MeetRecallEventJ
         // meeting is not OPEN (or nobody admits Dex). Written once the run's status step is done and
         // never before it: a run that throws or defers earlier leaves the alert to its re-run.
         // Receipts de-duplicate redeliveries, so a run is one Recall status change.
-        deps.log.error({ error_category: R1_MEET_ALERTS.botWaitingRoom });
+        // S09-R2 (M035 S02): `error_type` is the booking's source. A public-page booking's Meet is on
+        // Dex's own calendar and must be OPEN, so a door there means the Dex unit's Meet settings are
+        // wrong: error. In an Ashby meeting admitting Dex is HR's normal step (a bot nobody admits
+        // still raises `r1_meet_bot_admission_blocked` at the waiting-room timeout): warn.
+        const line = { error_category: R1_MEET_ALERTS.botWaitingRoom, error_type: match.booking.source };
+        if (match.booking.source === 'public_page') deps.log.error(line);
+        else deps.log.warn(line);
       }
       return step;
     }

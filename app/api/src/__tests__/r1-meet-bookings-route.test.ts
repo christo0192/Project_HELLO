@@ -13,11 +13,14 @@
  *    and every malformed value a 400 `invalid_query`; the keyset cursor round-trips, appears only when
  *    a further row came back, and is refused unless it is exactly one this route wrote;
  *  - PII: the double answers FULL rows (Meet URL, ticket fields, Ashby ids, Recall bot, session,
- *    profile, an embedded candidate) and every answer still carries exactly the ten fields and none of
- *    those values;
+ *    profile, an embedded candidate) and every answer still carries exactly the eleven fields and none
+ *    of those values;
+ *  - (M035 S02) `source`, the eleventh field: `ashby` or `public_page` as stored, anything else a 503;
+ *    a public-page row (no Ashby schedule ids) reads like any other;
  *  - a read failure or a drifted row is a 503, never a partial page;
- *  - the closed status and reason lists equal migration 0142's CHECK lists and the spec's enums, and
- *    every body validates against the spec's inline schema.
+ *  - the closed status list equals migration 0142's CHECK list, the reason and source lists equal
+ *    0143's (its reasons are 0142's in order, then two), all equal the spec's enums, and every body
+ *    validates against the spec's inline schema.
  */
 
 import { readFileSync } from 'node:fs';
@@ -34,6 +37,7 @@ import { getAuditSink, setAuditSink, type AuditSink } from '../lib/audit.js';
 import {
   R1_MEET_BOOKING_FIELDS,
   R1_MEET_BOOKING_REASONS,
+  R1_MEET_BOOKING_SOURCES,
   R1_MEET_BOOKING_STATUSES,
   R1_MEET_BOOKINGS_OWNER_SELECT,
   R1_MEET_BOOKINGS_SELECT,
@@ -54,6 +58,9 @@ type Role = 'admin' | 'interviewer' | 'viewer';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const SPEC = parseYamlDocument(readFileSync(path.resolve(here, '../../openapi/openapi.yaml'), 'utf8'));
 const MIGRATION = readFileSync(path.resolve(here, '../../../supabase/migrations/0142_r1_meet_bookings.sql'), 'utf8')
+  .replace(/\r\n/g, '\n');
+/** M035 S01: the source column and the swapped reason CHECK. */
+const MIGRATION_0143 = readFileSync(path.resolve(here, '../../../supabase/migrations/0143_r1_meet_public_bookings.sql'), 'utf8')
   .replace(/\r\n/g, '\n');
 
 const LIST = '/api/interview-rounds/meet-bookings';
@@ -115,6 +122,32 @@ function bookingRow(i: number, over: Row = {}): Row {
     // PostgREST prints a timestamptz with its offset and microseconds.
     created_at: '2026-11-24T09:00:00.123456+00:00',
     updated_at: '2026-11-24T09:30:00.654321+00:00',
+    source: 'ashby',
+    ...over,
+  };
+}
+
+/**
+ * A public-page booking row (M035, 0143): no Ashby schedule, event or scheduler id, but the matched
+ * application, plus the 0143 columns the read must never select or answer.
+ */
+const PUBLIC_WITHHELD = {
+  google_calendar_event_id: 'c'.repeat(32),
+  manage_token_digest: 'e'.repeat(64),
+  public_request_id: '70000000-0000-4000-8000-0000000000a7',
+} as const;
+
+function publicOver(over: Row = {}): Row {
+  return {
+    source: 'public_page',
+    ashby_interview_event_id: null,
+    ashby_schedule_id: null,
+    ashby_scheduled_by_user_id: null,
+    ashby_updated_at: null,
+    calendar_state: 'invited',
+    invite_sent_at: '2026-11-24T09:00:05+00:00',
+    move_count: 0,
+    ...PUBLIC_WITHHELD,
     ...over,
   };
 }
@@ -298,8 +331,15 @@ function expectNoWithheldValue(text: string): void {
     }
     expect(text, column).not.toContain(value);
   }
-  for (const word of ['meet_url', 'ticket', 'ashby', 'recall', 'session', 'owner_id', 'candidates', 'Embedded Candidate Name']) {
-    expect(text, word).not.toContain(word);
+  for (const [column, value] of Object.entries(PUBLIC_WITHHELD)) {
+    expect(text, column).not.toContain(value);
+  }
+  // `ashby` is also a value of `source` (M035): only that exact pair may carry the word.
+  const scrubbed = text.replace(/"source":"(?:ashby|public_page)"/g, '"source":""');
+  const words = ['meet_url', 'ticket', 'ashby', 'recall', 'session', 'owner_id', 'candidates', 'Embedded Candidate Name'];
+  // The 0143 column names (the reason `invite_undeliverable` is a value, so `invite_sent` only).
+  for (const word of [...words, 'calendar', 'invite_sent', 'manage_token', 'public_request', 'move_count']) {
+    expect(scrubbed, word).not.toContain(word);
   }
 }
 
@@ -690,9 +730,10 @@ describe('the keyset cursor', () => {
 // ── What leaves ──────────────────────────────────────────────────────────────
 
 describe('what leaves', () => {
-  it('projects exactly the ten fields from full rows, whatever the database answers', async () => {
+  it('projects exactly the eleven fields from full rows, whatever the database answers', async () => {
     addBooking(1);
     addBooking(2, { status: 'completed', reason: 'attempt_settled' });
+    addBooking(3, publicOver());
     for (const role of ['admin', 'viewer', 'interviewer'] as const) {
       const res = await list('', { role });
       expect(res.status).toBe(200);
@@ -720,7 +761,43 @@ describe('what leaves', () => {
       created_at: '2026-11-24T09:00:00.123Z',
       updated_at: '2026-11-24T09:30:00.654Z',
       version: 7,
+      source: 'ashby',
     });
+  });
+
+  it('answers a public-page booking (M035) with source public_page and nothing of its 0143 columns', async () => {
+    addBooking(1);
+    addBooking(2, publicOver({ status: 'cancelled', reason: 'candidate_cancelled', recall_bot_id: null }));
+    addBooking(3, publicOver({ status: 'failed', reason: 'invite_undeliverable', recall_bot_id: null, calendar_state: 'created', invite_sent_at: null }));
+    for (const role of ['admin', 'viewer', 'interviewer'] as const) {
+      const res = await list('', { role });
+      expect(res.status).toBe(200);
+      expectListBody(res.body);
+      expectNoWithheldValue(res.text);
+      expect(res.body.bookings.map((b: Row) => [b.id, b.source, b.status, b.reason])).toEqual([
+        [bookingId(1), 'ashby', 'bot_scheduled', 'eligible'],
+        [bookingId(2), 'public_page', 'cancelled', 'candidate_cancelled'],
+        [bookingId(3), 'public_page', 'failed', 'invite_undeliverable'],
+      ]);
+    }
+    const one = await detail(bookingId(2));
+    expect(one.status).toBe(200);
+    expect(one.body).toStrictEqual({
+      id: bookingId(2),
+      candidate_id: candidateId(2),
+      round_id: roundId(2),
+      status: 'cancelled',
+      reason: 'candidate_cancelled',
+      start_at: slotStart(2),
+      end_at: new Date(Date.parse(slotStart(2)) + 30 * 60_000).toISOString(),
+      created_at: '2026-11-24T09:00:00.123Z',
+      updated_at: '2026-11-24T09:30:00.654Z',
+      version: 2,
+      source: 'public_page',
+    });
+    expect(Object.keys(one.body)).toEqual([...R1_MEET_BOOKING_FIELDS]);
+    expect(validateSchema(one.body, DETAIL_SCHEMA, SPEC)).toEqual([]);
+    expectNoWithheldValue(one.text);
   });
 
   it('canonicalises an upper-case id before reading, and refuses a malformed one with 400 invalid_id', async () => {
@@ -761,7 +838,12 @@ describe('failures', () => {
 
   it.each([
     ['a status outside the twelve', { status: 'archived' }],
-    ['a reason outside the thirty-two', { reason: 'other' }],
+    ['a reason outside the thirty-four', { reason: 'other' }],
+    ['a null source', { source: null }],
+    ['a missing source', { source: undefined }],
+    ['a source outside the two', { source: 'csv' }],
+    ['an upper-case source', { source: 'ASHBY' }],
+    ['a source that is not a string', { source: 1 }],
     ['a malformed id', { id: 'booking-1' }],
     ['a malformed candidate id', { candidate_id: 'c-1' }],
     ['an unparseable start', { start_at: 'soon' }],
@@ -784,34 +866,71 @@ describe('failures', () => {
 
 describe('the closed lists', () => {
   /** Whole-line comments removed, whitespace collapsed (the parse of r1-meet-bookings-migration.test.ts). */
-  const code = MIGRATION.replace(/^\s*--.*$/gm, '').replace(/\s+/g, ' ').trim();
-  const inList = (constraint: string, column: string): string[] => {
-    const m = new RegExp(`constraint ${constraint} check \\( ?${column} in \\(([^)]*)\\) ?\\)`).exec(code);
+  const strip = (text: string): string => text.replace(/^\s*--.*$/gm, '').replace(/\s+/g, ' ').trim();
+  const code = strip(MIGRATION);
+  const code0143 = strip(MIGRATION_0143);
+  const inList = (constraint: string, column: string, text = code): string[] => {
+    const m = new RegExp(`constraint ${constraint} check \\( ?${column} in \\(([^)]*)\\) ?\\)`).exec(text);
     expect(m, constraint).not.toBeNull();
     return [...m![1]!.matchAll(/'([^']*)'/g)].map((match) => match[1]!);
   };
 
-  it('the twelve statuses and thirty-two reasons are 0142 CHECK lists, in order', () => {
+  it('the twelve statuses are 0142 CHECK lists; the thirty-four reasons are 0143 CHECK lists (0142 first, in order)', () => {
     expect([...R1_MEET_BOOKING_STATUSES]).toEqual(inList('chk_r1_meet_bookings_status', 'status'));
-    expect([...R1_MEET_BOOKING_REASONS]).toEqual(inList('chk_r1_meet_bookings_reason', 'reason'));
+    const reasons0142 = inList('chk_r1_meet_bookings_reason', 'reason');
+    const reasons0143 = inList('chk_r1_meet_bookings_reason', 'reason', code0143);
+    expect(reasons0142).toHaveLength(32);
+    expect(reasons0143).toHaveLength(34);
+    // 0143 (M035 S01) swaps the CHECK: 0142's 32 in 0142's order, then its own two.
+    expect(reasons0143.slice(0, 32)).toEqual(reasons0142);
+    for (const reason of reasons0143.slice(32)) expect(reasons0142, reason).not.toContain(reason);
+    expect([...R1_MEET_BOOKING_REASONS]).toEqual(reasons0143);
     expect(R1_MEET_BOOKING_STATUSES).toHaveLength(12);
-    expect(R1_MEET_BOOKING_REASONS).toHaveLength(32);
+    expect(R1_MEET_BOOKING_REASONS).toHaveLength(34);
+    expect(new Set(R1_MEET_BOOKING_REASONS).size).toBe(34);
     expect(Object.isFrozen(R1_MEET_BOOKING_STATUSES)).toBe(true);
     expect(Object.isFrozen(R1_MEET_BOOKING_REASONS)).toBe(true);
   });
 
-  it('the spec documents the same enums, the ten fields and the query parameters', () => {
+  it('the two sources are the 0143 CHECK list, frozen; source is the eleventh and last field', () => {
+    expect([...R1_MEET_BOOKING_SOURCES]).toEqual(inList('chk_r1_meet_bookings_source', 'source', code0143));
+    expect(R1_MEET_BOOKING_SOURCES).toHaveLength(2);
+    expect(Object.isFrozen(R1_MEET_BOOKING_SOURCES)).toBe(true);
+    expect(Object.isFrozen(R1_MEET_BOOKING_FIELDS)).toBe(true);
+    expect([...R1_MEET_BOOKING_FIELDS]).toEqual([
+      'id', 'candidate_id', 'round_id', 'status', 'reason', 'start_at', 'end_at', 'created_at', 'updated_at', 'version', 'source',
+    ]);
+    expect(R1_MEET_BOOKINGS_SELECT).toBe('id,candidate_id,round_id,status,reason,start_at,end_at,created_at,updated_at,version,source');
+    expect(R1_MEET_BOOKINGS_OWNER_SELECT).toBe(
+      'id,candidate_id,round_id,status,reason,start_at,end_at,created_at,updated_at,version,source,candidates!inner(owner_id)',
+    );
+  });
+
+  it('the spec documents the same enums, the eleven fields and the query parameters', () => {
     const item = ((LIST_SCHEMA as YMap).properties as YMap).bookings as YMap;
     for (const schema of [item.items as YMap, DETAIL_SCHEMA as YMap]) {
       const props = schema.properties as YMap;
       expect(schema.required).toEqual([...R1_MEET_BOOKING_FIELDS]);
       expect(Object.keys(props)).toEqual([...R1_MEET_BOOKING_FIELDS]);
+      expect(Object.keys(props)).toHaveLength(11);
       expect(schema.additionalProperties).toBe(false);
       expect((props.status as YMap).enum).toEqual([...R1_MEET_BOOKING_STATUSES]);
       expect((props.reason as YMap).enum).toEqual([...R1_MEET_BOOKING_REASONS]);
+      expect((props.reason as YMap).enum).toHaveLength(34);
+      expect((props.source as YMap).type).toBe('string');
+      expect((props.source as YMap).enum).toEqual([...R1_MEET_BOOKING_SOURCES]);
+      expect((props.source as YMap).nullable).toBeUndefined();
+      // Owner 2026-11-27: the interviewer is Lexy, so the source's words name no interviewer (S02-R4).
+      expect(String((props.source as YMap).description)).toBe(
+        'Where the booking came from: ashby = scheduled by HR in Ashby (M034); public_page = booked by the candidate on the public R1 booking page (M035).',
+      );
       expect((props.candidate_id as YMap).nullable).toBe(true);
       expect((props.round_id as YMap).nullable).toBe(true);
     }
+    // The list description names every field it carries, source included.
+    expect(String(operation(LIST).description)).toContain(
+      'Each booking carries exactly id, candidate_id, round_id, status, reason, start_at, end_at, created_at, updated_at, version and source (ashby or public_page)',
+    );
     const params = operation(LIST).parameters as YMap[];
     expect(params.map((p) => p.name)).toEqual(['status', 'from', 'to', 'limit', 'cursor']);
     expect(((params[0]!.schema as YMap).enum)).toEqual([...R1_MEET_BOOKING_STATUSES]);
@@ -828,6 +947,12 @@ describe('the closed lists', () => {
     expect(validateSchema(body, LIST_SCHEMA, SPEC).join('\n')).toMatch(/meet_url: undocumented property/);
     const wrongStatus = { meet_enabled: true, bookings: [{ ...bookingProjection(), status: 'archived' }], next_cursor: null };
     expect(validateSchema(wrongStatus, LIST_SCHEMA, SPEC).join('\n')).toMatch(/not in enum/);
+    // The source: a word outside the two, and a booking without it.
+    const wrongSource = { ...bookingProjection(), source: 'csv' };
+    expect(validateSchema(wrongSource, DETAIL_SCHEMA, SPEC).join('\n')).toMatch(/source: value "csv" not in enum/);
+    const { source: _source, ...noSource } = bookingProjection();
+    expect(validateSchema(noSource, DETAIL_SCHEMA, SPEC).join('\n')).toMatch(/source: missing required property/);
+    expect(validateSchema({ ...bookingProjection(), source: 'public_page' }, DETAIL_SCHEMA, SPEC)).toEqual([]);
   });
 });
 
@@ -843,5 +968,6 @@ function bookingProjection(): Row {
     created_at: slotStart(0),
     updated_at: slotStart(0),
     version: 0,
+    source: 'ashby',
   };
 }

@@ -17,9 +17,10 @@
  * recorded like the R1 queue's refusal). A list read, so a successful read is not audited, as the
  * queue is not.
  *
- * WHAT LEAVES. Ten fields: id, candidate_id, round_id, status, reason, start_at, end_at, created_at,
- * updated_at, version. Never the Meet URL, a ticket field, an Ashby id, the attester, the Recall bot,
- * the session or the profile. Every answer is `Cache-Control: no-store`.
+ * WHAT LEAVES. Eleven fields: id, candidate_id, round_id, status, reason, start_at, end_at, created_at,
+ * updated_at, version, source (`ashby` or `public_page`, M035). Never the Meet URL, a ticket field, an
+ * Ashby id, the attester, the Recall bot, the session, the profile, or a calendar, manage or request
+ * column of 0143. Every answer is `Cache-Control: no-store`.
  *
  * WHY NOT UNDER /api/r1. `/api/r1/*` is the public candidate surface by repo contract: every route
  * there is mounted on the candidate router and public by exact path (`r1-openapi-contract.test.ts`),
