@@ -1639,7 +1639,7 @@ describe('the bot\'s own participant is never a human (M035 S09 D-S09-6, UNVERIF
     expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', reason: 'eligible', ticket_arms: 0 });
     expect(outputMedia(h)).toHaveLength(0);
     // The candidate's own join is the human signal as usual: one arm. The missed bot join now counts
-    // as a person, so it costs one recount at most (policy observe, the default: a warning only).
+    // as a person, so this join also queues the recount (the known limit pinned below).
     h.advance(60 * SEC);
     expect(await deliver(h, b, 'participant_events.join', { participantId: CANDIDATE })).toEqual(done('processed', 'armed'));
     expect(outputMedia(h)).toHaveLength(1);
@@ -1794,6 +1794,41 @@ describe('the bot\'s own participant is never a human (M035 S09 D-S09-6, UNVERIF
     );
     expect(steps(h)).toEqual(['recall:get', 'recall:get', 'recall:leave', 'db:transition:failed', 'db:set_bot:release']);
     expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'no_show', recall_bot_id: null, ticket_arms: 1 });
+  });
+
+  // The known limit of a missed own join (PR #449 fix check, S09-R4 round 2; M034 behaviour, the
+  // `markedJoin` docstring and contracts §9): it never STARTS the bridge (above), but it is counted
+  // as a person wherever `countHumans` runs, until the live spike S0c settles the bound.
+  it('known limit: the bot\'s own join past the bound still counts, so attempt_ended re-arms in an empty call (not failed/no_show)', async () => {
+    const h = world();
+    // In the call from T0 (`in_call_recording`), an attempt bound, then failed and not counted.
+    const b = await booked(h, 'in_call_session', { sessionStatus: 'failed' });
+    h.db.addAttempt({ session_id: b.sessionId!, round_id: b.roundId, outcome: 'provider_error', counted: false });
+    // Reported 20 s after the bot got in (a listing lag): past the 15 s bound, so not the bot's own.
+    h.advance(20 * SEC);
+    event(h, b, 'participant_events.join', marked(BOT));
+    event(h, b, 'participant_events.join', { participantId: CANDIDATE });
+    event(h, b, 'participant_events.leave', { participantId: CANDIDATE });
+    const payload = { kind: 'attempt_ended', booking_id: b.id, session_id: b.sessionId };
+    expect(await runJob(h, r1MeetAttemptEndedDefinition, payload)).toEqual(done('processed', 'rearmed'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'in_call', recall_bot_id: b.botId, ticket_arms: 2 });
+    expect(outputMedia(h)).toHaveLength(1);
+    expectNoPii(h);
+  });
+
+  it('known limit: the bot\'s own join past the bound and one candidate are two humans; policy end ends the call', async () => {
+    const h = world();
+    const b = await inCall(h);
+    h.advance(20 * SEC);
+    expect(await deliver(h, b, 'participant_events.join', marked(BOT))).toEqual(done('ignored', 'marked_participant'));
+    expect(await deliver(h, b, 'participant_events.join', { participantId: CANDIDATE })).toEqual(done('processed', 'armed'));
+    expect(h.db.jobs('multi_human_check')).toHaveLength(1);
+    h.advance(120 * SEC);
+    reset(h);
+    expect(await check(h, b)).toEqual(done('processed', 'multiple_humans'));
+    expect(h.alerts()).toEqual(['r1_meet_multiple_humans']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'multiple_humans', recall_bot_id: null });
+    expectNoPii(h);
   });
 
   it('multi_human_check: the bot\'s own join and one candidate is one human; Recall down there defers', async () => {

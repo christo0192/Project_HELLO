@@ -98,9 +98,11 @@
  * the bot's own join is reported nor when. H1 (reported at the bot's entry): the rule finds it. H3
  * (never reported): a lone name-alike joins after the bound and counts. H2 (reported only when
  * recording starts, i.e. when someone else joins, later than 15 s): it counts as a person, so the
- * multi-human check would see two on every call. Under none of them does a marked join arm the
- * bridge (above). A Recall failure of that GET defers `multi_human_check` and `attempt_ended` before
- * any write; the human-present recount falls back to no bound (it only decides whether to queue a
+ * multi-human check would see two on every call. Under none of them does a marked join start the
+ * bridge (above); but a missed own join (H2, or no readable time) is counted wherever `countHumans`
+ * runs, so the multi-human check and the recovery of an attempt that did not count see one person
+ * too many (`markedJoin` lists the effects). A Recall failure of that GET defers
+ * `multi_human_check` and `attempt_ended` before any write; the human-present recount falls back to no bound (it only decides whether to queue a
  * recount). On Google Meet a rejoin is a NEW id, and HR may still be admitting the candidate, so two
  * humans only queue one `multi_human_check` 120 s later; if there are still more than one then,
  * policy `end` alerts `r1_meet_multiple_humans`, leaves at Recall FIRST, then marks
@@ -920,9 +922,18 @@ async function ended(
  * no id (nothing to count), is ignored. Any other is a person (a candidate named like the bot): it
  * only queues the recount, so it stays counted, and it never moves or arms the booking. If the
  * own-participant rule missed the bot's own join (stamped later than the bound, or with no readable
- * time), that join can then cost one `observe` warning at most, never an arm in an empty room; a
- * real person's arrival is still seen through `bot.in_call_recording`. Recall first (one GET, for
- * the bound), the database second: a Recall failure defers the job before any write.
+ * time), that join still never STARTS the bridge: a real person's arrival is seen through
+ * `bot.in_call_recording` or their own unmarked join. It is still counted as a person wherever
+ * `countHumans` runs, as every join was in M034 (PR #449 fix check, S09-R4 round 2): with the
+ * candidate in the call the multi-human check sees two (policy `observe`: a warning per check;
+ * policy `end`: the call ends as `failed/multiple_humans`), and once the candidate has left an
+ * attempt that did not count, `recoverOrEnd` still sees one human, so it re-arms the bridge in an
+ * empty call (an attempt that starts there can spend one of the round's starts) instead of ending
+ * `failed/no_show`; the call then ends only when the bot has left it (`failed/no_show`) or the
+ * round, the claim window or the arms (`R1_MEET_MAX_TICKET_ARMS`) run out (`failed/bot_fatal`).
+ * The live spike S0c settles the bound (runbook, "Whether Recall reports the bot's OWN join").
+ * Recall first (one GET, for the bound), the database second: a Recall failure defers the job
+ * before any write.
  */
 async function markedJoin(
   deps: R1MeetFlowDeps,

@@ -4164,7 +4164,9 @@ that the bot's own join is not counted and HR leaves after admitting the candida
   and only when it is stamped at most 15 s after the bot's first `in_call_*` status; it is then
   never counted. A participant Recall itself marks as a bot is never counted either. A join whose
   name is the bot's own never starts the bridge on its own (`bot.in_call_recording` does), so a
-  missed bot join costs at most one warning, never an early start. **S0c** reads the `r1_meet_multi_human_observed`
+  missed bot join never starts Dex early; it still counts as a person (a warning per check with
+  `observe`, a call ended as `failed/multiple_humans` with `end`, and the empty-call recovery
+  above). **S0c** reads the `r1_meet_multi_human_observed`
   lines (with the default `observe`) on one-candidate calls to learn which case holds and whether
   the 15 s bound fits: H1, the join is reported when the bot enters (the rule finds it: no
   warning); H3, it is never reported (no warning either; the bot's participant list in the Recall
