@@ -10,7 +10,8 @@
  * (lib/r1-meet-bookings). The API decides who sees which booking (`GET /api/interview-rounds/meet-bookings`).
  *
  * The server decides whether Meet is on, and this page only prints what it answered: there is nothing to
- * switch here. While it is off no booking is read or listed, so the filters go too.
+ * switch here. While it is off no booking is read or listed, so the filters go too. While it is on, a card
+ * gives HR the public booking link to copy; it is static and asks nothing (MeetBookingsPublicLink).
  *
  * One read a visit, one per change of filter and one per "Load more". Nothing is read on a timer. A read
  * that changes what is shown clears the rows first: a list under the wrong filter reads as true. The next
@@ -22,6 +23,7 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
 import { Button, EmptyPanel, ErrorPanel, InlineNotice, RetryButton, Skeleton } from '../components/design';
 import { MeetBookingsFilters } from '../components/r1/MeetBookingsFilters';
+import { MeetBookingsPublicLink } from '../components/r1/MeetBookingsPublicLink';
 import { MeetBookingsTable } from '../components/r1/MeetBookingsTable';
 import { CandidateShell } from '../components/talent/CandidateShell';
 import { apiErrorCopy } from '../lib/api-error-copy';
@@ -226,6 +228,13 @@ export function R1MeetBookingsPage() {
           ? `Google Meet interviews are ${meetOn ? 'on' : 'off'}.`
           : current === null && dateError === null && <Skeleton width="14rem" height={16} radius={3} />}
       </p>
+
+      {/* Shown only while the last answer says Meet is on, so the loading and off pages stay as they were. */}
+      {meetOn === true && (
+        <div className="mt-4">
+          <MeetBookingsPublicLink />
+        </div>
+      )}
 
       {meetOn !== false && (
         <div className="mt-4">

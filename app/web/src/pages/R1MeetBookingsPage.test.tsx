@@ -492,7 +492,88 @@ describe('whether Meet is on', () => {
     expect(screen.queryByRole('table')).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
     expect(within(screen.getByTestId('meet-status').parentElement!).queryByRole('button')).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Public booking link' })).toBeNull();
     expect(container.textContent).not.toMatch(/R1_MEET|_ENABLED|VITE_|\benv\b|\bflag\b/i);
+    await settle();
+    expect(asked()).toBe(1);
+  });
+});
+
+describe('the public booking link card', () => {
+  const card = () => screen.queryByRole('heading', { name: 'Public booking link' });
+  const here = () => `${window.location.origin}/book`;
+
+  it('is not there while the first answer is out', async () => {
+    mockApi.listR1MeetBookings.mockReturnValue(new Promise(() => undefined));
+    open();
+    expect(card()).toBeNull();
+    await settle();
+    expect(card()).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Copy link' })).toBeNull();
+  });
+
+  it('is not there after a read that failed: nothing said Meet is on', async () => {
+    mockApi.listR1MeetBookings.mockRejectedValue(failure(503, 'service_unavailable'));
+    open();
+    await screen.findByRole('alert');
+    expect(card()).toBeNull();
+    expect(screen.queryByLabelText('Link for candidates')).toBeNull();
+  });
+
+  it('is there, under the line, once the answer says Meet is on, with this site\'s /book', async () => {
+    open();
+    await table();
+    const heading = card();
+    expect(heading).not.toBeNull();
+    expect(heading).toHaveProperty('tagName', 'H2');
+    const field = screen.getByLabelText('Link for candidates');
+    expect(field).toHaveValue(here());
+    expect(field).toHaveAttribute('readonly');
+    // Under the status line and above the filters, in reading order.
+    const order = (a: Element, b: Element) => a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING;
+    expect(order(screen.getByTestId('meet-status'), heading!)).toBeTruthy();
+    expect(order(heading!, screen.getByRole('group', { name: 'Bookings to show' }))).toBeTruthy();
+  });
+
+  it('is there with an empty list too', async () => {
+    mockApi.listR1MeetBookings.mockResolvedValue(body({ bookings: [] }));
+    open();
+    await screen.findByText('No Meet booking from today on.');
+    expect(card()).not.toBeNull();
+  });
+
+  it('stays through a change of filter whose read is still out, like the line it sits under', async () => {
+    open();
+    await table();
+    mockApi.listR1MeetBookings.mockReturnValue(new Promise(() => undefined));
+    await pickOption(userEvent.setup(), /^Status/, 'Blocked');
+    await screen.findByRole('status', { name: 'Loading Meet bookings' });
+    expect(card()).not.toBeNull();
+    expect(screen.getByLabelText('Link for candidates')).toHaveValue(here());
+  });
+
+  it('goes when Meet was turned off between two pages', async () => {
+    mockApi.listR1MeetBookings
+      .mockResolvedValueOnce(body({ bookings: [booking()], next_cursor: 'cursor-1' }))
+      .mockResolvedValueOnce(OFF);
+    open();
+    await table();
+    expect(card()).not.toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: 'Load more' }));
+    await waitFor(() => expect(screen.getByTestId('meet-status')).toHaveTextContent('Google Meet interviews are off.'));
+    expect(card()).toBeNull();
+  });
+
+  it('copies the address and asks the API nothing for it', async () => {
+    const user = userEvent.setup();
+    const writeText = vi.spyOn(navigator.clipboard, 'writeText');
+    open();
+    await table();
+    expect(asked()).toBe(1);
+    await user.click(screen.getByRole('button', { name: 'Copy link' }));
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(writeText).toHaveBeenCalledWith(here());
+    expect(await screen.findByText('Link copied to the clipboard.')).toBeInTheDocument();
     await settle();
     expect(asked()).toBe(1);
   });
