@@ -123,7 +123,7 @@ export interface R1MeetFlowDeps {
    */
   readonly feedback?: R1MeetFeedbackDeps;
   /**
-   * The ports of the "Dex R1: Booked" tag lane (M035 S11, `ashby-booked-tag.ts`): the booked-tag
+   * The ports of the "Lexy R1: Booked" tag lane (M035 S11, `ashby-booked-tag.ts`): the booked-tag
    * store, Ashby's own write switches and the Ashby tag port. Optional so the S06 flows and harnesses
    * compile unchanged; absent, an `ashby_booked_tag` job throws `r1_meet_ashby_tag_unwired`.
    */
@@ -166,7 +166,7 @@ export const R1_MEET_ALERTS = Object.freeze({
   botAdmissionBlocked: 'r1_meet_bot_admission_blocked',
   /** M035 S09: the signed-in bot could not sign in to Google (`error_type` = the Recall sub-code). */
   botSignInFailed: 'r1_meet_bot_sign_in_failed',
-  /** M035 S11: the Dex R1 Booked tag could not be set up or written (`error_type` closed). */
+  /** M035 S11: the Lexy R1 Booked tag could not be set up or written (`error_type` closed). */
   ashbyTagFailed: 'r1_meet_ashby_tag_failed',
 } as const);
 

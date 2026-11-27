@@ -1,5 +1,5 @@
 /**
- * M035 S11 T2: the Ashby side of the "Dex R1: Booked" tag lane (`lib/r1/meet/ashby-booked-tag-ashby.ts`),
+ * M035 S11 T2: the Ashby side of the "Lexy R1: Booked" tag lane (`lib/r1/meet/ashby-booked-tag-ashby.ts`),
  * always through the REAL Ashby client over the stateful fake transport
  * (`support/r1-meet-ashby-tag-fake.ts`).
  *
@@ -10,7 +10,7 @@
  * - The port (D-S11-8): one attempt per call (a 429, a 503, a network failure and a timeout each make
  *   exactly ONE request), the exact write and list bodies, the five calls only and no `extra`, the
  *   metadata-only log lines, and an empty key refused before anything is built.
- * - The candidate's Dex tags and the holds rule (D-S11-6), the failure classes (D-S11-9) and the run
+ * - The candidate's Lexy tags and the holds rule (D-S11-6), the failure classes (D-S11-9) and the run
  *   budget (20 s, 5 s per call since PR #453 review S11-R3; no call under 3 s).
  * - Across the whole file: no request path outside the five the lane may call.
  */
@@ -123,7 +123,7 @@ function world() {
   };
 }
 
-/** A catalogue of `count` other tags with the Dex tag at `dexAt` (state paging, 100 per page). */
+/** A catalogue of `count` other tags with the Lexy tag at `dexAt` (state paging, 100 per page). */
 function bigCatalogue(fake: FakeAshbyTags, count: number, dexAt: number): void {
   for (let i = 0; i < count; i++) {
     if (i === dexAt) fake.catalogue.push(dex());
@@ -143,7 +143,7 @@ async function ashbyFailure(promise: Promise<unknown>): Promise<AshbyError> {
 
 describe('the constants of the lane', () => {
   it('pins the title, the client settings, the cache, the paging and the run budget', () => {
-    expect(R1_MEET_BOOKED_TAG_TITLE).toBe('Dex R1: Booked');
+    expect(R1_MEET_BOOKED_TAG_TITLE).toBe('Lexy R1: Booked');
     // PR #453 review S11-R3: 5 s per call and a 20 s run, so a slow Ashby holds a shared r1-meet
     // lane slot for at most 20 s a run (it was 10 s and 30 s).
     expect(R1_MEET_ASHBY_TAG_CLIENT_SETTINGS).toEqual({ maxAttempts: 1, timeoutMs: 5_000 });
@@ -159,9 +159,9 @@ describe('the constants of the lane', () => {
 });
 
 describe('the one-title resolver (D-S11-5)', () => {
-  it('finds the one active Dex tag on a single page, among other tags', async () => {
+  it('finds the one active Lexy tag on a single page, among other tags', async () => {
     const w = world();
-    w.fake.catalogue.push(christy(), referral(), dex(), { id: NEAR_TAG, title: 'Dex R1: Booked (old)', isArchived: false });
+    w.fake.catalogue.push(christy(), referral(), dex(), { id: NEAR_TAG, title: 'Lexy R1: Booked (old)', isArchived: false });
     await expect(w.port.resolver.resolve()).resolves.toEqual({ status: 'found', tagId: DEX_TAG, cached: false });
     expect(w.fake.paths()).toEqual(['/candidateTag.list']);
   });
@@ -194,7 +194,7 @@ describe('the one-title resolver (D-S11-5)', () => {
     trimmed.fake.catalogue.push(dex(DEX_TAG, { title: `  ${TITLE}\t` }));
     await expect(trimmed.port.resolver.resolve()).resolves.toEqual({ status: 'found', tagId: DEX_TAG, cached: false });
 
-    for (const title of ['dex r1: booked', 'DEX R1: BOOKED', 'Dex R1: Booked (old)', 'Dex R1:  Booked', 'Dex R1 Booked', 'Dex R1: Booked.']) {
+    for (const title of ['lexy r1: booked', 'LEXY R1: BOOKED', 'Lexy R1: Booked (old)', 'Lexy R1:  Booked', 'Lexy R1 Booked', 'Lexy R1: Booked.']) {
       const w = world();
       w.fake.catalogue.push(dex(DEX_TAG, { title }), christy());
       await expect(w.port.resolver.resolve(), title).resolves.toEqual({ status: 'not_found' });
@@ -533,33 +533,33 @@ describe('the port (D-S11-8)', () => {
   });
 });
 
-describe("the candidate's Dex tags (D-S11-6)", () => {
+describe("the candidate's Lexy tags (D-S11-6)", () => {
   it('reads an absent tags key as none, and refuses a shape it will not write from', () => {
     expect(r1MeetDexTagsOf({ id: CANDIDATE, name: ASHBY_TAG_SENTINELS.name })).toEqual([]);
     expect(r1MeetDexTagsOf({ tags: [] })).toEqual([]);
     for (const results of [null, undefined, [], [dex()], 'tags', 7, true]) {
       expect(() => r1MeetDexTagsOf(results), String(results)).toThrow(R1MeetAshbyTagMalformed);
     }
-    for (const tags of [{}, null, 'Dex R1: Booked', 3, { 0: dex() }]) {
+    for (const tags of [{}, null, 'Lexy R1: Booked', 3, { 0: dex() }]) {
       expect(() => r1MeetDexTagsOf({ tags }), JSON.stringify(tags)).toThrow(R1MeetAshbyTagMalformed);
     }
     expect(new R1MeetAshbyTagMalformed().message).toBe('r1_meet_ashby_tag_malformed');
   });
 
-  it('keeps only the Dex title (trimmed, any isArchived) and drops every other tag', () => {
+  it('keeps only the Lexy title (trimmed, any isArchived) and drops every other tag', () => {
     const tags = r1MeetDexTagsOf({
       tags: [
         christy(),
         referral(),
-        { id: NEAR_TAG, title: 'Dex R1: Booked (old)', isArchived: false },
-        { id: NEAR_TAG, title: 'dex r1: booked', isArchived: false },
+        { id: NEAR_TAG, title: 'Lexy R1: Booked (old)', isArchived: false },
+        { id: NEAR_TAG, title: 'lexy r1: booked', isArchived: false },
         { id: DEX_TAG, title: `  ${TITLE} `, isArchived: false },
         { id: DEX_TAG_2, title: TITLE, isArchived: true },
         { id: '', title: TITLE, isArchived: false },
         { id: 7, title: TITLE, isArchived: false },
         { id: OTHER_CANDIDATE, title: null, isArchived: false },
         null,
-        'Dex R1: Booked',
+        'Lexy R1: Booked',
       ],
     });
     expect(tags).toEqual([
@@ -588,7 +588,7 @@ describe("the candidate's Dex tags (D-S11-6)", () => {
     expect(kept).not.toContain(CHRISTY_TAG);
   });
 
-  it('holds when wanted only with an active Dex tag, and when not wanted only with no Dex tag at all', () => {
+  it('holds when wanted only with an active Lexy tag, and when not wanted only with no Lexy tag at all', () => {
     const active = { id: DEX_TAG, isArchived: false };
     const archived = { id: DEX_TAG_2, isArchived: true };
     expect(r1MeetBookedTagHolds([active], true)).toBe(true);

@@ -54,7 +54,7 @@ export const R1_MEET_DEFINITIONS: readonly R1MeetJobDefinition[] = Object.freeze
   r1MeetMaintenanceDefinition as R1MeetJobDefinition,
   r1MeetDrainDefinition as R1MeetJobDefinition,
   r1MeetScorecardFeedbackDefinition as R1MeetJobDefinition,
-  // M035 S11: the Dex R1 Booked tag lane, registered after S09's kind, so it is now the last.
+  // M035 S11: the Lexy R1 Booked tag lane, registered after S09's kind, so it is now the last.
   r1MeetAshbyBookedTagDefinition as R1MeetJobDefinition,
 ]);
 

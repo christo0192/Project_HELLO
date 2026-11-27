@@ -73,7 +73,7 @@ vi.mock('../lib/r1/meet/feedback-ashby.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/r1/meet/feedback-ashby.js')>();
   return { ...actual, createR1MeetAshbyFeedbackPort: vi.fn(actual.createR1MeetAshbyFeedbackPort) };
 });
-// M035 S11: the same pass-through spy on the "Dex R1: Booked" tag port factory.
+// M035 S11: the same pass-through spy on the "Lexy R1: Booked" tag port factory.
 vi.mock('../lib/r1/meet/ashby-booked-tag-ashby.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/r1/meet/ashby-booked-tag-ashby.js')>();
   return { ...actual, createR1MeetAshbyTagPort: vi.fn(actual.createR1MeetAshbyTagPort) };
@@ -860,7 +860,7 @@ describe('M035 S11: the tag ports of the lane', () => {
     expect(w.db.calls).toEqual([]);
   });
 
-  it("production ports: Ashby's own switches, read per call, the same two as Dex's scorecard", async () => {
+  it("production ports: Ashby's own switches, read per call, the same two as Lexy's scorecard", async () => {
     // A webhook secret long enough to count, built at run time (never a secret-shaped literal).
     const secret = 's'.repeat(24);
     vi.stubEnv('ASHBY_INTEGRATION_ENABLED', 'true');

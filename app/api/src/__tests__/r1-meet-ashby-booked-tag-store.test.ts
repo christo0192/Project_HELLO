@@ -1,10 +1,10 @@
 /**
- * M035 S11 T3: the database side of the "Dex R1: Booked" tag lane (`lib/r1/meet/ashby-booked-tag-store.ts`),
+ * M035 S11 T3: the database side of the "Lexy R1: Booked" tag lane (`lib/r1/meet/ashby-booked-tag-store.ts`),
  * the REAL store over the in-memory tables of `support/r1-meet-ashby-tag-fake.ts` (and, for shapes the
  * tables cannot produce, a client that answers one fixed value).
  *
  * Pinned here:
- *  - the exact query of each of the four reads (table, the column string byte for byte, filters,
+ *  - the exact query of each of the five reads (table, the column string byte for byte, filters,
  *    orders, limit, how it settles), and that the booking columns never name our candidate id, the
  *    Meet URL, the ticket, or a calendar, manage, request, move or invite column;
  *  - `booking`: lower-cased id, verbatim Ashby application id, `toISOString()` instants; a missing
@@ -13,7 +13,9 @@
  *  - `applicationLink`, `candidateApplications` (0 / 1 / 25 rows, the 26th an overflow with no ids,
  *    another candidate's links never seen, the candidate id matched in any case like 0143's
  *    `lower() = lower()`, PR #453 review S11-R4) and `newestPublicBooking` (created_at, then id, both
- *    descending; Ashby rows and other applications never answered);
+ *    descending; Ashby rows and other applications never answered) and `endedBookings` (the
+ *    Meet-off catch-up's page, PR #453 review S11-R2: public rows that ended while their slot is
+ *    still ahead, by id from a cursor; every row checked against what was asked);
  *  - schema pins: every booking column but `source` is a 0142 column; `source` is 0143's (contracts
  *    §3.1; 0143 is on main since S01, #450, so the pin no longer has a dark branch) and 0142 has none;
  *    the reasons the store accepts are 0143's reason CHECK (PR #453 review S11-R1); the two link
@@ -26,7 +28,9 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   R1_MEET_BOOKED_TAG_BOOKING_COLUMNS,
+  R1_MEET_BOOKED_TAG_ENDED_STATUSES,
   R1_MEET_BOOKED_TAG_MAX_APPLICATIONS,
+  R1_MEET_BOOKED_TAG_MAX_PAGE,
   R1_MEET_BOOKED_TAG_REASONS,
   createR1MeetBookedTagStore,
   type R1MeetBookedTagStore,
@@ -57,7 +61,7 @@ async function expectDbError(promise: Promise<unknown>, label?: string): Promise
 /** A client whose every query answers `answer`: the shapes the in-memory tables never produce. */
 function answering(answer: unknown): R1MeetBookedTagStore {
   const builder: Record<string, unknown> = {};
-  for (const op of ['select', 'eq', 'in', 'ilike', 'order', 'limit']) builder[op] = () => builder;
+  for (const op of ['select', 'eq', 'in', 'ilike', 'gt', 'order', 'limit']) builder[op] = () => builder;
   builder.maybeSingle = async () => answer;
   builder.then = (resolve: (value: unknown) => unknown, reject: (reason: unknown) => unknown) =>
     Promise.resolve(answer).then(resolve, reject);
@@ -579,6 +583,112 @@ describe('newestPublicBooking', () => {
     }
     // The same row answered alone is read.
     expect((await answering({ data: [pick(row)], error: null }).newestPublicBooking(applicationId))?.id).toBe(row.id);
+  });
+});
+
+// ── endedBookings (the Meet-off catch-up's page, PR #453 review S11-R2) ──
+
+describe('endedBookings', () => {
+  const NOW_MS = Date.parse(HARNESS_NOW);
+  const AHEAD = new Date(NOW_MS + 24 * 3600 * 1000).toISOString();
+  const PASSED = new Date(NOW_MS - 3600 * 1000).toISOString();
+  const page = (afterId: string | null = null, limit = 10) => ({ startAfterIso: HARNESS_NOW, afterId, limit });
+
+  it('is one list read of public rows that ended, slot after the instant, by id from the cursor', async () => {
+    const { tables, store } = world();
+    expect(R1_MEET_BOOKED_TAG_ENDED_STATUSES).toEqual(['cancelled', 'failed', 'drained']);
+    expect(Object.isFrozen(R1_MEET_BOOKED_TAG_ENDED_STATUSES)).toBe(true);
+    await store.endedBookings(page());
+    await store.endedBookings(page(ORDERED_LOW.toUpperCase(), R1_MEET_BOOKED_TAG_MAX_PAGE));
+    const filters = [
+      { op: 'eq', column: 'source', value: 'public_page' },
+      { op: 'in', column: 'status', value: ['cancelled', 'failed', 'drained'] },
+      { op: 'gt', column: 'start_at', value: HARNESS_NOW },
+    ];
+    const call = (limit: number, extra: object[]) => ({
+      table: 'r1_meet_bookings',
+      columns: R1_MEET_BOOKED_TAG_BOOKING_COLUMNS,
+      filters: [...filters, ...extra],
+      orders: [{ column: 'id', ascending: true }],
+      limit,
+      terminal: 'then',
+    });
+    expect(tables.calls).toEqual([
+      call(10, []),
+      // The cursor is lower-cased, like every booking id the store answers.
+      call(R1_MEET_BOOKED_TAG_MAX_PAGE, [{ op: 'gt', column: 'id', value: ORDERED_LOW }]),
+    ]);
+  });
+
+  it('answers the ids of every way a booking ends, slot after the instant, ascending, frozen; nothing else', async () => {
+    const { tables, store } = world();
+    const applicationId = fixtureId();
+    const ended = [
+      tables.publicBooking({ applicationId, status: 'cancelled', startAt: AHEAD }),
+      tables.publicBooking({ applicationId, status: 'failed', reason: 'in_past', startAt: AHEAD }),
+      tables.publicBooking({ applicationId, status: 'failed', startAt: AHEAD }),
+      tables.publicBooking({ applicationId, status: 'drained', startAt: AHEAD }),
+    ];
+    // Never answered: a live or completed public row, a public row whose slot starts at or before the
+    // instant, an Ashby row.
+    tables.publicBooking({ applicationId, status: 'pending', startAt: AHEAD });
+    tables.publicBooking({ applicationId, status: 'completed', startAt: AHEAD });
+    tables.publicBooking({ applicationId, status: 'drained', startAt: PASSED });
+    tables.publicBooking({ applicationId, status: 'cancelled', startAt: HARNESS_NOW });
+    tables.publicBooking({ applicationId, status: 'drained', startAt: AHEAD, source: 'ashby' });
+    const ids = await store.endedBookings(page());
+    expect(Object.isFrozen(ids)).toBe(true);
+    expect(ids).toEqual(ended.map((row) => row.id));
+    // From the cursor on, and at most the limit.
+    expect(await store.endedBookings(page(ended[1]!.id as string, 1))).toEqual([ended[2]!.id]);
+    expect(await store.endedBookings(page(ended[3]!.id as string))).toEqual([]);
+  });
+
+  it('a page it was not asked for correctly is refused before any query', async () => {
+    const { tables, store } = world();
+    const asks: Array<readonly [string, { startAfterIso: string; afterId: string | null; limit: number }]> = [
+      ['a zoneless instant', { startAfterIso: '2026-11-27T10:00:00', afterId: null, limit: 10 }],
+      ['not an instant', { startAfterIso: 'soon', afterId: null, limit: 10 }],
+      ['a cursor that is not a UUID', { startAfterIso: HARNESS_NOW, afterId: 'not-a-uuid', limit: 10 }],
+      ['limit 0', { startAfterIso: HARNESS_NOW, afterId: null, limit: 0 }],
+      ['limit above the page', { startAfterIso: HARNESS_NOW, afterId: null, limit: R1_MEET_BOOKED_TAG_MAX_PAGE + 1 }],
+      ['a fractional limit', { startAfterIso: HARNESS_NOW, afterId: null, limit: 2.5 }],
+    ];
+    for (const [label, asked] of asks) {
+      await expectDbError(store.endedBookings(asked), label);
+    }
+    expect(tables.calls).toEqual([]);
+  });
+
+  it('a drifted row, a row it did not ask for, an order it did not ask for and a DB error are r1_meet_db_error', async () => {
+    for (const failure of ['error', 'reject', 'throw'] as const) {
+      const { tables, store } = world();
+      tables.publicBooking({ applicationId: fixtureId(), status: 'drained', startAt: AHEAD });
+      tables.failNext('r1_meet_bookings', failure);
+      await expectDbError(store.endedBookings(page()), failure);
+    }
+    const { tables } = world();
+    const row = tables.publicBooking({ applicationId: fixtureId(), status: 'drained', startAt: AHEAD, id: ORDERED_LOW });
+    const pick = (value: BookedTagRow) => Object.fromEntries(SELECTED.map((column) => [column, value[column]]));
+    const high = pick({ ...row, id: ORDERED_HIGH });
+    const answers: Array<readonly [string, unknown, { afterId: string | null; limit: number }]> = [
+      ['a live row', { data: [pick({ ...row, status: 'pending', reason: 'eligible' })], error: null }, { afterId: null, limit: 10 }],
+      ['a completed row', { data: [pick({ ...row, status: 'completed', reason: 'attempt_settled' })], error: null }, { afterId: null, limit: 10 }],
+      ['an Ashby row', { data: [pick({ ...row, source: 'ashby' })], error: null }, { afterId: null, limit: 10 }],
+      ['a slot before the instant', { data: [pick({ ...row, start_at: PASSED })], error: null }, { afterId: null, limit: 10 }],
+      ['a slot at the instant', { data: [pick({ ...row, start_at: HARNESS_NOW })], error: null }, { afterId: null, limit: 10 }],
+      ['descending ids', { data: [high, pick(row)], error: null }, { afterId: null, limit: 10 }],
+      ['a repeated id', { data: [pick(row), pick(row)], error: null }, { afterId: null, limit: 10 }],
+      ['an id at the cursor', { data: [pick(row)], error: null }, { afterId: ORDERED_LOW, limit: 10 }],
+      ['more rows than the limit', { data: [pick(row), high], error: null }, { afterId: null, limit: 1 }],
+      ['a drifted instant', { data: [pick({ ...row, start_at: 'soon' })], error: null }, { afterId: null, limit: 10 }],
+      ['not a list', { data: pick(row), error: null }, { afterId: null, limit: 10 }],
+    ];
+    for (const [label, answer, asked] of answers) {
+      await expectDbError(answering(answer).endedBookings(page(asked.afterId, asked.limit)), label);
+    }
+    // The same rows answered as asked are read.
+    expect(await answering({ data: [pick(row), high], error: null }).endedBookings(page())).toEqual([ORDERED_LOW, ORDERED_HIGH]);
   });
 });
 

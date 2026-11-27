@@ -1,6 +1,6 @@
 /**
  * M035 S11 T4: the `ashby_booked_tag` job (`lib/r1/meet/ashby-booked-tag.ts`), which keeps the Ashby
- * tag "Dex R1: Booked" on a public booking's candidate exactly while the database says the booking
+ * tag "Lexy R1: Booked" on a public booking's candidate exactly while the database says the booking
  * stands. Driven through the REAL booked-tag store over the in-memory tables, the REAL tag port and
  * REAL Ashby client over the stateful fake transport, and (where it matters) the REAL dispatcher
  * (`support/r1-meet-ashby-tag-fake.ts`, `createR1MeetAshbyTagWorld`).
@@ -14,7 +14,7 @@
  *    either order; the rule is candidate-wide (the candidate id in any case, S11-R4), with an overflow
  *    guard;
  *  - the Ashby candidate id from the link, else `application.info`; Ashby-scheduled and missing rows
- *    are ignored with no Ashby call; only the Dex tag is ever written, and never a create;
+ *    are ignored with no Ashby call; only the Lexy tag is ever written, and never a create;
  *  - catalogue miss / ambiguous / truncated; every Ashby failure class; only a refused write drops the
  *    cached tag id (S11-R5); the back-off of the transient waits (S11-R3); write refusals; contention
  *    (a recruiter and a booking changing mid-run); the switches, the key and the wiring; the run's
@@ -169,7 +169,7 @@ const walks = (w: R1MeetAshbyTagWorld): number => w.fake.requestsOf('/candidateT
 const jobLines = (w: R1MeetAshbyTagWorld): Array<string | undefined> =>
   w.h.logs.filter((line) => line.meta.error_category === 'r1_meet_job').map((line) => line.meta.error_type);
 
-/** A person whose booking is in the given state; the candidate holds the Dex tag unless `tags` says. */
+/** A person whose booking is in the given state; the candidate holds the Lexy tag unless `tags` says. */
 function person(w: R1MeetAshbyTagWorld, options: SeedPersonOptions & { readonly withDex?: boolean } = {}): AshbyTagWorldPerson {
   const tags = options.tags ?? (options.withDex === false ? [] : [w.dexTag()]);
   return w.seedPerson({ ...options, tags });
@@ -332,7 +332,7 @@ describe('the frozen contract of the job', () => {
 // ── Add, remove, keep ───────────────────────────────────────────────────────
 
 describe('add once and repeat (one write across reruns)', () => {
-  it('adds the Dex tag once to a candidate without it, then answers tag_present on a rerun and a second job', async () => {
+  it('adds the Lexy tag once to a candidate without it, then answers tag_present on a rerun and a second job', async () => {
     const w = newWorld();
     const p = person(w, { withDex: false });
 
@@ -381,7 +381,7 @@ describe('remove: a cancel, or a failure or drain before the start', () => {
   ] as const;
 
   for (const c of cases) {
-    it(`removes the Dex tag after ${c.name}`, async () => {
+    it(`removes the Lexy tag after ${c.name}`, async () => {
       const w = newWorld();
       const p = person(w, { booking: { status: c.status, startAt: c.startAt, updatedAt: c.updatedAt } });
       p.booking.reason = c.reason;
@@ -587,8 +587,8 @@ describe('ignored rows', () => {
   });
 });
 
-describe('touches only the Dex tag, and never creates one', () => {
-  it('a remove writes the Dex id only; Christy and Referral stay', async () => {
+describe('touches only the Lexy tag, and never creates one', () => {
+  it('a remove writes the Lexy id only; Christy and Referral stay', async () => {
     const w = newWorld();
     const p = person(w, { tags: [w.christyTag(), w.referralTag(), w.dexTag()], booking: { status: 'cancelled' } });
     expect(await run(w, 'remove', p.bookingId)).toEqual(r1MeetProcessed('tag_removed'));
@@ -596,7 +596,7 @@ describe('touches only the Dex tag, and never creates one', () => {
     expect(tagIdsOf(w, p.candidateId)).toEqual([w.tagIds.christy, w.tagIds.referral]);
   });
 
-  it('an add names the Dex id only', async () => {
+  it('an add names the Lexy id only', async () => {
     const w = newWorld();
     const p = person(w, { tags: [w.christyTag(), w.referralTag()] });
     expect(await run(w, 'add', p.bookingId)).toEqual(r1MeetProcessed('tag_added'));
@@ -604,7 +604,7 @@ describe('touches only the Dex tag, and never creates one', () => {
     expect(tagIdsOf(w, p.candidateId)).toEqual([w.tagIds.christy, w.tagIds.referral, w.tagIds.dex]);
   });
 
-  it('an archived Dex duplicate on the candidate is removed too when the tag is not wanted', async () => {
+  it('an archived Lexy duplicate on the candidate is removed too when the tag is not wanted', async () => {
     const w = newWorld();
     const duplicate = w.newId();
     const p = person(w, {
@@ -619,7 +619,7 @@ describe('touches only the Dex tag, and never creates one', () => {
     expect(tagIdsOf(w, p.candidateId)).toEqual([w.tagIds.christy]);
   });
 
-  it('only an archived Dex tag on the candidate does not count as holding: the active one is added', async () => {
+  it('only an archived Lexy tag on the candidate does not count as holding: the active one is added', async () => {
     const w = newWorld();
     const duplicate = w.newId();
     const p = person(w, { tags: [{ id: duplicate, title: R1_MEET_BOOKED_TAG_TITLE, isArchived: true }] });
@@ -627,7 +627,7 @@ describe('touches only the Dex tag, and never creates one', () => {
     expect(writeBodies(w)).toEqual([['/candidate.addTag', body(p.candidateId, w.tagIds.dex)]]);
   });
 
-  it(`removes at most ${R1_MEET_ASHBY_TAG_MAX_REMOVES} Dex tags per run, then converges on the next`, async () => {
+  it(`removes at most ${R1_MEET_ASHBY_TAG_MAX_REMOVES} Lexy tags per run, then converges on the next`, async () => {
     const w = newWorld();
     const extra = Array.from({ length: R1_MEET_ASHBY_TAG_MAX_REMOVES }, () => ({
       id: w.newId(),
@@ -650,7 +650,7 @@ describe('catalogue miss, ambiguous and truncated (D-S11-5)', () => {
     w.h.meta({ deferCount: 3, deferredAt: iso(w.h.now() - 61 * 60 * 1000) }),
   ];
 
-  it('the Dex tag missing from the catalogue: two walks (cached, then fresh), alert, wait an hour, no write', async () => {
+  it('the Lexy tag missing from the catalogue: two walks (cached, then fresh), alert, wait an hour, no write', async () => {
     const w = newWorld();
     w.fake.catalogue.splice(w.fake.catalogue.findIndex((tag) => tag.id === w.tagIds.dex), 1);
     const p = person(w, { withDex: false });
@@ -665,7 +665,7 @@ describe('catalogue miss, ambiguous and truncated (D-S11-5)', () => {
   });
 
   for (const ignoreIncludeArchived of [false, true]) {
-    it(`a Dex tag present only archived is not found${ignoreIncludeArchived ? ' (a tenant that lists archived tags anyway)' : ''}`, async () => {
+    it(`a Lexy tag present only archived is not found${ignoreIncludeArchived ? ' (a tenant that lists archived tags anyway)' : ''}`, async () => {
       const w = newWorld();
       w.fake.ignoreIncludeArchived = ignoreIncludeArchived;
       const entry = w.fake.catalogue.findIndex((tag) => tag.id === w.tagIds.dex);
@@ -677,7 +677,7 @@ describe('catalogue miss, ambiguous and truncated (D-S11-5)', () => {
     });
   }
 
-  it('two active Dex tags: ambiguous, alert, wait an hour, no write; past the bound it throws', async () => {
+  it('two active Lexy tags: ambiguous, alert, wait an hour, no write; past the bound it throws', async () => {
     const w = newWorld();
     w.fake.catalogue.push({ id: w.newId(), title: ` ${R1_MEET_BOOKED_TAG_TITLE} `, isArchived: false });
     const p = person(w, { withDex: false });
@@ -703,7 +703,7 @@ describe('catalogue miss, ambiguous and truncated (D-S11-5)', () => {
   it('a near title or another case never matches', async () => {
     const w = newWorld();
     const entry = w.fake.catalogue.findIndex((tag) => tag.id === w.tagIds.dex);
-    w.fake.catalogue[entry] = { ...w.fake.catalogue[entry]!, title: 'dex r1: booked' };
+    w.fake.catalogue[entry] = { ...w.fake.catalogue[entry]!, title: 'lexy r1: booked' };
     w.fake.catalogue.push({ id: w.newId(), title: `${R1_MEET_BOOKED_TAG_TITLE} (old)`, isArchived: false });
     const p = person(w, { withDex: false });
     expect(await run(w, 'add', p.bookingId)).toEqual(r1MeetDefer('tag_not_found', 3600));

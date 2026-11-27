@@ -276,7 +276,7 @@ export interface R1MeetScorecardFeedbackJob {
   /** Lower-cased. */
   readonly assessmentId: string;
 }
-/** Converge the "Dex R1: Booked" tag of this public booking's Ashby candidate (M035 S11). */
+/** Converge the "Lexy R1: Booked" tag of this public booking's Ashby candidate (M035 S11). */
 export interface R1MeetAshbyBookedTagJob {
   readonly kind: 'ashby_booked_tag';
   /** A hint: the handler computes the wanted state from the database. */

@@ -1,11 +1,11 @@
 /**
  * The `ashby_booked_tag` job of the `r1-meet` runtime (M035 S11, dark; D-S11-2, D-S11-6..13, D-S11-15):
- * keep the Ashby tag "Dex R1: Booked" on the candidate of a public booking exactly while the database
+ * keep the Ashby tag "Lexy R1: Booked" on the candidate of a public booking exactly while the database
  * says the booking stands.
  *
- * OWNER DECISION 5 (M035 roadmap §2): "Booked tag + scorecard (Recommended)": a "Dex R1: Booked" tag
+ * OWNER DECISION 5 (M035 roadmap §2): "Booked tag + scorecard (Recommended)": a "Lexy R1: Booked" tag
  * on the candidate when they book, removed when the booking is cancelled by the candidate or HR, or
- * fails before the interview; Dex's scorecard as application feedback afterwards. No Ashby
+ * fails before the interview; Lexy's scorecard as application feedback afterwards. No Ashby
  * interview-schedule mirror.
  *
  * WHO QUEUES IT. Only migration 0143: its public create RPC queues `op: 'add'` for every booked answer,
@@ -37,12 +37,14 @@
  *                               none: alert, `ignored`.
  *   6  candidate_links_overflow WANTED, as above; more than 25 linked applications: alert, `ignored`
  *                               (the lane never decides from a partial list).
+ *      tag_wanted_held          a remove-only run (only the Meet-off catch-up, PR #453 review S11-R2)
+ *                               whose candidate still wants the tag: `ignored`, no Ashby read.
  *   7  tag_present / tag_absent `candidate.info` already holds the wanted state: `processed`, ZERO
  *                               writes.
  *   8  wanted: resolve the tag id (cached, then once FRESH on a miss): `tag_not_found` and
  *      `tag_ambiguous` alert and wait an hour (the Ashby admin's setup), a truncated catalogue waits
  *      `ashby_unavailable`; then ONE `candidate.addTag`. Not wanted: `candidate.removeTag` of every
- *      Dex tag on the candidate (archived duplicates included), at most 5 per run. A write the tenant
+ *      Lexy tag on the candidate (archived duplicates included), at most 5 per run. A write the tenant
  *      REFUSES drops the catalogue cache and looks again: the state already holding goes on; a refused
  *      add is tried once more with a fresh id; still refused is alert `write_rejected` and
  *      `ignored('tag_write_rejected')`.
@@ -115,7 +117,7 @@ export interface R1MeetAshbyTagDeps {
   readonly store: R1MeetBookedTagStore;
   /**
    * Ashby's own write switches, asked per job: the integration master switch with a usable webhook
-   * secret AND `ASHBY_RUNTIME_ENABLED` (the same two as Dex's scorecard). A throw counts as off.
+   * secret AND `ASHBY_RUNTIME_ENABLED` (the same two as Lexy's scorecard). A throw counts as off.
    */
   ashbyActive(): boolean;
   /** The Ashby tag port, or null while no usable Ashby key is configured. */
@@ -256,11 +258,29 @@ function switchesOn(tag: R1MeetAshbyTagDeps): boolean {
 /** Step 6's answer: whether the candidate wants the tag, or an overflow of linked applications. */
 type R1MeetBookedTagWant = { readonly overflow: false; readonly wanted: boolean } | { readonly overflow: true };
 
-/** Run the job (see the header). Exported for tests; the dispatcher reaches it through the definition. */
+/** How a run may act. The queue's runs use the default; only the Meet-off catch-up narrows it. */
+export interface R1MeetAshbyTagRunOptions {
+  /**
+   * Never ADD the tag (PR #453 review S11-R2, `ashby-booked-tag-meet-off.ts`): while Meet is off the
+   * catch-up only takes tags away from public bookings that ended. A candidate who still wants the
+   * tag is left as is (`ignored('tag_wanted_held')`, before any Ashby read); the queued job converges
+   * it once Meet is back on.
+   */
+  readonly removeOnly?: boolean;
+}
+
+/** What a remove-only run answers when the candidate still wants the tag (no Ashby read, no write). */
+export const R1_MEET_ASHBY_TAG_WANTED_HELD = 'tag_wanted_held';
+
+/**
+ * Run the job (see the header). Exported for tests and for the Meet-off catch-up; the dispatcher
+ * reaches it through the definition. Only `ashbyTag`, `now` and `log` of the flow deps are used.
+ */
 export async function runR1MeetAshbyBookedTag(
-  deps: R1MeetFlowDeps,
+  deps: Pick<R1MeetFlowDeps, 'ashbyTag' | 'now' | 'log'>,
   job: R1MeetAshbyBookedTagJob,
   meta: R1MeetJobMeta,
+  options: R1MeetAshbyTagRunOptions = {},
 ): Promise<R1MeetJobResult> {
   // 1. Wiring.
   const tag = deps.ashbyTag;
@@ -302,7 +322,7 @@ export async function runR1MeetAshbyBookedTag(
       resolver.resolve({ ...(fresh ? { fresh: true } : {}), budget }),
   };
 
-  /** The candidate's "Dex R1: Booked" tags, every other tag already dropped. */
+  /** The candidate's "Lexy R1: Booked" tags, every other tag already dropped. */
   const dexTags = async (candidateId: string): Promise<R1MeetDexTag[]> =>
     r1MeetDexTagsOf((await ashby.candidateInfo(candidateId)).results);
 
@@ -370,13 +390,15 @@ export async function runR1MeetAshbyBookedTag(
       return r1MeetIgnored('candidate_links_overflow');
     }
     const wanted = want.wanted;
+    // The Meet-off catch-up never adds (see `R1MeetAshbyTagRunOptions`).
+    if (wanted && options.removeOnly === true) return r1MeetIgnored(R1_MEET_ASHBY_TAG_WANTED_HELD);
 
     // 7. Already so: nothing to write.
     const tags = await dexTags(candidateId);
     if (r1MeetBookedTagHolds(tags, wanted)) return r1MeetProcessed(wanted ? 'tag_present' : 'tag_absent');
 
     if (wanted) {
-      // 8a. Add the one Dex tag. The cached id first, once more from a fresh catalogue on a miss.
+      // 8a. Add the one Lexy tag. The cached id first, once more from a fresh catalogue on a miss.
       let resolution = await ashby.resolve(false);
       if (resolution.status === 'not_found') resolution = await ashby.resolve(true);
       if (resolution.status !== 'found') return unresolved(resolution);
@@ -396,7 +418,7 @@ export async function runR1MeetAshbyBookedTag(
         }
       }
     } else {
-      // 8b. Remove every Dex tag on the candidate (archived duplicates too), a bounded number per run.
+      // 8b. Remove every Lexy tag on the candidate (archived duplicates too), a bounded number per run.
       for (const dexTag of tags.slice(0, R1_MEET_ASHBY_TAG_MAX_REMOVES)) {
         if ((await write(() => ashby.removeTag(candidateId, dexTag.id))) === 'refused') {
           const stillThere = (await dexTags(candidateId)).some((held) => held.id === dexTag.id);
@@ -441,7 +463,7 @@ export async function runR1MeetAshbyBookedTag(
   }
 }
 
-/** `ashby_booked_tag` (M035 S11): converge the "Dex R1: Booked" tag of a public booking's candidate. */
+/** `ashby_booked_tag` (M035 S11): converge the "Lexy R1: Booked" tag of a public booking's candidate. */
 export const r1MeetAshbyBookedTagDefinition: R1MeetJobDefinition<R1MeetAshbyBookedTagJob> = Object.freeze({
   kind: 'ashby_booked_tag',
   parse: parseAshbyBookedTagJob,

@@ -137,14 +137,14 @@ the batch back. It classifies a missing permission exactly as the access check d
 `candidateTag.list` (read; needs `hiringProcessMetadataRead`), `candidate.addTag`
 and `candidate.removeTag` (mutations; need `candidatesWrite`) serve the Christy
 verdict tag lane (`recommendation-tags.ts`, runbook
-`ashby-runtime-activation.md` §11) and the R1 Meet 'Dex R1: Booked' tag lane
+`ashby-runtime-activation.md` §11) and the R1 Meet 'Lexy R1: Booked' tag lane
 (`lib/r1/meet/ashby-booked-tag.ts`, M035 S11). `candidateTagList` sends
 `includeArchived: false` explicitly and bounds `limit` to 1..100, the endpoint's
 maximum. The two write helpers send a body of exactly `{candidateId, tagId}`, with
 no `extra`, because the endpoints set additionalProperties false. They pass
 `{ idempotent: true }`, which is safe only because both callers read
 `candidate.info` before they write; the Christy lane only ever writes its three
-tags and the booked lane only `Dex R1: Booked`. None of the three is a probe read. These three,
+tags and the booked lane only `Lexy R1: Booked`. None of the three is a probe read. These three,
 `candidateInfo` and `applicationInfo` also take an internal `deadlineAt` (never
 sent to Ashby): the lane passes its run's deadline, so a call's timeout, retries and
 `Retry-After` waits all end before the operation's lease does.

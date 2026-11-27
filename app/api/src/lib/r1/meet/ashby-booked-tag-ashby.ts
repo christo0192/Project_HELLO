@@ -1,8 +1,8 @@
 /**
- * The Ashby side of the "Dex R1: Booked" tag lane (M035 S11, dark; D-S11-5, D-S11-6, D-S11-8, D-S11-9).
+ * The Ashby side of the "Lexy R1: Booked" tag lane (M035 S11, dark; D-S11-5, D-S11-6, D-S11-8, D-S11-9).
  *
  * OWNER DECISION 5 (M035): a candidate who books R1 through the public link carries the Ashby tag
- * "Dex R1: Booked" while that booking stands, and loses it when the booking is cancelled or fails
+ * "Lexy R1: Booked" while that booking stands, and loses it when the booking is cancelled or fails
  * before the interview. The `ashby_booked_tag` job (`ashby-booked-tag.ts`) decides WHETHER the tag is
  * wanted, from the database; this module is only how the job talks to Ashby.
  *
@@ -21,7 +21,7 @@
  * Ashby admin creates it once.
  *
  * THE CANDIDATE'S TAGS (D-S11-6). From a `candidate.info` answer only the entries titled exactly
- * "Dex R1: Booked" (after a trim, any `isArchived`) are kept; every other tag (Christy's, Referral,
+ * "Lexy R1: Booked" (after a trim, any `isArchived`) are kept; every other tag (Christy's, Referral,
  * anything) is dropped before a later step can see it. `tags` left out reads as none; `tags` that is
  * not a list, or an answer that is not a Candidate, is malformed and the job waits.
  *
@@ -54,7 +54,7 @@ import { classifyR1MeetAshbyFailure, r1MeetAshbyClientLogger, type R1MeetAshbyFa
 import type { R1MeetLog } from './recall-actions.js';
 
 /** The exact title the Ashby admin creates. Compared after a trim, case-sensitive. */
-export const R1_MEET_BOOKED_TAG_TITLE = 'Dex R1: Booked';
+export const R1_MEET_BOOKED_TAG_TITLE = 'Lexy R1: Booked';
 
 /** The client settings of the port (D-S11-8, S11-R3): no retries inside the client, 5 s per call. */
 export const R1_MEET_ASHBY_TAG_CLIENT_SETTINGS = Object.freeze({ maxAttempts: 1, timeoutMs: 5_000 });
@@ -181,7 +181,7 @@ async function readBookedTagIds(
 }
 
 /**
- * Resolve the one active "Dex R1: Booked" tag id. A complete walk is cached for
+ * Resolve the one active "Lexy R1: Booked" tag id. A complete walk is cached for
  * {@link R1_MEET_BOOKED_TAG_CACHE_MS}; a failed or truncated one never is. `fresh` bypasses the cache
  * and refreshes it, and `invalidate` drops it. More than one active match fails closed.
  */
@@ -263,9 +263,9 @@ export function createR1MeetAshbyTagPort(options: R1MeetAshbyTagPortOptions): R1
   return Object.freeze({ client, resolver });
 }
 
-// ── The candidate's Dex tags (D-S11-6) ──────────────────────────────────────
+// ── The candidate's Lexy tags (D-S11-6) ──────────────────────────────────────
 
-/** One "Dex R1: Booked" tag on a candidate. Nothing else of a tag is kept. */
+/** One "Lexy R1: Booked" tag on a candidate. Nothing else of a tag is kept. */
 export interface R1MeetDexTag {
   readonly id: string;
   readonly isArchived: boolean;
@@ -280,7 +280,7 @@ export class R1MeetAshbyTagMalformed extends Error {
 }
 
 /**
- * The "Dex R1: Booked" tags of a `candidate.info` answer's `results`. Ashby marks `tags` required, so
+ * The "Lexy R1: Booked" tags of a `candidate.info` answer's `results`. Ashby marks `tags` required, so
  * a candidate with the key left out most plausibly has none: that reads as an empty list. A `tags`
  * that is there but not a list, or results that are not a plain object, throw
  * {@link R1MeetAshbyTagMalformed}. Every other tag is dropped here. An id listed twice is kept once,
@@ -304,8 +304,8 @@ export function r1MeetDexTagsOf(results: unknown): R1MeetDexTag[] {
 }
 
 /**
- * Does the candidate already hold the wanted state? Wanted: at least one Dex tag that is not
- * archived. Not wanted: no Dex tag at all (an archived one still has to go).
+ * Does the candidate already hold the wanted state? Wanted: at least one Lexy tag that is not
+ * archived. Not wanted: no Lexy tag at all (an archived one still has to go).
  */
 export function r1MeetBookedTagHolds(tags: readonly R1MeetDexTag[], wanted: boolean): boolean {
   return wanted ? tags.some((tag) => !tag.isArchived) : tags.length === 0;

@@ -1,7 +1,7 @@
 /**
- * The database side of the "Dex R1: Booked" tag lane (M035 S11, dark; D-S11-2, D-S11-3, D-S11-4).
+ * The database side of the "Lexy R1: Booked" tag lane (M035 S11, dark; D-S11-2, D-S11-3, D-S11-4).
  *
- * WHAT IT READS. Four narrow reads over the service-role client, one query each, and no write:
+ * WHAT IT READS. Five narrow reads over the service-role client, one query each, and no write:
  *   booking               one booking by id (`r1_meet_bookings`), the columns
  *                         `R1_MEET_BOOKED_TAG_BOOKING_COLUMNS` and nothing else (the `reason` tells a
  *                         failure that could not have been an interview, PR #453 review S11-R1);
@@ -15,8 +15,13 @@
  *                         `R1_MEET_BOOKED_TAG_MAX_APPLICATIONS`: one more row than that answers
  *                         `overflow` and no ids, so the job never decides from a partial list;
  *   newestPublicBooking   the newest public booking (`source = 'public_page'`) of one application,
- *                         by `created_at` and then `id`, both descending.
- * The tag is candidate-wide, so the job asks these four to compute whether ANY application of the
+ *                         by `created_at` and then `id`, both descending;
+ *   endedBookings         one page of the Meet-off catch-up (PR #453 review S11-R2,
+ *                         `ashby-booked-tag-meet-off.ts`): the ids of public bookings that ended
+ *                         (`R1_MEET_BOOKED_TAG_ENDED_STATUSES`) whose slot starts after a given
+ *                         instant (`start_at > startAfter`), after a cursor, by `id` ascending, at
+ *                         most `R1_MEET_BOOKED_TAG_MAX_PAGE`.
+ * The tag is candidate-wide, so the job asks the first four to compute whether ANY application of the
  * person still wants it (the converge rule, D-S11-2); the store itself decides nothing.
  *
  * WHAT IT NEVER READS. Our candidate id, the Meet URL, the ticket digest, or any calendar, manage,
@@ -25,8 +30,9 @@
  *
  * WHY NOT THE RUNTIME STORE (D-S11-3). `runtime-store.ts` parses a whole Ashby-scheduled booking: it
  * has no `source` and refuses the NULL Ashby schedule ids a public row carries. This store reads
- * `source` only when an `ashby_booked_tag` job exists, and only migration 0143 queues one, so it
- * works in either merge order with the slice that teaches the runtime store about public rows.
+ * `source` only when an `ashby_booked_tag` job exists (only migration 0143 queues one) or the
+ * Meet-off catch-up pages public rows, so it works in either merge order with the slice that
+ * teaches the runtime store about public rows.
  *
  * IDS. A booking id answers lower-cased; Ashby ids (application, candidate) are Ashby's own
  * spelling, kept verbatim, because the links match them exactly (the one exception: the person-wide
@@ -56,6 +62,15 @@ export const R1_MEET_BOOKED_TAG_BOOKING_COLUMNS =
 
 /** At most this many applications of one Ashby candidate are weighed; one more is an overflow. */
 export const R1_MEET_BOOKED_TAG_MAX_APPLICATIONS = 25;
+
+/** The largest page `endedBookings` reads (a larger `limit` is a caller bug: it throws). */
+export const R1_MEET_BOOKED_TAG_MAX_PAGE = 50;
+
+/**
+ * The statuses a booking ends in without an interview having to stand (0143's terminal trigger
+ * queues `op: 'remove'` for each): `completed` is not one, it keeps the tag. Frozen.
+ */
+export const R1_MEET_BOOKED_TAG_ENDED_STATUSES = Object.freeze(['cancelled', 'failed', 'drained'] as const);
 
 /**
  * The booking sources of 0143's `chk_r1_meet_bookings_source`. Private on purpose: the slice that
@@ -123,6 +138,16 @@ export interface R1MeetBookedTagApplications {
   readonly overflow: boolean;
 }
 
+/** One page of `endedBookings`. */
+export interface R1MeetBookedTagEndedPage {
+  /** Only slots that start after this instant (zoned). */
+  readonly startAfterIso: string;
+  /** Only ids above this one (lower-cased UUID), or null for the first page. */
+  readonly afterId: string | null;
+  /** 1..`R1_MEET_BOOKED_TAG_MAX_PAGE`. */
+  readonly limit: number;
+}
+
 export interface R1MeetBookedTagStore {
   /** One booking by id, or null. */
   booking(id: string): Promise<R1MeetBookedTagBooking | null>;
@@ -132,6 +157,11 @@ export interface R1MeetBookedTagStore {
   candidateApplications(externalCandidateId: string): Promise<R1MeetBookedTagApplications>;
   /** The newest public booking of one Ashby application, or null. */
   newestPublicBooking(applicationId: string): Promise<R1MeetBookedTagBooking | null>;
+  /**
+   * The ids (lower-cased, ascending) of public bookings that ended and whose slot starts after
+   * `startAfterIso`: one page of the Meet-off catch-up (see the header).
+   */
+  endedBookings(page: R1MeetBookedTagEndedPage): Promise<readonly string[]>;
 }
 
 // ── Reading rows ────────────────────────────────────────────────────────────
@@ -303,6 +333,51 @@ export function createR1MeetBookedTagStore(client: Db): R1MeetBookedTagStore {
       // The filters were source and application: a row of another source or application is drift.
       if (booking.source !== PUBLIC_SOURCE || booking.applicationId !== applicationId) throw dbError();
       return booking;
+    },
+
+    async endedBookings(page: R1MeetBookedTagEndedPage) {
+      const sinceMs = parseR1MeetInstant(page.startAfterIso);
+      const after = page.afterId === null ? null : page.afterId.toLowerCase();
+      if (
+        sinceMs === null
+        || (after !== null && !UUID.test(after))
+        || !Number.isInteger(page.limit)
+        || page.limit < 1
+        || page.limit > R1_MEET_BOOKED_TAG_MAX_PAGE
+      ) {
+        throw dbError();
+      }
+      const startAfterIso = new Date(sinceMs).toISOString();
+      const rows = rowsOf(
+        await run(() => {
+          const query = client
+            .from('r1_meet_bookings')
+            .select(R1_MEET_BOOKED_TAG_BOOKING_COLUMNS)
+            .eq('source', PUBLIC_SOURCE)
+            .in('status', [...R1_MEET_BOOKED_TAG_ENDED_STATUSES])
+            .gt('start_at', startAfterIso);
+          return (after === null ? query : query.gt('id', after)).order('id', { ascending: true }).limit(page.limit);
+        }),
+      );
+      if (rows.length > page.limit) throw dbError();
+      const ended: ReadonlySet<string> = new Set(R1_MEET_BOOKED_TAG_ENDED_STATUSES);
+      const ids: string[] = [];
+      let previous = after;
+      for (const row of rows) {
+        const booking = parseBooking(row);
+        // Every row answers what was asked, in the asked order, or it is drift.
+        if (
+          booking.source !== PUBLIC_SOURCE
+          || !ended.has(booking.status)
+          || Date.parse(booking.startAt) <= sinceMs
+          || (previous !== null && booking.id <= previous)
+        ) {
+          throw dbError();
+        }
+        ids.push(booking.id);
+        previous = booking.id;
+      }
+      return Object.freeze(ids);
     },
   });
 }

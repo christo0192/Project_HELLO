@@ -120,7 +120,7 @@ export const ASHBY_OPERATIONS: Readonly<Record<AshbyOperation, AshbyOperationSpe
   // The verdict-tag lane resolves its three titles here. Not a probe read.
   'candidateTag.list':                 { path: '/candidateTag.list',                 mutation: false },
   // Candidate-wide tag writes (permission `candidatesWrite`). The Christy lane only
-  // ever sends its three tags and the R1 Meet booked lane only 'Dex R1: Booked'
+  // ever sends its three tags and the R1 Meet booked lane only 'Lexy R1: Booked'
   // (M035 S11); both read candidate.info before they write.
   'candidate.addTag':                  { path: '/candidate.addTag',                  mutation: true },
   'candidate.removeTag':               { path: '/candidate.removeTag',               mutation: true },

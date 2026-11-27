@@ -1,5 +1,5 @@
 /**
- * The "Dex R1: Booked" tag lane's fakes (M035 S11). T2 adds the Ashby half: a STATEFUL scripted
+ * The "Lexy R1: Booked" tag lane's fakes (M035 S11). T2 adds the Ashby half: a STATEFUL scripted
  * `AshbyTransport` that runs under the REAL Ashby client and the REAL tag port, so every body, every
  * error class and every log line is what production would produce (the `r1-meet-feedback-fake.ts`
  * pattern).
@@ -34,7 +34,8 @@
  * T3 adds the TABLES half (`createBookedTagTables()`): the two tables the booked-tag store reads,
  * `r1_meet_bookings` and `ashby_application_links`, as plain rows behind an in-memory client whose
  * `from(table)` answers a query with `select(columns)`, `eq`, `in`, `ilike` (Postgres ILIKE: `%` and
- * `_` wildcards, `\` escapes, case ignored; PR #453 review S11-R4), `order(column, { ascending })`
+ * `_` wildcards, `\` escapes, case ignored; PR #453 review S11-R4), `gt` (instants by time, UUIDs by
+ * value, a null never greater; the Meet-off page, S11-R2), `order(column, { ascending })`
  * (stable; successive calls are successive sort keys; nulls last ascending and first descending, as
  * Postgres sorts), `limit(n)`, `maybeSingle()` (PGRST116 on more than one row) and `then`.
  *   select projects the named columns; a column the row does not have stays ABSENT (not null), so
@@ -54,7 +55,7 @@
  * the Ashby fake and the tables above, the REAL booked-tag store and the REAL tag port over them, the
  * `ashbyTag` port group (switches and key settable), the flow deps, the REAL dispatcher, and seeds for
  * a person (an Ashby candidate with tags, an application, its link and a public booking). The
- * catalogue starts with the Dex tag, a Christy tag and a Referral tag.
+ * catalogue starts with the Lexy tag, a Christy tag and a Referral tag.
  *
  * Ids are fixture ids (`7f000000-0000-4000-8000-…`); the key is built at run time and never looks
  * like a real credential. Never shipped: `tsconfig.build.json` excludes `src/__tests__`.
@@ -300,7 +301,7 @@ export type BookedTagTable = 'r1_meet_bookings' | 'ashby_application_links';
 export type BookedTagRow = Record<string, unknown>;
 
 export interface BookedTagFilter {
-  readonly op: 'eq' | 'in' | 'ilike';
+  readonly op: 'eq' | 'in' | 'ilike' | 'gt';
   readonly column: string;
   readonly value: unknown;
 }
@@ -398,7 +399,7 @@ function compareCells(a: unknown, b: unknown): number {
   return x < y ? -1 : x > y ? 1 : 0;
 }
 
-/** select / eq / in / order / limit / maybeSingle / then over plain rows, recording the query. */
+/** select / eq / in / ilike / gt / order / limit / maybeSingle / then over plain rows, recording the query. */
 class BookedTagQuery {
   constructor(
     private readonly rows: () => BookedTagRow[],
@@ -426,6 +427,11 @@ class BookedTagQuery {
     return this;
   }
 
+  gt(column: string, value: unknown): this {
+    this.call.filters.push({ op: 'gt', column, value });
+    return this;
+  }
+
   order(column: string, options: { ascending?: boolean } = {}): this {
     this.call.orders.push({ column, ascending: options.ascending !== false });
     return this;
@@ -442,6 +448,12 @@ class BookedTagQuery {
       this.call.filters.every((filter) => {
         if (filter.op === 'eq') return row[filter.column] === filter.value;
         if (filter.op === 'ilike') return ilikeMatches(row[filter.column], filter.value);
+        if (filter.op === 'gt') {
+          // Postgres: a null on either side is never greater.
+          const cell = row[filter.column];
+          if (cell === null || cell === undefined || filter.value === null || filter.value === undefined) return false;
+          return compareCells(cell, filter.value) > 0;
+        }
         return (filter.value as unknown[]).includes(row[filter.column]);
       });
     const ordered = this.rows()
@@ -633,7 +645,7 @@ export interface R1MeetAshbyTagWorld {
   setAshbyActive(value: boolean | 'throw'): void;
   /** Whether a usable Ashby key exists (`ashby()` answers the port or null). */
   setKeyConfigured(configured: boolean): void;
-  /** The catalogue's Dex entry as a candidate tag (the shape `candidate.info` answers). */
+  /** The catalogue's Lexy entry as a candidate tag (the shape `candidate.info` answers). */
   dexTag(over?: Partial<FakeTag>): FakeTag;
   christyTag(): FakeTag;
   referralTag(): FakeTag;
