@@ -4609,11 +4609,62 @@ before the network). Every other check above is the same.
 - **Known limit: a public card is never updated.** The guard looks only for Dex's card on the form
   since the slot start; it cannot tell which assessment a card holds, and a general card has no
   Ashby update. So when a newer assessment of the same attempt becomes the round's current one (a
-  re-score, or a re-queued R1 assessment), its receipt ends `already_posted` and Ashby keeps the
-  FIRST verdict and scores, while our review page shows the new ones. An Ashby-scheduled booking
-  instead updates its one card (the interview-event submit). If the Ashby card must show the new
-  result, a recruiter deletes Dex's card on the application in Ashby, then re-posts the newer
-  receipt with the SQL above (the guard then finds no card and submits the current assessment).
+  re-score, or a re-queued R1 assessment), its receipt ends `already_posted`, settled `processed`,
+  and Ashby keeps the FIRST verdict and scores, while our review page shows the new ones. An
+  Ashby-scheduled booking instead updates its one card (the interview-event submit).
+- **Remedy: putting the new result on the Ashby card.** The re-post SQL above does NOT do it on its
+  own: it selects only `failed` receipts, and a job for a `processed` receipt stops at
+  `already_submitted` before any Ashby call. Deleting the card and then running that SQL leaves
+  Ashby with NO card. Either HR enters the new result by hand from the R1 review page (as for an
+  `ignored` receipt), or, within 7 days of the slot end (later the job only ends `stale`), all
+  three steps below, in this order:
+  1. Find the newer receipt (read-only); expect one row, `outcome` `processed`:
+
+     ```sql
+     select b.source, x.dedupe_key, x.outcome
+       from screening_v2.r1_meet_bookings b
+       join screening_v2.interview_rounds r on r.id = b.round_id
+       join screening_v2.r1_meet_receipts x
+         on x.source = 'ashby'
+        and x.dedupe_key = 'ashby-schedule:feedback:' || b.id::text || ':' || r.assessment_id::text
+      where b.id = '<booking id>';
+     ```
+
+  2. A recruiter deletes Dex's card on that application in Ashby (only that card).
+  3. Move THAT one receipt back to `failed` and queue its job (the re-post SQL above, narrowed to the
+     one key; 0142's checks allow `processed -> failed` because `processed_at` stays set). Expect
+     `UPDATE 1`, then `INSERT 0 1`:
+
+     ```sql
+     update screening_v2.r1_meet_receipts
+        set outcome = 'failed'
+      where source = 'ashby'
+        and event_type = 'scorecard_feedback'
+        and dedupe_key = '<dedupe_key from step 1>'
+        and outcome = 'processed';
+     insert into screening_v2.job_queue (name, payload, dedup_key, max_attempts)
+     select 'r1-meet',
+            jsonb_build_object('kind', 'scorecard_feedback',
+                               'booking_id', split_part(x.dedupe_key, ':', 3),
+                               'assessment_id', split_part(x.dedupe_key, ':', 4)),
+            'r1-meet:scorecard-feedback:' || split_part(x.dedupe_key, ':', 3) || ':'
+              || split_part(x.dedupe_key, ':', 4),
+            5
+       from screening_v2.r1_meet_receipts x
+       join screening_v2.r1_meet_bookings b on b.id = split_part(x.dedupe_key, ':', 3)::uuid
+      where x.source = 'ashby'
+        and x.event_type = 'scorecard_feedback'
+        and x.outcome = 'failed'
+        and x.dedupe_key = '<dedupe_key from step 1>'
+        and b.end_at > now() - interval '7 days'
+     on conflict do nothing;
+     ```
+
+  The job runs the full check list and the guard. With the card gone it posts the current
+  assessment: `r1_meet_job` line `scorecard_feedback:submitted`, receipt `processed`. If it ends
+  `already_posted` again, Ashby still lists a Dex card since the slot start (not deleted, or Ashby
+  lists deleted cards: unverified until the live spike); nothing was posted twice, and HR enters the
+  new result by hand. Pinned in `r1-meet-feedback.test.ts` §10 (the three `REMEDY (S02-R2)` tests).
 - **Live spike (roadmap S11).** A general submit (no `interviewEventId`) with `userId` = the Dex user
   is accepted from this key and shows as Dex's card on the application; `applicationFeedback.list`
   answers `results` entries with `submittedByUser.id`, `creditedToUser.id`, `submittedAt` (zoned ISO

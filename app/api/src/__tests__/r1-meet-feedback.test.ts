@@ -23,8 +23,9 @@
  *     `applicationFeedback.list` before every submit (`[form, list, submit]`, the body without
  *     `interviewEventId`; Dex's card already there is `already_posted`; list failures defer or end
  *     terminal and never submit; a lost submit answer is found on the re-run; a re-score of the same
- *     attempt is `already_posted` too, the known limit of S02-R2), while an Ashby booking never lists
- *     and posts exactly as before (a re-score updates its one card).
+ *     attempt is `already_posted` too, the known limit of S02-R2, and the runbook's remedy works only
+ *     with the card deleted AND that receipt moved back to `failed`), while an Ashby booking never
+ *     lists and posts exactly as before (a re-score updates its one card).
  */
 
 import { describe, expect, it } from 'vitest';
@@ -1115,7 +1116,7 @@ describe('10. a public-page booking: general feedback guarded by applicationFeed
    * A newer assessment of the same attempt becomes the round's current one (a re-score): the trigger
    * records a second receipt for the booking. Returns the receipt key and its queued job's payload.
    */
-  async function rescore(w: R1MeetFeedbackWorld, b: CompletedBooking): Promise<{ key: string; payload: unknown }> {
+  async function rescore(w: R1MeetFeedbackWorld, b: CompletedBooking): Promise<{ key: string; payload: unknown; assessmentId: string }> {
     const newer = fixtureId();
     w.tables.assessments.push(finalAssessmentRow(newer, b.sessionId, { recommendation: 'advance', overall_score: 75 }));
     w.h.db.tables.interview_rounds.find((round) => round.id === b.roundId)!.assessment_id = newer;
@@ -1124,7 +1125,7 @@ describe('10. a public-page booking: general feedback guarded by applicationFeed
     const id = (recorded as { id: string }).id;
     const job = w.h.db.jobs('scorecard_feedback').find((row) => row.payload?.receipt_id === id);
     expect(job).toBeDefined();
-    return { key: r1MeetFeedbackReceiptKey(b.bookingId, newer), payload: job!.payload };
+    return { key: r1MeetFeedbackReceiptKey(b.bookingId, newer), payload: job!.payload, assessmentId: newer };
   }
 
   it('KNOWN LIMIT (S02-R2): a re-score of a public booking never updates its card; Ashby keeps the first one', async () => {
@@ -1142,6 +1143,66 @@ describe('10. a public-page booking: general feedback guarded by applicationFeed
     expect(w.ashby.feedbackList).toHaveLength(1);
     expect(w.receiptRow(second.key)).toMatchObject({ outcome: 'processed' });
     expect(infoLines(w, R1_MEET_FEEDBACK_ALREADY_POSTED_LOG)).toHaveLength(1);
+  });
+
+  /**
+   * The runbook's remedy for the known limit ("Public-page bookings (M035 S02)"): the recruiter
+   * deletes the interviewer's card in Ashby, the operator moves THAT receipt `processed -> failed`
+   * (processed_at stays set, which 0142's chk_r1_meet_receipts_processed allows), then queues the
+   * re-post job. The SQL update is mirrored on the fake row; the job is the one the re-post SQL builds.
+   */
+  async function rescoredPublic() {
+    const { w, b } = await publicWorld();
+    await w.dispatcher.handle(w.queueJob(b.job!.payload));
+    const second = await rescore(w, b);
+    await w.dispatcher.handle(w.queueJob(second.payload));
+    expect(w.receiptRow(second.key)).toMatchObject({ outcome: 'processed' });
+    const repost = () => w.dispatcher.handle(w.queueJob(r1MeetJobs.scorecardFeedback(b.bookingId, second.assessmentId).payload));
+    const moveBackToFailed = () => {
+      const row = w.receiptRow(second.key)!;
+      expect(row).toMatchObject({ source: 'ashby', outcome: 'processed' });
+      expect(row.processed_at).not.toBeNull();
+      row.outcome = 'failed';
+    };
+    return { w, b, second, repost, moveBackToFailed };
+  }
+
+  it('REMEDY (S02-R2): a re-post alone never re-posts a processed receipt, even with the card deleted', async () => {
+    const { w, second, repost } = await rescoredPublic();
+    w.ashby.feedbackList.length = 0; // the recruiter deleted the interviewer's card in Ashby
+    await expect(repost()).resolves.toBeUndefined();
+    expect(jobLines(w).at(-1)).toBe('scorecard_feedback:already_submitted');
+    expect(ops(w)).toEqual(['form', 'list', 'submit', 'form', 'list']);
+    expect(w.ashby.submits()).toHaveLength(1);
+    expect(w.receiptRow(second.key)).toMatchObject({ outcome: 'processed' });
+  });
+
+  it('REMEDY (S02-R2): card deleted, receipt moved back to failed, re-post: the current assessment is posted once', async () => {
+    const { w, second, repost, moveBackToFailed } = await rescoredPublic();
+    w.ashby.feedbackList.length = 0;
+    moveBackToFailed();
+    await expect(repost()).resolves.toBeUndefined();
+    expect(jobLines(w).at(-1)).toBe('scorecard_feedback:submitted');
+    expect(ops(w)).toEqual(['form', 'list', 'submit', 'form', 'list', 'form', 'list', 'submit']);
+    expect(w.ashby.submits()).toHaveLength(2);
+    expect(w.ashby.submits()[1]!.raw).not.toBe(w.ashby.submits()[0]!.raw);
+    expect(w.ashby.submits()[1]!.raw).not.toContain('interviewEventId');
+    expect(w.ashby.feedbackList).toHaveLength(1);
+    expect(w.receiptRow(second.key)).toMatchObject({ outcome: 'processed', processed_at: HARNESS_NOW });
+    // A second re-post of the same job is a no-op again.
+    await repost();
+    expect(jobLines(w).at(-1)).toBe('scorecard_feedback:already_submitted');
+    expect(w.ashby.submits()).toHaveLength(2);
+  });
+
+  it('REMEDY (S02-R2): receipt moved back but the card NOT deleted: already_posted again, no second card', async () => {
+    const { w, second, repost, moveBackToFailed } = await rescoredPublic();
+    moveBackToFailed();
+    await expect(repost()).resolves.toBeUndefined();
+    expect(jobLines(w).at(-1)).toBe('scorecard_feedback:already_posted');
+    expect(w.ashby.submits()).toHaveLength(1);
+    expect(w.ashby.feedbackList).toHaveLength(1);
+    expect(w.receiptRow(second.key)).toMatchObject({ outcome: 'processed' });
   });
 
   it('the same re-score of an Ashby booking updates its one card (the interview-event submit)', async () => {
