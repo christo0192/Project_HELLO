@@ -11,7 +11,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PHONE_MIGRATIONS } from './support/phone-migration.js';
@@ -863,17 +863,22 @@ describe('migration 0144: SQL test wiring (T3)', () => {
     expect(script).toContain("log() { printf '[r1-meet-public-import] %s %s\\n'");
   });
 
-  it('supabase-test.sh runs it once, after the 0142 suite and before the TST-15 rehearsal, and fails the run on failure', () => {
+  it('supabase-test.sh runs it once, after the 0142 suite (and the 0143 suite when present) and before the TST-15 rehearsal, and fails the run on failure', () => {
     const suite = read('scripts/supabase-test.sh');
     const call =
       'env SUPABASE_DB_CONTAINER="$SUPABASE_DB_CONTAINER" bash scripts/test-r1-meet-public-import.sh 2>&1 | tee -a "$RESULTS_FILE"';
     expect(suite.split('bash scripts/test-r1-meet-public-import.sh')).toHaveLength(2);
     expect(suite).toContain(`${call}\nif [ "\${PIPESTATUS[0]}" -ne 0 ]; then\n  log 'ERROR: 0144 R1 Meet public import assertions FAILED.'\n  exit 1\nfi\n`);
     expect(suite.indexOf(call)).toBeGreaterThan(suite.indexOf('bash scripts/test-r1-meet.sh'));
+    // S01's 0143 suite (M035 S01) runs first once its helper exists: 0144 lands after 0143.
+    if (existsSync(path.join(repo, 'scripts/test-r1-meet-public.sh'))) {
+      expect(suite.split('bash scripts/test-r1-meet-public.sh')).toHaveLength(2);
+      expect(suite.indexOf(call)).toBeGreaterThan(suite.indexOf('bash scripts/test-r1-meet-public.sh'));
+    }
     expect(suite.indexOf(call)).toBeLessThan(suite.indexOf('TST-15 rollback rehearsal'));
   });
 
-  it('supabase-ci.yml names the helper in both path filters, each after the 0142 helper', () => {
+  it('supabase-ci.yml names the helper in both path filters, each after the 0142 helper (and the 0143 helper when present)', () => {
     const ci = read('.github/workflows/supabase-ci.yml');
     const ours = [...ci.matchAll(/^ +- 'scripts\/test-r1-meet-public-import\.sh'$/gm)].map((m) => m.index!);
     const meet = [...ci.matchAll(/^ +- 'scripts\/test-r1-meet\.sh'$/gm)].map((m) => m.index!);
@@ -882,6 +887,32 @@ describe('migration 0144: SQL test wiring (T3)', () => {
     expect(meet[0]!).toBeLessThan(ours[0]!);
     expect(ours[0]!).toBeLessThan(meet[1]!);
     expect(meet[1]!).toBeLessThan(ours[1]!);
+    // S01's 0143 helper (M035 S01) is listed before it in each filter once that helper exists.
+    if (existsSync(path.join(repo, 'scripts/test-r1-meet-public.sh'))) {
+      const pub = [...ci.matchAll(/^ +- 'scripts\/test-r1-meet-public\.sh'$/gm)].map((m) => m.index!);
+      expect(pub).toHaveLength(2);
+      expect(pub[0]!).toBeLessThan(ours[0]!);
+      expect(ours[0]!).toBeLessThan(pub[1]!);
+      expect(pub[1]!).toBeLessThan(ours[1]!);
+    }
+  });
+
+  it('the 0143 suite name guard (when present) leaves out exactly the r1_meet_public_* functions 0144 declares, which this suite pins', () => {
+    const rel = 'app/supabase/tests/r1_meet_public_bookings_assert.sql';
+    if (!existsSync(path.join(repo, rel))) return;
+    const suite0143 = read(rel);
+    const declared = [...lc.matchAll(/create or replace function screening_v2\.(r1_meet_public_[a-z_]+)\(/g)].map((m) => m[1]!);
+    expect(declared).toEqual(['r1_meet_public_local_rows', 'r1_meet_public_import_application']);
+    const exclusion =
+      `        and x.proname not in (${declared.map((n) => `'${n}'`).join(', ')})\n`
+      + "        and x.proname like 'r1\\_meet\\_public\\_%')";
+    expect(suite0143.split(exclusion)).toHaveLength(2);
+    expect(suite0143.split('x.proname not in (')).toHaveLength(2);
+    // This suite pins the posture of both, and that each is the only function of its name.
+    for (const name of declared) {
+      expect(assertions).toContain(`('${name}',\n         'screening_v2.${name}(`);
+    }
+    expect(assertions).toContain("perform _r1_mpi_tests.assert('A ' || v_fn.fn || ' is the only function of its name',");
   });
 
   it('runs in one rolled-back transaction, deletes nothing, and keeps fixtures in the 7f144000 namespace', () => {
