@@ -36,7 +36,9 @@
  *       with `id` a non-negative safe integer or null and the two flags a boolean or null. Recall
  *       documents NO `is_bot` field (`docs_real-time-event-payloads.md`), so `is_bot` is `true` when
  *       Recall itself sends `is_bot: true` OR (M035 S09, D-S09-6) when a JOIN's display name equals
- *       this bot's own display name; otherwise Recall's boolean, or null.
+ *       this bot's own display name; otherwise Recall's boolean, or null. When Recall itself sends
+ *       `is_bot: true`, `id` is null (PR #449 review S09-R3): Recall's verdict stays apart from the
+ *       name evidence, so the handler ignores that participant outright and never counts it.
  *
  * The bot's own display name (M035 S09): `options.botNameOverride` (the route passes
  * `R1_MEET_BOT_NAME` as configured when the event is received) when it is a string of 1 to
@@ -103,7 +105,8 @@ export type R1MeetRecallEventFailure = (typeof R1_MEET_RECALL_EVENT_FAILURES)[nu
 /**
  * A participant of a real-time participant event: no name, email, platform or extra data.
  * `is_bot` is true when Recall says so or when a JOIN's display name equals this bot's own display
- * name (compared in memory and dropped, M035 S09); otherwise Recall's boolean, or null.
+ * name (compared in memory and dropped, M035 S09); otherwise Recall's boolean, or null. `id` is
+ * null when Recall says so (PR #449 review S09-R3: never counted, never the bot's own).
  */
 export type R1MeetRecallParticipant = {
   readonly id: number | null;
@@ -244,6 +247,12 @@ function ownDisplayNameOf(options: R1MeetRecallEventOptions | undefined, metadat
 /**
  * The participant object. `ownName` is non-null only for a JOIN with a known own name: then the
  * display name is read exactly once into a local, compared in memory and dropped.
+ *
+ * A participant Recall ITSELF calls a bot (`is_bot: true`) keeps NO id (PR #449 review S09-R3): the
+ * payload has one `is_bot` for both marks and `jobs.ts` reads only these three keys, so the id is
+ * the one place that keeps Recall's verdict apart from the name evidence. With no id it can be
+ * neither counted nor taken for the bot's own participant: the handler ignores it outright, as
+ * M034 ignored every participant Recall flagged. Its name is never read.
  */
 function participantOf(raw: unknown, ownName: string | null): R1MeetRecallParticipant {
   if (!isPlainObject(raw)) return Object.freeze({ id: null, is_host: null, is_bot: null });
@@ -252,11 +261,12 @@ function participantOf(raw: unknown, ownName: string | null): R1MeetRecallPartic
   const id = raw.id;
   const isHost = raw.is_host;
   const isBot = raw.is_bot;
-  const namedLikeBot = isBot !== true && ownName !== null && r1MeetSameDisplayName(raw.name, ownName);
+  const recallSaysBot = isBot === true;
+  const namedLikeBot = !recallSaysBot && ownName !== null && r1MeetSameDisplayName(raw.name, ownName);
   return Object.freeze({
-    id: typeof id === 'number' && Number.isSafeInteger(id) && id >= 0 ? id + 0 : null,
+    id: !recallSaysBot && typeof id === 'number' && Number.isSafeInteger(id) && id >= 0 ? id + 0 : null,
     is_host: typeof isHost === 'boolean' ? isHost : null,
-    is_bot: isBot === true || namedLikeBot ? true : typeof isBot === 'boolean' ? isBot : null,
+    is_bot: recallSaysBot || namedLikeBot ? true : typeof isBot === 'boolean' ? isBot : null,
   });
 }
 

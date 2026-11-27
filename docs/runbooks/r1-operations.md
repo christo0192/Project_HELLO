@@ -4101,7 +4101,7 @@ and bill. Drain first, then turn the flag off.
 | `r1_meet_drain_failed` | A drain could not release a bot (`<op>:<category>`), a pass threw, or `passes_exhausted` | Check Recall; insert the drain job again |
 | `r1_meet_malformed_payload` / `r1_meet_unknown_kind` | A job this build cannot read (version skew during a deploy) | Finish the deploy; replay from the DLQ |
 | `r1_meet_job_failed` | A job's final attempt failed; its receipt is `failed` | Read the DLQ `error_message`, fix the cause, replay |
-| `r1_meet_bot_waiting_room` | Dex's bot reported `bot.in_waiting_room` (no `error_type`): the meeting is not OPEN, or nobody has admitted Dex. The booking stays live; the bot waits up to 600 s | Public bookings: fix the Dex unit's Meet settings at once, before more candidates are stranded (access Open, people who are not signed in may join, waiting room off, the host need not join first). Ashby bookings: someone in the meeting must admit Dex |
+| `r1_meet_bot_waiting_room` | Dex's bot reported `bot.in_waiting_room` (no `error_type`): the meeting is not OPEN, or nobody has admitted Dex. The booking stays live; the bot waits up to 600 s. One line per processed event; a retried job may repeat it, never drop it | Public bookings: fix the Dex unit's Meet settings at once, before more candidates are stranded (access Open, people who are not signed in may join, waiting room off, the host need not join first). Ashby bookings: someone in the meeting must admit Dex |
 | `r1_meet_bot_admission_blocked` | The bot never got in (`error_type` = the Recall sub-code: a waiting-room timeout, `bot_kicked_from_waiting_room`, `meeting_not_started`, `google_meet_bot_blocked`, `google_meet_knocking_disabled`, `google_meet_sign_in_missing_login_credentials`, `google_meet_organisation_restricted`); `failed/bot_fatal`, never a candidate no-show. Once per booking | Fix the Meet settings (as above; a meeting restricted to the organisation, or one that needs a signed-in user, also refuses a guest bot); HR re-books the candidate |
 | `r1_meet_bot_sign_in_failed` | Signed-in mode only (`R1_MEET_GOOGLE_LOGIN_GROUP_ID` set): the bot could not sign in to Google (`error_type` = the Recall sub-code); `failed/bot_fatal`. Once per booking | Check the Recall Google Login Group and its login, the Legacy SSO profile and certificate, and the concurrent sign-in count (30 per account); or unset the login group to go back to the guest bot. HR re-books |
 
@@ -4160,9 +4160,11 @@ that the bot's own join is not counted and HR leaves after admitting the candida
   calendars join (they count as people). The recovery of an attempt that did not count also reads
   this count: with the bot's own join counted, a candidate who left could be offered one more
   attempt in an empty call (the bot then leaves 90 s after the last person, and the booking fails).
-  Since M035 S09 the bot's own participant is the earliest join whose display name is the bot's own
-  (or that Recall marks as a bot), and only when it is stamped at most 15 s after the bot's first
-  `in_call_*` status; it is then never counted. **S0c** reads the `r1_meet_multi_human_observed`
+  Since M035 S09 the bot's own participant is the earliest join whose display name is the bot's own,
+  and only when it is stamped at most 15 s after the bot's first `in_call_*` status; it is then
+  never counted. A participant Recall itself marks as a bot is never counted either. A join whose
+  name is the bot's own never starts the bridge on its own (`bot.in_call_recording` does), so a
+  missed bot join costs at most one warning, never an early start. **S0c** reads the `r1_meet_multi_human_observed`
   lines (with the default `observe`) on one-candidate calls to learn which case holds and whether
   the 15 s bound fits: H1, the join is reported when the bot enters (the rule finds it: no
   warning); H3, it is never reported (no warning either; the bot's participant list in the Recall

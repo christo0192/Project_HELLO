@@ -199,14 +199,38 @@ describe('buildR1MeetRecallEventJob: participant events', () => {
     expect(Object.keys(okPayload(job).participant!)).toEqual(['id', 'is_host', 'is_bot']);
   });
 
-  it('keeps is_bot and is_host when Recall sends booleans', () => {
-    const payload = okPayload(
-      buildR1MeetRecallEventJob(
-        participantBody('participant_events.join', participantFields({ is_bot: true, is_host: true, id: 0 })),
-        'realtime',
-      ),
-    );
-    expect(payload.participant).toStrictEqual({ id: 0, is_host: true, is_bot: true });
+  it('keeps is_bot and is_host when Recall sends booleans; a participant Recall calls a bot keeps no id (S09-R3)', () => {
+    const participant = (event: string, fields: Json) =>
+      okPayload(buildR1MeetRecallEventJob(participantBody(event, participantFields(fields)), 'realtime')).participant;
+    expect(participant('participant_events.join', { is_bot: false, is_host: true, id: 0 })).toStrictEqual({
+      id: 0,
+      is_host: true,
+      is_bot: false,
+    });
+    // Recall's own verdict: never counted and never the bot's own, so the handler ignores it outright.
+    for (const event of R1_MEET_REALTIME_EVENTS) {
+      expect(participant(event, { is_bot: true, is_host: true, id: 0 }), event).toStrictEqual({
+        id: null,
+        is_host: true,
+        is_bot: true,
+      });
+    }
+  });
+
+  it("Recall's own is_bot true: the name is never read, whatever it is (S09-R3)", () => {
+    let nameReads = 0;
+    const fields = participantFields({ is_bot: true });
+    Object.defineProperty(fields, 'name', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        nameReads += 1;
+        return 'Dex';
+      },
+    });
+    const payload = okPayload(buildR1MeetRecallEventJob(participantBody('participant_events.join', fields), 'realtime'));
+    expect(payload.participant).toStrictEqual({ id: null, is_host: false, is_bot: true });
+    expect(nameReads).toBe(0);
   });
 
   it.each<[string, unknown]>([
@@ -599,8 +623,9 @@ describe("buildR1MeetRecallEventJob: a join that carries the bot's own display n
     expect(joinParticipant(name)).toStrictEqual({ id: 100, is_host: false, is_bot: null });
   });
 
-  it("Recall's own booleans: true is kept for any name; false becomes true only for the bot's own name", () => {
-    expect(joinParticipant(PARTICIPANT_NAME, {}, { is_bot: true })).toStrictEqual({ id: 100, is_host: false, is_bot: true });
+  it("Recall's own booleans: true is kept for any name (with no id); false becomes true only for the bot's own name", () => {
+    expect(joinParticipant(PARTICIPANT_NAME, {}, { is_bot: true })).toStrictEqual({ id: null, is_host: false, is_bot: true });
+    expect(joinParticipant('Dex', {}, { is_bot: true })).toStrictEqual({ id: null, is_host: false, is_bot: true });
     expect(joinParticipant(PARTICIPANT_NAME, {}, { is_bot: false })).toStrictEqual({ id: 100, is_host: false, is_bot: false });
     expect(joinParticipant('Dexter', {}, { is_bot: false })).toStrictEqual({ id: 100, is_host: false, is_bot: false });
     expect(joinParticipant('Dex', {}, { is_bot: false })).toStrictEqual({ id: 100, is_host: false, is_bot: true });
@@ -646,7 +671,11 @@ describe("buildR1MeetRecallEventJob: a join that carries the bot's own display n
     expect(joinParticipant('Dex', {}, {}, {}, 'participant_events.leave')).toStrictEqual({ id: 100, is_host: false, is_bot: null });
     expect(joinParticipant('Dex', { botNameOverride: 'Dex' }, {}, {}, 'participant_events.leave')!.is_bot).toBeNull();
     expect(joinParticipant('Dex', {}, { is_bot: false }, {}, 'participant_events.leave')!.is_bot).toBe(false);
-    expect(joinParticipant('Dex', {}, { is_bot: true }, {}, 'participant_events.leave')!.is_bot).toBe(true);
+    expect(joinParticipant('Dex', {}, { is_bot: true }, {}, 'participant_events.leave')).toStrictEqual({
+      id: null,
+      is_host: false,
+      is_bot: true,
+    });
   });
 
   it('status events are untouched by the options (participant stays null)', () => {

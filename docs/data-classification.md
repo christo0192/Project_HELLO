@@ -665,7 +665,8 @@ The receipt RPC adds `receipt_id` and `source` to each job.
   flags are booleans or null. All of it is Internal. For a JOIN only (M035 S09), Recall's
   participant name is read once, compared in memory with the bot's own display name
   (`R1_MEET_BOT_NAME`, else the profile's) and dropped: only the boolean `is_bot` is kept (true
-  when Recall says the participant is a bot or the names match). The name is never stored, logged,
+  when Recall says the participant is a bot or the names match). When Recall itself says the
+  participant is a bot, `id` is null (never counted) and the name is not read. The name is never stored, logged,
   queued, put in an error or returned, and a leave never reads it. Recall's participant email,
   `platform` and `extra_data` are never read, and neither are the bot's recording or endpoint
   artifacts.

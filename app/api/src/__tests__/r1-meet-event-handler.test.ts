@@ -33,8 +33,9 @@
  *    is `failed/bot_fatal` with exactly one alert, never `no_show`; an event that alone says no-show
  *    reads the bot ONCE before the move (Recall first), so an out-of-order `bot.done` of a refused
  *    bot is a bot failure too, a 503 defers before the move and a 404 keeps the event's reason;
- *  - a fresh `bot.in_waiting_room` of a live booking's bot alerts once, never on a re-run, never
- *    for a terminal booking, and the status mapping is unchanged.
+ *  - a `bot.in_waiting_room` of a live booking's bot alerts once per run that ends (PR #449 review
+ *    S09-R1: a re-run alerts too, a run that throws or defers before its end never does, so the
+ *    alert is never lost), never for a terminal booking, and the status mapping is unchanged.
  *
  * M035 S09 T4 (D-S09-6, UNVERIFIED until the live spike S0c), the bot's own participant:
  *  - `r1MeetBotInCallAtMs` (the oldest `in_call_*` time) and `r1MeetBotParticipantId` (the EARLIEST
@@ -42,8 +43,11 @@
  *  - `countHumans` excludes null ids and that one id only: every other id counts, marked or not;
  *  - through the real client: the bot's own join never arms or counts (H1); a candidate's join is the
  *    human signal with no recount; a later name-alike is a person (one recount; `end` ends the call,
- *    `observe` only warns); a lone name-alike after the bot got in arms (H3); a marked join with no
- *    id is ignored; a Recall failure of the bound defers a marked join, `attempt_ended` and the check
+ *    `observe` only warns); a marked join NEVER moves or arms the booking (PR #449 review S09-R4: a
+ *    lone name-alike counts and `bot.in_call_recording` arms (H3); the bot's own join that misses
+ *    the bound, or has no readable time, arms nothing); a participant Recall itself calls a bot
+ *    reaches the handler with no id and is ignored outright (S09-R3); a marked join with no id is
+ *    ignored; a Recall failure of the bound defers a marked join, `attempt_ended` and the check
  *    before any write, and only drops the bound at the human-present recount.
  */
 
@@ -71,6 +75,7 @@ import {
 } from '../lib/r1/meet/event-handler.js';
 import { r1MeetJobMeta, type R1MeetJobMeta, type R1MeetJobResult } from '../lib/r1/meet/jobs.js';
 import type { R1MeetFlowDeps, R1MeetJobDefinition } from '../lib/r1/meet/recall-actions.js';
+import { buildR1MeetRecallEventJob } from '../lib/r1/meet/recall-event.js';
 import { r1MeetBotReleaseDefinition } from '../lib/r1/meet/schedule-handler.js';
 import { R1_MEET_TICKET_PATTERN, r1MeetTicketDigest } from '../lib/r1/meet/ticket.js';
 import {
@@ -228,6 +233,8 @@ interface Delivery {
   readonly subCode?: string | null;
   readonly participantId?: number | null;
   readonly isBot?: boolean | null;
+  /** The event's `occurred_at`: omitted = now; `null` = Recall's time could not be read. */
+  readonly occurredAt?: string | null;
   /** `null` = the bot's metadata named no booking; omitted = the booking's id. */
   readonly bookingId?: string | null;
   readonly botId?: string;
@@ -246,7 +253,7 @@ function event(h: R1MeetHarness, b: Pick<Booked, 'id' | 'botId'> | null, type: s
     event_type: type,
     recall_bot_id: d.botId ?? b!.botId,
     booking_id: d.bookingId === undefined ? b!.id : d.bookingId,
-    occurred_at: iso(h.now()),
+    occurred_at: d.occurredAt === undefined ? iso(h.now()) : d.occurredAt,
     sub_code: d.subCode ?? null,
     participant: type.startsWith('participant_events.')
       ? { id: d.participantId === undefined ? 101 : d.participantId, is_host: null, is_bot: d.isBot ?? null }
@@ -725,18 +732,18 @@ describe('recall_event: order, duplicates and the booking match (D-S06-22)', () 
 
 // ── Strays (D-S06-23) ───────────────────────────────────────────────────────
 
-describe('recall_event: stray bots (D-S06-23)', () => {
-  /** A bot created at Recall whose attach never happened: the booking stays `pending`. */
-  async function unattached(h: R1MeetHarness): Promise<{ id: string; botId: string }> {
-    const created = await h.createBooking({ startAt: iso(h.now() + 30 * MIN) });
-    h.db.failNext('r1_meet_set_bot');
-    await expect(ensureBot(h.deps, created.bookingId, h.meta())).rejects.toThrow('r1_meet_db_error');
-    const botId = [...h.recall.bots.keys()].at(-1)!;
-    expect(h.db.booking(created.bookingId)).toMatchObject({ status: 'pending', recall_bot_id: null });
-    reset(h);
-    return { id: created.bookingId, botId };
-  }
+/** A bot created at Recall whose attach never happened: the booking stays `pending`. */
+async function unattached(h: R1MeetHarness): Promise<{ id: string; botId: string }> {
+  const created = await h.createBooking({ startAt: iso(h.now() + 30 * MIN) });
+  h.db.failNext('r1_meet_set_bot');
+  await expect(ensureBot(h.deps, created.bookingId, h.meta())).rejects.toThrow('r1_meet_db_error');
+  const botId = [...h.recall.bots.keys()].at(-1)!;
+  expect(h.db.booking(created.bookingId)).toMatchObject({ status: 'pending', recall_bot_id: null });
+  reset(h);
+  return { id: created.bookingId, botId };
+}
 
+describe('recall_event: stray bots (D-S06-23)', () => {
   it('pending, then attached: the event waits, and once attached it is the current bot', async () => {
     const h = world();
     const s = await unattached(h);
@@ -1272,21 +1279,51 @@ describe('recall_event: a bot held in the waiting room alerts at once (M035 S09)
     expect(errorLines(h)).toEqual([WAITING_ROOM]);
   });
 
-  it('a re-run of the same job (attempts 2, or after a deferral) never alerts again', async () => {
-    const h = world();
-    const b = await booked(h, 'bot_joining');
-    const payload = event(h, b, 'bot.in_waiting_room');
-    expect(await run(h, payload)).toEqual(done('ignored', 'no_change'));
-    expect(await run(h, payload, h.meta({ attempts: 2 }))).toEqual(done('ignored', 'no_change'));
-    expect(await run(h, payload, h.meta({ deferCount: 1, deferredAt: iso(h.now()) }))).toEqual(done('ignored', 'no_change'));
-    expect(h.alerts()).toEqual(['r1_meet_bot_waiting_room']);
-  });
-
-  it('a first run that is a re-run (attempts 2) alerts nothing at all', async () => {
+  it('a run that is a re-run (attempts 2) still alerts: one line per run that ends (PR #449 review S09-R1)', async () => {
     const h = world();
     const b = await booked(h, 'bot_scheduled');
     expect(await deliver(h, b, 'bot.in_waiting_room', {}, h.meta({ attempts: 2 }))).toEqual(done('processed', 'bot_joining'));
+    expect(errorLines(h)).toEqual([WAITING_ROOM]);
+  });
+
+  it('the first attempt dies at the booking read: no alert; its retry (attempts 2) alerts once', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_scheduled');
+    const payload = event(h, b, 'bot.in_waiting_room');
+    h.db.failNext('r1_meet_bookings');
+    await expect(run(h, payload)).rejects.toThrow('r1_meet_db_error');
     expect(h.alerts()).toEqual([]);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_scheduled' });
+    expect(await run(h, payload, h.meta({ attempts: 2 }))).toEqual(done('processed', 'bot_joining'));
+    expect(errorLines(h)).toEqual([WAITING_ROOM]);
+  });
+
+  it('the status step fails (a database error): that run writes no alert, its retry writes the one line', async () => {
+    const h = world();
+    const b = await booked(h, 'bot_scheduled');
+    const payload = event(h, b, 'bot.in_waiting_room');
+    h.db.failNext('r1_meet_transition_booking');
+    await expect(run(h, payload)).rejects.toThrow('r1_meet_db_error');
+    expect(h.alerts()).toEqual([]);
+    expect(await run(h, payload, h.meta({ attempts: 2 }))).toEqual(done('processed', 'bot_joining'));
+    expect(errorLines(h)).toEqual([WAITING_ROOM]);
+  });
+
+  it('the event of a bot a pending booking is attaching: deferred with no alert; the re-run against the attached booking alerts once', async () => {
+    const h = world();
+    const s = await unattached(h);
+    const payload = event(h, s, 'bot.in_waiting_room');
+    expect(await run(h, payload)).toEqual(deferred('stray_pending', 30));
+    expect(h.alerts()).toEqual([]);
+    expect(await ensureBot(h.deps, s.id, h.meta())).toMatchObject({ code: 'bot_scheduled' });
+    h.advance(30 * SEC);
+    reset(h);
+    expect(await run(h, payload, h.meta({ deferCount: 1, deferredAt: iso(h.now() - 30 * SEC) }))).toEqual(
+      done('processed', 'bot_joining'),
+    );
+    expect(errorLines(h)).toEqual([WAITING_ROOM]);
+    expect(h.db.jobs('bot_release')).toEqual([]);
+    expectNoPii(h);
   });
 
   it('a compare-and-set lost and retried within the run: still one alert', async () => {
@@ -1537,8 +1574,9 @@ describe('the bot\'s own participant is never a human (M035 S09 D-S09-6, UNVERIF
     expect(h.db.jobs('multi_human_check')).toEqual([]);
     h.advance(60 * SEC);
     reset(h);
-    // Not the bot's own: the earliest marked join (the bot's) already took that place.
-    expect(await deliver(h, b, 'participant_events.join', marked(NAME_ALIKE))).toEqual(done('ignored', 'already_present'));
+    // Not the bot's own: the earliest marked join (the bot's) already took that place. A person, so it
+    // is counted (the recount), but a marked join never moves or arms the booking.
+    expect(await deliver(h, b, 'participant_events.join', marked(NAME_ALIKE))).toEqual(done('ignored', 'marked_participant'));
     expect(steps(h)).toEqual(['recall:get', 'queue:multi_human_check']);
     expect(h.db.jobs('multi_human_check')).toEqual([
       expect.objectContaining({ payload: checkPayload(b), scheduled_at: iso(h.now() + 120 * SEC) }),
@@ -1576,24 +1614,79 @@ describe('the bot\'s own participant is never a human (M035 S09 D-S09-6, UNVERIF
     expectNoPii(h);
   });
 
-  it('H3: no join row of the bot; a lone name-alike 120 s after the bot got in is the human signal and arms', async () => {
+  it('H3: no join row of the bot; a lone name-alike 120 s after the bot got in counts, and bot.in_call_recording arms', async () => {
     const h = world();
     const b = await inCall(h);
     h.advance(120 * SEC);
-    expect(await deliver(h, b, 'participant_events.join', marked(NAME_ALIKE))).toEqual(done('processed', 'armed'));
-    // The bound's GET first (Recall first), then the normal arm; the recount reuses the rows read.
-    expect(steps(h)).toEqual([
-      'recall:get',
-      'db:transition:human_present',
-      'recall:get',
-      'db:arm_ticket',
-      'queue:bridge_check',
-      'recall:output_media',
-    ]);
+    // A person (past the bound), one human: no recount, and a marked join never arms (S09-R4).
+    expect(await deliver(h, b, 'participant_events.join', marked(NAME_ALIKE))).toEqual(done('ignored', 'marked_participant'));
+    expect(steps(h)).toEqual(['recall:get']);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', ticket_arms: 0 });
+    expect(h.db.jobs('multi_human_check')).toEqual([]);
+    // Recall starts recording when the first participant joins: that is the candidate's human signal.
+    reset(h);
+    expect(await deliver(h, b, 'bot.in_call_recording')).toEqual(done('processed', 'armed'));
     expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', ticket_arms: 1 });
     expect(outputMedia(h)).toHaveLength(1);
-    expect(h.db.jobs('multi_human_check')).toEqual([]);
     expectNoPii(h, lastTicket(h), digestOf(lastTicket(h)));
+  });
+
+  it("the bot's own join stamped 20 s after it got in (it misses the bound): never a move or an arm (S09-R4)", async () => {
+    const h = world();
+    const b = await inCall(h);
+    h.advance(20 * SEC);
+    expect(await deliver(h, b, 'participant_events.join', marked(BOT))).toEqual(done('ignored', 'marked_participant'));
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', reason: 'eligible', ticket_arms: 0 });
+    expect(outputMedia(h)).toHaveLength(0);
+    // The candidate's own join is the human signal as usual: one arm. The missed bot join now counts
+    // as a person, so it costs one recount at most (policy observe, the default: a warning only).
+    h.advance(60 * SEC);
+    expect(await deliver(h, b, 'participant_events.join', { participantId: CANDIDATE })).toEqual(done('processed', 'armed'));
+    expect(outputMedia(h)).toHaveLength(1);
+    expect(h.db.jobs('multi_human_check')).toHaveLength(1);
+    expect(h.alerts()).toEqual([]);
+  });
+
+  it('a marked join with no readable time, while the bot is in the call: never a move or an arm (S09-R4)', async () => {
+    const h = world();
+    const b = await inCall(h);
+    h.advance(2 * SEC);
+    expect(await deliver(h, b, 'participant_events.join', { ...marked(BOT), occurredAt: null })).toEqual(
+      done('ignored', 'marked_participant'),
+    );
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', ticket_arms: 0 });
+    expect(outputMedia(h)).toHaveLength(0);
+  });
+
+  it('a participant Recall itself calls a bot (no id after the receiver) is ignored outright and never counted (S09-R3)', async () => {
+    const h = world();
+    const b = await inCall(h);
+    // What the receiver makes of Recall's own `is_bot: true` (a notetaker, say), 60 s after the bot got in.
+    const notetaker = buildR1MeetRecallEventJob(
+      {
+        event: 'participant_events.join',
+        data: {
+          bot: { id: b.botId, metadata: { booking_id: b.id, profile: 'r1_dex_sales' } },
+          data: { participant: { id: 8, is_host: false, is_bot: true }, timestamp: { absolute: iso(h.now() + 60 * SEC) } },
+        },
+      },
+      'realtime',
+    );
+    expect(notetaker.ok && notetaker.payload.participant).toStrictEqual({ id: null, is_host: false, is_bot: true });
+    // Delivered exactly as the receiver wrote it.
+    const written = notetaker.ok ? notetaker.payload.participant! : { id: 8, is_bot: true };
+    h.advance(60 * SEC);
+    const flagged: Delivery = { participantId: written.id, isBot: written.is_bot };
+    expect(await deliver(h, b, 'participant_events.join', flagged)).toEqual(done('ignored', 'bot_participant'));
+    expect(h.requests).toEqual([]);
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', ticket_arms: 0 });
+    // The candidate arms; a second flagged bot after the candidate is not a second human either.
+    expect(await deliver(h, b, 'participant_events.join', { participantId: CANDIDATE })).toEqual(done('processed', 'armed'));
+    expect(await deliver(h, b, 'participant_events.join', flagged)).toEqual(done('ignored', 'bot_participant'));
+    expect(h.db.jobs('multi_human_check')).toEqual([]);
+    reset(h);
+    expect(await check(h, b)).toEqual(done('ignored', 'one_human'));
+    expectNoPii(h);
   });
 
   it('the same lone marked join before the bot is in the call (no bound): the bot\'s own, ignored', async () => {
@@ -1630,9 +1723,11 @@ describe('the bot\'s own participant is never a human (M035 S09 D-S09-6, UNVERIF
     h.intercept('get', 'network');
     await expect(run(h, payload, h.meta({ deferCount: 30, deferredAt: iso(h.now()) }))).rejects.toThrow('r1_meet_recall_network');
     expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', ticket_arms: 0 });
-    // Recall answers: a mark 120 s after the bot got in is a person.
-    expect(await run(h, payload, h.meta({ deferCount: 1, deferredAt: iso(h.now()) }))).toEqual(done('processed', 'armed'));
-    expect(h.db.booking(b.id)).toMatchObject({ status: 'human_present', ticket_arms: 1 });
+    // Recall answers: a mark 120 s after the bot got in is a person (counted, never an arm).
+    expect(await run(h, payload, h.meta({ deferCount: 1, deferredAt: iso(h.now()) }))).toEqual(
+      done('ignored', 'marked_participant'),
+    );
+    expect(h.db.booking(b.id)).toMatchObject({ status: 'bot_joining', ticket_arms: 0 });
   });
 
   it('Recall no longer knows the bot (404 at the bound): no bound, so the earliest marked join is the bot\'s', async () => {

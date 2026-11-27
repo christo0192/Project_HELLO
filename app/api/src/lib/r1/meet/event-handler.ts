@@ -22,14 +22,22 @@
  *
  * STATUS MAPPING (D-S06-24, M035 S09 D-S09-3/4), on the current bot of a live booking:
  *   joining_call, in_waiting_room, in_call_not_recording, recording_permission_*
- *                                  bot_scheduled -> bot_joining; anything else: no change. A FRESH
- *                                  run of `in_waiting_room` also alerts `r1_meet_bot_waiting_room`
- *                                  at once, before the status step (the meeting is not OPEN, or
- *                                  nobody admitted Dex: HR must fix it before more candidates are
- *                                  stranded); once per run, never on a re-run;
- *   in_call_recording, or a participant join that is not this bot's own participant
- *                                  a human is present (below); the bot's own join, or a
- *                                  marked join with no id, is ignored (`bot_participant`);
+ *                                  bot_scheduled -> bot_joining; anything else: no change. Every
+ *                                  run of `in_waiting_room` that ENDS (its status step done, a
+ *                                  re-run or a run after a deferral included) also alerts
+ *                                  `r1_meet_bot_waiting_room` at once, one line per run whatever the
+ *                                  compare-and-set retries do (the meeting is not OPEN, or nobody
+ *                                  admitted Dex: HR must fix it before more candidates are
+ *                                  stranded). A run that throws or defers before its end writes
+ *                                  nothing, so its re-run is the one that alerts: the alert is never
+ *                                  lost, and only a run killed between that line and its ack can
+ *                                  repeat it (PR #449 review S09-R1);
+ *   in_call_recording, or an UNMARKED participant join
+ *                                  a human is present (below);
+ *   a participant join the receiver marked `is_bot`
+ *                                  never a human signal on its own (below): the bot's own join, or a
+ *                                  marked join with no id, is ignored (`bot_participant`); any other
+ *                                  only queues the recount (`marked_participant`);
  *   call_ended, done, fatal        bot_scheduled | bot_joining -> failed/bot_fatal for `bot.fatal` or
  *                                  a FATAL sub-code (below). Otherwise the bot is read ONCE before
  *                                  the move (`r1MeetPreCallVerdict`): a `fatal` status, a fatal
@@ -60,9 +68,13 @@
  * otherwise one GET and whatever the bot's state allows (a leave). Then `set_bot('release')`. A run
  * that dies in between replays through the terminal branch, which finishes the owed release.
  *
- * HUMAN PRESENT (D-S06-25). The two signals are `bot.in_call_recording` and a participant join that is
- * not this bot's own participant (below: a join the receiver marked `is_bot` goes down this path too
- * unless it is the bot's own). The compare-and-set `-> human_present` elects ONE winner among the jobs
+ * HUMAN PRESENT (D-S06-25). The two signals are `bot.in_call_recording` and an UNMARKED participant
+ * join. A join the receiver marked `is_bot` never moves or arms the booking (PR #449 review S09-R4):
+ * if the own-participant rule below misses the bot's own join (stamped late, or with no readable
+ * time), it would otherwise arm the bridge in an empty room. A marked join that is not the bot's own
+ * (a candidate named like the bot) still counts, and its human signal is `bot.in_call_recording`,
+ * which Recall raises when the first participant joins (`start_recording_on: participant_join`). The
+ * compare-and-set `-> human_present` elects ONE winner among the jobs
  * of the two signals (and their duplicates). The winner, or a RE-RUN of a job (a crash or a deferral
  * may have stopped it after the move or after the arm), arms when the ticket is unclaimed and either
  * was never armed or the booking has been untouched for 20 s (an arm a moment ago is someone's live
@@ -74,9 +86,11 @@
  * MULTIPLE HUMANS (D-S06-28, critic C4; M035 S09 D-S09-6). Humans present = distinct participant ids
  * with more joins than leaves, except null ids and the bot's OWN participant, counted from the durable
  * `recall_event` rows of THIS bot (ids, the receiver's `is_bot` and times only: no name is ever read
- * here). The receiver marks a join `is_bot` when Recall says so or when its display name is this
- * bot's own (compared there in memory and dropped). A mark is EVIDENCE, never a verdict on its own: a
- * candidate who happens to share the bot's name must stay visible. So the bot's own participant is
+ * here). The receiver marks a join `is_bot` when its display name is this bot's own (compared there in
+ * memory and dropped). A participant Recall ITSELF calls a bot reaches this file with no id (the
+ * receiver drops it, PR #449 review S09-R3), so it is ignored and never counted, as in M034. A name
+ * mark is EVIDENCE, never a verdict on its own: a candidate who happens to share the bot's name must
+ * stay visible. So the bot's own participant is
  * the EARLIEST marked join with an id, and only when it is stamped at most 15 s
  * (`R1_MEET_BOT_JOIN_SLACK_MS`) after the bot's first `in_call_*` status in Recall's history (one
  * GET, made only when a marked join exists; no in-call status yet = no bound). Every other id counts,
@@ -84,8 +98,8 @@
  * the bot's own join is reported nor when. H1 (reported at the bot's entry): the rule finds it. H3
  * (never reported): a lone name-alike joins after the bound and counts. H2 (reported only when
  * recording starts, i.e. when someone else joins, later than 15 s): it counts as a person, so the
- * multi-human check would see two on every call; it never arms early, because a person is in the
- * call by then. A Recall failure of that GET defers `multi_human_check` and `attempt_ended` before
+ * multi-human check would see two on every call. Under none of them does a marked join arm the
+ * bridge (above). A Recall failure of that GET defers `multi_human_check` and `attempt_ended` before
  * any write; the human-present recount falls back to no bound (it only decides whether to queue a
  * recount). On Google Meet a rejoin is a NEW id, and HR may still be admitting the candidate, so two
  * humans only queue one `multi_human_check` 120 s later; if there are still more than one then,
@@ -773,16 +787,12 @@ async function queueHumanCheck(
   });
 }
 
-/**
- * D-S06-25 (see the header). `known`: the call's participant rows and the bot's own id, when the
- * caller (a marked join) already read them, so the recount needs no second read.
- */
+/** D-S06-25 (see the header): `bot.in_call_recording` or an UNMARKED participant join. */
 async function humanPresent(
   deps: R1MeetFlowDeps,
   job: R1MeetRecallEventJob,
   booking: R1MeetBooking,
   meta: R1MeetJobMeta,
-  known: CallParticipants | null = null,
 ): Promise<Step> {
   let winner = false;
   if (booking.status === 'bot_scheduled' || booking.status === 'bot_joining') {
@@ -800,7 +810,7 @@ async function humanPresent(
   }
   // Counted BEFORE the arm: a failed database read throws before anything is armed, and the re-run
   // arms. A Recall failure of the bot's in-call time only drops the bound (queueHumanCheck).
-  if (job.eventType === 'participant_events.join') await queueHumanCheck(deps, job, booking, known);
+  if (job.eventType === 'participant_events.join') await queueHumanCheck(deps, job, booking, null);
   // The page already claimed a ticket (in_call): the bridge check of that arm watches it.
   if (booking.status === 'in_call') return r1MeetIgnored('in_call');
 
@@ -905,10 +915,14 @@ async function ended(
 }
 
 /**
- * A participant join the receiver marked `is_bot` (D-S09-6): evidence, not a verdict. The bot's own
- * participant, or a marked join with no id (nothing to count), is ignored; any other is a person (a
- * candidate named like the bot) and goes down the normal human path. Recall first (one GET, for the
- * bound), the database second: a Recall failure defers the job before any write.
+ * A participant join the receiver marked `is_bot` (D-S09-6): evidence, not a verdict, and never a
+ * human signal on its own (PR #449 review S09-R4). The bot's own participant, or a marked join with
+ * no id (nothing to count), is ignored. Any other is a person (a candidate named like the bot): it
+ * only queues the recount, so it stays counted, and it never moves or arms the booking. If the
+ * own-participant rule missed the bot's own join (stamped later than the bound, or with no readable
+ * time), that join can then cost one `observe` warning at most, never an arm in an empty room; a
+ * real person's arrival is still seen through `bot.in_call_recording`. Recall first (one GET, for
+ * the bound), the database second: a Recall failure defers the job before any write.
  */
 async function markedJoin(
   deps: R1MeetFlowDeps,
@@ -922,7 +936,8 @@ async function markedJoin(
   const own = await botParticipantOf(deps, job.recallBotId, events, meta);
   if ('result' in own) return own.result;
   if (own.id === participantId) return r1MeetIgnored('bot_participant');
-  return humanPresent(deps, job, booking, meta, { events, botParticipantId: own.id });
+  await queueHumanCheck(deps, job, booking, { events, botParticipantId: own.id });
+  return r1MeetIgnored('marked_participant');
 }
 
 async function currentBotEvent(
@@ -960,26 +975,21 @@ export const r1MeetRecallEventDefinition: R1MeetJobDefinition<R1MeetRecallEventJ
   kind: 'recall_event',
   parse: parseRecallEventJob,
   async run(deps: R1MeetFlowDeps, job: R1MeetRecallEventJob, meta: R1MeetJobMeta): Promise<R1MeetJobResult> {
-    // D-S09-4(b): at most one waiting-room alert per run, whatever the compare-and-set retries do.
-    let waitingRoomAlerted = false;
     for (let pass = 0; pass < R1_MEET_EVENT_MAX_PASSES; pass += 1) {
       const match = await matchBooking(deps, job);
       // Not one of ours: never touched (no Recall call, no job).
       if (match.kind === 'unknown') return r1MeetIgnored('unknown_bot');
       if (match.kind === 'stray') return strayBot(deps, job, match, meta);
-      if (
-        !waitingRoomAlerted
-        && job.eventType === 'bot.in_waiting_room'
-        && !meta.isRerun
-        && HOLDS_BOT.has(match.booking.status)
-      ) {
-        // The live booking's own bot is held at the door: the meeting is not OPEN (or nobody admits
-        // Dex). Receipts de-duplicate redeliveries, so a fresh run is one Recall status change.
-        waitingRoomAlerted = true;
+      const step = await currentBotEvent(deps, job, match.booking, meta);
+      if (step === AGAIN) continue;
+      if (job.eventType === 'bot.in_waiting_room' && HOLDS_BOT.has(match.booking.status)) {
+        // D-S09-4(b), PR #449 review S09-R1: the live booking's own bot is held at the door, so the
+        // meeting is not OPEN (or nobody admits Dex). Written once the run's status step is done and
+        // never before it: a run that throws or defers earlier leaves the alert to its re-run.
+        // Receipts de-duplicate redeliveries, so a run is one Recall status change.
         deps.log.error({ error_category: R1_MEET_ALERTS.botWaitingRoom });
       }
-      const step = await currentBotEvent(deps, job, match.booking, meta);
-      if (step !== AGAIN) return step;
+      return step;
     }
     throw new R1MeetJobError(R1_MEET_CONFLICT);
   },
