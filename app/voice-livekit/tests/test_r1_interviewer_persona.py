@@ -720,12 +720,8 @@ class TestMeetRollbackRunbook(unittest.TestCase):
         self.assertIn("A full rollback on Meet needs an API and web code change", self.flat)
         self.assertIn("`R1_MEET_BOT_NAME` changes none of these. It renames only a guest bot's name tile",
                       self.flat)
-        web = {
-            "app/web/src/lib/r1-review.ts": "'Lexy (AI interviewer)'",
-            "app/web/src/lib/r1-meet-bookings.ts": "label: 'Lexy scheduled'",
-        }
-        for rel, literal in web.items():
-            self.assertIn(literal, _repo_text(rel), rel)
+        # The web labels themselves are pinned by the web tests (r1-no-christy.test.ts and the
+        # label tests): a voice test must not read web files (scripts/ci-voice-test-scope.mjs).
         for label in ('"Lexy (AI interviewer)"', '"Lexy scheduled"', '"Lexy joining"'):
             self.assertIn(label, self.flat)
         rows = [line for line in self.doc.splitlines()
