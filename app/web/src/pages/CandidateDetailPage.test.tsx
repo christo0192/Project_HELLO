@@ -1122,6 +1122,22 @@ describe('CandidateDetailPage', () => {
     });
   });
 
+  it('a request answered not_phone_screened says why in words, not the raw code', async () => {
+    const { ApiError } = await import('../api');
+    mockApi.requestCandidatePhoneCall.mockRejectedValueOnce(new ApiError('not_phone_screened', 409));
+    renderDetailPage("candidate-1", "?tab=overview");
+    await screen.findByText('Jane Doe');
+    await userEvent.click(await screen.findByRole('button', { name: 'Call candidate' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm call' }));
+    const status = await screen.findByRole('status');
+    expect(status).toHaveTextContent(
+      'This candidate came in through the public R1 booking link and is not phone-screened, so no phone call was booked or requested.',
+    );
+    expect(status).not.toHaveTextContent('not_phone_screened');
+    expect(screen.queryByRole('dialog', { name: 'Confirm phone screening' })).not.toBeInTheDocument();
+    expect(mockApi.requestCandidatePhoneCall).toHaveBeenCalledTimes(1);
+  });
+
   it('C3: no re-screen recommendation for a decision-graded (or ungraded) scorecard', async () => {
     mockApi.getCandidatePhoneScreenings.mockResolvedValue({
       ok: true, enabled: true, current_cycle: 1,
