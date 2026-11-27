@@ -45,6 +45,9 @@
  *     keys: applicationId, formDefinitionId, feedbackForm { fieldSubmissions }, userId (the Dex Ashby
  *     user) and interviewEventId (the booking's event). With both ids Ashby UPDATES Dex's one
  *     submission for that event, so a retry can never post a second card (D-S09-1). No `extra`.
+ *     A public-page booking (M035 S02) has no interview event: FOUR keys, no `interviewEventId` key
+ *     at all (general application feedback; the handler guards duplicates with
+ *     `applicationFeedback.list` before every such submit).
  *
  * This is NOT the phone-screen card: it shares only the generic helpers of the Ashby integration
  * (the M029 Overall mapping, the title binder, the https origin check), never that card's binding.
@@ -198,7 +201,11 @@ export interface R1MeetFeedbackBindOptions {
 export interface R1MeetFeedbackRequestInput {
   readonly applicationId: string;
   readonly formDefinitionId: string;
-  readonly interviewEventId: string;
+  /**
+   * The booking's Ashby interview event; null for a public-page booking (M035 S02), which has no
+   * Ashby schedule: its card is general application feedback and the body carries no event key.
+   */
+  readonly interviewEventId: string | null;
   readonly dexUserId: string;
   readonly fieldSubmissions: readonly R1MeetFeedbackSubmission[];
 }
@@ -410,7 +417,9 @@ export function bindR1MeetFeedbackForm(
 /**
  * The `applicationFeedback.submit` body: EXACTLY applicationId, formDefinitionId, feedbackForm
  * { fieldSubmissions }, userId and interviewEventId, never `extra` (the client spreads `extra` after
- * its validated fields, so it could otherwise carry anything).
+ * its validated fields, so it could otherwise carry anything). Four keys when the booking has no
+ * interview event (a public-page booking, M035 S02): the `interviewEventId` key is then absent, not
+ * null or undefined.
  */
 export function r1MeetFeedbackRequest(input: R1MeetFeedbackRequestInput): FeedbackSubmitRequest {
   return {
@@ -420,7 +429,7 @@ export function r1MeetFeedbackRequest(input: R1MeetFeedbackRequestInput): Feedba
       fieldSubmissions: input.fieldSubmissions.map((submission) => ({ path: submission.path, value: submission.value })),
     },
     userId: input.dexUserId,
-    interviewEventId: input.interviewEventId,
+    ...(typeof input.interviewEventId === 'string' ? { interviewEventId: input.interviewEventId } : {}),
   };
 }
 

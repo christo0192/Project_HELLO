@@ -19,6 +19,13 @@
  *  7  every off-path guard makes ZERO Ashby calls, a browser round included;
  *  8  a failed receipt is re-postable by hand, and a success moves it to `processed`;
  *  9  every log line is closed words, counts and a status: no id, path, URL, name or text.
+ * 10  M035 S02, a public-page booking (no interview event): general feedback guarded by
+ *     `applicationFeedback.list` before every submit (`[form, list, submit]`, the body without
+ *     `interviewEventId`; Dex's card already there is `already_posted`; list failures defer or end
+ *     terminal and never submit; a lost submit answer is found on the re-run; a re-score of the same
+ *     attempt is `already_posted` too, the known limit of S02-R2, and the runbook's remedy works only
+ *     with the card deleted AND that receipt moved back to `failed`), while an Ashby booking never
+ *     lists and posts exactly as before (a re-score updates its one card).
  */
 
 import { describe, expect, it } from 'vitest';
@@ -28,8 +35,10 @@ import { createQueueRunner } from '../lib/queue/runner.js';
 import { getR1MeetFeedbackConfig } from '../lib/r1/meet/config.js';
 import {
   R1_MEET_FEEDBACK_ALERTS,
+  R1_MEET_FEEDBACK_ALREADY_POSTED_LOG,
   R1_MEET_FEEDBACK_ASHBY_INACTIVE_LOG,
   R1_MEET_FEEDBACK_DEFER,
+  r1MeetFeedbackSubmitMayHaveRun,
   r1MeetScorecardFeedbackDefinition,
 } from '../lib/r1/meet/feedback.js';
 import {
@@ -52,6 +61,7 @@ import {
   createR1MeetDispatcher,
   type R1MeetDispatcher,
 } from '../lib/r1/meet/dispatcher.js';
+import { r1MeetFeedbackReceiptKey } from '../lib/r1/meet/feedback-store.js';
 import type { R1MeetFlowDeps } from '../lib/r1/meet/recall-actions.js';
 import { R1_MEET_LIVE_STATUSES, R1_MEET_TERMINAL_STATUSES } from '../lib/r1/meet/runtime-store.js';
 import { FAKE_STATUS_REASONS } from './support/r1-meet-fake-db.js';
@@ -62,6 +72,7 @@ import {
   createR1MeetFeedbackWorld,
   dexFormDefinition,
   dexFormFields,
+  finalAssessmentRow,
   type AshbyStep,
   type CompletedBooking,
   type R1MeetFeedbackWorld,
@@ -889,5 +900,436 @@ describe('9. logs are closed words only', () => {
       R1_MEET_FEEDBACK_ALERTS.formInvalid,
       R1_MEET_FEEDBACK_ALERTS.configInvalid,
     ]));
+  });
+});
+
+// ── 10. Public-page bookings (M035 S02) ─────────────────────────────────────
+
+describe('10. a public-page booking: general feedback guarded by applicationFeedback.list', () => {
+  const HOUR_MS = 60 * 60 * 1000;
+  const OTHER_USER_ID = '7f000000-0000-4000-8000-000000000602';
+  const OTHER_FORM_ID = '7f000000-0000-4000-8000-00000000f0ff';
+
+  async function publicWorld(options: Parameters<R1MeetFeedbackWorld['completedBooking']>[0] = {}) {
+    const w = createR1MeetFeedbackWorld();
+    const b = await w.completedBooking({ source: 'public_page', applicationId: APPLICATION_ID, ...options });
+    return { w, b };
+  }
+
+  const startOf = (w: R1MeetFeedbackWorld, b: CompletedBooking): string => w.h.db.booking(b.bookingId)!.start_at as string;
+
+  /** The exact general body: the Ashby card's body without the event key, key order kept. */
+  function expectedGeneralBody(b: CompletedBooking): string {
+    const body = expectedBody(b).replace(`,"interviewEventId":"${EVENT_ID}"`, '');
+    expect(body).not.toContain('interviewEventId');
+    return body;
+  }
+
+  /** One of Dex's cards on the application, in Ashby's entry shape, 50 minutes after the slot start. */
+  function dexCard(w: R1MeetFeedbackWorld, b: CompletedBooking, over: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      id: fixtureId(),
+      applicationId: b.applicationId,
+      submittedValues: { summary_path: SENTINELS.quote },
+      submittedByUser: { id: DEX_USER_ID, firstName: SENTINELS.name, email: SENTINELS.email },
+      creditedToUser: { id: DEX_USER_ID },
+      submittedAt: new Date(Date.parse(startOf(w, b)) + 50 * 60 * 1000).toISOString(),
+      feedbackFormDefinitionId: FEEDBACK_FORM_ID,
+      ...over,
+    };
+  }
+
+  const ops = (w: R1MeetFeedbackWorld) => w.ashby.requests.map((request) => request.op);
+  const infoLines = (w: R1MeetFeedbackWorld, category: string) =>
+    w.h.logs.filter((line) => line.meta.error_category === category);
+
+  it('the booking is the public shape: no interview event, schedule or scheduler', async () => {
+    const { w, b } = await publicWorld();
+    expect(b.eventId).toBeNull();
+    const booking = await w.deps.store.getBooking(b.bookingId);
+    expect(booking).toMatchObject({ source: 'public_page', eventId: null, scheduleId: null, scheduledByUserId: null, applicationId: APPLICATION_ID });
+  });
+
+  it('no Dex card yet: [form, list, submit], the exact general body, processed, the receipt processed', async () => {
+    const { w, b } = await publicWorld();
+    await expect(w.dispatcher.handle(w.queueJob(b.job!.payload))).resolves.toBeUndefined();
+
+    expect(w.ashby.requests.map((request) => [request.op, request.path])).toEqual([
+      ['form', '/feedbackFormDefinition.info'],
+      ['list', '/applicationFeedback.list'],
+      ['submit', '/applicationFeedback.submit'],
+    ]);
+    const createdAfter = Date.parse(startOf(w, b)) - HOUR_MS;
+    expect(w.ashby.lists()[0]!.raw).toBe(`{"applicationId":"${APPLICATION_ID}","limit":100,"createdAfter":${createdAfter}}`);
+    expect(w.ashby.submits()[0]!.raw).toBe(expectedGeneralBody(b));
+    expect(w.ashby.submits()[0]!.raw).not.toContain('interviewEventId');
+    expect(w.receiptRow(b.key)).toMatchObject({ outcome: 'processed', processed_at: HARNESS_NOW });
+    expect(jobLines(w)).toEqual(['scorecard_feedback:submitted']);
+    expect(infoLines(w, R1_MEET_FEEDBACK_ALREADY_POSTED_LOG)).toEqual([]);
+    expect(errorLines(w)).toEqual([]);
+  });
+
+  it('the handler answers processed(submitted) directly as well', async () => {
+    const { w, b } = await publicWorld();
+    expect(await run(w, b)).toEqual(r1MeetProcessed('submitted'));
+    expect(ops(w)).toEqual(['form', 'list', 'submit']);
+    expect(outcome(w, b)).toBe('processed');
+  });
+
+  it.each([
+    ['on the configured form', {}],
+    ['with a null form id', { feedbackFormDefinitionId: null }],
+    ['with no form id at all', { feedbackFormDefinitionId: undefined }],
+    ['on the form, id in upper case', { feedbackFormDefinitionId: FEEDBACK_FORM_ID.toUpperCase() }],
+    ['credited to Dex, submitted by someone else', { submittedByUser: { id: OTHER_USER_ID }, creditedToUser: { id: DEX_USER_ID.toUpperCase() } }],
+    ['submitted exactly at the slot start', 'start'],
+  ] as Array<[string, Record<string, unknown> | 'start']>)('a Dex card %s: [form, list], no submit, already_posted, the receipt processed', async (_label, over) => {
+    const { w, b } = await publicWorld();
+    w.ashby.feedbackList = [dexCard(w, b, over === 'start' ? { submittedAt: startOf(w, b) } : over)];
+    expect(await run(w, b)).toEqual(r1MeetProcessed('already_posted'));
+    expect(ops(w)).toEqual(['form', 'list']);
+    expect(w.ashby.submits()).toHaveLength(0);
+    expect(w.receiptRow(b.key)).toMatchObject({ outcome: 'processed', processed_at: HARNESS_NOW });
+    expect(infoLines(w, R1_MEET_FEEDBACK_ALREADY_POSTED_LOG)).toEqual([
+      { level: 'info', meta: { error_category: R1_MEET_FEEDBACK_ALREADY_POSTED_LOG } },
+    ]);
+    expect(infoLines(w, 'r1_meet_feedback_submitted')).toEqual([]);
+    expect(errorLines(w)).toEqual([]);
+  });
+
+  it('already_posted through the dispatcher ends the job and the receipt processed', async () => {
+    const { w, b } = await publicWorld();
+    w.ashby.feedbackList = [dexCard(w, b)];
+    await expect(w.dispatcher.handle(w.queueJob(b.job!.payload))).resolves.toBeUndefined();
+    expect(jobLines(w)).toEqual(['scorecard_feedback:already_posted']);
+    expect(outcome(w, b)).toBe('processed');
+    // A re-delivered job makes no Ashby call at all.
+    await w.dispatcher.handle(w.queueJob(b.job!.payload, { attempts: 2 }));
+    expect(jobLines(w)).toEqual(['scorecard_feedback:already_posted', 'scorecard_feedback:already_submitted']);
+    expect(ops(w)).toEqual(['form', 'list']);
+  });
+
+  it.each([
+    ['submitted before the slot start', 'before'],
+    ['on another form', { feedbackFormDefinitionId: OTHER_FORM_ID }],
+    ["another interviewer's card", { submittedByUser: { id: OTHER_USER_ID }, creditedToUser: { id: OTHER_USER_ID } }],
+    ['on another application', { applicationId: fixtureId() }],
+  ] as Array<[string, Record<string, unknown> | 'before']>)('a card %s does not count: the card is submitted', async (_label, over) => {
+    const { w, b } = await publicWorld();
+    w.ashby.feedbackList = [
+      dexCard(w, b, over === 'before' ? { submittedAt: new Date(Date.parse(startOf(w, b)) - 1).toISOString() } : over),
+    ];
+    expect(await run(w, b)).toEqual(r1MeetProcessed('submitted'));
+    expect(ops(w)).toEqual(['form', 'list', 'submit']);
+    expect(w.ashby.submits()[0]!.raw).toBe(expectedGeneralBody(b));
+    expect(infoLines(w, R1_MEET_FEEDBACK_ALREADY_POSTED_LOG)).toEqual([]);
+  });
+
+  const LIST_TRANSIENT: Array<[string, () => AshbyStep[], string, number, string]> = [
+    ['429', () => [{ status: 429, body: '' }], 'feedback_list_rate_limited', 60, 'r1_meet_feedback_list_rate_limited'],
+    ['500', () => [{ status: 500, body: '' }], 'feedback_list_unavailable', 30, 'r1_meet_feedback_list_unavailable'],
+    ['503', () => [{ status: 503, body: '' }], 'feedback_list_unavailable', 30, 'r1_meet_feedback_list_unavailable'],
+    ['network', () => ['network'], 'feedback_list_unavailable', 30, 'r1_meet_feedback_list_unavailable'],
+    ['timeout', () => ['timeout'], 'feedback_list_unavailable', 30, 'r1_meet_feedback_list_unavailable'],
+    ['an unreadable list', () => [{ status: 200, body: { success: true, results: 'not a list' } }], 'feedback_list_unavailable', 30, 'r1_meet_feedback_list_unavailable'],
+    ['an entry with no user id', () => [{ status: 200, body: { success: true, results: [{ submittedAt: HARNESS_NOW }] } }], 'feedback_list_unavailable', 30, 'r1_meet_feedback_list_unavailable'],
+    ['more pages than the cap', () => [1, 2, 3, 4, 5].map((i) => ({
+      status: 200,
+      body: { success: true, results: [], moreDataAvailable: true, nextCursor: `cursor-${i}` },
+    })), 'feedback_list_unavailable', 30, 'r1_meet_feedback_list_unavailable'],
+  ];
+
+  it('the list waits use the existing delays (no new deferral key)', () => {
+    expect(R1_MEET_FEEDBACK_DEFER).toStrictEqual({ notSettled: 60, form: 60, rateLimited: 60, unavailable: 30 });
+  });
+
+  it.each(LIST_TRANSIENT)('a list %s defers within the bound, leaves the receipt alone and never submits', async (_label, steps, code, seconds) => {
+    const { w, b } = await publicWorld();
+    for (const step of steps()) w.ashby.next('list', step);
+    await expect(w.dispatcher.handle(w.queueJob(b.job!.payload))).resolves.toEqual({ outcome: 'defer', reasonCode: code, delaySeconds: seconds });
+    expect(w.ashby.submits()).toHaveLength(0);
+    expect(w.ashby.lists().length).toBeGreaterThanOrEqual(1);
+    expect(outcome(w, b)).toBe('enqueued');
+    expect(errorLines(w)).toEqual([]);
+  });
+
+  it.each(LIST_TRANSIENT)('a list %s past the bound throws its closed code and never submits', async (_label, steps, _code, _seconds, thrownCode) => {
+    const { w, b } = await publicWorld();
+    for (const step of steps()) w.ashby.next('list', step);
+    expect((await thrown(run(w, b, EXHAUSTED))).code).toBe(thrownCode);
+    expect(w.ashby.submits()).toHaveLength(0);
+    expect(outcome(w, b)).toBe('enqueued');
+  });
+
+  it.each([
+    ['403', { status: 403, body: { success: false, errors: ['missing_endpoint_permission'] } }, 'http_client_error:missing_endpoint_permission', 403],
+    ['404', { status: 404, body: '' }, 'http_client_error', 404],
+    ['success:false', { status: 200, body: { success: false, errors: ['application_not_found'] } }, 'logical_failure:application_not_found', 200],
+  ] as Array<[string, AshbyStep, string, number]>)('a list %s is terminal feedback_list_rejected: alert, receipt failed, no submit', async (_label, step, detail, status) => {
+    const { w, b } = await publicWorld();
+    w.ashby.next('list', step);
+    await expect(w.dispatcher.handle(w.queueJob(b.job!.payload))).resolves.toBeUndefined();
+    expect(jobLines(w)).toEqual(['scorecard_feedback:feedback_list_rejected']);
+    expect(errorLines(w)).toEqual([{ error_category: R1_MEET_FEEDBACK_ALERTS.rejected, error_type: detail, http_status: status }]);
+    expect(w.receiptRow(b.key)).toMatchObject({ outcome: 'failed', processed_at: HARNESS_NOW });
+    expect(w.ashby.submits()).toHaveLength(0);
+  });
+
+  it('a list request the port refuses (a Dex user that is not a UUID) is terminal before the network', async () => {
+    const { w, b } = await publicWorld();
+    const deps: R1MeetFlowDeps = { ...w.deps, feedback: { ...w.feedback, dexUserId: 'dex' } };
+    expect(await run(w, b, {}, deps)).toEqual(r1MeetIgnored('feedback_list_rejected'));
+    expect(errorLines(w)).toEqual([{ error_category: R1_MEET_FEEDBACK_ALERTS.rejected, error_type: 'invalid_request' }]);
+    expect(ops(w)).toEqual(['form']);
+    expect(outcome(w, b)).toBe('failed');
+  });
+
+  it('a lost submit answer, then the re-run: the guard finds the card and nothing is posted twice', async () => {
+    const { w, b } = await publicWorld();
+    w.ashby.next('submit', 'lost');
+    expect(await run(w, b)).toEqual(r1MeetDefer('ashby_unavailable', R1_MEET_FEEDBACK_DEFER.unavailable));
+    expect(w.ashby.submits().filter((submit) => submit.accepted)).toHaveLength(1);
+    expect(outcome(w, b)).toBe('enqueued');
+
+    w.h.setNow(w.h.now() + (R1_MEET_FEEDBACK_DEFER.unavailable + 1) * 1000);
+    expect(await run(w, b, { ...RERUN, lastDeferReason: 'ashby_unavailable' })).toEqual(r1MeetProcessed('already_posted'));
+    expect(ops(w)).toEqual(['form', 'list', 'submit', 'form', 'list']);
+    expect(w.ashby.submits()).toHaveLength(1);
+    expect(outcome(w, b)).toBe('processed');
+    expect(infoLines(w, R1_MEET_FEEDBACK_ALREADY_POSTED_LOG)).toHaveLength(1);
+  });
+
+  it('a card that landed before the job dead-lettered: the manual re-post finds it and posts nothing', async () => {
+    const { w, b } = await publicWorld();
+    w.ashby.next('submit', 'lost');
+    const last = w.queueJob(b.job!.payload, { attempts: 5, maxAttempts: 5, deferCount: R1_MEET_DEFER_MAX_COUNT, deferredAt: HARNESS_NOW });
+    await expect(w.dispatcher.handle(last)).rejects.toThrow('r1_meet_feedback_ashby_unavailable');
+    expect(outcome(w, b)).toBe('failed');
+
+    await expect(w.dispatcher.handle(w.queueJob(r1MeetJobs.scorecardFeedback(b.bookingId, b.assessmentId).payload))).resolves.toBeUndefined();
+    expect(jobLines(w).at(-1)).toBe('scorecard_feedback:already_posted');
+    expect(w.ashby.submits()).toHaveLength(1);
+    expect(outcome(w, b)).toBe('processed');
+  });
+
+  /**
+   * A newer assessment of the same attempt becomes the round's current one (a re-score): the trigger
+   * records a second receipt for the booking. Returns the receipt key and its queued job's payload.
+   */
+  async function rescore(w: R1MeetFeedbackWorld, b: CompletedBooking): Promise<{ key: string; payload: unknown; assessmentId: string }> {
+    const newer = fixtureId();
+    w.tables.assessments.push(finalAssessmentRow(newer, b.sessionId, { recommendation: 'advance', overall_score: 75 }));
+    w.h.db.tables.interview_rounds.find((round) => round.id === b.roundId)!.assessment_id = newer;
+    const recorded = await w.store.recordFeedback(b.bookingId, newer, w.h.now());
+    expect(recorded).toMatchObject({ enqueued: true });
+    const id = (recorded as { id: string }).id;
+    const job = w.h.db.jobs('scorecard_feedback').find((row) => row.payload?.receipt_id === id);
+    expect(job).toBeDefined();
+    return { key: r1MeetFeedbackReceiptKey(b.bookingId, newer), payload: job!.payload, assessmentId: newer };
+  }
+
+  it('KNOWN LIMIT (S02-R2): a re-score of a public booking never updates its card; Ashby keeps the first one', async () => {
+    const { w, b } = await publicWorld();
+    await w.dispatcher.handle(w.queueJob(b.job!.payload));
+    expect(w.ashby.submits()).toHaveLength(1);
+
+    const second = await rescore(w, b);
+    await expect(w.dispatcher.handle(w.queueJob(second.payload))).resolves.toBeUndefined();
+    // Ashby has no update of a general card, and the guard cannot tell which assessment a card holds:
+    // the first card stays, the new receipt ends processed, and nothing is posted twice.
+    expect(jobLines(w)).toEqual(['scorecard_feedback:submitted', 'scorecard_feedback:already_posted']);
+    expect(ops(w)).toEqual(['form', 'list', 'submit', 'form', 'list']);
+    expect(w.ashby.submits()).toHaveLength(1);
+    expect(w.ashby.feedbackList).toHaveLength(1);
+    expect(w.receiptRow(second.key)).toMatchObject({ outcome: 'processed' });
+    expect(infoLines(w, R1_MEET_FEEDBACK_ALREADY_POSTED_LOG)).toHaveLength(1);
+  });
+
+  /**
+   * The runbook's remedy for the known limit ("Public-page bookings (M035 S02)"): the recruiter
+   * deletes the interviewer's card in Ashby, the operator moves THAT receipt `processed -> failed`
+   * (processed_at stays set, which 0142's chk_r1_meet_receipts_processed allows), then queues the
+   * re-post job. The SQL update is mirrored on the fake row; the job is the one the re-post SQL builds.
+   */
+  async function rescoredPublic() {
+    const { w, b } = await publicWorld();
+    await w.dispatcher.handle(w.queueJob(b.job!.payload));
+    const second = await rescore(w, b);
+    await w.dispatcher.handle(w.queueJob(second.payload));
+    expect(w.receiptRow(second.key)).toMatchObject({ outcome: 'processed' });
+    const repost = () => w.dispatcher.handle(w.queueJob(r1MeetJobs.scorecardFeedback(b.bookingId, second.assessmentId).payload));
+    const moveBackToFailed = () => {
+      const row = w.receiptRow(second.key)!;
+      expect(row).toMatchObject({ source: 'ashby', outcome: 'processed' });
+      expect(row.processed_at).not.toBeNull();
+      row.outcome = 'failed';
+    };
+    return { w, b, second, repost, moveBackToFailed };
+  }
+
+  it('REMEDY (S02-R2): a re-post alone never re-posts a processed receipt, even with the card deleted', async () => {
+    const { w, second, repost } = await rescoredPublic();
+    w.ashby.feedbackList.length = 0; // the recruiter deleted the interviewer's card in Ashby
+    await expect(repost()).resolves.toBeUndefined();
+    expect(jobLines(w).at(-1)).toBe('scorecard_feedback:already_submitted');
+    expect(ops(w)).toEqual(['form', 'list', 'submit', 'form', 'list']);
+    expect(w.ashby.submits()).toHaveLength(1);
+    expect(w.receiptRow(second.key)).toMatchObject({ outcome: 'processed' });
+  });
+
+  it('REMEDY (S02-R2): card deleted, receipt moved back to failed, re-post: the current assessment is posted once', async () => {
+    const { w, second, repost, moveBackToFailed } = await rescoredPublic();
+    w.ashby.feedbackList.length = 0;
+    moveBackToFailed();
+    await expect(repost()).resolves.toBeUndefined();
+    expect(jobLines(w).at(-1)).toBe('scorecard_feedback:submitted');
+    expect(ops(w)).toEqual(['form', 'list', 'submit', 'form', 'list', 'form', 'list', 'submit']);
+    expect(w.ashby.submits()).toHaveLength(2);
+    expect(w.ashby.submits()[1]!.raw).not.toBe(w.ashby.submits()[0]!.raw);
+    expect(w.ashby.submits()[1]!.raw).not.toContain('interviewEventId');
+    expect(w.ashby.feedbackList).toHaveLength(1);
+    expect(w.receiptRow(second.key)).toMatchObject({ outcome: 'processed', processed_at: HARNESS_NOW });
+    // A second re-post of the same job is a no-op again.
+    await repost();
+    expect(jobLines(w).at(-1)).toBe('scorecard_feedback:already_submitted');
+    expect(w.ashby.submits()).toHaveLength(2);
+  });
+
+  it('REMEDY (S02-R2): receipt moved back but the card NOT deleted: already_posted again, no second card', async () => {
+    const { w, second, repost, moveBackToFailed } = await rescoredPublic();
+    moveBackToFailed();
+    await expect(repost()).resolves.toBeUndefined();
+    expect(jobLines(w).at(-1)).toBe('scorecard_feedback:already_posted');
+    expect(w.ashby.submits()).toHaveLength(1);
+    expect(w.ashby.feedbackList).toHaveLength(1);
+    expect(w.receiptRow(second.key)).toMatchObject({ outcome: 'processed' });
+  });
+
+  it('the same re-score of an Ashby booking updates its one card (the interview-event submit)', async () => {
+    const { w, b } = await world();
+    await w.dispatcher.handle(w.queueJob(b.job!.payload));
+
+    const second = await rescore(w, b);
+    await expect(w.dispatcher.handle(w.queueJob(second.payload))).resolves.toBeUndefined();
+    expect(jobLines(w)).toEqual(['scorecard_feedback:submitted', 'scorecard_feedback:submitted']);
+    expect(ops(w)).toEqual(['form', 'submit', 'form', 'submit']);
+    expect(w.ashby.submits()).toHaveLength(2);
+    expect(w.ashby.submits()[1]!.raw).not.toBe(w.ashby.submits()[0]!.raw);
+    expect(w.ashby.feedbackList).toHaveLength(1);
+    expect(w.receiptRow(second.key)).toMatchObject({ outcome: 'processed' });
+  });
+
+  it('a failed settle after already_posted only warns; the dispatcher finishes the receipt', async () => {
+    const { w, b } = await publicWorld();
+    w.ashby.feedbackList = [dexCard(w, b)];
+    const deps: R1MeetFlowDeps = {
+      ...w.deps,
+      feedback: {
+        ...w.feedback,
+        store: {
+          ...w.store,
+          settleReceipt: async () => {
+            throw new R1MeetJobError('r1_meet_db_error');
+          },
+        },
+      },
+    };
+    const dispatcher = createR1MeetDispatcher({ flowDeps: () => deps, active: () => true });
+    await expect(dispatcher.handle(w.queueJob(b.job!.payload))).resolves.toBeUndefined();
+    expect(w.h.logs.filter((line) => line.level === 'warn').map((line) => line.meta)).toEqual([
+      { error_category: 'r1_meet_feedback_receipt_settle_failed' },
+    ]);
+    expect(outcome(w, b)).toBe('processed');
+    expect(w.ashby.submits()).toHaveLength(0);
+  });
+
+  it.each([
+    [{ attempts: 1, deferCount: 1, lastDeferReason: 'feedback_list_unavailable', lastError: null }],
+    [{ attempts: 1, deferCount: 1, lastDeferReason: 'feedback_list_rate_limited', lastError: null }],
+    [{ attempts: 2, deferCount: 0, lastDeferReason: null, lastError: 'r1_meet_feedback_list_unavailable' }],
+    [{ attempts: 2, deferCount: 0, lastDeferReason: null, lastError: 'r1_meet_feedback_list_rate_limited' }],
+  ])('one earlier run that stopped at the list cannot have submitted: %o', (meta) => {
+    expect(r1MeetFeedbackSubmitMayHaveRun(meta)).toBe(false);
+  });
+
+  it('more than one earlier run is still unknown (the rule is unchanged)', () => {
+    expect(r1MeetFeedbackSubmitMayHaveRun({ attempts: 1, deferCount: 2, lastDeferReason: 'feedback_list_unavailable', lastError: null })).toBe(true);
+    expect(r1MeetFeedbackSubmitMayHaveRun({ attempts: 2, deferCount: 1, lastDeferReason: 'feedback_list_rate_limited', lastError: null })).toBe(true);
+  });
+
+  it('after one list wait, a refused first submit is ashby_rejected (no card can be there yet)', async () => {
+    const { w, b } = await publicWorld();
+    w.ashby.next('submit', { status: 403, body: { success: false, errors: ['missing_endpoint_permission'] } });
+    expect(await run(w, b, { deferCount: 1, deferredAt: HARNESS_NOW, lastDeferReason: 'feedback_list_unavailable' })).toEqual(r1MeetIgnored('ashby_rejected'));
+    expect(ops(w)).toEqual(['form', 'list', 'submit']);
+    expect(outcome(w, b)).toBe('failed');
+  });
+
+  it('a general submit Ashby answers 429 or 5xx defers like an event submit', async () => {
+    const { w, b } = await publicWorld();
+    w.ashby.next('submit', { status: 429, body: '' });
+    expect(await run(w, b)).toEqual(r1MeetDefer('ashby_rate_limited', R1_MEET_FEEDBACK_DEFER.rateLimited));
+    w.ashby.next('submit', { status: 503, body: '' });
+    expect(await run(w, b, { ...RERUN, lastDeferReason: 'ashby_rate_limited' })).toEqual(r1MeetDefer('ashby_unavailable', R1_MEET_FEEDBACK_DEFER.unavailable));
+    expect(w.ashby.submits().every((submit) => submit.raw === expectedGeneralBody(b))).toBe(true);
+  });
+
+  it.each([
+    ['no session', 'booking_unbound', (w: R1MeetFeedbackWorld, b: CompletedBooking) => {
+      w.h.db.booking(b.bookingId)!.session_id = null;
+    }],
+    ['no round', 'booking_unbound', (w: R1MeetFeedbackWorld, b: CompletedBooking) => {
+      w.h.db.booking(b.bookingId)!.round_id = null;
+    }],
+    ['stale', 'stale', (w: R1MeetFeedbackWorld, b: CompletedBooking) => {
+      w.h.setNow(Date.parse(w.h.db.booking(b.bookingId)!.end_at as string) + 7 * DAY_MS + 1);
+    }],
+    ['a withdrawn consent', 'consent_withdrawn', (w: R1MeetFeedbackWorld, b: CompletedBooking) => {
+      w.h.db.tables.interview_round_consents.push({ id: fixtureId(), round_id: b.roundId, withdrawn_at: HARNESS_NOW, proof: { decision: 'withdrawn' } });
+    }],
+  ] as Array<[string, string, (w: R1MeetFeedbackWorld, b: CompletedBooking) => void]>)('the earlier guards still hold for it (%s): no Ashby call', async (_label, code, change) => {
+    const { w, b } = await publicWorld();
+    change(w, b);
+    expect(await run(w, b)).toEqual(r1MeetIgnored(code));
+    expect(w.ashby.requests).toEqual([]);
+  });
+
+  it('an Ashby booking never lists: [form, submit] and the event body, even with a Dex card in the list', async () => {
+    const { w, b } = await world();
+    w.ashby.feedbackList = [dexCard(w, b)];
+    expect(await run(w, b)).toEqual(r1MeetProcessed('submitted'));
+    expect(ops(w)).toEqual(['form', 'submit']);
+    expect(w.ashby.lists()).toEqual([]);
+    expect(w.ashby.submits()[0]!.raw).toBe(expectedBody(b));
+    expect(JSON.parse(w.ashby.submits()[0]!.raw)).toHaveProperty('interviewEventId', EVENT_ID);
+  });
+
+  it('logs stay closed words: no id, card text, name or email from the list', async () => {
+    const { w, b } = await publicWorld();
+    w.ashby.feedbackList = [dexCard(w, b), dexCard(w, b, { submittedByUser: { id: OTHER_USER_ID, email: SENTINELS.email }, creditedToUser: null })];
+    await w.dispatcher.handle(w.queueJob(b.job!.payload));
+    const second = await w.completedBooking({ source: 'public_page', applicationId: fixtureId() });
+    w.ashby.next('list', { status: 200, body: { success: true, results: [{ submittedByUser: { email: SENTINELS.email }, submittedValues: SENTINELS.quote }] } });
+    await w.dispatcher.handle(w.queueJob(second.job!.payload));
+    w.ashby.next('list', { status: 403, body: { success: false, errors: [{ code: 'forbidden', message: SENTINELS.name }] } });
+    await w.dispatcher.handle(w.queueJob(second.job!.payload, { deferCount: 1, deferredAt: HARNESS_NOW }));
+
+    const ids = [b, second].flatMap((booking) => [
+      booking.bookingId, booking.roundId, booking.sessionId, booking.candidateId, booking.assessmentId, booking.applicationId,
+    ]);
+    ids.push(FEEDBACK_FORM_ID, DEX_USER_ID, OTHER_USER_ID);
+    for (const line of w.h.logs) {
+      expect(Object.keys(line.meta).every((key) => ['error_category', 'error_type', 'http_status'].includes(key)), JSON.stringify(line)).toBe(true);
+      expect(line.meta.error_category).toMatch(/^[a-z0-9_]{1,64}$/);
+      expect(line.meta.error_type ?? '').toMatch(/^[A-Za-z0-9_.:]{0,64}$/);
+    }
+    const text = JSON.stringify(w.h.logs);
+    for (const value of ids) expect(text).not.toContain(value);
+    expect(text).not.toMatch(/https?:|example\.test|SENTINEL|sentinel|cursor/);
+    expect(jobLines(w)).toEqual([
+      'scorecard_feedback:already_posted',
+      'scorecard_feedback:feedback_list_unavailable',
+      'scorecard_feedback:feedback_list_rejected',
+    ]);
   });
 });

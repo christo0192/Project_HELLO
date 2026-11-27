@@ -49,6 +49,7 @@ const booking = (over: Partial<R1MeetBooking> = {}): R1MeetBooking => ({
   created_at: '2026-11-20T05:00:00.000Z',
   updated_at: '2026-11-21T06:15:00.000Z',
   version: 1,
+  source: 'ashby',
   ...over,
 });
 

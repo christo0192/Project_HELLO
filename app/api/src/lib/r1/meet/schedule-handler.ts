@@ -47,6 +47,17 @@
  * second, and re-reads the booking at its start, so a run killed after any step replays into the
  * same end state with one live bot at most.
  *
+ * PUBLIC-PAGE BOOKINGS (M035). A booking the candidate made on the public R1 booking page (source
+ * `public_page`) has no Ashby schedule: no event, schedule or scheduler id. The Ashby paths refuse it:
+ * a `booking_rerun` of one answers `ignored('public_booking')` before the reason check and before any
+ * RPC (the public booking RPC never parks a booking, so no re-run is ever owed to one), and the create
+ * RPC's stored-delivery replay (`sourceFromBooking`) takes an Ashby booking only, so the Ashby create
+ * RPC can never be called with a public one. The three places that act on a booking id the Ashby
+ * create RPC answered (`existing`, `detachForReplay`, the `in_past` answer) refuse a public booking the
+ * same way: unreachable by the 0142 event-id lookup, defence in depth. The event and schedule reads
+ * (`unschedule`, the reconcile) only ever see Ashby bookings (the store says so). `ensure_bot`,
+ * `bot_release` and `round_cancelled` act on both sources alike.
+ *
  * LOGS: alerts only (`R1_MEET_ALERTS`), closed words. Never an id, a name, an email, a Meet URL.
  * Loading this module performs no I/O: everything arrives in `R1MeetFlowDeps`.
  */
@@ -96,6 +107,7 @@ import {
   R1_MEET_DISPATCHED_STATUSES,
   R1_MEET_LIVE_STATUSES,
   R1_MEET_TERMINAL_STATUSES,
+  type R1MeetAshbyBooking,
   type R1MeetBooking,
   type R1MeetCancelReason,
   type R1MeetCreateAnswer,
@@ -286,8 +298,11 @@ async function sourceFromJob(
   };
 }
 
-/** A re-run replays the delivery the booking stored; it never carries the Meet URL itself. */
-async function sourceFromBooking(deps: R1MeetFlowDeps, booking: R1MeetBooking): Promise<CreateSource> {
+/**
+ * A re-run replays the delivery the booking stored; it never carries the Meet URL itself. Only an Ashby
+ * booking has a stored delivery: a public-page booking never reaches the Ashby create RPC (M035).
+ */
+async function sourceFromBooking(deps: R1MeetFlowDeps, booking: R1MeetAshbyBooking): Promise<CreateSource> {
   return {
     eventId: booking.eventId,
     scheduleId: booking.scheduleId,
@@ -354,6 +369,8 @@ async function afterCreate(
       // A booking that never got its bot and whose slot has started: it never will.
       const booking = await deps.store.getBooking(answer.bookingId);
       if (booking === null) return r1MeetIgnored('booking_gone');
+      // The Ashby create RPC answers Ashby bookings only; a public one is never acted on here (M035).
+      if (booking.source !== 'ashby') return r1MeetIgnored('public_booking');
       if (!LIVE.has(booking.status)) return r1MeetIgnored('booking_terminal');
       return failBooking(deps, booking, 'in_past');
     }
@@ -372,6 +389,8 @@ async function existing(
 ): Promise<Step> {
   const booking = await deps.store.getBooking(bookingId);
   if (booking === null) return r1MeetIgnored('booking_gone');
+  // The Ashby create RPC answers Ashby bookings only; a public one is never acted on here (M035).
+  if (booking.source !== 'ashby') return r1MeetIgnored('public_booking');
   if (TERMINAL.has(booking.status)) return r1MeetIgnored('booking_terminal');
   const moved =
     booking.startAt !== source.startAt || booking.endAt !== source.endAt || booking.meetUrl !== source.meetUrl;
@@ -482,6 +501,8 @@ async function reschedule(
 async function detachForReplay(deps: R1MeetFlowDeps, bookingId: string, meta: Meta): Promise<Step> {
   const booking = await deps.store.getBooking(bookingId);
   if (booking === null) return r1MeetIgnored('booking_gone');
+  // The Ashby create RPC answers Ashby bookings only; a public one is never acted on here (M035).
+  if (booking.source !== 'ashby') return r1MeetIgnored('public_booking');
   if (booking.recallBotId === null) return AGAIN;
   const failed = booking.status === 'failed';
   if (!failed && TERMINAL.has(booking.status)) return r1MeetIgnored('booking_terminal');
@@ -786,13 +807,17 @@ export const r1MeetAshbyScheduleDefinition: R1MeetJobDefinition<R1MeetAshbySched
   },
 });
 
-/** `booking_rerun` (S06): replay the create RPC from the booking's stored delivery (D-S06-18). */
+/**
+ * `booking_rerun` (S06): replay the create RPC from the booking's stored delivery (D-S06-18). A
+ * public-page booking has none and is never parked by its RPC: refused before any RPC (M035).
+ */
 export const r1MeetBookingRerunDefinition: R1MeetJobDefinition<R1MeetBookingRerunJob> = Object.freeze({
   kind: 'booking_rerun',
   parse: parseBookingRerunJob,
   async run(deps: R1MeetFlowDeps, job: R1MeetBookingRerunJob, meta: R1MeetJobMeta): Promise<R1MeetJobResult> {
     const booking = await deps.store.getBooking(job.bookingId);
     if (booking === null) return r1MeetIgnored('booking_gone');
+    if (booking.source !== 'ashby') return r1MeetIgnored('public_booking');
     // Something else (a delivery, HR) changed the booking since: this re-run is about nothing.
     if (booking.reason !== job.reason) return r1MeetIgnored('reason_changed');
     if (Date.parse(booking.startAt) <= deps.now()) return r1MeetIgnored('in_past');

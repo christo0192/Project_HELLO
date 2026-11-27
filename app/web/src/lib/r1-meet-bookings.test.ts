@@ -14,6 +14,7 @@ import {
   MEET_FILTER_LAST_DATE,
   R1_MEET_BOOKINGS_PATH,
   R1_MEET_BOOKING_REASONS,
+  R1_MEET_BOOKING_SOURCES,
   R1_MEET_BOOKING_STATUSES,
   R1_MEET_STATUS_OPTIONS,
   isMeetFilterDate,
@@ -45,6 +46,7 @@ function booking(over: Partial<R1MeetBooking> = {}): R1MeetBooking {
     created_at: '2026-11-20T05:00:00.000Z',
     updated_at: '2026-11-21T06:15:00.000Z',
     version: 1,
+    source: 'ashby',
     ...over,
   };
 }
@@ -109,6 +111,8 @@ const REASON_WORDS: Record<R1MeetBookingReason, string | null> = {
   multiple_humans: 'More than one person was in the meeting.',
   attempt_settled: 'The interview has ended.',
   flag_off: 'Google Meet interviews were turned off.',
+  candidate_cancelled: 'The candidate cancelled with the link in their invite.',
+  invite_undeliverable: 'Lexy’s calendar invite could not be sent.',
 };
 
 describe('the status words', () => {
@@ -130,6 +134,9 @@ describe('the status words', () => {
       expect(meetBookingTerm('blocked', reason)).toEqual({ label: 'Blocked', tone: 'unresolved' });
     }
     expect(meetBookingTerm('failed', 'no_show')).toEqual({ label: 'Not completed', tone: 'unresolved' });
+    // An invite Google would not deliver is not a meeting bot that broke (M035 S02; S08 owns the copy).
+    expect(meetBookingTerm('failed', 'invite_undeliverable')).toEqual({ label: 'Not completed', tone: 'unresolved' });
+    expect(meetBookingTerm('cancelled', 'candidate_cancelled')).toEqual({ label: 'Cancelled', tone: 'closed' });
     expect(meetBookingTerm('failed', 'a_later_reason')).toEqual({ label: 'Not completed', tone: 'unresolved' });
   });
 
@@ -231,6 +238,7 @@ function expectMalformed(value: unknown): void {
 
 const FIELDS = [
   'id', 'candidate_id', 'round_id', 'status', 'reason', 'start_at', 'end_at', 'created_at', 'updated_at', 'version',
+  'source',
 ];
 
 const without = (field: string): Record<string, unknown> => {
@@ -269,7 +277,14 @@ describe('the reader', () => {
     expect(readR1MeetBookings(body({ bookings: [row] })).bookings).toEqual([row]);
   });
 
-  it('copies the ten fields and nothing else', () => {
+  it('reads a booking made on the public booking page, and copies its source', () => {
+    const row = other('2', { source: 'public_page' });
+    const read = readR1MeetBookings(body({ bookings: [booking(), row] }));
+    expect(read.bookings).toEqual([booking(), row]);
+    expect(read.bookings.map((each) => each.source)).toEqual(['ashby', 'public_page']);
+  });
+
+  it('copies the eleven fields and nothing else', () => {
     const poisoned = Object.assign(booking(), {
       meet_url: 'https://example.test/poison',
       recall_bot_id: 'poison',
@@ -336,6 +351,15 @@ describe('the reader', () => {
     ['a fractional version', { ...booking(), version: 1.5 }],
     ['a version as text', { ...booking(), version: '1' }],
     ['a version that is not a number', { ...booking(), version: Number.NaN }],
+    // A source is not plain text like a status or a reason: one this page does not know refuses the page.
+    ['a null source', { ...booking(), source: null }],
+    ['an empty source', { ...booking(), source: '' }],
+    ['a source this page does not know', { ...booking(), source: 'csv' }],
+    ['a source in capitals', { ...booking(), source: 'ASHBY' }],
+    ['a source spelled with a hyphen', { ...booking(), source: 'public-page' }],
+    ['a source a prototype answers to', { ...booking(), source: 'constructor' }],
+    ['a numeric source', { ...booking(), source: 1 }],
+    ['a source as a list', { ...booking(), source: ['ashby'] }],
   ] as ReadonlyArray<readonly [string, unknown]>)('refuses the whole page for a row with %s', (_name, row) => {
     expectMalformed(body({ bookings: [booking(), row] }));
   });
@@ -624,6 +648,7 @@ function apiVocabulary(yaml: string) {
     statusFilter: listOf(under(block, /^ +- name: status\s*$/), 'enum'),
     status: listOf(under(item, /^ +status:\s*$/), 'enum'),
     reason: listOf(under(item, /^ +reason:\s*$/), 'enum'),
+    source: listOf(under(item, /^ +source:\s*$/), 'enum'),
     fields: listOf(item, 'required'),
     frame: listOf(under(block, /^ +application\/json:\s*$/), 'required'),
   };
@@ -634,13 +659,14 @@ const web = {
   statusFilter: [...R1_MEET_BOOKING_STATUSES] as string[],
   status: [...R1_MEET_BOOKING_STATUSES] as string[],
   reason: [...R1_MEET_BOOKING_REASONS] as string[],
+  source: [...R1_MEET_BOOKING_SOURCES] as string[],
   // What the reader really copies, not a second list of it.
   fields: Object.keys(readR1MeetBookings(body()).bookings[0]),
   frame: Object.keys(readR1MeetBookings(body())),
 };
 
 describe('the vocabularies agree with the API document', () => {
-  it('has the same statuses, reasons and fields, in the same order', () => {
+  it('has the same statuses, reasons, sources and fields, in the same order', () => {
     expect(apiVocabulary(openapi)).toEqual(web);
   });
 
@@ -648,10 +674,12 @@ describe('the vocabularies agree with the API document', () => {
     const api = apiVocabulary(openapi);
     expect(api.statusFilter).toHaveLength(12);
     expect(api.status).toHaveLength(12);
-    expect(api.reason).toHaveLength(32);
-    expect(api.fields).toHaveLength(10);
+    expect(api.reason).toHaveLength(34);
+    expect(api.source).toEqual(['ashby', 'public_page']);
+    expect(api.fields).toHaveLength(11);
     expect(new Set(api.status).size).toBe(12);
-    expect(new Set(api.reason).size).toBe(32);
+    expect(new Set(api.reason).size).toBe(34);
+    expect(new Set(api.fields).size).toBe(11);
     const block = pathBlock(openapi).join('\n');
     expect(block).toContain('operationId: listR1MeetBookings');
     expect(block).not.toContain('operationId: getR1MeetBooking\n');
@@ -684,9 +712,11 @@ describe('the vocabularies agree with the API document', () => {
     ['gains a status', 'status', (block: string) => lastReplace(block, 'failed, drained]', 'failed, drained, parked]')],
     ['drops a status', 'status', (block: string) => lastReplace(block, 'failed, drained]', 'failed]')],
     ['filters on a status less', 'statusFilter', (block: string) => block.replace('failed, drained]', 'failed]')],
-    ['gains a reason', 'reason', (block: string) => block.replace('attempt_settled, flag_off]', 'attempt_settled, flag_off, parked]')],
+    ['gains a reason', 'reason', (block: string) => block.replace('candidate_cancelled, invite_undeliverable]', 'candidate_cancelled, invite_undeliverable, parked]')],
     ['renames a reason', 'reason', (block: string) => block.replace('no_show, admission_refused', 'nobody_came, admission_refused')],
-    ['gains a field', 'fields', (block: string) => block.replace('updated_at, version]', 'updated_at, version, meet_url]')],
+    ['gains a source', 'source', (block: string) => block.replace('[ashby, public_page]', '[ashby, public_page, csv]')],
+    ['drops a source', 'source', (block: string) => block.replace('[ashby, public_page]', '[ashby]')],
+    ['gains a field', 'fields', (block: string) => block.replace('version, source]', 'version, source, meet_url]')],
     ['drops a field', 'fields', (block: string) => block.replace('required: [id, candidate_id, round_id,', 'required: [id, candidate_id,')],
     ['renames a parameter', 'queryParameters', (block: string) => block.replace('- name: limit', '- name: page_size')],
     ['renames the frame', 'frame', (block: string) => block.replace('required: [meet_enabled, bookings, next_cursor]', 'required: [meet_on, bookings, next_cursor]')],
@@ -706,6 +736,7 @@ describe('the vocabularies agree with the API document', () => {
       /path not found/,
     );
     expect(() => apiVocabulary(mutated((block) => block.replace(/^ +reason:$/m, '                        why:')))).toThrow(/not found/);
+    expect(() => apiVocabulary(mutated((block) => block.replace(/^ +source:$/m, '                        origin:')))).toThrow(/not found/);
     expect(() => apiVocabulary(mutated((block) => block.replaceAll(/enum: \[.*\]/g, 'enum: []')))).toThrow(/empty enum list/);
   });
 });

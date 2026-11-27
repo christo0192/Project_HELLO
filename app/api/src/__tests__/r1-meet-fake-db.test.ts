@@ -4,7 +4,8 @@
  *
  * Pinned:
  *  - the status/reason pairing and the transition matrix equal the SQL of
- *    `chk_r1_meet_bookings_status_reason` and `r1_meet_transition_booking`, parsed from 0142;
+ *    `chk_r1_meet_bookings_status_reason` (as 0143 swapped it: 0142's pairs plus two) and
+ *    `r1_meet_transition_booking` (0142);
  *  - every answer of every RPC the runtime and the bridge page call is reachable through the port, and
  *    the set of answers equals the RPC's catalog comment (the one answer the CHECKs make unreachable is
  *    named, with why);
@@ -12,7 +13,9 @@
  *    `{ code: '23514' }` and rolls the whole call back; a unique index answers `23505`;
  *  - the first refusal wins, in the SQL's order;
  *  - the tables answer the store's reads (projection, count, JSON paths, compare-and-set update), the
- *    two triggers, the queue dedup, and `failNext`.
+ *    two triggers, the queue dedup, and `failNext`;
+ *  - (M035 S02) the `source` column of 0143 and its two CHECKs (`chk_r1_meet_bookings_source`,
+ *    `chk_r1_meet_bookings_source_ids`), and the public seed (`seedPublicBooking`, `createPublicBooking`).
  */
 
 import { readFileSync } from 'node:fs';
@@ -46,6 +49,22 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const raw = readFileSync(path.resolve(here, '../../../supabase/migrations/0142_r1_meet_bookings.sql'), 'utf8').replace(/\r\n/g, '\n');
 const sql = raw.replace(/^\s*--.*$/gm, '').replace(/\s+/g, ' ');
 const quoted = (list: string): string[] => [...list.matchAll(/'([a-z_]+)'/g)].map((match) => match[1]!);
+/** Migration 0143 (M035 S01), comments stripped and whitespace collapsed as `sql`. */
+const sql0143 = readFileSync(path.resolve(here, '../../../supabase/migrations/0143_r1_meet_public_bookings.sql'), 'utf8')
+  .replace(/\r\n/g, '\n')
+  .replace(/^\s*--.*$/gm, '')
+  .replace(/\s+/g, ' ');
+
+/** The reasons of each status in one `chk_r1_meet_bookings_status_reason` text (8 families). */
+function statusReasons(block: string): Record<string, string[]> {
+  const pairs = [...block.matchAll(/status in \(([^)]*)\) and reason in \(([^)]*)\)/g)];
+  expect(pairs.length).toBe(8);
+  const out: Record<string, string[]> = {};
+  for (const [, statuses, reasons] of pairs) {
+    for (const s of quoted(statuses!)) out[s] = [...(out[s] ?? []), ...quoted(reasons!)];
+  }
+  return out;
+}
 
 function functionText(name: string): string {
   const start = sql.indexOf(`create or replace function screening_v2.${name}(`);
@@ -164,15 +183,29 @@ function expectAnswerSet(name: string, seen: Set<string>, expected: readonly str
 // ── The port's vocabulary is the migration's ─────────────────────────────────
 
 describe('the port is pinned to the 0142 text', () => {
-  it('chk_r1_meet_bookings_status_reason: the reasons of each status', () => {
+  it('chk_r1_meet_bookings_status_reason: the reasons of each status are 0143 swapped CHECK (0142 plus two)', () => {
     const start = sql.indexOf('constraint chk_r1_meet_bookings_status_reason check (');
-    const block = sql.slice(start, sql.indexOf('constraint chk_r1_meet_bookings_version', start));
-    const pairs = [...block.matchAll(/status in \(([^)]*)\) and reason in \(([^)]*)\)/g)];
-    expect(pairs.length).toBe(8);
-    const fromSql: Record<string, string[]> = {};
-    for (const [, statuses, reasons] of pairs) {
-      for (const s of quoted(statuses!)) fromSql[s] = [...(fromSql[s] ?? []), ...quoted(reasons!)];
+    const from0142 = statusReasons(sql.slice(start, sql.indexOf('constraint chk_r1_meet_bookings_version', start)));
+    // 0143 (M035 S01) drops and re-adds the CHECK: this text is the one the database enforces.
+    const start0143 = sql0143.indexOf('add constraint chk_r1_meet_bookings_status_reason check (');
+    expect(start0143, '0143 chk_r1_meet_bookings_status_reason').toBeGreaterThan(-1);
+    const fromSql = statusReasons(sql0143.slice(start0143, sql0143.indexOf(') not valid;', start0143)));
+    expect(Object.keys(fromSql)).toEqual(Object.keys(from0142));
+    // 0143 only appends: each status keeps 0142's reasons in 0142's order, and what it adds is new to
+    // 0142 and is exactly the two reasons 0143 appends to the reason CHECK.
+    const added: string[] = [];
+    for (const [s, reasons] of Object.entries(fromSql)) {
+      expect(reasons.slice(0, from0142[s]!.length), s).toEqual(from0142[s]);
+      const delta = reasons.slice(from0142[s]!.length);
+      for (const reason of delta) expect(Object.values(from0142).flat(), reason).not.toContain(reason);
+      // The fake lists each status's reasons in the migration's order, so the delta is appended too.
+      expect([...FAKE_STATUS_REASONS[s]!], s).toEqual(reasons);
+      added.push(...delta);
     }
+    const reasonList0143 = /add constraint chk_r1_meet_bookings_reason check \(reason in \(([^)]*)\)\) not valid;/.exec(sql0143);
+    expect(reasonList0143, '0143 chk_r1_meet_bookings_reason').not.toBeNull();
+    expect(added.sort()).toEqual(quoted(reasonList0143![1]!).slice(32).sort());
+    expect(added).toHaveLength(2);
     const sorted = (record: Readonly<Record<string, readonly string[]>>): Record<string, string[]> =>
       Object.fromEntries(
         Object.entries(record)
@@ -181,7 +214,39 @@ describe('the port is pinned to the 0142 text', () => {
       );
     expect(sorted(FAKE_STATUS_REASONS)).toEqual(sorted(fromSql));
     expect(Object.keys(FAKE_STATUS_REASONS).sort()).toEqual([...R1_MEET_BOOKING_STATUSES].sort());
-    expect([...new Set(Object.values(FAKE_STATUS_REASONS).flat())].sort()).toEqual([...R1_MEET_BOOKING_REASONS].sort());
+    // The flat reason set is the runtime's closed list, the two public reasons included (34).
+    const flat = [...new Set(Object.values(FAKE_STATUS_REASONS).flat())];
+    expect(flat).toHaveLength(34);
+    expect(flat.sort()).toEqual([...R1_MEET_BOOKING_REASONS].sort());
+  });
+
+  it('the 0143 pairs: cancelled/candidate_cancelled and failed/invite_undeliverable write; crossed over they are 23514', async () => {
+    const h = createR1MeetHarness();
+    // Seeded (the CHECK alone): either source, terminal and bot-less.
+    for (const seed of [h.db.seedBooking.bind(h.db), h.db.seedPublicBooking.bind(h.db)]) {
+      expect(seed({ status: 'cancelled', reason: 'candidate_cancelled' })).toMatchObject({ status: 'cancelled', reason: 'candidate_cancelled' });
+      expect(seed({ status: 'failed', reason: 'invite_undeliverable' })).toMatchObject({ status: 'failed', reason: 'invite_undeliverable' });
+    }
+    const written = h.db.tables.r1_meet_bookings.length;
+    expect(() => h.db.seedBooking({ status: 'cancelled', reason: 'invite_undeliverable' })).toThrow('23514 chk_r1_meet_bookings_status_reason');
+    expect(() => h.db.seedPublicBooking({ status: 'failed', reason: 'candidate_cancelled' })).toThrow('23514 chk_r1_meet_bookings_status_reason');
+    expect(h.db.tables.r1_meet_bookings).toHaveLength(written);
+
+    // Through the transition RPC (pending -> failed is in the matrix): the new failed reason writes,
+    // the new cancelled reason on failed is the pairing CHECK and rolls back.
+    const pb = h.createPublicBooking();
+    const before = structuredClone(h.db.booking(pb.bookingId));
+    const refused = await call(h.db, 'r1_meet_transition_booking', {
+      p_booking_id: pb.bookingId, p_from_status: 'pending', p_to_status: 'failed', p_reason: 'candidate_cancelled', p_now: NOW,
+    });
+    expect(refused).toEqual({ data: null, error: { code: '23514', message: 'chk_r1_meet_bookings_status_reason' } });
+    expect(h.db.booking(pb.bookingId)).toEqual(before);
+    expect(await status(h.db, 'r1_meet_transition_booking', {
+      p_booking_id: pb.bookingId, p_from_status: 'pending', p_to_status: 'failed', p_reason: 'invite_undeliverable', p_now: NOW,
+    })).toBe('ok');
+    expect(h.db.booking(pb.bookingId)).toMatchObject({ status: 'failed', reason: 'invite_undeliverable' });
+    // And the store reads it back with its reason.
+    expect(await h.db.store.getBooking(pb.bookingId)).toMatchObject({ status: 'failed', reason: 'invite_undeliverable', source: 'public_page' });
   });
 
   it('r1_meet_transition_booking: the matrix', () => {
@@ -837,5 +902,88 @@ describe('the tables answer the store, and the test aids work', () => {
     await expect(h.db.store.getBooking(p.id)).rejects.toThrow('r1_meet_db_error');
     await expect(h.db.store.getBooking(p.id)).resolves.toMatchObject({ id: p.id, keyAttempt: 1 });
     expect(h.db.calls.filter((c) => c.kind === 'rpc').map((c) => c.name).slice(-2)).toEqual(['r1_meet_set_bot', 'r1_meet_set_bot']);
+  });
+});
+
+// ── 0143's source (M035 S02) ────────────────────────────────────────────────
+
+describe('the source of 0143 (M035 S02): the column, its two CHECKs and the public seed', () => {
+  it('every row the create RPC or seedBooking writes is an Ashby row', async () => {
+    const h = createR1MeetHarness();
+    const created = await h.createBooking();
+    expect(h.db.booking(created.bookingId)!.source).toBe('ashby');
+    const round = h.db.addRound();
+    expect(h.db.seedBooking({ round_id: round.id }).source).toBe('ashby');
+  });
+
+  it('an Ashby row without one of its three schedule ids, or a public row with one, is 23514 source_ids', () => {
+    const h = createR1MeetHarness();
+    const bad: Array<[string, () => Row]> = [
+      ['chk_r1_meet_bookings_source_ids', () => h.db.seedBooking({ status: 'failed', reason: 'in_past', ashby_schedule_id: null })],
+      ['chk_r1_meet_bookings_source_ids', () => h.db.seedBooking({ status: 'failed', reason: 'in_past', ashby_interview_event_id: null })],
+      ['chk_r1_meet_bookings_source_ids', () => h.db.seedBooking({ status: 'failed', reason: 'in_past', ashby_scheduled_by_user_id: null })],
+      ['chk_r1_meet_bookings_source_ids', () => h.db.seedPublicBooking({ status: 'failed', reason: 'in_past', ashby_interview_event_id: fixtureId() })],
+      ['chk_r1_meet_bookings_source_ids', () => h.db.seedPublicBooking({ status: 'failed', reason: 'in_past', ashby_schedule_id: fixtureId() })],
+      ['chk_r1_meet_bookings_source_ids', () => h.db.seedPublicBooking({ status: 'failed', reason: 'in_past', ashby_scheduled_by_user_id: SCHEDULER_ID })],
+      ['chk_r1_meet_bookings_source', () => h.db.seedBooking({ status: 'failed', reason: 'in_past', source: 'csv' })],
+      ['chk_r1_meet_bookings_source', () => h.db.seedBooking({ status: 'failed', reason: 'in_past', source: null })],
+      ['chk_r1_meet_bookings_source', () => h.db.seedPublicBooking({ status: 'failed', reason: 'in_past', source: 'PUBLIC_PAGE' })],
+      ['chk_r1_meet_bookings_ashby_application_id', () => h.db.seedPublicBooking({ status: 'failed', reason: 'in_past', ashby_application_id: null })],
+      ['chk_r1_meet_bookings_ashby_schedule_id', () => h.db.seedBooking({ status: 'failed', reason: 'in_past', ashby_schedule_id: 'x' })],
+      ['chk_r1_meet_bookings_ashby_scheduled_by_user_id', () => h.db.seedBooking({ status: 'failed', reason: 'in_past', ashby_scheduled_by_user_id: 'x' })],
+    ];
+    for (const [constraint, seed] of bad) {
+      expect(seed, constraint).toThrow(`23514 ${constraint}`);
+    }
+    expect(h.db.tables.r1_meet_bookings).toEqual([]);
+  });
+
+  it('a public seed stores the public shape and reads back through the store', async () => {
+    const h = createR1MeetHarness();
+    const pb = h.createPublicBooking();
+    const row = h.db.booking(pb.bookingId)!;
+    expect(row).toMatchObject({
+      source: 'public_page',
+      ashby_interview_event_id: null,
+      ashby_schedule_id: null,
+      ashby_scheduled_by_user_id: null,
+      ashby_interview_stage_id: null,
+      ashby_interview_id: null,
+      ashby_updated_at: null,
+      ashby_application_id: pb.applicationId,
+      round_id: pb.roundId,
+      candidate_id: pb.candidateId,
+      status: 'pending',
+      reason: 'eligible',
+      version: 0,
+      key_attempt: 0,
+      recall_bot_id: null,
+    });
+    expect(h.db.tables.ashby_application_links).toContainEqual({
+      provider: 'ashby',
+      external_application_id: pb.applicationId,
+      candidate_id: pb.candidateId,
+      terminal_state: null,
+    });
+    const booking = await h.db.store.getBooking(pb.bookingId);
+    expect(booking).toMatchObject({
+      id: pb.bookingId,
+      source: 'public_page',
+      eventId: null,
+      scheduleId: null,
+      scheduledByUserId: null,
+      applicationId: pb.applicationId,
+      roundId: pb.roundId,
+      status: 'pending',
+    });
+    // Two public rows: the event unique index ignores their NULL event ids.
+    const other = h.createPublicBooking();
+    expect(await h.db.store.getBooking(other.bookingId)).toMatchObject({ source: 'public_page', eventId: null });
+    // A public row projects to exactly the selected columns too.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const client = h.db.client as any;
+    const answer = (await client.from('r1_meet_bookings').select(R1_MEET_BOOKING_COLUMNS).eq('id', pb.bookingId).maybeSingle()) as FakeAnswer;
+    expect(Object.keys(answer.data as Row).sort()).toEqual(R1_MEET_BOOKING_COLUMNS.split(',').map((c) => c.trim()).sort());
+    expect((answer.data as Row).source).toBe('public_page');
   });
 });

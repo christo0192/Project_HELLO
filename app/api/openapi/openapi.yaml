@@ -281,7 +281,7 @@ paths:
       tags: [r1]
       operationId: listR1MeetBookings
       summary: R1 bookings over Google Meet, by slot start (viewer+; an interviewer sees only candidates they own; M034, dark)
-      description: 'R1 over Google Meet (M034), dark behind R1_MEET_ENABLED: while Meet is off (R1_ENABLED and a valid Meet configuration are both needed) nothing is read and the answer is 200 with meet_enabled false, bookings empty and next_cursor null. Read rule = the rule of the R1 video, applied as a filter on the read: admin and viewer every booking (one whose Ashby application matched no candidate included), interviewer only a booking whose candidate they own. Each booking carries exactly id, candidate_id, round_id, status, reason, start_at, end_at, created_at, updated_at and version: never the Meet URL, a ticket field, an Ashby id, the attester, the Recall bot, the session or the profile. Sorted by start_at, then id. Filters: status, from (start_at at or after) and to (start_at before), each an ISO 8601 instant with its zone; limit 1 to 100 (default 50). next_cursor is set only when another page follows; pass it back as cursor, unchanged, with the same filters. Not audited (a list read); Cache-Control: no-store.'
+      description: 'R1 over Google Meet (M034), dark behind R1_MEET_ENABLED: while Meet is off (R1_ENABLED and a valid Meet configuration are both needed) nothing is read and the answer is 200 with meet_enabled false, bookings empty and next_cursor null. Read rule = the rule of the R1 video, applied as a filter on the read: admin and viewer every booking (one whose Ashby application matched no candidate included), interviewer only a booking whose candidate they own. Each booking carries exactly id, candidate_id, round_id, status, reason, start_at, end_at, created_at, updated_at, version and source (ashby or public_page): never the Meet URL, a ticket field, an Ashby id, the attester, the Recall bot, the session or the profile. Sorted by start_at, then id. Filters: status, from (start_at at or after) and to (start_at before), each an ISO 8601 instant with its zone; limit 1 to 100 (default 50). next_cursor is set only when another page follows; pass it back as cursor, unchanged, with the same filters. Not audited (a list read); Cache-Control: no-store.'
       parameters:
         - name: status
           in: query
@@ -334,7 +334,7 @@ paths:
                     items:
                       type: object
                       additionalProperties: false
-                      required: [id, candidate_id, round_id, status, reason, start_at, end_at, created_at, updated_at, version]
+                      required: [id, candidate_id, round_id, status, reason, start_at, end_at, created_at, updated_at, version, source]
                       properties:
                         id:
                           type: string
@@ -354,7 +354,7 @@ paths:
                           enum: [pending, unmatched_application, unmapped_scheduler, blocked, bot_scheduled, bot_joining, human_present, in_call, completed, cancelled, failed, drained]
                         reason:
                           type: string
-                          enum: [dex_absent, cancelled, in_past, not_scheduled, no_attester, no_meet_link, eligible, application_unknown, application_terminal, scheduler_unmapped, created_by_unknown, disabled, paused, candidate_ineligible, role_not_configured, round_active, phone_engagement_active, phone_assessment_pending, capacity_exhausted, consent_template_unavailable, slot_too_far, bot_cap_reached, bot_create_failed, bot_fatal, event_removed, round_cancelled, round_expired, no_show, admission_refused, multiple_humans, attempt_settled, flag_off]
+                          enum: [dex_absent, cancelled, in_past, not_scheduled, no_attester, no_meet_link, eligible, application_unknown, application_terminal, scheduler_unmapped, created_by_unknown, disabled, paused, candidate_ineligible, role_not_configured, round_active, phone_engagement_active, phone_assessment_pending, capacity_exhausted, consent_template_unavailable, slot_too_far, bot_cap_reached, bot_create_failed, bot_fatal, event_removed, round_cancelled, round_expired, no_show, admission_refused, multiple_humans, attempt_settled, flag_off, candidate_cancelled, invite_undeliverable]
                         start_at:
                           type: string
                           format: date-time
@@ -370,6 +370,10 @@ paths:
                         version:
                           type: integer
                           minimum: 0
+                        source:
+                          type: string
+                          enum: [ashby, public_page]
+                          description: 'Where the booking came from: ashby = scheduled by HR in Ashby (M034); public_page = booked by the candidate on the public R1 booking page (M035).'
                   next_cursor:
                     type: string
                     nullable: true
@@ -397,7 +401,7 @@ paths:
               schema:
                 type: object
                 additionalProperties: false
-                required: [id, candidate_id, round_id, status, reason, start_at, end_at, created_at, updated_at, version]
+                required: [id, candidate_id, round_id, status, reason, start_at, end_at, created_at, updated_at, version, source]
                 properties:
                   id:
                     type: string
@@ -417,7 +421,7 @@ paths:
                     enum: [pending, unmatched_application, unmapped_scheduler, blocked, bot_scheduled, bot_joining, human_present, in_call, completed, cancelled, failed, drained]
                   reason:
                     type: string
-                    enum: [dex_absent, cancelled, in_past, not_scheduled, no_attester, no_meet_link, eligible, application_unknown, application_terminal, scheduler_unmapped, created_by_unknown, disabled, paused, candidate_ineligible, role_not_configured, round_active, phone_engagement_active, phone_assessment_pending, capacity_exhausted, consent_template_unavailable, slot_too_far, bot_cap_reached, bot_create_failed, bot_fatal, event_removed, round_cancelled, round_expired, no_show, admission_refused, multiple_humans, attempt_settled, flag_off]
+                    enum: [dex_absent, cancelled, in_past, not_scheduled, no_attester, no_meet_link, eligible, application_unknown, application_terminal, scheduler_unmapped, created_by_unknown, disabled, paused, candidate_ineligible, role_not_configured, round_active, phone_engagement_active, phone_assessment_pending, capacity_exhausted, consent_template_unavailable, slot_too_far, bot_cap_reached, bot_create_failed, bot_fatal, event_removed, round_cancelled, round_expired, no_show, admission_refused, multiple_humans, attempt_settled, flag_off, candidate_cancelled, invite_undeliverable]
                   start_at:
                     type: string
                     format: date-time
@@ -433,6 +437,10 @@ paths:
                   version:
                     type: integer
                     minimum: 0
+                  source:
+                    type: string
+                    enum: [ashby, public_page]
+                    description: 'Where the booking came from: ashby = scheduled by HR in Ashby (M034); public_page = booked by the candidate on the public R1 booking page (M035).'
         '400': { description: Malformed booking id (invalid_id). }
         '403': { description: The caller's account is inactive (access_denied). }
         '404': { description: 'No such booking, not one the caller may see, or Meet is off (not_found).' }

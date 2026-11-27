@@ -237,6 +237,13 @@ describe('claimR1MeetTicket: r1_meet_claim_ticket', () => {
     );
   });
 
+  it('a public-page booking (M035, 0143: no Ashby event, so the answer has a NULL event id) binds the same', async () => {
+    const ashby = await claimR1MeetTicket(fakeDb({ rpc: { data: claimOk(), error: null } }).db, DIGEST, NOW_ISO);
+    expect(ashby).toMatchObject({ kind: 'ok' });
+    const publicPage = claimOk({ ashby_interview_event_id: null });
+    expect(await claimR1MeetTicket(fakeDb({ rpc: { data: publicPage, error: null } }).db, DIGEST, NOW_ISO)).toEqual(ashby);
+  });
+
   it('maps every closed refusal of 0142 §17', async () => {
     expect([...R1_MEET_CLAIM_REFUSALS]).toEqual([
       'invalid_ticket',

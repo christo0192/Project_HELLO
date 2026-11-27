@@ -11,16 +11,19 @@
  *  - the Ashby delivery order (numeric stamps, `r` stamps, the `:cancelled`, `:schedule` and event
  *    suffixes, receipt order when Ashby sent no updatedAt) and the IST day of the bot cap;
  *  - the RPC arguments are the parameters migration 0142 declares, and every status of every catalog
- *    comment is a known answer that parses, so a drift fails here and not as PGRST202 in production.
+ *    comment is a known answer that parses, so a drift fails here and not as PGRST202 in production;
+ *  - (M035 S02) the booking `source` and the two members of the booking union: an Ashby row has all
+ *    three Ashby schedule ids, a public-page row none, a mixed row is `r1_meet_db_error`, and the reads
+ *    by an Ashby event or schedule id answer Ashby bookings only.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createClient } from '@supabase/supabase-js';
 import type { supabase } from '../lib/supabase.js';
-import { R1_MEET_BOOKING_STATUSES } from '../lib/r1/meet/bookings-read.js';
+import { R1_MEET_BOOKING_SOURCES, R1_MEET_BOOKING_STATUSES } from '../lib/r1/meet/bookings-read.js';
 import { R1MeetJobError } from '../lib/r1/meet/jobs.js';
 import {
   R1_MEET_BOOKING_COLUMNS,
@@ -37,6 +40,9 @@ import {
   R1_MEET_UNDISPATCHED_STATUSES,
   createR1MeetStore,
   r1MeetIstDay,
+  type R1MeetAshbyBooking,
+  type R1MeetBooking,
+  type R1MeetPublicBooking,
   type R1MeetRpcName,
   type R1MeetStore,
 } from '../lib/r1/meet/runtime-store.js';
@@ -142,8 +148,22 @@ const row = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
   session_id: null,
   created_at: '2030-01-01T09:00:01.5+00:00',
   updated_at: '2030-01-01T09:00:02.123456+00:00',
+  source: 'ashby',
   ...over,
 });
+
+/** A public-page row as 0143's public create RPC writes it: no Ashby schedule, stage or interview. */
+const publicRow = (over: Record<string, unknown> = {}): Record<string, unknown> =>
+  row({
+    source: 'public_page',
+    ashby_interview_event_id: null,
+    ashby_schedule_id: null,
+    ashby_scheduled_by_user_id: null,
+    ashby_interview_stage_id: null,
+    ashby_interview_id: null,
+    ashby_updated_at: null,
+    ...over,
+  });
 
 const BOOKING_PARSED = {
   id: BOOKING,
@@ -171,13 +191,25 @@ const BOOKING_PARSED = {
   sessionId: null,
   createdAt: '2030-01-01T09:00:01.500Z',
   updatedAt: '2030-01-01T09:00:02.123Z',
+  source: 'ashby',
+};
+
+const PUBLIC_PARSED = {
+  ...BOOKING_PARSED,
+  eventId: null,
+  scheduleId: null,
+  scheduledByUserId: null,
+  interviewStageId: null,
+  interviewId: null,
+  ashbyUpdatedAt: null,
+  source: 'public_page',
 };
 
 const COLUMNS =
   'id, ashby_interview_event_id, ashby_schedule_id, ashby_application_id, ashby_interview_stage_id, '
   + 'ashby_interview_id, ashby_scheduled_by_user_id, ashby_updated_at, round_id, objective_profile, status, '
   + 'reason, version, key_attempt, meet_url, start_at, end_at, recall_bot_id, ticket_not_before, '
-  + 'ticket_expires_at, ticket_claimed_at, ticket_arms, session_id, created_at, updated_at';
+  + 'ticket_expires_at, ticket_claimed_at, ticket_arms, session_id, created_at, updated_at, source';
 
 const LIVE = ['pending', 'unmatched_application', 'unmapped_scheduler', 'blocked', 'bot_scheduled', 'bot_joining', 'human_present', 'in_call'];
 const TERMINAL = ['completed', 'cancelled', 'failed', 'drained'];
@@ -189,6 +221,23 @@ const migrations = path.resolve(here, '../../../supabase/migrations');
 const raw = readFileSync(path.join(migrations, '0142_r1_meet_bookings.sql'), 'utf8').replace(/\r\n/g, '\n');
 /** Comments stripped, whitespace collapsed. */
 const sql = raw.replace(/^\s*--.*$/gm, '').replace(/\s+/g, ' ');
+
+// ── Migration 0143 (M035 S01): the source column and its CHECK ─────────────────
+
+const raw0143 = readFileSync(path.join(migrations, '0143_r1_meet_public_bookings.sql'), 'utf8').replace(/\r\n/g, '\n');
+/** Comments stripped, whitespace collapsed (as `sql` above). */
+const sql0143 = raw0143.replace(/^\s*--.*$/gm, '').replace(/\s+/g, ' ');
+/** Every column 0143 adds to the bookings table, in order. */
+const added0143 = [...sql0143.matchAll(/alter table screening_v2\.r1_meet_bookings add column if not exists ([a-z_]+) /g)].map(
+  (m) => m[1]!,
+);
+/**
+ * The column bound by `chk_r1_meet_bookings_source` (the rule `parseBooking`'s source reader enforces),
+ * its default and its closed list, parsed from its `add column` statement.
+ */
+const SOURCE_0143 = /add column if not exists ([a-z_]+) text not null default '([a-z_]+)' constraint chk_r1_meet_bookings_source check \(([a-z_]+) in \(([^)]*)\)\);/.exec(
+  sql0143,
+);
 
 function functionText(name: string): string {
   const start = sql.indexOf(`create or replace function screening_v2.${name}(`);
@@ -238,13 +287,26 @@ function bodyAnswers(name: string): string[] {
 }
 
 describe('what is selected', () => {
-  it('reads every booking column of 0142 except ticket_digest and candidate_id', () => {
+  it('reads every booking column of 0142 except ticket_digest and candidate_id, then the source of 0143', () => {
     expect(R1_MEET_BOOKING_COLUMNS).toBe(COLUMNS);
     const start = sql.indexOf('create table if not exists screening_v2.r1_meet_bookings (');
     const table = sql.slice(start, sql.indexOf('constraint uq_r1_meet_bookings_event', start));
     const declared = [...table.matchAll(/[(,] ([a-z_]+) (?:uuid|text|timestamptz|integer)\b/g)].map((m) => m[1]!);
     expect(declared).toHaveLength(27);
-    expect(COLUMNS.split(', ')).toEqual(declared.filter((name) => name !== 'ticket_digest' && name !== 'candidate_id'));
+    // 0143 (M035 S01) adds seven columns; the runtime reads exactly one of them, the column of
+    // `chk_r1_meet_bookings_source`, appended last (contracts 3.1). The calendar, request and manage
+    // columns are never selected here (S05 reads them itself).
+    expect(SOURCE_0143, 'chk_r1_meet_bookings_source').not.toBeNull();
+    const [, sourceColumn, , checkedColumn] = SOURCE_0143!;
+    expect(checkedColumn, 'the CHECK reads its own column').toBe(sourceColumn);
+    expect(added0143).toHaveLength(7);
+    expect(added0143).toContain(sourceColumn);
+    for (const name of declared) expect(added0143, name).not.toContain(name);
+    expect(COLUMNS.split(', ')).toEqual([
+      ...declared.filter((name) => name !== 'ticket_digest' && name !== 'candidate_id'),
+      sourceColumn,
+    ]);
+    for (const name of added0143.filter((n) => n !== sourceColumn)) expect(COLUMNS.split(', '), name).not.toContain(name);
   });
 
   it('partitions the twelve statuses of 0142', () => {
@@ -362,6 +424,7 @@ describe('single booking reads', () => {
       session_id: ['x'],
       created_at: [null, 'soon'],
       updated_at: [null, 'soon'],
+      source: [null, '', 'ASHBY', 'public', 7],
     };
     expect(Object.keys(bad)).toEqual(COLUMNS.split(', '));
     for (const [key, values] of Object.entries(bad)) {
@@ -443,6 +506,124 @@ describe('list reads', () => {
     await expectCode(read(fakeDb({ data: [], error: { message: 'x' } }).store), 'r1_meet_db_error');
     await expectCode(read(fakeDb(new Error('socket')).store), 'r1_meet_db_error');
     await expectCode(read(fakeDb('throw').store), 'r1_meet_db_error');
+  });
+});
+
+describe('two sources (M035 S02): the Ashby and the public-page booking', () => {
+  const IDS = ['ashby_interview_event_id', 'ashby_schedule_id', 'ashby_scheduled_by_user_id'] as const;
+  const SET: Record<(typeof IDS)[number], string> = {
+    ashby_interview_event_id: EVENT,
+    ashby_schedule_id: SCHEDULE,
+    ashby_scheduled_by_user_id: SCHEDULER,
+  };
+
+  it("the closed list of sources is 0143's, frozen; a row written before 0143 reads as the first", () => {
+    expect(SOURCE_0143, 'chk_r1_meet_bookings_source').not.toBeNull();
+    const [, , defaultValue, , list] = SOURCE_0143!;
+    const values = [...list!.matchAll(/'([^']*)'/g)].map((m) => m[1]!);
+    expect(values).toHaveLength(2);
+    expect([...R1_MEET_BOOKING_SOURCES]).toEqual(values);
+    expect(defaultValue).toBe(R1_MEET_BOOKING_SOURCES[0]);
+    expect(Object.isFrozen(R1_MEET_BOOKING_SOURCES)).toBe(true);
+  });
+
+  it("an Ashby row parses to today's booking plus source ashby, in today's key order", async () => {
+    const booking = await fakeDb(rows(row())).store.getBooking(BOOKING);
+    expect(booking).toEqual(BOOKING_PARSED);
+    expect(Object.keys(booking!)).toEqual(Object.keys(BOOKING_PARSED));
+    if (booking === null || booking.source !== 'ashby') throw new Error('expected an Ashby booking');
+    expectTypeOf(booking).toEqualTypeOf<R1MeetAshbyBooking>();
+  });
+
+  it('a public-page row parses to the public member: the three schedule ids null, frozen, the same keys', async () => {
+    const booking = await fakeDb(rows(publicRow())).store.getBooking(BOOKING);
+    expect(booking).toEqual(PUBLIC_PARSED);
+    expect(Object.keys(booking!)).toEqual(Object.keys(BOOKING_PARSED));
+    expect(Object.isFrozen(booking)).toBe(true);
+    if (booking === null || booking.source !== 'public_page') throw new Error('expected a public booking');
+    expectTypeOf(booking).toEqualTypeOf<R1MeetPublicBooking>();
+    expect([booking.eventId, booking.scheduleId, booking.scheduledByUserId]).toEqual([null, null, null]);
+    // The matched application stays: Dex's card lands on it.
+    expect(booking.applicationId).toBe(APPLICATION);
+  });
+
+  it('a public row keeps what 0143 does not constrain: stage, interview and the Ashby updatedAt', async () => {
+    const booking = await fakeDb(
+      rows(publicRow({ ashby_interview_stage_id: STAGE, ashby_interview_id: INTERVIEW, ashby_updated_at: '2030-01-01T09:00:00+00:00' })),
+    ).store.getBooking(BOOKING);
+    expect(booking).toEqual({
+      ...PUBLIC_PARSED,
+      interviewStageId: STAGE,
+      interviewId: INTERVIEW,
+      ashbyUpdatedAt: '2030-01-01T09:00:00.000Z',
+    });
+  });
+
+  it.each(IDS)('a mixed row fails r1_meet_db_error: an Ashby row without %s, a public row with it', async (key) => {
+    await expectCode(fakeDb(rows(row({ [key]: null }))).store.getBooking(BOOKING), 'r1_meet_db_error', `ashby, ${key} null`);
+    await expectCode(fakeDb(rows(publicRow({ [key]: SET[key] }))).store.getBooking(BOOKING), 'r1_meet_db_error', `public, ${key} set`);
+    // In a list too: one mixed row fails the whole read, never a silent drop.
+    await expectCode(fakeDb(rows([row(), publicRow({ [key]: SET[key] })])).store.listOwedReleases(20), 'r1_meet_db_error');
+    await expectCode(fakeDb(rows([publicRow(), row({ [key]: null })])).store.listOverdue(NOW, 50), 'r1_meet_db_error');
+  });
+
+  it('a public row with all three Ashby ids, or an Ashby row with none, is mixed too', async () => {
+    await expectCode(fakeDb(rows(publicRow(SET))).store.getBooking(BOOKING), 'r1_meet_db_error');
+    await expectCode(
+      fakeDb(rows(row({ ashby_interview_event_id: null, ashby_schedule_id: null, ashby_scheduled_by_user_id: null }))).store.getBooking(BOOKING),
+      'r1_meet_db_error',
+    );
+  });
+
+  it('the reads by an Ashby event or schedule id answer the Ashby member only; a public row there fails', async () => {
+    expectTypeOf<Awaited<ReturnType<R1MeetStore['getBookingByEvent']>>>().toEqualTypeOf<R1MeetAshbyBooking | null>();
+    expectTypeOf<Awaited<ReturnType<R1MeetStore['listLiveBySchedule']>>>().toEqualTypeOf<readonly R1MeetAshbyBooking[]>();
+    expectTypeOf<Awaited<ReturnType<R1MeetStore['getBooking']>>>().toEqualTypeOf<R1MeetBooking | null>();
+    expect(await fakeDb(rows(row())).store.getBookingByEvent(EVENT)).toEqual(BOOKING_PARSED);
+    expect(await fakeDb(rows([row()])).store.listLiveBySchedule(SCHEDULE)).toEqual([BOOKING_PARSED]);
+    await expectCode(fakeDb(rows(publicRow())).store.getBookingByEvent(EVENT), 'r1_meet_db_error');
+    await expectCode(fakeDb(rows([publicRow()])).store.listLiveBySchedule(SCHEDULE), 'r1_meet_db_error');
+    await expectCode(fakeDb(rows([row(), publicRow({ id: id('d9') })])).store.listLiveBySchedule(SCHEDULE), 'r1_meet_db_error');
+    // No row is still no row.
+    expect(await fakeDb(rows(null)).store.getBookingByEvent(EVENT)).toBeNull();
+  });
+
+  const singles: Array<[string, (store: R1MeetStore) => Promise<unknown>]> = [
+    ['getBooking', (store) => store.getBooking(BOOKING)],
+    ['getBookingByBot', (store) => store.getBookingByBot(BOT)],
+    ['getBookingBySession', (store) => store.getBookingBySession(SESSION)],
+  ];
+  it.each(singles)('%s parses a public row', async (_name, read) => {
+    expect(await read(fakeDb(rows(publicRow())).store)).toEqual(PUBLIC_PARSED);
+  });
+
+  const lists: Array<[string, (store: R1MeetStore) => Promise<unknown>]> = [
+    ['listOwedReleases', (store) => store.listOwedReleases(20)],
+    ['listOverdue', (store) => store.listOverdue(NOW, 50)],
+    ['listInCall', (store) => store.listInCall(50)],
+    ['listStuckPending', (store) => store.listStuckPending({ untouchedSince: NOW, startAfter: NOW, limit: 30 })],
+    ['listCapBlocked', (store) => store.listCapBlocked({ startAfter: NOW, limit: 25 })],
+    ['listDrainable', (store) => store.listDrainable({ untouchedSince: null, limit: 10 })],
+  ];
+  it.each(lists)('%s parses an Ashby and a public row side by side', async (_name, read) => {
+    const list = await read(fakeDb(rows([row(), publicRow({ id: id('d9') })])).store);
+    expect(list).toEqual([BOOKING_PARSED, { ...PUBLIC_PARSED, id: id('d9') }]);
+    expect(Object.isFrozen(list)).toBe(true);
+  });
+
+  it.each([
+    ['cancelled', 'candidate_cancelled'],
+    ['failed', 'invite_undeliverable'],
+  ])('the reason reader takes the 0143 pair %s/%s on either source', async (status, reason) => {
+    for (const r of [row({ status, reason, recall_bot_id: null }), publicRow({ status, reason, recall_bot_id: null })]) {
+      const booking = await fakeDb(rows(r)).store.getBooking(BOOKING);
+      expect(booking).toMatchObject({ status, reason, recallBotId: null });
+      expect(Object.isFrozen(booking)).toBe(true);
+    }
+    // In a list read too (the owed-release sweep reads terminal rows).
+    expect(await fakeDb(rows([publicRow({ status, reason })])).store.listOwedReleases(20)).toEqual([
+      { ...PUBLIC_PARSED, status, reason },
+    ]);
   });
 });
 
@@ -577,19 +758,25 @@ describe('the IST day of the bot cap', () => {
     expect(await fakeDb({ data: null, error: null, count: 0 }).store.countBotsInDay({ ...window, excludeId: BOOKING })).toBe(0);
   });
 
-  it('counts exactly the status and reason pairs that follow an attached bot', () => {
-    const pairing = /constraint chk_r1_meet_bookings_status_reason check \((.*?)\), constraint/.exec(sql)![1]!;
-    const families = [...pairing.matchAll(/status in \(([^)]*)\) and reason in \(([^)]*)\)/g)].map((m) => ({
-      statuses: [...m[1]!.matchAll(/'(\w+)'/g)].map((s) => s[1]!),
-      reasons: [...m[2]!.matchAll(/'(\w+)'/g)].map((s) => s[1]!),
-    }));
-    expect(families).toHaveLength(8);
-    const counted = families.flatMap(({ statuses, reasons }) =>
-      statuses.filter((s) => (R1_MEET_CAP_STATUSES as readonly string[]).includes(s)).flatMap((s) =>
-        reasons.filter((r) => (R1_MEET_CAP_REASONS as readonly string[]).includes(r)).map((r) => `${s}/${r}`),
-      ),
-    );
-    expect(counted.sort()).toEqual([
+  it('counts exactly the status and reason pairs that follow an attached bot (0142, and 0143 adds none)', () => {
+    const countedOf = (pairing: string): string[] => {
+      const families = [...pairing.matchAll(/status in \(([^)]*)\) and reason in \(([^)]*)\)/g)].map((m) => ({
+        statuses: [...m[1]!.matchAll(/'(\w+)'/g)].map((s) => s[1]!),
+        reasons: [...m[2]!.matchAll(/'(\w+)'/g)].map((s) => s[1]!),
+      }));
+      expect(families).toHaveLength(8);
+      return families.flatMap(({ statuses, reasons }) =>
+        statuses.filter((s) => (R1_MEET_CAP_STATUSES as readonly string[]).includes(s)).flatMap((s) =>
+          reasons.filter((r) => (R1_MEET_CAP_REASONS as readonly string[]).includes(r)).map((r) => `${s}/${r}`),
+        ),
+      ).sort();
+    };
+    const counted = countedOf(/constraint chk_r1_meet_bookings_status_reason check \((.*?)\), constraint/.exec(sql)![1]!);
+    // 0143 swaps the pairing CHECK (M035 S01): its two new pairs are not bot-day pairs.
+    const swapped = /add constraint chk_r1_meet_bookings_status_reason check \((.*?)\) not valid;/.exec(sql0143);
+    expect(swapped, '0143 chk_r1_meet_bookings_status_reason').not.toBeNull();
+    expect(countedOf(swapped![1]!)).toEqual(counted);
+    expect(counted).toEqual([
       'bot_joining/eligible',
       'bot_scheduled/eligible',
       'completed/attempt_settled',

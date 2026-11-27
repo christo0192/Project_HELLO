@@ -4220,14 +4220,15 @@ and bill. Drain first, then turn the flag off.
 | `r1_meet_drain_failed` | A drain could not release a bot (`<op>:<category>`), a pass threw, or `passes_exhausted` | Check Recall; insert the drain job again |
 | `r1_meet_malformed_payload` / `r1_meet_unknown_kind` | A job this build cannot read (version skew during a deploy) | Finish the deploy; replay from the DLQ |
 | `r1_meet_job_failed` | A job's final attempt failed; its receipt is `failed` | Read the DLQ `error_message`, fix the cause, replay |
-| `r1_meet_bot_waiting_room` | Dex's bot reported `bot.in_waiting_room` (no `error_type`): the meeting is not OPEN, or nobody has admitted Dex. The booking stays live; the bot waits up to 600 s. One line per processed event; a retried job may repeat it, never drop it | Public bookings: fix the Dex unit's Meet settings at once, before more candidates are stranded (access Open, people who are not signed in may join, waiting room off, the host need not join first). Ashby bookings: someone in the meeting must admit Dex |
+| `r1_meet_bot_waiting_room` | Dex's bot reported `bot.in_waiting_room` (`error_type` = the booking's source, M035 S02): the meeting is not OPEN, or nobody has admitted Dex. The booking stays live; the bot waits up to 600 s. One line per processed event; a retried job may repeat it, never drop it. ERROR level for `public_page`; for `ashby` the same line is a WARNING (admitting Dex is HR's normal step there; a bot nobody admits still raises `r1_meet_bot_admission_blocked`) | `public_page`: fix the Dex unit's Meet settings at once, before more candidates are stranded (access Open, people who are not signed in may join, waiting room off, the host need not join first). `ashby`: someone in the meeting must admit Dex |
 | `r1_meet_bot_admission_blocked` | The bot never got in (`error_type` = the Recall sub-code: a waiting-room timeout, `bot_kicked_from_waiting_room`, `meeting_not_started`, `google_meet_bot_blocked`, `google_meet_knocking_disabled`, `google_meet_sign_in_missing_login_credentials`, `google_meet_organisation_restricted`); `failed/bot_fatal`, never a candidate no-show. Once per booking | Fix the Meet settings (as above; a meeting restricted to the organisation, or one that needs a signed-in user, also refuses a guest bot); HR re-books the candidate |
 | `r1_meet_bot_sign_in_failed` | Signed-in mode only (`R1_MEET_GOOGLE_LOGIN_GROUP_ID` set): the bot could not sign in to Google (`error_type` = the Recall sub-code); `failed/bot_fatal`. Once per booking | Check the Recall Google Login Group and its login, the Legacy SSO profile and certificate, and the concurrent sign-in count (30 per account); or unset the login group to go back to the guest bot. HR re-books |
 
 Warnings: `r1_meet_receipt_finish_failed`, `r1_meet_maintenance_had_errors` (`error_type` = the
 failed steps), `r1_meet_attempt_ended_enqueue_failed` (maintenance re-drives it),
 `r1_meet_multi_human_observed`, `r1_meet_recall_failed`, `r1_meet_queue_poll_error`,
-`r1_meet_queue_stale_lease`, `r1_meet_queue_no_handler`, `r1_meet_maintenance_enqueue_error`.
+`r1_meet_queue_stale_lease`, `r1_meet_queue_no_handler`, `r1_meet_maintenance_enqueue_error`,
+`r1_meet_bot_waiting_room` with `error_type` `ashby` (an Ashby meeting; the row above).
 
 **Cost.** Three bounds: the daily cap (`r1_meet_bot_cap_reached`), Recall's own usage alert (above),
 and the automatic-leave timers (a lost bot costs at most about 15 minutes before a call, 45 minutes
@@ -4568,6 +4569,108 @@ squash commit: no migration, no data, one blank env name.
   RichText `Summary` takes the `PlainText` value the Christy card already sends in production.
 - The Summary's line breaks read well on the Ashby card, and the `Detailed report` link opens the
   R1 review page after a staff sign-in.
+
+### Public-page bookings (M035 S02)
+
+A booking made on the public R1 booking page (`source` `public_page`, M035; none exists until S06 and
+`R1_MEET_PUBLIC_BOOKING_ENABLED`) has no Ashby schedule, so no interview event. Its card is posted
+as GENERAL feedback on the matched application: the same `applicationFeedback.submit` with the same
+form values and the Dex user, but no `interviewEventId` key (`submitGeneral` in `feedback-ashby.ts`;
+an Ashby-scheduled booking still uses the interview-event submit, which refuses a missing event id
+before the network). Every other check above is the same.
+
+- **The duplicate guard.** Ashby makes a NEW card on every general submit, so before EVERY submit of
+  a public booking (every run, not only a retry) the job reads `applicationFeedback.list` for the
+  application: pages of 100 from one hour before the slot start, at most 5 pages. A card by the Dex
+  user (submitter or credited user), submitted at or after the slot start (`start_at`), on the
+  configured form (case ignored) or with no form id, counts as already posted. Ashby-scheduled
+  bookings never call the list.
+- **`already_posted`.** The guard found the card: no submit, the receipt `processed`, one info line
+  `r1_meet_feedback_already_posted`, and the `r1_meet_job` line `scorecard_feedback:already_posted`.
+  This is how a submit whose answer was lost, a re-delivered job and a re-post end without a second
+  card.
+- **List failures never submit.** A 429 defers `feedback_list_rate_limited` (60 s); a 5xx, timeout,
+  network failure or a list the reader cannot read in full (not a list, an entry with no readable
+  user id, a Dex entry with a bad time or form id, a repeated or missing cursor, more than 5 pages)
+  defers `feedback_list_unavailable` (30 s). Past the deferral bound they throw
+  `r1_meet_feedback_list_rate_limited` / `r1_meet_feedback_list_unavailable` (then attempts and the
+  dead-letter queue). A permanent 4xx or `success:false` on the list alerts
+  `r1_meet_feedback_rejected` (`error_type` `<category>[:<Ashby code>]`, `http_status`) and ends
+  `feedback_list_rejected` with the receipt `failed`: fix the cause (403: the key's permissions), then
+  re-post.
+- **The key** also needs `candidatesRead` for `applicationFeedback.list` (already held for
+  `candidate.info`; check it passes this endpoint). The guard reads only four fields of each entry
+  (`submittedByUser.id`, `creditedToUser.id`, `submittedAt`, `feedbackFormDefinitionId`) and keeps
+  two of Dex's (the form id and the time) in memory; it never reads other interviewers' answers,
+  names or emails, and logs nothing of the list.
+- **Re-post.** The SQL above re-posts public cards too: each re-posted job runs the guard first, so a
+  card that did land before the job failed is found (`already_posted`) instead of posted again. Only
+  Dex's cards count: a card HR entered by hand under their own Ashby user does not stop the post.
+- **Known limit: a public card is never updated.** The guard looks only for Dex's card on the form
+  since the slot start; it cannot tell which assessment a card holds, and a general card has no
+  Ashby update. So when a newer assessment of the same attempt becomes the round's current one (a
+  re-score, or a re-queued R1 assessment), its receipt ends `already_posted`, settled `processed`,
+  and Ashby keeps the FIRST verdict and scores, while our review page shows the new ones. An
+  Ashby-scheduled booking instead updates its one card (the interview-event submit).
+- **Remedy: putting the new result on the Ashby card.** The re-post SQL above does NOT do it on its
+  own: it selects only `failed` receipts, and a job for a `processed` receipt stops at
+  `already_submitted` before any Ashby call. Deleting the card and then running that SQL leaves
+  Ashby with NO card. Either HR enters the new result by hand from the R1 review page (as for an
+  `ignored` receipt), or, within 7 days of the slot end (later the job only ends `stale`), all
+  three steps below, in this order:
+  1. Find the newer receipt (read-only); expect one row, `outcome` `processed`:
+
+     ```sql
+     select b.source, x.dedupe_key, x.outcome
+       from screening_v2.r1_meet_bookings b
+       join screening_v2.interview_rounds r on r.id = b.round_id
+       join screening_v2.r1_meet_receipts x
+         on x.source = 'ashby'
+        and x.dedupe_key = 'ashby-schedule:feedback:' || b.id::text || ':' || r.assessment_id::text
+      where b.id = '<booking id>';
+     ```
+
+  2. A recruiter deletes Dex's card on that application in Ashby (only that card).
+  3. Move THAT one receipt back to `failed` and queue its job (the re-post SQL above, narrowed to the
+     one key; 0142's checks allow `processed -> failed` because `processed_at` stays set). Expect
+     `UPDATE 1`, then `INSERT 0 1`:
+
+     ```sql
+     update screening_v2.r1_meet_receipts
+        set outcome = 'failed'
+      where source = 'ashby'
+        and event_type = 'scorecard_feedback'
+        and dedupe_key = '<dedupe_key from step 1>'
+        and outcome = 'processed';
+     insert into screening_v2.job_queue (name, payload, dedup_key, max_attempts)
+     select 'r1-meet',
+            jsonb_build_object('kind', 'scorecard_feedback',
+                               'booking_id', split_part(x.dedupe_key, ':', 3),
+                               'assessment_id', split_part(x.dedupe_key, ':', 4)),
+            'r1-meet:scorecard-feedback:' || split_part(x.dedupe_key, ':', 3) || ':'
+              || split_part(x.dedupe_key, ':', 4),
+            5
+       from screening_v2.r1_meet_receipts x
+       join screening_v2.r1_meet_bookings b on b.id = split_part(x.dedupe_key, ':', 3)::uuid
+      where x.source = 'ashby'
+        and x.event_type = 'scorecard_feedback'
+        and x.outcome = 'failed'
+        and x.dedupe_key = '<dedupe_key from step 1>'
+        and b.end_at > now() - interval '7 days'
+     on conflict do nothing;
+     ```
+
+  The job runs the full check list and the guard. With the card gone it posts the current
+  assessment: `r1_meet_job` line `scorecard_feedback:submitted`, receipt `processed`. If it ends
+  `already_posted` again, Ashby still lists a Dex card since the slot start (not deleted, or Ashby
+  lists deleted cards: unverified until the live spike); nothing was posted twice, and HR enters the
+  new result by hand. Pinned in `r1-meet-feedback.test.ts` §10 (the three `REMEDY (S02-R2)` tests).
+- **Live spike (roadmap S11).** A general submit (no `interviewEventId`) with `userId` = the Dex user
+  is accepted from this key and shows as Dex's card on the application; `applicationFeedback.list`
+  answers `results` entries with `submittedByUser.id`, `creditedToUser.id`, `submittedAt` (zoned ISO
+  8601) and `feedbackFormDefinitionId` as the public reference documents, and honours
+  `createdAfter` (epoch ms), `limit` and `cursor`. Until then these fields are UNVERIFIED: an
+  unreadable list only defers, it never posts.
 
 ## R1 public booking: Dex's Google account and OAuth grant (M035 S03, dark)
 

@@ -17,6 +17,9 @@
  *  - the section 2.5 kill points for move, cancel and unschedule: the second run ends in the same
  *    state with one live bot at most; a duplicate job is a no-op;
  *  - `bot_release`, `round_cancelled`, `ensure_bot`;
+ *  - (M035 S02) a public-page booking: `booking_rerun` answers `ignored('public_booking')` with no RPC,
+ *    the three answers of the Ashby create RPC that name a booking refuse a public one, and an Ashby
+ *    re-run sends the create RPC exactly the M034 arguments;
  *  - no id, URL, name or email in a log line, no Meet URL in a job S06 enqueues.
  */
 
@@ -34,6 +37,7 @@ import {
   r1MeetRoundCancelledDefinition,
   worstR1MeetResult,
 } from '../lib/r1/meet/schedule-handler.js';
+import type { R1MeetCreateAnswer } from '../lib/r1/meet/runtime-store.js';
 import type { Row } from './support/r1-meet-fake-db.js';
 import {
   HARNESS_NOW,
@@ -1454,5 +1458,142 @@ describe('no PII', () => {
       expect(text).not.toContain('meet.google.com');
       expect(text).not.toContain('@');
     }
+  });
+});
+
+// ── Public-page bookings (M035 S02) ─────────────────────────────────────────
+
+describe('public-page bookings (M035 S02): the Ashby paths refuse them', () => {
+  const rpcCalls = (h: R1MeetHarness) => h.db.calls.filter((call) => call.kind === 'rpc');
+
+  it('booking_rerun of a public row answers ignored(public_booking) before the reason check, the slot check and any RPC', async () => {
+    const w = world();
+    const pb = w.h.createPublicBooking();
+    // A parked public row too (the public RPC never parks one, but the refusal must not depend on it).
+    const parked = w.h.db.seedPublicBooking({ status: 'blocked', reason: 'capacity_exhausted' });
+    w.reset();
+    w.h.db.calls.length = 0;
+    const payloads = [
+      { kind: 'booking_rerun', booking_id: pb.bookingId, reason: 'capacity_exhausted', n: 0 },
+      { kind: 'booking_rerun', booking_id: parked.id, reason: 'capacity_exhausted', n: 0 },
+      { kind: 'booking_rerun', booking_id: parked.id, reason: 'paused', n: 2 },
+    ];
+    for (const payload of payloads) {
+      await expect(runDef(w.h, r1MeetBookingRerunDefinition, payload)).resolves.toEqual(done('ignored', 'public_booking'));
+    }
+    // A slot that has started: still the public refusal (it comes first).
+    w.h.setNow(Date.parse(w.h.db.booking(pb.bookingId)!.end_at as string));
+    await expect(runDef(w.h, r1MeetBookingRerunDefinition, payloads[0])).resolves.toEqual(done('ignored', 'public_booking'));
+
+    expect(rpcCalls(w.h)).toEqual([]);
+    expect(w.h.db.calls.every((call) => call.kind === 'from' && call.name === 'r1_meet_bookings')).toBe(true);
+    expect(w.h.requests).toEqual([]);
+    expect(w.h.timeline).toEqual([]);
+    expect(w.h.db.jobs()).toEqual([]);
+    expect(w.h.db.booking(pb.bookingId)).toMatchObject({ status: 'pending', reason: 'eligible', version: 0, key_attempt: 0 });
+    expect(w.h.db.booking(parked.id)).toMatchObject({ status: 'blocked', reason: 'capacity_exhausted', version: 0 });
+    expectNoPii(w.h, pb.bookingId, parked.id);
+  });
+
+  it('an Ashby booking_rerun replays the stored delivery into r1_meet_create_round_from_ashby, argument for argument', async () => {
+    const w = world();
+    w.h.db.settings.sendRound = 'capacity_exhausted';
+    const ev = w.event(3 * DAY);
+    await w.run(w.job(ev));
+    const stored = { ...w.bookingOf(ev)! };
+    w.reset();
+    w.h.db.settings.sendRound = 'ok';
+    const [rerun] = w.h.db.jobs('booking_rerun');
+    w.h.setNow(Date.parse(rerun!.scheduled_at as string));
+    w.h.db.calls.length = 0;
+
+    await expect(runDef(w.h, r1MeetBookingRerunDefinition, rerun!.payload)).resolves.toEqual(done('processed', 'bot_scheduled'));
+
+    const createCalls = rpcCalls(w.h).filter((call) => call.name === 'r1_meet_create_round_from_ashby');
+    expect(createCalls).toHaveLength(1);
+    const expected = {
+      p_ashby_interview_event_id: ev.eventId,
+      p_ashby_schedule_id: w.scheduleId,
+      p_ashby_application_id: ev.applicationId,
+      p_ashby_interview_stage_id: null,
+      p_ashby_interview_id: null,
+      p_ashby_scheduled_by_user_id: SCHEDULER_ID,
+      // When HR attested: the stored Ashby updatedAt (it is before now).
+      p_attested_at: stored.ashby_updated_at,
+      p_ashby_updated_at: stored.ashby_updated_at,
+      p_meet_url: MEET_URL,
+      p_start_at: ev.startAt,
+      p_end_at: ev.endAt,
+      p_created_by: STAFF_USER_ID,
+      p_objective_profile: 'r1_dex_sales',
+      p_expiry_grace_sec: 7200,
+      p_now: iso(w.h.now()),
+    };
+    expect(createCalls[0]!.args).toEqual(expected);
+    // Byte for byte, key order included: the M034 argument object is unchanged.
+    expect(JSON.stringify(createCalls[0]!.args)).toBe(JSON.stringify(expected));
+    expect(typeof stored.ashby_updated_at).toBe('string');
+    expect(creates(w.h)[0]!.headers['idempotency-key']).toBe(keyOf(ev.eventId, 0, 0));
+  });
+
+  describe('the three places that act on a booking id the Ashby create RPC answered', () => {
+    /** A public booking holding an undispatched bot, and an eligible Ashby event job for another slot. */
+    async function setup() {
+      const w = world();
+      const pb = w.h.createPublicBooking();
+      await expect(ensureBot(w.h.deps, pb.bookingId, w.h.meta())).resolves.toMatchObject({ code: 'bot_scheduled' });
+      const row = w.h.db.booking(pb.bookingId)!;
+      const before = { ...row };
+      const ev = w.event(2 * DAY);
+      w.reset();
+      w.h.db.calls.length = 0;
+      return { w, pb, row: () => w.h.db.booking(pb.bookingId)!, before, payload: w.job(ev) };
+    }
+
+    const answers = (pb: { bookingId: string; roundId: string }): Array<[string, R1MeetCreateAnswer]> => [
+      [
+        'exists',
+        {
+          status: 'exists',
+          bookingId: pb.bookingId,
+          roundId: pb.roundId,
+          bookingStatus: 'bot_scheduled',
+          reason: 'eligible',
+          version: 0,
+          keyAttempt: 0,
+          roundExpiresAt: null,
+          roundLive: true,
+          objectiveProfile: 'r1_dex_sales',
+        },
+      ],
+      ['bot_attached', { status: 'bot_attached', bookingId: pb.bookingId, bookingStatus: 'bot_scheduled', version: 0, keyAttempt: 0 }],
+      ['in_past', { status: 'in_past', bookingId: pb.bookingId }],
+    ];
+
+    it.each(['exists', 'bot_attached', 'in_past'])('%s with a public booking id: ignored(public_booking), no Recall call, no RPC', async (status) => {
+      const { w, pb, row, before, payload } = await setup();
+      const answer = answers(pb).find(([name]) => name === status)![1];
+      const asked: unknown[] = [];
+      const deps = {
+        ...w.h.deps,
+        store: {
+          ...w.h.deps.store,
+          createRound: async (input: unknown) => {
+            asked.push(input);
+            return answer;
+          },
+        },
+      };
+      const job = r1MeetAshbyScheduleDefinition.parse(payload);
+      if (job === null) throw new Error('test: the payload did not parse');
+      await expect(r1MeetAshbyScheduleDefinition.run(deps, job, w.h.meta())).resolves.toEqual(done('ignored', 'public_booking'));
+      expect(asked).toHaveLength(1);
+      expect(w.h.requests).toEqual([]);
+      expect(rpcCalls(w.h)).toEqual([]);
+      expect(w.h.db.jobs('bot_release')).toEqual([]);
+      expect(row()).toEqual(before);
+      expect(w.h.recall.bots.has(before.recall_bot_id as string)).toBe(true);
+      expectNoPii(w.h, pb.bookingId, before.recall_bot_id as string);
+    });
   });
 });

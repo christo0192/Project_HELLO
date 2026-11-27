@@ -4,6 +4,8 @@
  * the deep-frozen PII-free body, a round trip through the Recall client against the shared fake,
  * and the key's format and refusals. M035 S09 T1: the exact guest body (no `google_meet`), the
  * late-joiner notice (`chat.on_participant_join`) and the explicit, inert-by-name bot detection.
+ * M035 S02: the public-page key (`r1-meet-pb-<booking>-…`), the picker by source, the Ashby
+ * strings unchanged, and the two key spaces disjoint.
  *
  * Deterministic: no clock (the builder has none), no network (the fake Recall transport), synthetic
  * ids only. Fixture keys are low-entropy.
@@ -18,7 +20,9 @@ import {
   R1_MEET_REALTIME_EVENTS,
   R1_MEET_RECALL_VARIANT,
   buildR1MeetCreateBotRequest,
+  r1MeetBookingIdempotencyKey,
   r1MeetCreateBotIdempotencyKey,
+  r1MeetPublicCreateBotIdempotencyKey,
   type R1MeetBotBooking,
   type R1MeetBotSettings,
   type R1MeetCreateBotFailure,
@@ -609,5 +613,165 @@ describe('r1MeetCreateBotIdempotencyKey', () => {
     expect((thrownBy(() => r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, -1, -1)) as Error).message).toBe(
       'r1_meet_idempotency_invalid_version',
     );
+  });
+});
+
+// ── The public-page key and the key by source (M035 S02) ───────────────────
+
+describe('r1MeetPublicCreateBotIdempotencyKey (a public-page booking has no Ashby event)', () => {
+  const PB = '7f000000-0000-4000-8000-0000000000ad';
+
+  it('is r1-meet-pb-<booking id>-v<version>-k<key attempt>', () => {
+    expect(r1MeetPublicCreateBotIdempotencyKey(PB, 0, 0)).toBe('r1-meet-pb-7f000000-0000-4000-8000-0000000000ad-v0-k0');
+    expect(r1MeetPublicCreateBotIdempotencyKey(PB, 3, 2)).toBe('r1-meet-pb-7f000000-0000-4000-8000-0000000000ad-v3-k2');
+  });
+
+  it('lower-cases an upper-case booking id', () => {
+    expect(r1MeetPublicCreateBotIdempotencyKey(PB.toUpperCase(), 3, 1)).toBe('r1-meet-pb-7f000000-0000-4000-8000-0000000000ad-v3-k1');
+  });
+
+  it('gives a distinct key for every (version, key attempt) pair', () => {
+    const keys = new Set<string>();
+    for (const version of [0, 1, 11]) {
+      for (const attempt of [0, 1, 11]) keys.add(r1MeetPublicCreateBotIdempotencyKey(PB, version, attempt));
+    }
+    expect(keys.size).toBe(9);
+  });
+
+  it('always satisfies RECALL_IDEMPOTENCY_KEY_RE, up to the largest safe version and key attempt (83 characters)', () => {
+    for (const version of [0, 1, 3, 999, Number.MAX_SAFE_INTEGER]) {
+      for (const attempt of [0, 7, Number.MAX_SAFE_INTEGER]) {
+        const key = r1MeetPublicCreateBotIdempotencyKey(PB.toUpperCase(), version, attempt);
+        expect(key, `${version}/${attempt}`).toMatch(RECALL_IDEMPOTENCY_KEY_RE);
+      }
+    }
+    expect(r1MeetPublicCreateBotIdempotencyKey(PB, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER)).toHaveLength(83);
+    expect(r1MeetPublicCreateBotIdempotencyKey(PB, 0, 0)).toHaveLength(53);
+  });
+
+  it.each([
+    ['a non-UUID id', 'booking-1'],
+    ['an empty id', ''],
+    ['a braced UUID', `{${PB}}`],
+    ['a padded UUID', ` ${PB}`],
+    ['a number', 42],
+    ['null', null],
+    ['undefined', undefined],
+  ])('throws r1_meet_idempotency_invalid_booking_id for %s, never echoing it', (_label, bookingId) => {
+    const error = thrownBy(() => r1MeetPublicCreateBotIdempotencyKey(bookingId as never, 1, 0));
+    expect(error).toBeInstanceOf(TypeError);
+    expect((error as Error).message).toBe('r1_meet_idempotency_invalid_booking_id');
+  });
+
+  it.each([
+    ['-1', -1],
+    ['1.5', 1.5],
+    ['2 ** 53', 2 ** 53],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['a string', '3'],
+  ])('throws r1_meet_idempotency_invalid_version for version %s', (_label, version) => {
+    const error = thrownBy(() => r1MeetPublicCreateBotIdempotencyKey(PB, version as never, 0));
+    expect(error).toBeInstanceOf(TypeError);
+    expect((error as Error).message).toBe('r1_meet_idempotency_invalid_version');
+  });
+
+  it.each([
+    ['-1', -1],
+    ['1.5', 1.5],
+    ['2 ** 53', 2 ** 53],
+    ['NaN', Number.NaN],
+    ['a string', '0'],
+    ['undefined', undefined],
+  ])('throws r1_meet_idempotency_invalid_key_attempt for key attempt %s', (_label, attempt) => {
+    const error = thrownBy(() => r1MeetPublicCreateBotIdempotencyKey(PB, 1, attempt as never));
+    expect(error).toBeInstanceOf(TypeError);
+    expect((error as Error).message).toBe('r1_meet_idempotency_invalid_key_attempt');
+  });
+
+  it('checks the booking id, then the version, then the key attempt', () => {
+    expect((thrownBy(() => r1MeetPublicCreateBotIdempotencyKey('booking-1', -1, -1)) as Error).message).toBe(
+      'r1_meet_idempotency_invalid_booking_id',
+    );
+    expect((thrownBy(() => r1MeetPublicCreateBotIdempotencyKey(PB, -1, -1)) as Error).message).toBe(
+      'r1_meet_idempotency_invalid_version',
+    );
+    expect((thrownBy(() => r1MeetPublicCreateBotIdempotencyKey(PB, 0, -1)) as Error).message).toBe(
+      'r1_meet_idempotency_invalid_key_attempt',
+    );
+  });
+
+  it('never shares a key, or a key prefix, with an Ashby booking: the two spaces are disjoint', () => {
+    const ids = [PB, FIXTURE_EVENT_ID, BOOKING_ID, '00000000-0000-4000-8000-000000000000'];
+    const ashby: string[] = [];
+    const pub: string[] = [];
+    for (const uuid of ids) {
+      for (const version of [0, 1, 50]) {
+        for (const attempt of [0, 1, 20]) {
+          ashby.push(r1MeetCreateBotIdempotencyKey(uuid, version, attempt));
+          pub.push(r1MeetPublicCreateBotIdempotencyKey(uuid, version, attempt));
+        }
+      }
+    }
+    for (const a of ashby) {
+      // The ninth character: a hex digit of the event id for Ashby, the `p` of `pb-` for a public booking.
+      expect(a.charAt(8)).toMatch(/^[0-9a-f]$/);
+      for (const p of pub) {
+        expect(p.charAt(8)).toBe('p');
+        expect(a.startsWith(p) || p.startsWith(a)).toBe(false);
+      }
+    }
+  });
+});
+
+describe('r1MeetBookingIdempotencyKey: the create key by the booking source', () => {
+  const PB = '7f000000-0000-4000-8000-0000000000ad';
+
+  it('an Ashby booking keys on its event id, exactly as r1MeetCreateBotIdempotencyKey (the M034 strings unchanged)', () => {
+    const ashby = { source: 'ashby', eventId: FIXTURE_EVENT_ID, id: PB, version: 3, keyAttempt: 0 } as const;
+    expect(r1MeetBookingIdempotencyKey(ashby)).toBe('r1-meet-4e5f6a7b-8c9d-4e0f-a1b2-c3d4e5f6a7b8-v3-k0');
+    expect(r1MeetBookingIdempotencyKey({ ...ashby, keyAttempt: 2 })).toBe('r1-meet-4e5f6a7b-8c9d-4e0f-a1b2-c3d4e5f6a7b8-v3-k2');
+    for (const [version, attempt] of [[0, 0], [1, 7], [50, 20]] as const) {
+      expect(r1MeetBookingIdempotencyKey({ ...ashby, version, keyAttempt: attempt })).toBe(
+        r1MeetCreateBotIdempotencyKey(FIXTURE_EVENT_ID, version, attempt),
+      );
+    }
+    // The booking's own row id plays no part in an Ashby key.
+    expect(r1MeetBookingIdempotencyKey({ ...ashby, id: BOOKING_ID })).toBe(r1MeetBookingIdempotencyKey(ashby));
+  });
+
+  it('a public-page booking keys on its own row id', () => {
+    const pub = { source: 'public_page', eventId: null, id: PB, version: 0, keyAttempt: 0 } as const;
+    expect(r1MeetBookingIdempotencyKey(pub)).toBe('r1-meet-pb-7f000000-0000-4000-8000-0000000000ad-v0-k0');
+    expect(r1MeetBookingIdempotencyKey({ ...pub, version: 1, keyAttempt: 2 })).toBe(
+      r1MeetPublicCreateBotIdempotencyKey(PB, 1, 2),
+    );
+  });
+
+  it('passes the key functions\' own refusals through', () => {
+    expect((thrownBy(() => r1MeetBookingIdempotencyKey({ source: 'ashby', eventId: 'evt-1', id: PB, version: 0, keyAttempt: 0 })) as Error).message).toBe(
+      'r1_meet_idempotency_invalid_event_id',
+    );
+    expect((thrownBy(() => r1MeetBookingIdempotencyKey({ source: 'ashby', eventId: null as never, id: PB, version: 0, keyAttempt: 0 })) as Error).message).toBe(
+      'r1_meet_idempotency_invalid_event_id',
+    );
+    expect((thrownBy(() => r1MeetBookingIdempotencyKey({ source: 'public_page', eventId: null, id: 'b-1', version: 0, keyAttempt: 0 })) as Error).message).toBe(
+      'r1_meet_idempotency_invalid_booking_id',
+    );
+    expect((thrownBy(() => r1MeetBookingIdempotencyKey({ source: 'public_page', eventId: null, id: PB, version: -1, keyAttempt: 0 })) as Error).message).toBe(
+      'r1_meet_idempotency_invalid_version',
+    );
+  });
+
+  it.each([
+    ['an unknown source', { source: 'csv', eventId: FIXTURE_EVENT_ID, id: PB, version: 0, keyAttempt: 0 }],
+    ['an upper-case source', { source: 'ASHBY', eventId: FIXTURE_EVENT_ID, id: PB, version: 0, keyAttempt: 0 }],
+    ['no source', { eventId: FIXTURE_EVENT_ID, id: PB, version: 0, keyAttempt: 0 }],
+    ['null', null],
+    ['a string', 'ashby'],
+  ])('throws r1_meet_idempotency_invalid_source for %s', (_label, booking) => {
+    const error = thrownBy(() => r1MeetBookingIdempotencyKey(booking as never));
+    expect(error).toBeInstanceOf(TypeError);
+    expect((error as Error).message).toBe('r1_meet_idempotency_invalid_source');
   });
 });

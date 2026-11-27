@@ -11,6 +11,13 @@
  * counters, the slot) rolls everything back and answers `{ data: null, error: { code: '23514' } }`,
  * a unique index `23505`, and the create RPC's own `raise` `P0001`.
  *
+ * Of migration 0143 (M035) it ports only what the runtime reads (M035 S02): the booking `source`
+ * column (`'ashby'` on every row the create RPC and `seedBooking` write), `chk_r1_meet_bookings_source`
+ * and `chk_r1_meet_bookings_source_ids` (the three Ashby schedule ids all set for `ashby`, all null for
+ * `public_page`), the two status/reason pairs it adds (`cancelled`/`candidate_cancelled`,
+ * `failed`/`invite_undeliverable`), and `seedPublicBooking`. Not the calendar, manage or request
+ * columns, and not the public create RPC.
+ *
  * What it is NOT: the SQL. `r1_send_round` (capacity, holds, the month counter) is a knob
  * (`settings.sendRound`), and so are the consent template and the sales_r1 role. The SQL itself is
  * proven by app/supabase/tests; `r1-meet-fake-db.test.ts` pins this port's matrix, pairing and answer
@@ -41,7 +48,10 @@ export interface FakeAnswer {
 
 // ── The 0142 vocabulary this port enforces (pinned to the migration by r1-meet-fake-db.test.ts) ──
 
-/** `chk_r1_meet_bookings_status_reason`: the reasons each status accepts. */
+/**
+ * `chk_r1_meet_bookings_status_reason`: the reasons each status accepts. As 0143 swaps it (M035,
+ * contracts 3.1): `cancelled` also accepts `candidate_cancelled`, `failed` also `invite_undeliverable`.
+ */
 export const FAKE_STATUS_REASONS: Readonly<Record<string, readonly string[]>> = Object.freeze({
   pending: ['eligible'],
   bot_scheduled: ['eligible'],
@@ -56,8 +66,8 @@ export const FAKE_STATUS_REASONS: Readonly<Record<string, readonly string[]>> = 
     'capacity_exhausted', 'consent_template_unavailable', 'slot_too_far', 'bot_cap_reached',
   ],
   completed: ['attempt_settled'],
-  cancelled: ['cancelled', 'dex_absent', 'event_removed', 'round_cancelled'],
-  failed: ['in_past', 'bot_create_failed', 'bot_fatal', 'no_show', 'admission_refused', 'multiple_humans', 'round_expired'],
+  cancelled: ['cancelled', 'dex_absent', 'event_removed', 'round_cancelled', 'candidate_cancelled'],
+  failed: ['in_past', 'bot_create_failed', 'bot_fatal', 'no_show', 'admission_refused', 'multiple_humans', 'round_expired', 'invite_undeliverable'],
   drained: ['flag_off'],
 });
 
@@ -205,9 +215,22 @@ function checkBooking(b: Row): void {
   check(typeof b.meet_url === 'string' && MEET.test(b.meet_url), 'chk_r1_meet_bookings_meet_url');
   check(ms(b.end_at) > ms(b.start_at) && ms(b.end_at) <= ms(b.start_at) + DAY, 'chk_r1_meet_bookings_slot');
   check(b.ticket_digest === null || HEX64.test(b.ticket_digest), 'chk_r1_meet_bookings_ticket_digest');
-  for (const key of ['ashby_schedule_id', 'ashby_application_id', 'ashby_scheduled_by_user_id']) {
-    check(typeof b[key] === 'string' && UUID_I.test(b[key]), `chk_r1_meet_bookings_${key}`);
+  // 0143 (M035): the source, and the three Ashby schedule ids that follow it (the application id
+  // stays NOT NULL for both sources; schedule and scheduler are a uuid or null).
+  check(['ashby', 'public_page'].includes(b.source), 'chk_r1_meet_bookings_source');
+  check(
+    typeof b.ashby_application_id === 'string' && UUID_I.test(b.ashby_application_id),
+    'chk_r1_meet_bookings_ashby_application_id',
+  );
+  for (const key of ['ashby_schedule_id', 'ashby_scheduled_by_user_id']) {
+    check(b[key] === null || (typeof b[key] === 'string' && UUID_I.test(b[key])), `chk_r1_meet_bookings_${key}`);
   }
+  const scheduleIds = [b.ashby_interview_event_id, b.ashby_schedule_id, b.ashby_scheduled_by_user_id];
+  check(
+    (b.source === 'ashby' && scheduleIds.every((id) => id !== null && id !== undefined))
+      || (b.source === 'public_page' && scheduleIds.every((id) => id === null)),
+    'chk_r1_meet_bookings_source_ids',
+  );
   check(
     (!ROUND_BOUND.includes(b.status) || (b.round_id !== null && b.candidate_id !== null))
       && (b.status !== 'unmatched_application' || (b.candidate_id === null && b.round_id === null))
@@ -314,6 +337,13 @@ export interface R1MeetFakeDb {
   /** The raw row (every column, `ticket_digest` and `candidate_id` included), or undefined. */
   booking(id: string): Row | undefined;
   seedBooking(row: Partial<Row>): Row;
+  /**
+   * A public-page booking (M035, 0143): `source = 'public_page'` and the Ashby columns other than the
+   * application id NULL (event, schedule, scheduler, stage, interview, updated_at). `row` may override
+   * any of them (a test of the 0143 CHECKs does). The calendar, manage and request columns of 0143 are
+   * not part of this port (S05/S06 extend it when they read them).
+   */
+  seedPublicBooking(row: Partial<Row>): Row;
   addRound(row?: Partial<Row>): Row;
   addSession(row: Partial<Row> & { interview_round_id: string }): Row;
   /** The attempt of a session (`interview_round_attempts`, keyed by `session_id`), as `r1_settle_attempt` leaves it. */
@@ -698,6 +728,7 @@ export function createR1MeetFakeDb(options: R1MeetFakeDbOptions = {}): R1MeetFak
         session_id: null,
         created_at: iso(now),
         updated_at: iso(now),
+        source: 'ashby',
       };
       tables.r1_meet_bookings.push(row);
     }
@@ -1327,6 +1358,7 @@ export function createR1MeetFakeDb(options: R1MeetFakeDbOptions = {}): R1MeetFak
     session_id: null,
     created_at: iso(clock()),
     updated_at: iso(clock()),
+    source: 'ashby',
   });
 
   const commit = (work: () => void): void => {
@@ -1363,6 +1395,18 @@ export function createR1MeetFakeDb(options: R1MeetFakeDbOptions = {}): R1MeetFak
         tables.r1_meet_bookings.push(booking);
       });
       return findBooking(booking.id)!;
+    },
+    seedPublicBooking(row) {
+      return fake.seedBooking({
+        source: 'public_page',
+        ashby_interview_event_id: null,
+        ashby_schedule_id: null,
+        ashby_scheduled_by_user_id: null,
+        ashby_interview_stage_id: null,
+        ashby_interview_id: null,
+        ashby_updated_at: null,
+        ...row,
+      });
     },
     addRound(row = {}) {
       const round: Row = {

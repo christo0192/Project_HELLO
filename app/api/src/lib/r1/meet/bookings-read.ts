@@ -11,14 +11,16 @@
  *                   owner filter, so a booking with no candidate is never theirs
  *   inactive user   nobody (refused before any read, as `requireAuth` also does)
  *
- * WHAT LEAVES. Exactly the ten fields of `R1_MEET_BOOKING_FIELDS`: no Meet URL, no ticket field, no
- * Ashby id, no attester, no Recall bot id, no session and no profile. Every column is named in the
- * select, and every row is projected field by field, so a column added to the table (or an embed)
- * can never reach a response. Timestamps come back as `toISOString()` instants.
+ * WHAT LEAVES. Exactly the eleven fields of `R1_MEET_BOOKING_FIELDS`: no Meet URL, no ticket field, no
+ * Ashby id, no attester, no Recall bot id, no session and no profile. The eleventh, `source` (M035),
+ * says where the booking came from (`ashby` or `public_page`); nothing else of 0143 is read (never the
+ * calendar, manage or request columns). Every column is named in the select, and every row is
+ * projected field by field, so a column added to the table (or an embed) can never reach a response.
+ * Timestamps come back as `toISOString()` instants.
  *
- * A row that is not what migration 0142 allows (an id that is not a uuid, a status or reason outside
- * the closed lists, an unparseable instant, a version that is not a whole number) fails the read as
- * `unavailable`: the route answers 503 and never a page that silently drops a booking.
+ * A row that is not what migrations 0142 and 0143 allow (an id that is not a uuid, a status, reason or
+ * source outside the closed lists, an unparseable instant, a version that is not a whole number) fails
+ * the read as `unavailable`: the route answers 503 and never a page that silently drops a booking.
  *
  * ORDER AND PAGES. By `start_at` ascending, then `id`: a total order. One read of `limit + 1` rows
  * per page; the extra row only says that there is a next page, whose keyset cursor is the last row
@@ -55,7 +57,20 @@ export const R1_MEET_BOOKING_STATUSES = Object.freeze([
 ] as const);
 export type R1MeetBookingStatus = (typeof R1_MEET_BOOKING_STATUSES)[number];
 
-/** The booking reasons, in the order of 0142's `chk_r1_meet_bookings_reason`. Frozen. */
+/**
+ * Where a booking came from, in the order of 0143's `chk_r1_meet_bookings_source` (M035): `ashby` is a
+ * slot HR scheduled in Ashby with Dex (M034), `public_page` one the candidate booked on the public R1
+ * booking page. Frozen.
+ */
+export const R1_MEET_BOOKING_SOURCES = Object.freeze(['ashby', 'public_page'] as const);
+export type R1MeetBookingSource = (typeof R1_MEET_BOOKING_SOURCES)[number];
+
+/**
+ * The booking reasons, in the order of 0143's `chk_r1_meet_bookings_reason` (M035): the 32 of 0142 in
+ * 0142's order, then the two of the public booking page, `candidate_cancelled` (a `cancelled` reason:
+ * the candidate cancelled with the link in their invite) and `invite_undeliverable` (a `failed`
+ * reason: Dex's calendar invite could not be sent). Frozen.
+ */
 export const R1_MEET_BOOKING_REASONS = Object.freeze([
   'dex_absent',
   'cancelled',
@@ -89,13 +104,18 @@ export const R1_MEET_BOOKING_REASONS = Object.freeze([
   'multiple_humans',
   'attempt_settled',
   'flag_off',
+  'candidate_cancelled',
+  'invite_undeliverable',
 ] as const);
 export type R1MeetBookingReason = (typeof R1_MEET_BOOKING_REASONS)[number];
 
 export const R1_MEET_BOOKINGS_DEFAULT_LIMIT = 50;
 export const R1_MEET_BOOKINGS_MAX_LIMIT = 100;
 
-/** Every field a booking answer carries, in answer order, and the only columns the read selects. */
+/**
+ * Every field a booking answer carries, in answer order, and the only columns the read selects.
+ * `source` (0143, M035) is the eleventh and last.
+ */
 export const R1_MEET_BOOKING_FIELDS = Object.freeze([
   'id',
   'candidate_id',
@@ -107,6 +127,7 @@ export const R1_MEET_BOOKING_FIELDS = Object.freeze([
   'created_at',
   'updated_at',
   'version',
+  'source',
 ] as const);
 
 /** What an admin or a viewer selects (pinned by `r1-meet-bookings-route.test.ts`). */
@@ -126,6 +147,8 @@ export interface R1MeetBookingView {
   readonly created_at: string;
   readonly updated_at: string;
   readonly version: number;
+  /** Where the booking came from: HR's Ashby schedule or the public R1 booking page (M035). */
+  readonly source: R1MeetBookingSource;
 }
 
 /** A keyset position: the last booking of the previous page. */
@@ -163,6 +186,7 @@ const NOT_FOUND = Object.freeze({ kind: 'not_found' as const });
 
 const STATUSES: ReadonlySet<string> = new Set(R1_MEET_BOOKING_STATUSES);
 const REASONS: ReadonlySet<string> = new Set(R1_MEET_BOOKING_REASONS);
+const SOURCES: ReadonlySet<string> = new Set(R1_MEET_BOOKING_SOURCES);
 const QUERY_KEYS: ReadonlySet<string> = new Set(['status', 'from', 'to', 'limit', 'cursor']);
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -260,7 +284,7 @@ export function parseR1MeetBookingsQuery(query: unknown): R1MeetBookingsQuery | 
   return Object.freeze({ status, from, to, limit, cursor });
 }
 
-/** One row as the answer carries it, or null when it is not what 0142 allows. */
+/** One row as the answer carries it, or null when it is not what 0142 and 0143 allow. */
 function projectBooking(row: unknown): R1MeetBookingView | null {
   if (!isPlainObject(row)) return null;
   const id = uuidOrNull(row.id);
@@ -270,7 +294,7 @@ function projectBooking(row: unknown): R1MeetBookingView | null {
   const endAt = canonicalInstant(row.end_at);
   const createdAt = canonicalInstant(row.created_at);
   const updatedAt = canonicalInstant(row.updated_at);
-  const { status, reason, version } = row;
+  const { status, reason, version, source } = row;
   if (
     typeof id !== 'string'
     || candidateId === undefined
@@ -286,6 +310,8 @@ function projectBooking(row: unknown): R1MeetBookingView | null {
     || typeof version !== 'number'
     || !Number.isSafeInteger(version)
     || version < 0
+    || typeof source !== 'string'
+    || !SOURCES.has(source)
   ) {
     return null;
   }
@@ -300,6 +326,7 @@ function projectBooking(row: unknown): R1MeetBookingView | null {
     created_at: createdAt,
     updated_at: updatedAt,
     version,
+    source: source as R1MeetBookingSource,
   });
 }
 

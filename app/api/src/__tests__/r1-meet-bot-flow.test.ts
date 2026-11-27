@@ -8,7 +8,8 @@
  *    disclosure pinned at bot join and re-sent at each participant join (M035 S09), no
  *    `google_meet` for the default guest bot, metadata = booking id + profile, no name or email;
  *  - the Idempotency-Key `r1-meet-<event>-v<version>-k<key_attempt>` from the booking as the LAST RPC
- *    left it;
+ *    left it; for a public-page booking (M035 S02) `r1-meet-pb-<booking>-v<version>-k<key_attempt>`,
+ *    with the same body (only `metadata.booking_id` differs), rotation, cap and attach compensation;
  *  - a lost answer retried returns the SAME bot under the SAME key; a cached 500, 400 or 402 is
  *    replayed under the old key and cured only by `rotate_key`; 409 in progress, 429, 507, 502..504,
  *    network and timeout keep the key; `key_attempts_exhausted` and a permanent 4xx fail the booking;
@@ -45,6 +46,50 @@ async function pendingBooking(h: R1MeetHarness, options: Parameters<R1MeetHarnes
 const creates = (h: R1MeetHarness) => h.requests.filter((request) => request.op === 'create');
 const keyOf = (eventId: string, version: number, keyAttempt: number) => `r1-meet-${eventId}-v${version}-k${keyAttempt}`;
 
+/** The exact create body of the happy path (D-S06-13): only `metadata.booking_id` names the booking. */
+function happyBody(bookingId: string, startAt: string): Record<string, unknown> {
+  return {
+    meeting_url: MEET_URL,
+    bot_name: 'Lexy',
+    join_at: new Date(Date.parse(startAt) - 120_000).toISOString(),
+    variant: { google_meet: 'web_4_core' },
+    automatic_leave: {
+      waiting_room_timeout: 600,
+      noone_joined_timeout: 900,
+      everyone_left_timeout: { timeout: 90 },
+      in_call_not_recording_timeout: 900,
+      in_call_recording_timeout: 2700,
+      bot_detection: {
+        using_participant_events: { timeout: 600, activate_after: 1200 },
+        using_participant_names: { matches: ['notetaker', 'recorder', 'assistant'], timeout: 600, activate_after: 7200 },
+      },
+    },
+    recording_config: {
+      transcript: null,
+      video_mixed_mp4: null,
+      meeting_metadata: null,
+      participant_events: {},
+      start_recording_on: 'participant_join',
+      retention: { type: 'timed', hours: 1 },
+      realtime_endpoints: [
+        { type: 'webhook', url: REALTIME_URL, events: ['participant_events.join', 'participant_events.leave'] },
+      ],
+    },
+    chat: {
+      on_bot_join: {
+        send_to: 'everyone',
+        message: 'Lexy is an AI interviewer from Interview Kickstart. This call is recorded.',
+        pin: true,
+      },
+      on_participant_join: {
+        message: 'Lexy is an AI interviewer from Interview Kickstart. This call is recorded.',
+        exclude_host: false,
+      },
+    },
+    metadata: { booking_id: bookingId, profile: 'r1_dex_sales' },
+  };
+}
+
 function expectNoPii(h: R1MeetHarness, ...values: string[]): void {
   const text = JSON.stringify(h.logs);
   for (const value of [...values, 'meet.google.com', '@', 'hello.example.test']) expect(text).not.toContain(value);
@@ -60,46 +105,7 @@ describe('ensureBot: the happy path', () => {
 
     const [create] = creates(h);
     expect(create!.headers['idempotency-key']).toBe(keyOf(b.eventId, 0, 0));
-    expect(create!.body).toEqual({
-      meeting_url: MEET_URL,
-      bot_name: 'Lexy',
-      join_at: new Date(Date.parse(startAt) - 120_000).toISOString(),
-      variant: { google_meet: 'web_4_core' },
-      automatic_leave: {
-        waiting_room_timeout: 600,
-        noone_joined_timeout: 900,
-        everyone_left_timeout: { timeout: 90 },
-        in_call_not_recording_timeout: 900,
-        in_call_recording_timeout: 2700,
-        bot_detection: {
-          using_participant_events: { timeout: 600, activate_after: 1200 },
-          using_participant_names: { matches: ['notetaker', 'recorder', 'assistant'], timeout: 600, activate_after: 7200 },
-        },
-      },
-      recording_config: {
-        transcript: null,
-        video_mixed_mp4: null,
-        meeting_metadata: null,
-        participant_events: {},
-        start_recording_on: 'participant_join',
-        retention: { type: 'timed', hours: 1 },
-        realtime_endpoints: [
-          { type: 'webhook', url: REALTIME_URL, events: ['participant_events.join', 'participant_events.leave'] },
-        ],
-      },
-      chat: {
-        on_bot_join: {
-          send_to: 'everyone',
-          message: 'Lexy is an AI interviewer from Interview Kickstart. This call is recorded.',
-          pin: true,
-        },
-        on_participant_join: {
-          message: 'Lexy is an AI interviewer from Interview Kickstart. This call is recorded.',
-          exclude_host: false,
-        },
-      },
-      metadata: { booking_id: b.id, profile: 'r1_dex_sales' },
-    });
+    expect(create!.body).toEqual(happyBody(b.id, startAt));
     // The default (guest) bot: no login group, so no google_meet block at all.
     expect('google_meet' in (create!.body as Record<string, unknown>)).toBe(false);
     // No candidate data in the body: no email, no candidate or round id.
@@ -499,5 +505,115 @@ describe('ensureBot: every attach refusal (D-S06-14)', () => {
     else expect(b.row()).toMatchObject(refusal.final);
     // The bot itself is untouched by this run: the release job removes it.
     expect(h.recall.bots.has(botId)).toBe(true);
+  });
+});
+
+describe('ensureBot: a public-page booking (M035 S02)', () => {
+  function publicBooking(h: R1MeetHarness, options: Parameters<R1MeetHarness['createPublicBooking']>[0] = {}) {
+    const created = h.createPublicBooking(options);
+    h.timeline.length = 0;
+    h.requests.length = 0;
+    h.logs.length = 0;
+    return { id: created.bookingId, applicationId: created.applicationId, row: () => h.db.booking(created.bookingId)! };
+  }
+  const publicKeyOf = (bookingId: string, version: number, keyAttempt: number) => `r1-meet-pb-${bookingId}-v${version}-k${keyAttempt}`;
+
+  it('the Ashby key stays the exact M034 string', async () => {
+    const h = createR1MeetHarness();
+    const b = await pendingBooking(h, { eventId: '7f000000-0000-4000-8000-0000000000e1' });
+    await expect(ensureBot(h.deps, b.id, h.meta())).resolves.toMatchObject({ code: 'bot_scheduled' });
+    expect(creates(h)[0]!.headers['idempotency-key']).toBe('r1-meet-7f000000-0000-4000-8000-0000000000e1-v0-k0');
+  });
+
+  it('creates under r1-meet-pb-<booking>-v0-k0 with the happy-path body, then attaches', async () => {
+    const h = createR1MeetHarness();
+    const b = publicBooking(h);
+    expect(b.row()).toMatchObject({ source: 'public_page', ashby_interview_event_id: null, ashby_schedule_id: null });
+    const startAt = b.row().start_at as string;
+
+    await expect(ensureBot(h.deps, b.id, h.meta())).resolves.toEqual({ outcome: 'done', receipt: 'processed', code: 'bot_scheduled' });
+
+    const [create] = creates(h);
+    expect(create!.headers['idempotency-key']).toBe(publicKeyOf(b.id, 0, 0));
+    expect(create!.headers['idempotency-key']).toMatch(/^r1-meet-pb-[0-9a-f-]{36}-v0-k0$/);
+    // The same body as an Ashby booking's: only metadata.booking_id names this booking.
+    expect(create!.body).toEqual(happyBody(b.id, startAt));
+    const text = JSON.stringify(create!.body);
+    expect(text).not.toContain('@');
+    expect(text).not.toContain(b.row().candidate_id as string);
+    expect(text).not.toContain(b.row().round_id as string);
+    expect(text).not.toContain(b.applicationId);
+
+    const [bot] = [...h.recall.bots.keys()];
+    expect(b.row()).toMatchObject({ status: 'bot_scheduled', reason: 'eligible', recall_bot_id: bot, version: 0, key_attempt: 0, source: 'public_page' });
+    expect(h.timeline).toEqual(['recall:create', 'db:set_bot:attach']);
+    expectNoPii(h, b.id, bot!, b.applicationId);
+  });
+
+  it('a cached 500 rotates the key first and is cured under -k1', async () => {
+    const h = createR1MeetHarness();
+    const b = publicBooking(h);
+    h.recall.failNext(500);
+    await expect(ensureBot(h.deps, b.id, h.meta())).resolves.toEqual({
+      outcome: 'defer',
+      code: 'r1_meet_recall_unavailable',
+      delaySeconds: 10,
+    });
+    expect(h.timeline).toEqual(['recall:create', 'db:set_bot:rotate_key']);
+    expect(b.row()).toMatchObject({ status: 'pending', version: 0, key_attempt: 1 });
+    const body = creates(h)[0]!.body as Parameters<typeof h.client.createBot>[0];
+    await expect(h.client.createBot(body, { idempotencyKey: publicKeyOf(b.id, 0, 0) })).rejects.toMatchObject({
+      httpStatus: 500,
+      rotateIdempotencyKey: true,
+    });
+
+    await expect(ensureBot(h.deps, b.id, h.meta({ deferCount: 1 }))).resolves.toMatchObject({ code: 'bot_scheduled' });
+    expect(creates(h).map((request) => request.headers['idempotency-key'])).toEqual([
+      publicKeyOf(b.id, 0, 0),
+      publicKeyOf(b.id, 0, 0),
+      publicKeyOf(b.id, 0, 1),
+    ]);
+    expect(h.recall.bots.size).toBe(1);
+  });
+
+  it('at the daily cap: rotate_key, then blocked/bot_cap_reached with an alert, and no Recall call', async () => {
+    const h = createR1MeetHarness({ config: { dailyBotCap: 1 } });
+    const b = publicBooking(h, { startAt: '2030-01-02T10:00:00.000Z' });
+    // One bot already used that IST day, by an Ashby booking: the cap counts both sources.
+    const round = h.db.addRound();
+    h.db.seedBooking({
+      round_id: round.id,
+      start_at: '2030-01-02T09:00:00.000Z',
+      end_at: '2030-01-02T09:30:00.000Z',
+      status: 'bot_scheduled',
+      recall_bot_id: fixtureId(),
+    });
+
+    await expect(ensureBot(h.deps, b.id, h.meta())).resolves.toEqual({ outcome: 'done', receipt: 'processed', code: 'bot_cap_reached' });
+    expect(h.timeline).toEqual(['db:set_bot:rotate_key', 'db:transition:blocked']);
+    expect(b.row()).toMatchObject({ status: 'blocked', reason: 'bot_cap_reached', recall_bot_id: null, key_attempt: 1 });
+    expect(h.requests).toEqual([]);
+    expect(h.alerts()).toEqual(['r1_meet_bot_cap_reached']);
+    expectNoPii(h, b.id, b.applicationId);
+  });
+
+  it('an attach refusal queues the bot_release of the bot it made, before anything else', async () => {
+    const h = createR1MeetHarness();
+    const b = publicBooking(h);
+    let botId = '';
+    h.afterRecall = (op, response) => {
+      if (op !== 'create') return;
+      botId = (response as { id: string }).id;
+      b.row().version = 1;
+    };
+    await expect(ensureBot(h.deps, b.id, h.meta())).resolves.toMatchObject({ code: 'attach_version_conflict' });
+    expect(h.db.jobs('bot_release').map((job) => [job.payload, job.dedup_key, job.max_attempts])).toEqual([
+      [{ kind: 'bot_release', recall_bot_id: botId, booking_id: b.id }, `r1-meet:bot-release:${botId}`, 10],
+    ]);
+    const attachAt = h.timeline.indexOf('db:set_bot:attach');
+    expect(h.timeline[attachAt + 1]).toBe('queue:bot_release');
+    expect(b.row()).toMatchObject({ status: 'pending', recall_bot_id: null });
+    expect(h.recall.bots.has(botId)).toBe(true);
+    expect(creates(h)[0]!.headers['idempotency-key']).toBe(publicKeyOf(b.id, 0, 0));
   });
 });
