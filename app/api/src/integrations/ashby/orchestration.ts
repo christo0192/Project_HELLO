@@ -63,11 +63,28 @@ export interface ApplicationReader {
 }
 
 /**
- * 0130 (ADR-0018): how an Ashby application is screened. Every link starts as
- * `resume_parsing`; only `apply_ashby_candidate_profile` stamps
- * `phone_parsing`, and never flips it back.
+ * 0130 + 0144: how an Ashby application is screened, in the order of the
+ * links' `intake_type` CHECK (0144 §1). Every link this pipeline creates
+ * starts as `resume_parsing`; only `apply_ashby_candidate_profile` stamps
+ * `phone_parsing`, and never flips it back (ADR-0018). `r1_public_booking`
+ * is written only by the M035 public booking import (an application the
+ * public R1 booking page imported on the spot) and never changes (0144 §2):
+ * this pipeline never re-imports, ingests or profiles such a link.
  */
-export type AshbyIntakeType = 'resume_parsing' | 'phone_parsing';
+export const ASHBY_INTAKE_TYPES = Object.freeze(['resume_parsing', 'phone_parsing', 'r1_public_booking'] as const);
+export type AshbyIntakeType = (typeof ASHBY_INTAKE_TYPES)[number];
+
+/**
+ * The two intakes Christy screens (0130). The phone-screening RPCs and every
+ * staff projection use this vocabulary, so an `r1_public_booking` link reads
+ * there as null and the OpenAPI enums stay the 0130 pair.
+ */
+export type AshbyScreeningIntakeType = Exclude<AshbyIntakeType, 'r1_public_booking'>;
+
+/** True for exactly the three values of the 0144 intake CHECK. */
+export function isAshbyIntakeType(value: unknown): value is AshbyIntakeType {
+  return typeof value === 'string' && (ASHBY_INTAKE_TYPES as readonly string[]).includes(value);
+}
 
 /** 0130 §1: the closed `profile_outcome` vocabulary on the link (a CHECK). */
 export type AshbyProfileOutcome =
@@ -99,7 +116,8 @@ export type AshbyProfileSkipReason = 'number_invalid' | 'number_placeholder' | '
  */
 export interface AshbyCandidateProfileInput {
   applicationLinkId: string;
-  intake: AshbyIntakeType;
+  /** The 0130 §5 RPC accepts only the two screening intakes. */
+  intake: AshbyScreeningIntakeType;
   /** Sanitised name. Sent for `phone_parsing` only. */
   name?: string | null;
   /** Bounded email. Sent for `phone_parsing` only. */
@@ -142,7 +160,7 @@ export interface ExistingLinkRow {
    * opaque identifier; never logged.
    */
   externalCandidateId?: string | null;
-  /** 0130 (ADR-0018): the link's intake, if the store surfaces it. */
+  /** 0130 + 0144: the link's intake (any of the three), if the store surfaces it. */
   intakeType?: AshbyIntakeType;
 }
 
@@ -475,7 +493,7 @@ export interface WorkflowLinkRow {
   inviteId: string | null;
   lifecycle: string;
   terminalState: 'withdrawn' | 'deleted' | 'manual_stage_cancel' | null;
-  /** 0130 (ADR-0018): the link's intake, if the store surfaces it. */
+  /** 0130 + 0144: the link's intake (any of the three), if the store surfaces it. */
   intakeType?: AshbyIntakeType;
 }
 
@@ -592,6 +610,12 @@ export async function runImport(externalApplicationId: string, deps: ImportDeps)
 
   const existing = await deps.stores.findLinkByApplicationId(appId);
   if (existing?.terminalState) return { status: 'skipped', reason: 'terminal' };
+  // 0144: the M035 public booking import owns this application. No stage
+  // webhook, reconciliation or backlog run may seed an ingestion, bind a
+  // resume, materialize a shell or enqueue an operation for it, so this
+  // returns before every read and write below (the mapping, the intake
+  // admission, candidate.info, the binds, the link, the ingestion row).
+  if (existing?.intakeType === 'r1_public_booking') return { status: 'skipped', reason: 'r1_public_booking' };
 
   const jobId = view.jobId;
   if (!jobId) return { status: 'skipped', reason: 'no_job' };

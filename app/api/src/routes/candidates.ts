@@ -31,7 +31,7 @@ import {
 import { createLogger } from '../lib/logger.js';
 import { chunkIds, mapChunks, POSTGREST_MAX_ROWS, readAllPages } from '../lib/id-batches.js';
 import { projectIntakeType } from '../integrations/ashby/candidate-workflow.js';
-import type { AshbyIntakeType } from '../integrations/ashby/orchestration.js';
+import type { AshbyScreeningIntakeType } from '../integrations/ashby/orchestration.js';
 
 const candidateLogger = createLogger('candidates');
 
@@ -460,11 +460,12 @@ export function projectResumeReview(state: unknown): ResumeReview | null {
 }
 
 /**
- * M017 (ADR-0018): how a candidate entered screening. The two values of the
- * Ashby link's `intake_type` CHECK (0130); `phone_parsing` is an application
- * with no resume, whose name and number came from Ashby itself.
+ * M017 (ADR-0018): how a candidate entered screening. The two screening
+ * intakes of the Ashby link's `intake_type` CHECK (0130); `phone_parsing` is
+ * an application with no resume, whose name and number came from Ashby
+ * itself. An `r1_public_booking` link (0144) reads as null.
  */
-export type IntakeType = AshbyIntakeType;
+export type IntakeType = AshbyScreeningIntakeType;
 
 /**
  * M017 Addendum A: the ONE intake rule, shared by the list and the detail.
