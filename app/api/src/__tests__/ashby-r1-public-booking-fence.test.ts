@@ -437,6 +437,9 @@ describe('3. the import handler logs the skip and does nothing else', () => {
       expect(skipped).toHaveLength(1);
       expect({ error_category: skipped[0]!.error_category, error_type: skipped[0]!.error_type })
         .toEqual({ error_category: 'ashby_import_skipped', error_type: R1 });
+      // S12 fix round F2: a WARNING, not info. HR moving such an application into the
+      // AI-screening stage may expect Christy to start, and she never will.
+      expect(skipped[0]!.level).toBe('warn');
       expectNoIds(lines);
     });
   }

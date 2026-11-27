@@ -3,11 +3,12 @@
  * import, and the fences that keep such an import away from resume ingestion, the Ashby profile
  * step and the phone lane). The behavioural SQL assertions run in supabase-ci
  * (app/supabase/tests/r1_meet_public_import_assert.sql); these text-level checks keep the file
- * dark, additive, independent of 0143, keep the lifted claim_ashby_profile_due and
- * v_ashby_application_impact equal to their 0130 and 0140 declarations plus exactly one marked
- * hunk each, keep the local lookup RPC in step with the S04 store that reads it, and keep the
- * import RPC's order, writes and answers to the contract (link first, then the shell; never an
- * ingestion, an engagement or any other row).
+ * dark, additive, independent of 0143, keep the lifted claim_ashby_profile_due,
+ * v_ashby_application_impact and v_funnel_candidate equal to their 0130, 0140 and 0122
+ * declarations plus exactly one marked hunk each, keep the local lookup RPC in step with the S04
+ * store that reads it, keep the import RPC's order, writes and answers to the contract (link
+ * first, then the shell; never an ingestion, an engagement or any other row; one R1 per Ashby
+ * person), and keep the book path's person check in step with its store (person-store.ts).
  */
 
 import { describe, expect, it } from 'vitest';
@@ -22,6 +23,11 @@ import {
   R1_PUBLIC_LOCAL_ROWS_RPC,
   R1_PUBLIC_LOCAL_ROW_COLUMNS,
 } from '../lib/r1/meet/public/match-store.js';
+import {
+  R1_PUBLIC_PERSON_R1_INVALID_FIELDS,
+  R1_PUBLIC_PERSON_R1_REFUSAL_CODES,
+  R1_PUBLIC_PERSON_R1_RPC,
+} from '../lib/r1/meet/public/person-store.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const migrations = path.resolve(here, '../../../supabase/migrations');
@@ -169,12 +175,25 @@ const VIEW_0140 = slice(M0140, VIEW_START, VIEW_END);
 const VIEW_0144 = slice(sql, VIEW_START, VIEW_END);
 const VIEW = stripHunks(VIEW_0144);
 
-/** §6 and §7: the two RPCs, as written and as executable text. */
+/** §8: the Christy funnel view as 0122 and 0144 declare it (from its header through `from base;`). */
+const M0122 = lf(readFileSync(path.join(migrations, '0122_r1_scorer.sql'), 'utf8'));
+const FUNNEL_START = 'create or replace view screening_v2.v_funnel_candidate';
+const FUNNEL_END = '\n  from base;\n';
+const FUNNEL_0122 = slice(M0122, FUNNEL_START, FUNNEL_END);
+const FUNNEL_0144 = slice(sql, FUNNEL_START, FUNNEL_END);
+const FUNNEL = stripHunks(FUNNEL_0144);
+
+/** §6, §7 and §9: the three RPCs, as written and as executable text. */
 const LOCAL_ROWS_RAW = bodyIn(sql, R1_PUBLIC_LOCAL_ROWS_RPC);
 const LOCAL_ROWS = flat(LOCAL_ROWS_RAW);
 const IMPORT_RPC = 'r1_meet_public_import_application';
 const IMPORT_RAW = bodyIn(sql, IMPORT_RPC);
 const IMPORT = flat(IMPORT_RAW);
+const PERSON_RAW = bodyIn(sql, R1_PUBLIC_PERSON_R1_RPC);
+const PERSON = flat(PERSON_RAW);
+
+/** 0143 §12's "this person has done R1" predicate, as the import and the person check both spell it. */
+const R1_DONE = "r.kind = 'sales_r1' and (r.status = 'completed' or r.attempts_counted > 0)";
 
 /** The import RPC's parameters, its invalid_request fields and its refusal codes (contracts §4.2, §9). */
 const IMPORT_PARAMETERS = [
@@ -214,7 +233,7 @@ const firstSeen = (values: readonly string[]): string[] => [...new Set(values)];
 
 /** Every `'<key>', '<value>'` literal pair's value for one key, in order. */
 function literalsOf(body: string, key: string): string[] {
-  return [...body.matchAll(new RegExp(`'${key}', '([a-z_]+)'`, 'g'))].map((m) => m[1]!);
+  return [...body.matchAll(new RegExp(`'${key}', '([a-z0-9_]+)'`, 'g'))].map((m) => m[1]!);
 }
 
 /** Every `return jsonb_build_object(...)` of a body: its keys and values, in order. */
@@ -294,12 +313,30 @@ describe('migration 0144: file and frame', () => {
     expect(header).toContain('R1_MEET_PUBLIC_BOOKING_ENABLED (default OFF');
     expect(header).toContain(
       'Redeclares (lifted in full, ONE marked hunk each): claim_ashby_profile_due (0130 §6), ' +
-        'v_ashby_application_impact (0140 §2). References no 0143 object.',
+        'v_ashby_application_impact (0140 §2), v_funnel_candidate (0122 §8). References no 0143 object.',
     );
   });
 
+  it('states its lock order: the links table first, then the engagement and ingestion tables (S12 fix round F5)', () => {
+    const header = sql
+      .slice(0, sql.indexOf("set local lock_timeout = '10s';"))
+      .replace(/^--[ \t]?/gm, '')
+      .replace(/\s+/g, ' ');
+    expect(header).toContain('Lock order. §1 takes ACCESS EXCLUSIVE on ashby_application_links and holds it to commit');
+    expect(header).toContain("Links before engagements is the phone lane's own order");
+    // The order the header states is the order of the statements.
+    const links = code.indexOf(`alter table ${LINKS} drop constraint if exists ${INTAKE_CHECK};`);
+    const engagements = code.indexOf('create trigger trg_phone_engagements_r1_public_booking ');
+    const ingestions = code.indexOf('create trigger trg_ashby_resume_ingestions_r1_public_booking ');
+    expect(links).toBeGreaterThan(-1);
+    expect(links).toBeLessThan(engagements);
+    expect(engagements).toBeLessThan(ingestions);
+    // ... and no statement before §1 locks another table.
+    expect(code.slice(0, links)).toBe("set local lock_timeout = '10s'; ");
+  });
+
   it('keeps its sections in order, each between two dash rules', () => {
-    const markers = ['-- §1. ', '-- §2. ', '-- §3. ', '-- §4. ', '-- §5. ', '-- §6. ', '-- §7. ', '-- §90. '];
+    const markers = ['-- §1. ', '-- §2. ', '-- §3. ', '-- §4. ', '-- §5. ', '-- §6. ', '-- §7. ', '-- §8. ', '-- §9. ', '-- §90. '];
     const lines = sql.split('\n');
     let last = -1;
     for (const marker of markers) {
@@ -407,10 +444,10 @@ describe('migration 0144 §4: claim_ashby_profile_due is the 0130 claim plus one
   it('has exactly one hunk, M035-S12-a, whose code is the intake filter', () => {
     expect(CLAIM.tags).toEqual(['M035-S12-a']);
     expect(withoutComments(CLAIM.hunks['M035-S12-a']!).trim()).toBe("and l.intake_type <> 'r1_public_booking'");
-    // The file holds exactly two hunks: this one (§4) and the impact view's (§5).
-    expect(stripHunks(sql).tags).toEqual(['M035-S12-a', 'M035-S12-b']);
-    expect(sql.split('▼ 0144')).toHaveLength(3);
-    expect(sql.split('▲ 0144')).toHaveLength(3);
+    // The file holds exactly three hunks: this one (§4), the impact view's (§5) and the funnel view's (§8).
+    expect(stripHunks(sql).tags).toEqual(['M035-S12-a', 'M035-S12-b', 'M035-S12-c']);
+    expect(sql.split('▼ 0144')).toHaveLength(4);
+    expect(sql.split('▲ 0144')).toHaveLength(4);
   });
 
   it('places the hunk right after the lifecycle filter, inside the due CTE', () => {
@@ -683,6 +720,7 @@ describe('migration 0144 §7: r1_meet_public_import_application, the on-the-spot
       'ashby_erased_application_links',
       'decision_use_blocked_at',
       "where l.provider = 'ashby' and l.external_application_id = p_ashby_application_id;",
+      'join screening_v2.interview_rounds r',
       'from screening_v2.ashby_job_mappings',
       'insert into screening_v2.ashby_application_links',
       'insert into screening_v2.candidates',
@@ -717,6 +755,27 @@ describe('migration 0144 §7: r1_meet_public_import_application, the on-the-spot
         `${person} and c.decision_use_blocked_at is not null ) then return jsonb_build_object('status', 'refused', 'code', 'candidate_ineligible');`,
     );
     expect(IMPORT.indexOf("'code', 'dsar_hold'")).toBeLessThan(IMPORT.indexOf("'code', 'candidate_ineligible'"));
+  });
+
+  it('one R1 per Ashby person: after the adoption, a person with a completed or counted sales_r1 round is candidate_ineligible (S12 fix round F3)', () => {
+    const rule =
+      'if exists ( select 1 from screening_v2.ashby_application_links l join screening_v2.interview_rounds r ' +
+      "on r.candidate_id = l.candidate_id where l.provider = 'ashby' and lower(l.external_candidate_id) = " +
+      `lower(p_ashby_candidate_id) and ${R1_DONE} ) then ` +
+      "return jsonb_build_object('status', 'refused', 'code', 'candidate_ineligible'); end if;";
+    expect(IMPORT).toContain(rule);
+    expect(IMPORT.split('screening_v2.interview_rounds')).toHaveLength(2);
+    // After the adoption (an existing link is the book path's to decide) and before the mapping.
+    const adopted = IMPORT.indexOf("'status', 'exists'");
+    expect(adopted).toBeGreaterThan(-1);
+    expect(IMPORT.indexOf(rule)).toBeGreaterThan(adopted);
+    expect(IMPORT.indexOf(rule)).toBeLessThan(IMPORT.indexOf('from screening_v2.ashby_job_mappings'));
+    // The very predicate 0143 §12 uses for r1_completed.
+    const M0143 = '0143_r1_meet_public_bookings.sql';
+    if (existsSync(path.join(migrations, M0143))) {
+      const refusal = flat(bodyIn(lf(readFileSync(path.join(migrations, M0143), 'utf8')), 'r1_meet_public_refusal'));
+      expect(refusal).toContain("r.kind = 'sales_r1' and (r.status = 'completed' or r.attempts_counted > 0)");
+    }
   });
 
   it('adopts an existing link unchanged: terminal_state only makes it terminal, no candidate makes it unbound', () => {
@@ -766,6 +825,153 @@ describe('migration 0144 §7: r1_meet_public_import_application, the on-the-spot
       'returning id into v_candidate_id; update screening_v2.ashby_application_links set candidate_id = v_candidate_id, ' +
         'updated_at = p_now where id = v_link_id;',
     );
+  });
+});
+
+describe('migration 0144 §8: v_funnel_candidate is the 0122 view plus one marked hunk (S12 fix round F1)', () => {
+  const HUNK =
+    "where not (exists (select 1 from screening_v2.ashby_application_links pb where pb.candidate_id = c.id and " +
+    "pb.intake_type = 'r1_public_booking') and not exists (select 1 from screening_v2.ashby_application_links ol " +
+    "where ol.candidate_id = c.id and ol.intake_type <> 'r1_public_booking'))";
+
+  it('is byte-identical to the 0122 view once the hunk is removed', () => {
+    expect(FUNNEL.residue).toBe(FUNNEL_0122);
+  });
+
+  it('has exactly one hunk, M035-S12-c, whose code leaves out a candidate whose only links are r1_public_booking', () => {
+    expect(FUNNEL.tags).toEqual(['M035-S12-c']);
+    expect(flat(FUNNEL.hunks['M035-S12-c']!)).toBe(HUNK);
+  });
+
+  it('gives the base CTE its WHERE, right after the last join (the CTE had none)', () => {
+    const lines = FUNNEL_0144.split('\n');
+    const open = lines.findIndex((line) => line.includes('-- ▼ 0144 M035-S12-c'));
+    expect(lines[open - 1]).toBe('    left join refchk     on refchk.candidate_id = c.id');
+    const close = lines.findIndex((line) => line.includes('-- ▲ 0144 M035-S12-c'));
+    expect(lines[close + 1]).toBe('  )');
+    const base = FUNNEL_0122.slice(FUNNEL_0122.indexOf('  base as ('), FUNNEL_0122.indexOf('\n  )\n', FUNNEL_0122.indexOf('  base as (')));
+    expect(base).not.toMatch(/\bwhere\b/);
+    // The output columns are the 0122 ones: the select list is untouched.
+    expect(FUNNEL_0144.slice(FUNNEL_0144.lastIndexOf('  select\n    base.*,'))).toBe(
+      FUNNEL_0122.slice(FUNNEL_0122.lastIndexOf('  select\n    base.*,')),
+    );
+  });
+
+  it('still runs as its caller', () => {
+    expect(FUNNEL_0144.startsWith(`${FUNNEL_START}\n  with (security_invoker = true) as\n`)).toBe(true);
+  });
+
+  it('keeps the 0122 revoke and grant lines verbatim, once, after the view and its comment', () => {
+    const grants = slice(M0122, 'revoke all on screening_v2.v_funnel_candidate from', 'to service_role;\n');
+    expect(grants.split('\n')).toHaveLength(3);
+    expect(sql.split(grants)).toHaveLength(2);
+    const comment = sql.indexOf('comment on view screening_v2.v_funnel_candidate is');
+    expect(comment).toBeGreaterThan(sql.indexOf(FUNNEL_0144));
+    expect(sql.indexOf(grants)).toBeGreaterThan(comment);
+  });
+
+  it('keeps the 0122 comment and appends the 0144 sentence', () => {
+    const anchor = 'comment on view screening_v2.v_funnel_candidate is\n';
+    expect(commentText(sql, anchor)).toBe(
+      `${commentText(M0122, anchor)} 0144 (M035 S12): a candidate the public R1 booking page imported ` +
+        '(its only Ashby links are r1_public_booking) is left out.',
+    );
+  });
+
+  it('up to 0144 only 0090, 0122 and 0144 declare the view, so 0144 is the declaration a later change lifts from', () => {
+    const declaring = readdirSync(migrations)
+      .filter((name) => /^\d{4}_.*\.sql$/.test(name) && name <= FILE)
+      .sort()
+      .filter((name) => lf(readFileSync(path.join(migrations, name), 'utf8')).includes(FUNNEL_START));
+    expect(declaring).toEqual(['0090_funnel_observability.sql', '0122_r1_scorer.sql', FILE]);
+  });
+
+  it('the rollup and the HR state still read this view and the unchanged 0122 HR state view', () => {
+    // refresh_funnel_rollup (0098) is not redeclared: it reads the view by name, so the hunk reaches it.
+    expect(sql).not.toContain('create or replace function screening_v2.refresh_funnel_rollup');
+    expect(sql).not.toContain('create or replace view screening_v2.v_funnel_hr_state');
+    const m0098 = lf(readFileSync(path.join(migrations, '0098_funnel_hr_disposition.sql'), 'utf8'));
+    expect(flat(bodyIn(m0098, 'refresh_funnel_rollup'))).toContain('from screening_v2.v_funnel_candidate where cohort_day >= v_window_start');
+  });
+});
+
+describe('migration 0144 §9: r1_meet_public_person_r1_check, one R1 per Ashby person on the book path (S12 fix round F3)', () => {
+  it('has the exact header: two parameters, stable, security definer, pinned search_path', () => {
+    expect(PERSON_RAW.startsWith(
+      `create or replace function screening_v2.${R1_PUBLIC_PERSON_R1_RPC}(\n` +
+        '  p_candidate_id uuid,\n' +
+        '  p_ashby_application_id text\n' +
+        ')\n' +
+        'returns jsonb\n' +
+        'language plpgsql\n' +
+        'stable\n' +
+        'security definer\n' +
+        'set search_path = pg_catalog, screening_v2\n' +
+        'as $$\n',
+    )).toBe(true);
+    expect(R1_PUBLIC_PERSON_R1_RPC).toBe('r1_meet_public_person_r1_check');
+  });
+
+  it('is service-role only, in two one-line statements, with a 0144 comment', () => {
+    expect(sql).toContain(
+      `\nrevoke all on function screening_v2.${R1_PUBLIC_PERSON_R1_RPC}(uuid, text) from public, anon, authenticated;\n`,
+    );
+    expect(sql).toContain(`\ngrant execute on function screening_v2.${R1_PUBLIC_PERSON_R1_RPC}(uuid, text) to service_role;\n`);
+    expect(code).not.toMatch(
+      /grant [a-z ,]+ on function screening_v2\.r1_meet_public_person_r1_check\([^)]*\) to [a-z_, ]*\b(anon|authenticated|public)\b/,
+    );
+    const comment = commentText(sql, `comment on function screening_v2.${R1_PUBLIC_PERSON_R1_RPC}(uuid, text) is\n`);
+    expect(comment).toMatch(/^0144 \(M035 S12 fix round\): /);
+    expect(comment).toContain('Service-role only.');
+  });
+
+  it('answers eligible, the two refusal codes and the two fields of the store, each with exactly its keys', () => {
+    expect(firstSeen(literalsOf(PERSON, 'status'))).toEqual(['invalid_request', 'refused', 'eligible']);
+    expect(literalsOf(PERSON, 'field')).toEqual([...R1_PUBLIC_PERSON_R1_INVALID_FIELDS]);
+    expect(literalsOf(PERSON, 'code')).toEqual([...R1_PUBLIC_PERSON_R1_REFUSAL_CODES]);
+    expect(answers(PERSON)).toEqual([
+      { keys: ['status', 'field'], values: ["'invalid_request'", "'candidate_id'"] },
+      { keys: ['status', 'field'], values: ["'invalid_request'", "'application_id'"] },
+      { keys: ['status', 'code'], values: ["'refused'", "'application_unknown'"] },
+      { keys: ['status', 'code'], values: ["'refused'", "'r1_completed'"] },
+      { keys: ['status'], values: ["'eligible'"] },
+    ]);
+    expect(PERSON.split('return ')).toHaveLength(6);
+  });
+
+  it('validates the candidate first, then the UUID-shaped application id (the 0143 precheck shape)', () => {
+    expect(PERSON).toContain(
+      "if p_candidate_id is null then return jsonb_build_object('status', 'invalid_request', 'field', 'candidate_id'); end if; " +
+        "if p_ashby_application_id is null or p_ashby_application_id !~* c_uuid then " +
+        "return jsonb_build_object('status', 'invalid_request', 'field', 'application_id'); end if;",
+    );
+    expect(PERSON).toContain("c_uuid constant text := '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';");
+  });
+
+  it('reads the link verbatim and bound to this candidate, else application_unknown', () => {
+    expect(PERSON).toContain(
+      'select l.candidate_id, l.external_candidate_id into v_link_candidate, v_person from screening_v2.ashby_application_links l ' +
+        "where l.provider = 'ashby' and l.external_application_id = p_ashby_application_id; v_found := found; " +
+        'if not v_found or v_link_candidate is distinct from p_candidate_id then ' +
+        "return jsonb_build_object('status', 'refused', 'code', 'application_unknown'); end if;",
+    );
+  });
+
+  it("refuses r1_completed for the person's OTHER candidates only, with 0143 §12's predicate, case ignored", () => {
+    expect(PERSON).toContain(
+      'if v_person is not null and exists ( select 1 from screening_v2.ashby_application_links l2 ' +
+        'join screening_v2.interview_rounds r on r.candidate_id = l2.candidate_id ' +
+        "where l2.provider = 'ashby' and lower(l2.external_candidate_id) = lower(v_person) " +
+        `and l2.candidate_id <> p_candidate_id and ${R1_DONE} ) then ` +
+        "return jsonb_build_object('status', 'refused', 'code', 'r1_completed'); end if;",
+    );
+  });
+
+  it('writes, raises, locks, performs and reads the clock nothing', () => {
+    const body = PERSON.toLowerCase().replace(/'(?:[^']|'')*'/g, "''");
+    expect(body).not.toMatch(/\b(insert|update|delete|truncate|merge|raise|perform|execute)\b/);
+    expect(body).not.toMatch(/\bfor (share|update|no key update|key share)\b/);
+    expect(withoutComments(PERSON_RAW)).not.toMatch(MACHINE_CLOCK);
   });
 });
 
@@ -826,6 +1032,7 @@ describe('migration 0144: additive and dark', () => {
       'claim_ashby_profile_due',
       'r1_meet_public_local_rows',
       'r1_meet_public_import_application',
+      'r1_meet_public_person_r1_check',
     ]);
     for (const m of bodies) {
       expect(withoutComments(m[0]), m[1]).not.toMatch(MACHINE_CLOCK);
@@ -901,8 +1108,8 @@ describe('migration 0144: SQL test wiring (T3)', () => {
     const rel = 'app/supabase/tests/r1_meet_public_bookings_assert.sql';
     if (!existsSync(path.join(repo, rel))) return;
     const suite0143 = read(rel);
-    const declared = [...lc.matchAll(/create or replace function screening_v2\.(r1_meet_public_[a-z_]+)\(/g)].map((m) => m[1]!);
-    expect(declared).toEqual(['r1_meet_public_local_rows', 'r1_meet_public_import_application']);
+    const declared = [...lc.matchAll(/create or replace function screening_v2\.(r1_meet_public_[a-z0-9_]+)\(/g)].map((m) => m[1]!);
+    expect(declared).toEqual(['r1_meet_public_local_rows', 'r1_meet_public_import_application', 'r1_meet_public_person_r1_check']);
     const exclusion =
       `        and x.proname not in (${declared.map((n) => `'${n}'`).join(', ')})\n`
       + "        and x.proname like 'r1\\_meet\\_public\\_%')";
@@ -959,6 +1166,10 @@ describe('migration 0144: SQL test wiring (T3)', () => {
       'impact_application_rows',
       R1_PUBLIC_LOCAL_ROWS_RPC,
       IMPORT_RPC,
+      R1_PUBLIC_PERSON_R1_RPC,
+      'v_funnel_candidate',
+      'refresh_funnel_rollup',
+      'funnel_stage_daily',
       'advance_ashby_ingestion',
       'apply_ashby_candidate_profile',
       'ensure_ashby_phone_engagement',
@@ -970,14 +1181,17 @@ describe('migration 0144: SQL test wiring (T3)', () => {
     for (const guard of GUARDS) expect(assertions, guard.fn).toContain(`'${guard.message}'`);
     for (const field of IMPORT_FIELDS) expect(statements, field).toContain(`('${field}', '`);
     for (const code of IMPORT_CODES) expect(statements, code).toContain(`"code":"${code}"`);
+    for (const code of R1_PUBLIC_PERSON_R1_REFUSAL_CODES) expect(statements, code).toContain(`"code":"${code}"`);
+    for (const field of R1_PUBLIC_PERSON_R1_INVALID_FIELDS) expect(statements, field).toContain(`"field":"${field}"`);
     for (const key of R1_PUBLIC_LOCAL_ROW_COLUMNS) expect(statements, key).toContain(`'${key}'`);
     for (const value of INTAKE_VALUES) expect(statements, value).toContain(`'${value}'`);
   });
 
-  it('keeps sections A to G in order', () => {
+  it('keeps sections A to I in order', () => {
     let at = -1;
     for (const label of ['A. Catalog posture.', 'B. The intake lock', 'C. The two insert guards', 'D. claim_ashby_profile_due',
-      'E. The business-impact read model', 'F. r1_meet_public_local_rows', 'G. r1_meet_public_import_application']) {
+      'E. The business-impact read model', 'F. r1_meet_public_local_rows', 'G. r1_meet_public_import_application',
+      'H. The Christy phone funnel', 'I. r1_meet_public_person_r1_check']) {
       const next = assertions.indexOf(`\n-- ${label}`);
       expect(next, label).toBeGreaterThan(at);
       at = next;

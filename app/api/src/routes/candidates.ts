@@ -31,9 +31,19 @@ import {
 import { createLogger } from '../lib/logger.js';
 import { chunkIds, mapChunks, POSTGREST_MAX_ROWS, readAllPages } from '../lib/id-batches.js';
 import { projectIntakeType } from '../integrations/ashby/candidate-workflow.js';
-import type { AshbyScreeningIntakeType } from '../integrations/ashby/orchestration.js';
+import {
+  isR1PublicBookingEngagementRefusal,
+  type AshbyScreeningIntakeType,
+} from '../integrations/ashby/orchestration.js';
 
 const candidateLogger = createLogger('candidates');
+
+/**
+ * 0144 (M035 S12 fix round F4): the 409 a phone request or a slot booking gets
+ * for a candidate the public R1 booking page imported. Such a candidate is
+ * never phone-screened (owner rule), so the refusal is permanent.
+ */
+export const NOT_PHONE_SCREENED = 'not_phone_screened';
 
 /** Resolve visibility before any phone-cycle or appointment read. */
 async function candidateVisibleToRecruiter(
@@ -845,6 +855,16 @@ candidatesRouter.post(
         p_candidate_id: req.params.id,
         p_now: new Date().toISOString(),
       });
+      // 0144 §3 (S12 fix round F4): an application the public R1 booking page
+      // imported is never phone-screened; the engagement guard refused the
+      // insert and the RPC wrote nothing. A plain refusal, not an outage.
+      if (error && isR1PublicBookingEngagementRefusal(error)) {
+        await recordAudit(req, 'resource.create', 409, {
+          metadata: { resource: 'phone_call_request', status: NOT_PHONE_SCREENED },
+        });
+        res.status(409).json({ ok: false, error: NOT_PHONE_SCREENED });
+        return;
+      }
       if (error) {
         candidateLogger.warn('unknown_event', {
           error_category: 'manual_phone_request',
@@ -1209,6 +1229,12 @@ candidatesRouter.post(
         p_actor_id: req.authUser?.id ?? null,
         p_now: new Date().toISOString(),
       });
+      // 0144 §3 (S12 fix round F4): a public booking import is never
+      // phone-screened, so no slot can be booked for it; nothing was written.
+      if (error && isR1PublicBookingEngagementRefusal(error)) {
+        res.status(409).json({ ok: false, error: NOT_PHONE_SCREENED });
+        return;
+      }
       if (error) {
         res.status(503).json({ ok: false, error: 'phone_schedule_unavailable' });
         return;

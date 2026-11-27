@@ -1208,3 +1208,32 @@ Rolling the application back to a build without this lane is safe on the 0134
 database. 0134 is additive and forward-only, and the new type and functions simply go
 unused. Tag operations stay `pending`, and they count in `backlog.operationsPending`
 on the health route until the lane runs again.
+
+## 12. Public booking imports (M035 S12, migration 0144, dark)
+
+When the public R1 booking page (M035 S06, behind `R1_MEET_PUBLIC_BOOKING_ENABLED`)
+finds no local candidate for a typed email, it may import the person's one Active
+Ashby application on the spot. That link gets intake `r1_public_booking` and a new
+candidate row. The owner's rule is that such a candidate "must not get a Christy
+call", so the import is out of the Christy pipeline for good: no resume ingestion,
+no profile step, no phone engagement, and the intake never changes (0144 §2 refuses
+any change). Nothing here runs while the flag is off.
+
+**What HR sees.**
+
+- The candidate is in the role's candidate list as `queued`, with no phone
+  screening and no intake label. They are not counted in the Christy phone funnel
+  (0144 §8) or in the business-impact figures (0144 §5).
+- If HR moves the application into the AI-screening stage in Ashby, Christy does not
+  start. Each stage webhook or reconciliation that reaches it writes one warning,
+  `ashby_import_skipped` / `r1_public_booking`, and nothing else.
+- Requesting a phone screening ("Confirm call") or booking one ("Book a slot") on the
+  candidate page answers `409 not_phone_screened`. Nobody is called, and retrying
+  gives the same answer.
+
+**What HR does.** Nothing is broken, so do not retry. The candidate's screening is
+the R1 interview they book on the public page. Move the Ashby application on by hand
+from the R1 result. There is no tool to send an import back to Christy, by design. If an
+import was a mistake (for example someone typed another applicant's email), screen
+that person by hand and tell engineering. Do not edit `intake_type` in SQL: the
+trigger refuses it.

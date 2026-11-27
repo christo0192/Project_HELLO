@@ -31,13 +31,19 @@
 --     the order, the limit, the eight keys, no contact data in the answer, no write.
 --   G r1_meet_public_import_application: every invalid field and their precedence, the accepted
 --     boundaries, the link and the shell it writes (exactly), nothing else written, replays,
---     adoption, the holds over the Ashby person and their precedence, the mapping, and the
---     privileges (anon / authenticated refused, service_role runs both RPCs).
+--     adoption, the holds over the Ashby person and their precedence, one R1 per Ashby person
+--     (S12 fix round F3), the mapping, and the privileges (anon / authenticated refused,
+--     service_role runs both RPCs).
+--   H the Christy phone funnel (v_funnel_candidate, and the funnel_stage_daily rollup built from
+--     it) leaves an import out and keeps every other candidate (S12 fix round F1).
+--   I r1_meet_public_person_r1_check: the book path's one-R1-per-person lookup (S12 fix round
+--     F3): every invalid input, application_unknown, r1_completed only for the person's OTHER
+--     candidates, the exact answers, no write, and the privileges.
 --
 -- The clock is pinned: p_now = 2026-12-01 04:00 UTC everywhere; nothing asserts on now(). Fixture
 -- ids live in 7f144000-0000-4000-8000-<kind:4><n:8> (unused elsewhere): 1 auth users, 2 roles,
 -- 10 candidates, 13 job mappings, 14 DSAR requests, 15 phone engagements, 16 ingestions, 22 Ashby
--- applications, 26 Ashby candidates. Job ids are mpi-job-<n>, stage ids mpi-stage-<n>, candidate
+-- applications, 26 Ashby candidates, 27 interview rounds. Job ids are mpi-job-<n>, stage ids mpi-stage-<n>, candidate
 -- names "meet public import assert <n>", emails <n>@example.test, numbers are built at run time.
 -- The claim fixtures are created 2020-01-01, so they sort first among never-checked links and
 -- leftover rows cannot crowd them out of the 50-row claim. No real data.
@@ -164,7 +170,8 @@ $$;
 
 -- Fixture ids: 7f144000-0000-4000-8000-<kind:4><n:8>.
 --   1 auth users, 2 roles, 10 candidates, 13 job mappings, 14 DSAR requests,
---   15 phone engagements, 16 ingestions, 22 Ashby applications, 26 Ashby candidates.
+--   15 phone engagements, 16 ingestions, 22 Ashby applications, 26 Ashby candidates,
+--   27 interview rounds.
 create function _r1_mpi_tests.id(p_kind integer, p_n integer) returns uuid
 language sql immutable as $$
   select ('7f144000-0000-4000-8000-' || lpad(p_kind::text, 4, '0') || lpad(p_n::text, 8, '0'))::uuid
@@ -286,6 +293,26 @@ begin
           case when p_status = 'rejected' then 'mpi fixture' end);
   return _r1_mpi_tests.id(14, p_k);
 end;
+$$;
+
+-- A sales_r1 interview round (id(27, k)) of a candidate, in a status, with p_counted counted
+-- attempts. Only the columns the 0144 rule reads matter; the link digest is built at run time.
+create function _r1_mpi_tests.sales_round(p_k integer, p_candidate uuid, p_status text, p_counted integer default 0)
+returns uuid language plpgsql as $$
+begin
+  insert into screening_v2.interview_rounds
+    (id, candidate_id, role_id, link_token_digest, expires_at, created_by, status, attempts_counted)
+  values (_r1_mpi_tests.id(27, p_k), p_candidate, _r1_mpi_tests.id(2, 1),
+          encode(sha256(convert_to('r1-mpi-round-' || p_k::text, 'UTF8')), 'hex'),
+          timestamptz '2099-01-01 00:00:00+00', _r1_mpi_tests.id(1, 1), p_status, p_counted);
+  return _r1_mpi_tests.id(27, p_k);
+end;
+$$;
+
+-- The book path's person check for candidate id(10, c) and application id(22, a).
+create function _r1_mpi_tests.person(p_c integer, p_a integer) returns jsonb
+language sql as $$
+  select screening_v2.r1_meet_public_person_r1_check(_r1_mpi_tests.id(10, p_c), _r1_mpi_tests.id(22, p_a)::text)
 $$;
 
 -- One expected row of r1_meet_public_local_rows (application p_app of Ashby candidate id(26, p_app);
@@ -410,7 +437,7 @@ begin
     format('insert into screening_v2.ashby_application_links (external_application_id, intake_type) values (%L, null)',
            _r1_mpi_tests.id(22, 5)::text), '23502');
 
-  -- The six functions 0144 declares (three RPC-level, three trigger functions).
+  -- The seven functions 0144 declares (four RPC-level, three trigger functions).
   for v_fn in
     select *
       from (values
@@ -423,6 +450,9 @@ begin
         ('r1_meet_public_import_application',
          'screening_v2.r1_meet_public_import_application(text,text,text,text,text,text,text,timestamptz)',
          true, 'v', 'plpgsql', 'jsonb', 1),
+        ('r1_meet_public_person_r1_check',
+         'screening_v2.r1_meet_public_person_r1_check(uuid,text)',
+         true, 's', 'plpgsql', 'jsonb', 0),
         ('reject_r1_public_booking_intake_change',
          'screening_v2.reject_r1_public_booking_intake_change()', false, 'v', 'plpgsql', 'trigger', 0),
         ('reject_r1_public_booking_engagement',
@@ -504,6 +534,18 @@ begin
   perform _r1_mpi_tests.assert('A the view comment names the 0144 change',
     position('0144 (M035 S12)' in
              obj_description('screening_v2.v_ashby_application_impact'::regclass, 'pg_class')) > 0);
+  perform _r1_mpi_tests.assert('A v_funnel_candidate still runs as its caller (security_invoker)',
+    (select c.reloptions from pg_class c
+      where c.oid = 'screening_v2.v_funnel_candidate'::regclass) @> array['security_invoker=true']);
+  perform _r1_mpi_tests.assert('A the funnel view comment keeps the 0122 text and names the 0144 change',
+    position('One row per candidate across the whole funnel' in
+             obj_description('screening_v2.v_funnel_candidate'::regclass, 'pg_class')) = 1
+    and position('0144 (M035 S12)' in
+                 obj_description('screening_v2.v_funnel_candidate'::regclass, 'pg_class')) > 0);
+  perform _r1_mpi_tests.assert('A the funnel view is still service-role only',
+    has_table_privilege('service_role', 'screening_v2.v_funnel_candidate', 'select')
+    and not has_table_privilege('anon', 'screening_v2.v_funnel_candidate', 'select')
+    and not has_table_privilege('authenticated', 'screening_v2.v_funnel_candidate', 'select'));
 end;
 $$;
 
@@ -1425,6 +1467,101 @@ begin
 end;
 $$;
 
+-- G4b. One R1 per Ashby person (S12 fix round F3): a person with a completed or counted sales_r1
+-- round under another local candidate is candidate_ineligible, case ignored, after the adoption
+-- and before the mapping; an uncounted cancelled, expired or live round is not a done R1; another
+-- person's R1 never counts; each refusal writes nothing.
+do $$
+declare
+  k_t0 constant timestamptz := _r1_mpi_tests.t0();
+  k_m1 constant uuid := _r1_mpi_tests.id(13, 1);
+  v jsonb;
+  v_before jsonb;
+  v_c uuid;
+begin
+  -- Person 300: a completed R1 under candidate 300 (application 300).
+  v_c := _r1_mpi_tests.cand(300);
+  perform _r1_mpi_tests.link(300, k_m1, v_c);
+  perform _r1_mpi_tests.sales_round(300, v_c, 'completed', 1);
+  -- Person 302: HR's retake round, cancelled, keeps its counted attempt.
+  v_c := _r1_mpi_tests.cand(302);
+  perform _r1_mpi_tests.link(302, k_m1, v_c);
+  perform _r1_mpi_tests.sales_round(302, v_c, 'cancelled', 1);
+  -- Person 304: a round in progress with a counted attempt.
+  v_c := _r1_mpi_tests.cand(304);
+  perform _r1_mpi_tests.link(304, k_m1, v_c);
+  perform _r1_mpi_tests.sales_round(304, v_c, 'in_progress', 1);
+  -- Person 306: a cancelled and an expired round, neither with a counted attempt.
+  v_c := _r1_mpi_tests.cand(306);
+  perform _r1_mpi_tests.link(306, k_m1, v_c);
+  perform _r1_mpi_tests.sales_round(306, v_c, 'cancelled', 0);
+  perform _r1_mpi_tests.sales_round(307, v_c, 'expired', 0);
+  -- Person 308: a live, uncounted invited round (not a done R1; see contracts 9).
+  v_c := _r1_mpi_tests.cand(308);
+  perform _r1_mpi_tests.link(308, k_m1, v_c);
+  perform _r1_mpi_tests.sales_round(308, v_c, 'invited', 0);
+  -- Person 310: a completed R1 of ANOTHER person (310) than the one imported (311).
+  v_c := _r1_mpi_tests.cand(310);
+  perform _r1_mpi_tests.link(310, k_m1, v_c);
+  perform _r1_mpi_tests.sales_round(310, v_c, 'completed', 1);
+  -- Application 312's own bound link, whose candidate has a completed R1: adopted (exists).
+  v_c := _r1_mpi_tests.cand(312);
+  perform _r1_mpi_tests.link(312, k_m1, v_c);
+  perform _r1_mpi_tests.sales_round(312, v_c, 'completed', 1);
+  -- Person 314: a DSAR hold AND a completed R1 under candidate 314.
+  v_c := _r1_mpi_tests.cand(314);
+  perform _r1_mpi_tests.link(314, k_m1, v_c);
+  perform _r1_mpi_tests.dsar(314, v_c, 'restrict', 'pending');
+  perform _r1_mpi_tests.sales_round(314, v_c, 'completed', 1);
+
+  v_before := _r1_mpi_tests.counts();
+  v := screening_v2.r1_meet_public_import_application(_r1_mpi_tests.id(22, 301)::text, _r1_mpi_tests.id(26, 300)::text,
+         'mpi-job-1', 'mpi-stage-1', _r1_mpi_tests.name(301), _r1_mpi_tests.email(301), _r1_mpi_tests.phone(301), k_t0);
+  perform _r1_mpi_tests.assert('G R1 per person: a completed R1 under another candidate of the person is candidate_ineligible',
+    v = '{"status":"refused","code":"candidate_ineligible"}'::jsonb, v::text);
+  v := screening_v2.r1_meet_public_import_application(_r1_mpi_tests.id(22, 301)::text, upper(_r1_mpi_tests.id(26, 300)::text),
+         'mpi-job-1', 'mpi-stage-1', null, null, null, k_t0);
+  perform _r1_mpi_tests.assert('G R1 per person: the person id asked in upper case still matches',
+    v = '{"status":"refused","code":"candidate_ineligible"}'::jsonb, v::text);
+  v := screening_v2.r1_meet_public_import_application(_r1_mpi_tests.id(22, 303)::text, _r1_mpi_tests.id(26, 302)::text,
+         'mpi-job-1', null, null, null, null, k_t0);
+  perform _r1_mpi_tests.assert('G R1 per person: a cancelled round that holds a counted attempt is a done R1',
+    v = '{"status":"refused","code":"candidate_ineligible"}'::jsonb, v::text);
+  v := screening_v2.r1_meet_public_import_application(_r1_mpi_tests.id(22, 305)::text, _r1_mpi_tests.id(26, 304)::text,
+         'mpi-job-1', null, null, null, null, k_t0);
+  perform _r1_mpi_tests.assert('G R1 per person: a round in progress with a counted attempt is a done R1',
+    v = '{"status":"refused","code":"candidate_ineligible"}'::jsonb, v::text);
+  v := screening_v2.r1_meet_public_import_application(_r1_mpi_tests.id(22, 301)::text, _r1_mpi_tests.id(26, 300)::text,
+         'mpi-job-99', null, null, null, null, k_t0);
+  perform _r1_mpi_tests.assert('G precedence: candidate_ineligible (a done R1) before mapping_unavailable',
+    v = '{"status":"refused","code":"candidate_ineligible"}'::jsonb, v::text);
+  v := screening_v2.r1_meet_public_import_application(_r1_mpi_tests.id(22, 315)::text, _r1_mpi_tests.id(26, 314)::text,
+         'mpi-job-1', null, null, null, null, k_t0);
+  perform _r1_mpi_tests.assert('G precedence: dsar_hold before a done R1',
+    v = '{"status":"refused","code":"dsar_hold"}'::jsonb, v::text);
+  perform _r1_mpi_tests.assert('G the done-R1 refusals wrote nothing',
+    _r1_mpi_tests.counts() = v_before
+    and _r1_mpi_tests.link_of(301) is null and _r1_mpi_tests.link_of(303) is null
+    and _r1_mpi_tests.link_of(305) is null and _r1_mpi_tests.link_of(315) is null);
+
+  v := _r1_mpi_tests.import_app(312);
+  perform _r1_mpi_tests.assert('G an existing link of this application is adopted before the R1 rule (the book path decides)',
+    v ->> 'status' = 'exists' and v ->> 'candidate_id' = _r1_mpi_tests.id(10, 312)::text, v::text);
+  v := screening_v2.r1_meet_public_import_application(_r1_mpi_tests.id(22, 309)::text, _r1_mpi_tests.id(26, 306)::text,
+         'mpi-job-1', null, null, null, null, k_t0);
+  perform _r1_mpi_tests.assert('G R1 per person: uncounted cancelled and expired rounds are not a done R1',
+    v ->> 'status' = 'imported', v::text);
+  v := screening_v2.r1_meet_public_import_application(_r1_mpi_tests.id(22, 317)::text, _r1_mpi_tests.id(26, 308)::text,
+         'mpi-job-1', null, null, null, null, k_t0);
+  perform _r1_mpi_tests.assert('G R1 per person: a live, uncounted round elsewhere is not a done R1',
+    v ->> 'status' = 'imported', v::text);
+  v := screening_v2.r1_meet_public_import_application(_r1_mpi_tests.id(22, 311)::text, _r1_mpi_tests.id(26, 311)::text,
+         'mpi-job-1', null, null, null, null, k_t0);
+  perform _r1_mpi_tests.assert('G R1 per person: another person''s completed R1 never counts',
+    v ->> 'status' = 'imported', v::text);
+end;
+$$;
+
 -- G5. Privileges, by trying: anon and authenticated are refused both RPCs (and the claim); service_role
 -- runs both (each call rolled back by runs_as).
 do $$
@@ -1452,6 +1589,208 @@ begin
     v = _r1_mpi_tests.ok_rows(_r1_mpi_tests.local_row(100, 'email', 100, false, true)), v::text);
   perform _r1_mpi_tests.assert('G the service_role import left nothing behind (rolled back)',
     _r1_mpi_tests.link_of(196) is null);
+end;
+$$;
+
+-- =================================================================================================
+-- H. The Christy phone funnel leaves an on-the-spot import out (S12 fix round F1).
+-- =================================================================================================
+-- v_funnel_candidate has one row per candidate; without the 0144 hunk every import would join its
+-- mapped role's funnel as parsed, missing_phone and not_dialed, and the funnel_stage_daily rollup
+-- (refresh_funnel_rollup, 0098) would count it. Every import of sections E, G and H is created at
+-- the pinned clock on role 1, so the rollup's (2026-12-01, role 1) grain holds many of them.
+do $$
+declare
+  k_t0 constant timestamptz := _r1_mpi_tests.t0();
+  k_m1 constant uuid := _r1_mpi_tests.id(13, 1);
+  k_role constant uuid := _r1_mpi_tests.id(2, 1);
+  v jsonb;
+  v_shell uuid;
+  v_rp uuid;
+  v_pp uuid;
+  v_mixed uuid;
+  v_bare uuid;
+  v_only bigint;
+  v_view bigint;
+  v_all bigint;
+  v_rolled bigint;
+begin
+  -- An import WITH a dialable Ashby number: still not a Christy funnel candidate.
+  v := _r1_mpi_tests.import_app(320, 'mpi-job-1', _r1_mpi_tests.name(320), _r1_mpi_tests.email(320),
+                                _r1_mpi_tests.phone(320));
+  perform _r1_mpi_tests.assert('H setup: an on-the-spot import with a number', v ->> 'status' = 'imported', v::text);
+  v_shell := (v ->> 'candidate_id')::uuid;
+  -- Controls: a resume_parsing and a phone_parsing candidate, a candidate with an r1_public_booking
+  -- link AND a resume link (not an import-only candidate), and a candidate with no link at all.
+  v_rp := _r1_mpi_tests.cand(321);
+  perform _r1_mpi_tests.link(321, k_m1, v_rp);
+  v_pp := _r1_mpi_tests.cand(322);
+  perform _r1_mpi_tests.link(322, k_m1, v_pp, 'phone_parsing');
+  v_mixed := _r1_mpi_tests.cand(323);
+  perform _r1_mpi_tests.link(323, k_m1, v_mixed, 'r1_public_booking');
+  perform _r1_mpi_tests.link(324, k_m1, v_mixed);
+  v_bare := _r1_mpi_tests.cand(325);
+
+  perform _r1_mpi_tests.assert('H the import is not in v_funnel_candidate, and its shell still exists',
+    not exists (select 1 from screening_v2.v_funnel_candidate f where f.candidate_id = v_shell)
+    and exists (select 1 from screening_v2.candidates c where c.id = v_shell));
+  perform _r1_mpi_tests.assert('H the resume, phone-parsing, mixed and link-less candidates are all in the funnel',
+    (select count(*) from screening_v2.v_funnel_candidate f
+      where f.candidate_id in (v_rp, v_pp, v_mixed, v_bare)) = 4);
+  perform _r1_mpi_tests.assert('H the control candidates keep their 0122 reading (parsed, missing_phone, not_dialed)',
+    (select bool_and(f.furthest_stage = 'parsed' and f.missing_phone and f.drop_reason = 'not_dialed')
+       from screening_v2.v_funnel_candidate f where f.candidate_id in (v_rp, v_pp, v_mixed, v_bare)));
+
+  select count(*) into v_only
+    from screening_v2.candidates c
+   where exists (select 1 from screening_v2.ashby_application_links l
+                  where l.candidate_id = c.id and l.intake_type = 'r1_public_booking')
+     and not exists (select 1 from screening_v2.ashby_application_links l
+                      where l.candidate_id = c.id and l.intake_type <> 'r1_public_booking');
+  perform _r1_mpi_tests.assert('H many import-only candidates exist by now (the next check is not vacuous)',
+    v_only >= 5, v_only::text);
+  perform _r1_mpi_tests.assert('H no import-only candidate is anywhere in the funnel',
+    not exists (select 1 from screening_v2.v_funnel_candidate f
+                 where exists (select 1 from screening_v2.ashby_application_links l
+                                where l.candidate_id = f.candidate_id and l.intake_type = 'r1_public_booking')
+                   and not exists (select 1 from screening_v2.ashby_application_links l
+                                    where l.candidate_id = f.candidate_id and l.intake_type <> 'r1_public_booking')));
+  perform _r1_mpi_tests.assert('H every other candidate still has exactly one funnel row',
+    (select count(*) from screening_v2.v_funnel_candidate)
+      = (select count(*) from screening_v2.candidates) - v_only
+    and (select count(*) from screening_v2.v_funnel_candidate)
+      = (select count(distinct f.candidate_id) from screening_v2.v_funnel_candidate f));
+
+  -- The stored rollup is built from the view, so the imports are left out of it too.
+  v := screening_v2.refresh_funnel_rollup(k_t0, 30);
+  perform _r1_mpi_tests.assert('H refresh_funnel_rollup runs', v ->> 'status' = 'ok', v::text);
+  select count(*) into v_view from screening_v2.v_funnel_candidate f
+   where f.cohort_day = (k_t0)::date and f.role_id = k_role;
+  select count(*) into v_all from screening_v2.candidates c
+   where (c.created_at)::date = (k_t0)::date and c.role_id = k_role;
+  select coalesce((select d.candidates_total from screening_v2.funnel_stage_daily d
+                    where d.cohort_day = (k_t0)::date and d.role_id = k_role), 0) into v_rolled;
+  perform _r1_mpi_tests.assert('H the rollup''s candidates_total for the imports'' day and role counts no import',
+    v_rolled = v_view and v_all > v_view,
+    'rolled ' || v_rolled || ', view ' || v_view || ', all ' || v_all);
+end;
+$$;
+
+-- =================================================================================================
+-- I. r1_meet_public_person_r1_check: one R1 per Ashby person on the book path (S12 fix round F3).
+-- =================================================================================================
+do $$
+declare
+  k_m1 constant uuid := _r1_mpi_tests.id(13, 1);
+  v jsonb;
+  v_before jsonb;
+  v_c uuid;
+  v_role text;
+  v_sql text;
+begin
+  -- Person 340: candidate 340 is to be booked; the person's other candidate 341 completed R1.
+  v_c := _r1_mpi_tests.cand(340);
+  perform _r1_mpi_tests.link(340, k_m1, v_c);
+  v_c := _r1_mpi_tests.cand(341);
+  perform _r1_mpi_tests.link(341, k_m1, v_c, p_person => 340);
+  perform _r1_mpi_tests.sales_round(341, v_c, 'completed', 1);
+  -- Person 342: the other row stores the person id in upper case; its cancelled retake was counted.
+  v_c := _r1_mpi_tests.cand(342);
+  perform _r1_mpi_tests.link(342, k_m1, v_c);
+  v_c := _r1_mpi_tests.cand(343);
+  insert into screening_v2.ashby_application_links (external_application_id, external_candidate_id, job_mapping_id, candidate_id)
+  values (_r1_mpi_tests.id(22, 343)::text, upper(_r1_mpi_tests.id(26, 342)::text), k_m1, v_c);
+  perform _r1_mpi_tests.sales_round(343, v_c, 'cancelled', 1);
+  -- Person 344: the other row has only uncounted cancelled and expired rounds.
+  v_c := _r1_mpi_tests.cand(344);
+  perform _r1_mpi_tests.link(344, k_m1, v_c);
+  v_c := _r1_mpi_tests.cand(345);
+  perform _r1_mpi_tests.link(345, k_m1, v_c, p_person => 344);
+  perform _r1_mpi_tests.sales_round(345, v_c, 'cancelled', 0);
+  perform _r1_mpi_tests.sales_round(346, v_c, 'expired', 0);
+  -- Candidate 347: its OWN completed R1 is the 0143 precheck's, not this lookup's.
+  v_c := _r1_mpi_tests.cand(347);
+  perform _r1_mpi_tests.link(347, k_m1, v_c);
+  perform _r1_mpi_tests.sales_round(347, v_c, 'completed', 1);
+  -- Person 348: another PERSON (349) completed R1.
+  v_c := _r1_mpi_tests.cand(348);
+  perform _r1_mpi_tests.link(348, k_m1, v_c);
+  v_c := _r1_mpi_tests.cand(349);
+  perform _r1_mpi_tests.link(349, k_m1, v_c);
+  perform _r1_mpi_tests.sales_round(349, v_c, 'completed', 1);
+  -- Person 350: the other row has a live, uncounted invited round (not a done R1; contracts 9).
+  v_c := _r1_mpi_tests.cand(350);
+  perform _r1_mpi_tests.link(350, k_m1, v_c);
+  v_c := _r1_mpi_tests.cand(351);
+  perform _r1_mpi_tests.link(351, k_m1, v_c, p_person => 350);
+  perform _r1_mpi_tests.sales_round(351, v_c, 'invited', 0);
+  -- Person 352: the other row's round is in progress with a counted attempt.
+  v_c := _r1_mpi_tests.cand(352);
+  perform _r1_mpi_tests.link(352, k_m1, v_c);
+  v_c := _r1_mpi_tests.cand(353);
+  perform _r1_mpi_tests.link(353, k_m1, v_c, p_person => 352);
+  perform _r1_mpi_tests.sales_round(353, v_c, 'in_progress', 1);
+  -- Candidates 354 and 355: two links with NO Ashby candidate id; 355 completed R1.
+  v_c := _r1_mpi_tests.cand(354);
+  insert into screening_v2.ashby_application_links (external_application_id, job_mapping_id, candidate_id)
+  values (_r1_mpi_tests.id(22, 354)::text, k_m1, v_c);
+  v_c := _r1_mpi_tests.cand(355);
+  insert into screening_v2.ashby_application_links (external_application_id, job_mapping_id, candidate_id)
+  values (_r1_mpi_tests.id(22, 355)::text, k_m1, v_c);
+  perform _r1_mpi_tests.sales_round(355, v_c, 'completed', 1);
+
+  v_before := _r1_mpi_tests.counts();
+
+  -- Invalid input: a closed field, the candidate first; nothing read.
+  v := screening_v2.r1_meet_public_person_r1_check(null, null);
+  perform _r1_mpi_tests.assert('I invalid_request: candidate_id first', v = '{"status":"invalid_request","field":"candidate_id"}'::jsonb, v::text);
+  v := screening_v2.r1_meet_public_person_r1_check(_r1_mpi_tests.id(10, 340), null);
+  perform _r1_mpi_tests.assert('I invalid_request: a null application id', v = '{"status":"invalid_request","field":"application_id"}'::jsonb, v::text);
+  v := screening_v2.r1_meet_public_person_r1_check(_r1_mpi_tests.id(10, 340), 'mpi-app-not-a-uuid');
+  perform _r1_mpi_tests.assert('I invalid_request: an application id that is not UUID-shaped', v = '{"status":"invalid_request","field":"application_id"}'::jsonb, v::text);
+
+  -- application_unknown: no link, a link bound to another candidate, the id in another case.
+  v := _r1_mpi_tests.person(340, 399);
+  perform _r1_mpi_tests.assert('I application_unknown: no link for the application', v = '{"status":"refused","code":"application_unknown"}'::jsonb, v::text);
+  v := _r1_mpi_tests.person(340, 341);
+  perform _r1_mpi_tests.assert('I application_unknown: the link is bound to another candidate', v = '{"status":"refused","code":"application_unknown"}'::jsonb, v::text);
+  v := screening_v2.r1_meet_public_person_r1_check(_r1_mpi_tests.id(10, 340), upper(_r1_mpi_tests.id(22, 340)::text));
+  perform _r1_mpi_tests.assert('I application_unknown: the application id is matched verbatim (as the 0143 precheck does)',
+    v = '{"status":"refused","code":"application_unknown"}'::jsonb, v::text);
+
+  -- r1_completed: another candidate of the same person did R1.
+  v := _r1_mpi_tests.person(340, 340);
+  perform _r1_mpi_tests.assert('I r1_completed: another candidate of the person completed R1', v = '{"status":"refused","code":"r1_completed"}'::jsonb, v::text);
+  v := _r1_mpi_tests.person(342, 342);
+  perform _r1_mpi_tests.assert('I r1_completed: case ignored, and a cancelled round with a counted attempt', v = '{"status":"refused","code":"r1_completed"}'::jsonb, v::text);
+  v := _r1_mpi_tests.person(352, 352);
+  perform _r1_mpi_tests.assert('I r1_completed: a round in progress with a counted attempt', v = '{"status":"refused","code":"r1_completed"}'::jsonb, v::text);
+  v := _r1_mpi_tests.person(341, 341);
+  perform _r1_mpi_tests.assert('I eligible for the candidate who did R1 (the precheck answers its own rounds)', v = '{"status":"eligible"}'::jsonb, v::text);
+
+  -- eligible otherwise.
+  v := _r1_mpi_tests.person(344, 344);
+  perform _r1_mpi_tests.assert('I eligible: uncounted cancelled and expired rounds elsewhere', v = '{"status":"eligible"}'::jsonb, v::text);
+  v := _r1_mpi_tests.person(347, 347);
+  perform _r1_mpi_tests.assert('I eligible: the candidate''s own completed R1 is left to the precheck', v = '{"status":"eligible"}'::jsonb, v::text);
+  v := _r1_mpi_tests.person(348, 348);
+  perform _r1_mpi_tests.assert('I eligible: another person''s R1 never counts', v = '{"status":"eligible"}'::jsonb, v::text);
+  v := _r1_mpi_tests.person(350, 350);
+  perform _r1_mpi_tests.assert('I eligible: a live, uncounted round elsewhere is not a done R1', v = '{"status":"eligible"}'::jsonb, v::text);
+  v := _r1_mpi_tests.person(354, 354);
+  perform _r1_mpi_tests.assert('I eligible: a link with no Ashby candidate id is never matched to another row', v = '{"status":"eligible"}'::jsonb, v::text);
+
+  perform _r1_mpi_tests.assert('I the lookup wrote nothing', _r1_mpi_tests.counts() = v_before);
+
+  -- Privileges, by trying.
+  v_sql := format('select screening_v2.r1_meet_public_person_r1_check(%L::uuid, %L)',
+                  _r1_mpi_tests.id(10, 340), _r1_mpi_tests.id(22, 340)::text);
+  foreach v_role in array array['anon', 'authenticated'] loop
+    perform _r1_mpi_tests.raises_as(v_role, 'I r1_meet_public_person_r1_check', v_sql, '42501');
+  end loop;
+  v := _r1_mpi_tests.runs_as('service_role', 'I r1_meet_public_person_r1_check', v_sql);
+  perform _r1_mpi_tests.assert('I service_role: the lookup answers r1_completed',
+    v = '{"status":"refused","code":"r1_completed"}'::jsonb, v::text);
 end;
 $$;
 

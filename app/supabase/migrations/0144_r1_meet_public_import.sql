@@ -21,20 +21,32 @@
 --   §5 v_ashby_application_impact leaves r1_public_booking links out of every impact figure.
 --   §6 r1_meet_public_local_rows: the public page's read-only local match lookup.
 --   §7 r1_meet_public_import_application: the on-the-spot import, link first, then the shell; the
---      only writer of r1_public_booking.
+--      only writer of r1_public_booking. A person who has done R1 is never imported.
+--   §8 v_funnel_candidate leaves a candidate the public booking page imported out of the Christy
+--      phone funnel (and so out of the funnel_stage_daily rollup).
+--   §9 r1_meet_public_person_r1_check: the public page's book-path lookup, one R1 per Ashby person.
 --   §90 privileges (the RPCs are service-role only; no client role may execute a trigger function)
 --      and comments.
 --
 -- Redeclares (lifted in full, ONE marked hunk each): claim_ashby_profile_due (0130 §6),
--- v_ashby_application_impact (0140 §2). References no 0143 object.
+-- v_ashby_application_impact (0140 §2), v_funnel_candidate (0122 §8). References no 0143 object.
 --
 -- PII-minimal: the fences store nothing and their messages carry no id and no value.
 --
 -- Additive and re-runnable: a guarded CHECK swap (drop constraint if exists, add not valid,
 -- validate; every existing row is resume_parsing or phone_parsing, so it validates), `create or
--- replace` functions and view (the view's columns are unchanged), `drop trigger if exists` +
+-- replace` functions and views (each view's columns are unchanged), `drop trigger if exists` +
 -- `create trigger`. No existing row is changed and no column default moves. Forward-only: while
 -- dark the new value is simply never written.
+--
+-- Lock order. §1 takes ACCESS EXCLUSIVE on ashby_application_links and holds it to commit (inside
+-- one transaction the NOT VALID + VALIDATE split of the 0026 idiom saves no lock time; it only
+-- keeps the swap in three plain statements). §2 adds a trigger on the same table, then §3 takes
+-- SHARE ROW EXCLUSIVE on phone_engagements and on ashby_resume_ingestions. Links before
+-- engagements is the phone lane's own order (0114: the link row, then the engagement row), so a
+-- phone write that holds a link row makes this migration wait (lock_timeout 10 s, then it fails
+-- whole and is re-run) instead of deadlocking with it. Merge and apply in the 07:00-08:30 IST
+-- window, when the phone lane is idle.
 set local lock_timeout = '10s';
 
 -- ---------------------------------------------------------------------------------------------
@@ -683,10 +695,16 @@ $$;
 --      closed: an erased or held person is never re-collected because someone typed an email;
 --   4. an existing link of this application is adopted UNCHANGED, whatever its intake:
 --      application_terminal (terminal_state is set), link_unbound (it has no candidate yet: an
---      import is mid-flight), else exists with its candidate and link ids;
---   5. the job's enabled, non-archived mapping (at most one live mapping per job, 0109), read FOR
+--      import is mid-flight), else exists with its candidate and link ids (the page's book path
+--      then asks §9 and the 0143 precheck about that candidate);
+--   5. one R1 per Ashby PERSON (the owner's "no R1 yet"; S12 fix round F3): candidate_ineligible
+--      when a local candidate linked to the same Ashby candidate id (case ignored) has a sales_r1
+--      round, of any channel, that is completed or holds a counted attempt (0143 §12's
+--      predicate). A new shell would have no round of its own, so without this a person who took
+--      R1 under one application could book a second one through another;
+--   6. the job's enabled, non-archived mapping (at most one live mapping per job, 0109), read FOR
 --      SHARE; none: mapping_unavailable;
---   6. the writes, LINK FIRST: the link (intake r1_public_booking, no candidate yet) with ON
+--   7. the writes, LINK FIRST: the link (intake r1_public_booking, no candidate yet) with ON
 --      CONFLICT DO NOTHING, so a concurrent import of the same application never makes or deletes
 --      a shell (the Ashby import's insert waits on the unique index and then fails); a lost race
 --      answers from the re-read as in 4, having written nothing. Then the shell (the columns of
@@ -801,7 +819,21 @@ begin
                               'application_link_id', v_link_id::text);
   end if;
 
-  -- 5. The job's enabled, live mapping gives the role and the owner.
+  -- 5. One R1 per Ashby person: no new shell for a person who has done R1 under another
+  --    application (the links of this application were answered in 4).
+  if exists (
+    select 1
+      from screening_v2.ashby_application_links l
+      join screening_v2.interview_rounds r on r.candidate_id = l.candidate_id
+     where l.provider = 'ashby'
+       and lower(l.external_candidate_id) = lower(p_ashby_candidate_id)
+       and r.kind = 'sales_r1'
+       and (r.status = 'completed' or r.attempts_counted > 0)
+  ) then
+    return jsonb_build_object('status', 'refused', 'code', 'candidate_ineligible');
+  end if;
+
+  -- 6. The job's enabled, live mapping gives the role and the owner.
   select m.id, m.role_id, m.owner_id
     into v_mapping_id, v_role_id, v_owner_id
     from screening_v2.ashby_job_mappings m
@@ -812,7 +844,7 @@ begin
     return jsonb_build_object('status', 'refused', 'code', 'mapping_unavailable');
   end if;
 
-  -- 6. The writes, link first.
+  -- 7. The writes, link first.
   insert into screening_v2.ashby_application_links (
     provider, external_application_id, external_candidate_id, external_job_id, external_stage_id,
     job_mapping_id, candidate_id, lifecycle, intake_type, created_at, updated_at)
@@ -856,6 +888,280 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------------------------
+-- §8. v_funnel_candidate leaves public booking imports out of the Christy funnel.
+-- ---------------------------------------------------------------------------------------------
+-- Lifted in full from 0122 §8 (its newest declaration) by script, byte-identical except ONE marked
+-- hunk (M035-S12-c) that gives the base CTE a WHERE. The view has one row per candidates row, and
+-- an on-the-spot import is a shell with phone_valid false and no attempt, so without the hunk
+-- every import would join its mapped role's phone funnel as parsed, missing_phone and not_dialed
+-- (refresh_funnel_rollup, 0098, counts it into funnel_stage_daily, which the role pipeline panel
+-- shows as "Awaiting first dial"). Left out: a candidate with an r1_public_booking link and no
+-- link of another intake (an import shell has exactly one link: materialize.ts binds one
+-- candidate per application). A candidate with no link at all (a recruiter upload) stays.
+-- idx_ashby_application_links_candidate (0029) serves both probes. v_funnel_hr_state is not
+-- lifted: its hr_state is null without a non-R1 assessment, which an import never has, and the
+-- rollup left-joins it to this view, so an import adds nothing there either. The output columns
+-- are unchanged, so `create or replace view` keeps every dependent valid. The 0122 grants follow
+-- verbatim, and the 0122 comment with one sentence more.
+create or replace view screening_v2.v_funnel_candidate
+  with (security_invoker = true) as
+  with att as (
+    select e.candidate_id,
+           count(a.*)                                             as attempts_total,
+           count(*) filter (where a.answered_at is not null)      as connects_total,
+           min(a.admitted_at)                                     as first_attempt_at,
+           max(a.admitted_at)                                     as last_attempt_at,
+           min(a.answered_at)                                     as first_connect_at
+    from screening_v2.phone_engagements e
+    join screening_v2.phone_call_attempts a on a.engagement_id = e.id
+    group by e.candidate_id
+  ),
+  att_last as (
+    select distinct on (e.candidate_id) e.candidate_id, a.outcome_class
+    from screening_v2.phone_engagements e
+    join screening_v2.phone_call_attempts a on a.engagement_id = e.id
+    order by e.candidate_id, a.admitted_at desc, a.id desc
+  ),
+  eng as (
+    select candidate_id,
+           bool_or(state in ('opted_out','wrong_number')) as any_engagement_consent_drop
+    from screening_v2.phone_engagements
+    group by candidate_id
+  ),
+  psess as (
+    select c.id as session_id, c.candidate_id, c.duration_sec, c.terminal_reason
+    from screening_v2.call_sessions c
+    where exists (
+      select 1 from screening_v2.phone_call_attempts a where a.session_id = c.id
+    )
+  ),
+  sess as (
+    select candidate_id,
+           count(*)                                                          as phone_sessions_total,
+           coalesce(sum(duration_sec), 0)                                    as total_call_seconds,
+           bool_or(terminal_reason in ('candidate_opt_out','wrong_number'))  as any_session_consent_drop
+    from psess
+    group by candidate_id
+  ),
+  consent as (
+    select p.candidate_id, true as consent_passed
+    from psess p
+    join screening_v2.phone_session_plans pl on pl.session_id = p.session_id
+    group by p.candidate_id
+  ),
+  qa as (
+    select p.candidate_id,
+           count(*) filter (
+             where pr.disposition in ('asked_answered','volunteered_with_evidence')
+           ) as answered_questions
+    from psess p
+    join screening_v2.phone_session_progress pr on pr.session_id = p.session_id
+    group by p.candidate_id
+  ),
+  asmt as (
+    -- 0122 (R1 PR-5): an R1 interview round's assessment is never a candidate's
+    -- "latest assessment" in this phone-funnel view; R1 has its own surface.
+    select distinct on (a.candidate_id)
+           a.candidate_id, a.recommendation, a.scoring_status, a.overall_score,
+           a.weighted_score_5, a.partial
+    from screening_v2.assessments a
+    where not exists (
+      select 1 from screening_v2.call_sessions rs
+      where rs.id = a.session_id and rs.interview_round_id is not null
+    )
+    order by a.candidate_id, a.created_at desc, a.id desc
+  ),
+  refchk as (
+    select l.candidate_id,
+           bool_or(
+             jm.reference_check_stage_id is not null
+             and l.external_stage_id = jm.reference_check_stage_id
+           ) as reached_reference_check
+    from screening_v2.ashby_application_links l
+    join screening_v2.ashby_job_mappings jm on jm.id = l.job_mapping_id
+    where l.candidate_id is not null
+    group by l.candidate_id
+  ),
+  base as (
+    select
+      c.id                                              as candidate_id,
+      c.role_id                                         as role_id,
+      r.title                                           as role_title,
+      screening_v2.funnel_role_class(
+        coalesce(c.parsed->>'current_role', c.parsed->>'title', r.title)
+      )                                                 as resume_role_class,
+      c.created_at                                      as intake_at,
+      (c.created_at)::date                              as cohort_day,
+      (c.phone_valid is not true)                       as missing_phone,
+      coalesce(att.attempts_total, 0)                   as attempts_total,
+      coalesce(att.connects_total, 0)                   as connects_total,
+      att.first_attempt_at,
+      att.last_attempt_at,
+      att.first_connect_at,
+      case
+        when att.first_attempt_at is not null and att.first_connect_at is not null
+        then extract(epoch from (att.first_connect_at - att.first_attempt_at))::numeric
+      end                                               as time_to_first_connect_sec,
+      att_last.outcome_class                            as latest_outcome_class,
+      (coalesce(att.attempts_total, 0) > 0)             as dialed,
+      (coalesce(att.connects_total, 0) > 0)             as connected,
+      coalesce(consent.consent_passed, false)           as consent_passed,
+      (coalesce(eng.any_engagement_consent_drop, false)
+        or coalesce(sess.any_session_consent_drop, false)) as consent_dropped,
+      coalesce(sess.total_call_seconds, 0)              as total_call_seconds,
+      coalesce(qa.answered_questions, 0)                as answered_questions,
+      (coalesce(qa.answered_questions, 0) >= 1)         as answered_ge1,
+      asmt.recommendation,
+      asmt.scoring_status,
+      asmt.overall_score,
+      asmt.weighted_score_5,
+      coalesce(asmt.partial, false)                     as assessment_partial,
+      (asmt.candidate_id is not null)                   as scored,
+      (asmt.recommendation = 'advance')                 as qualified,
+      (asmt.recommendation = 'reject')                  as disqualified,
+      (asmt.recommendation = 'hold')                    as on_hold,
+      (asmt.candidate_id is not null and asmt.recommendation is null) as human_review,
+      coalesce(refchk.reached_reference_check, false)   as reached_reference_check
+    from screening_v2.candidates c
+    left join screening_v2.roles r        on r.id = c.role_id
+    left join att        on att.candidate_id = c.id
+    left join att_last   on att_last.candidate_id = c.id
+    left join eng        on eng.candidate_id = c.id
+    left join sess       on sess.candidate_id = c.id
+    left join consent    on consent.candidate_id = c.id
+    left join qa         on qa.candidate_id = c.id
+    left join asmt       on asmt.candidate_id = c.id
+    left join refchk     on refchk.candidate_id = c.id
+    -- ▼ 0144 M035-S12-c a candidate the public booking page imported is not in the Christy funnel
+    where not (exists (select 1 from screening_v2.ashby_application_links pb
+                        where pb.candidate_id = c.id and pb.intake_type = 'r1_public_booking')
+               and not exists (select 1 from screening_v2.ashby_application_links ol
+                                where ol.candidate_id = c.id and ol.intake_type <> 'r1_public_booking'))
+    -- ▲ 0144 M035-S12-c a candidate the public booking page imported is not in the Christy funnel
+  )
+  select
+    base.*,
+    case
+      when base.reached_reference_check then 'reference_check'
+      when base.qualified              then 'qualified'
+      when base.scored                 then 'scored'
+      when base.answered_ge1           then 'answered'
+      when base.consent_passed         then 'consent_passed'
+      when base.connected              then 'connected'
+      when base.dialed                 then 'dialed'
+      else 'parsed'
+    end as furthest_stage,
+    case
+      when base.reached_reference_check then null
+      -- Advanced/qualified is a SUCCESS terminus, not a drop. It MUST be
+      -- peeled before the failure/consent branches: reached_reference_check is
+      -- an unwired placeholder (always false today), so without this a
+      -- qualified candidate would fall through to 'scored'/'consent_dropped'
+      -- and be mislabeled as a drop. drop_reason is null for anyone who has
+      -- not fallen out of the funnel.
+      when base.qualified               then null
+      when base.disqualified            then 'scorecard_reject'
+      when base.human_review            then 'human_review'
+      when base.on_hold                 then 'scorecard_hold'
+      when base.consent_dropped         then 'consent_dropped'
+      -- Scored but not advance/reject/hold/human_review: unreachable under the
+      -- current recommendation vocabulary (advance|hold|reject|null), kept as an
+      -- honest catch-all for a future recommendation value — never a false
+      -- "not advanced" label for the qualified cohort.
+      when base.scored                  then 'scored_other'
+      when base.connected and not base.consent_passed then 'dropped_pre_consent'
+      when base.connected and not base.answered_ge1    then 'no_answers'
+      when base.dialed and not base.connected          then coalesce(base.latest_outcome_class, 'not_connected')
+      when not base.dialed                             then 'not_dialed'
+      else 'in_progress'
+    end as drop_reason
+  from base;
+
+comment on view screening_v2.v_funnel_candidate is
+  'One row per candidate across the whole funnel (parse -> dial -> connect -> '
+  'consent -> Q&A -> scorecard -> reference check), with furthest_stage and a '
+  'single consolidated drop_reason. Derived live from the operational tables — '
+  'the source of truth for per-candidate drill-down. Counts/flags only, no PII.'
+  ' 0144 (M035 S12): a candidate the public R1 booking page imported (its only Ashby links are '
+  'r1_public_booking) is left out.';
+
+revoke all on screening_v2.v_funnel_candidate from anon, authenticated, public;
+grant select on screening_v2.v_funnel_candidate to service_role;
+
+-- ---------------------------------------------------------------------------------------------
+-- §9. r1_meet_public_person_r1_check: one R1 per Ashby person on the book path.
+-- ---------------------------------------------------------------------------------------------
+-- Read-only (S12 fix round, F3). The owner's rule "Open application, no R1 yet" holds per PERSON.
+-- One person can have several local candidate rows (one per Ashby application, never merged:
+-- integrations/ashby/materialize.ts), and the 0143 precheck answers r1_completed only for the
+-- candidate it is given. The public page's book path (M035 S06) calls this right before that
+-- precheck, with the candidate and the application it is about to book, and answers 404 not_found
+-- on any refusal:
+--   * application_unknown: no Ashby link with this verbatim application id bound to this candidate
+--     (the 0143 precheck's own first refusal, read the same way);
+--   * r1_completed: ANOTHER local candidate (not p_candidate_id) whose Ashby link names the same
+--     Ashby candidate id as this link (case ignored) has a sales_r1 round, of any channel, that is
+--     completed or holds a counted attempt (0143 §12's predicate). The candidate's own rounds are
+--     left to the precheck, which keeps HR's re-linked retake bookable. A link without an Ashby
+--     candidate id has no other row to look at;
+--   * eligible: otherwise.
+-- Answers {status:'eligible'} | {status:'refused', code} | {status:'invalid_request', field}
+-- (candidate_id, application_id; the first failing wins). Nothing about the other rows is
+-- returned. No write, no lock, no clock. The person probe scans the links table (no index on
+-- external_candidate_id, as 0143 notes).
+create or replace function screening_v2.r1_meet_public_person_r1_check(
+  p_candidate_id uuid,
+  p_ashby_application_id text
+)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  c_uuid constant text := '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
+  v_found boolean;
+  v_link_candidate uuid;
+  v_person text;
+begin
+  -- 1. Validation. Nothing is read.
+  if p_candidate_id is null then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'candidate_id');
+  end if;
+  if p_ashby_application_id is null or p_ashby_application_id !~* c_uuid then
+    return jsonb_build_object('status', 'invalid_request', 'field', 'application_id');
+  end if;
+
+  -- 2. The application's link, by its verbatim id, bound to THIS candidate, and its Ashby person.
+  select l.candidate_id, l.external_candidate_id
+    into v_link_candidate, v_person
+    from screening_v2.ashby_application_links l
+   where l.provider = 'ashby' and l.external_application_id = p_ashby_application_id;
+  v_found := found;
+  if not v_found or v_link_candidate is distinct from p_candidate_id then
+    return jsonb_build_object('status', 'refused', 'code', 'application_unknown');
+  end if;
+
+  -- 3. The same Ashby person's OTHER local candidates: none may have done R1.
+  if v_person is not null and exists (
+    select 1
+      from screening_v2.ashby_application_links l2
+      join screening_v2.interview_rounds r on r.candidate_id = l2.candidate_id
+     where l2.provider = 'ashby'
+       and lower(l2.external_candidate_id) = lower(v_person)
+       and l2.candidate_id <> p_candidate_id
+       and r.kind = 'sales_r1'
+       and (r.status = 'completed' or r.attempts_counted > 0)
+  ) then
+    return jsonb_build_object('status', 'refused', 'code', 'r1_completed');
+  end if;
+
+  return jsonb_build_object('status', 'eligible');
+end;
+$$;
+
+-- ---------------------------------------------------------------------------------------------
 -- §90. Privileges and comments.
 -- ---------------------------------------------------------------------------------------------
 -- The trigger functions are never called directly: no client role may execute them (a trigger
@@ -880,11 +1186,13 @@ comment on function screening_v2.reject_r1_public_booking_ingestion() is
   '(P0001, a closed message) an ashby_resume_ingestions insert whose application link has intake '
   'r1_public_booking: a public booking import never gets a resume ingestion.';
 
--- The two RPCs are service-role only: the public page reaches them only through the API.
+-- The three RPCs are service-role only: the public page reaches them only through the API.
 revoke all on function screening_v2.r1_meet_public_local_rows(text, text, integer) from public, anon, authenticated;
 grant execute on function screening_v2.r1_meet_public_local_rows(text, text, integer) to service_role;
 revoke all on function screening_v2.r1_meet_public_import_application(text, text, text, text, text, text, text, timestamptz) from public, anon, authenticated;
 grant execute on function screening_v2.r1_meet_public_import_application(text, text, text, text, text, text, text, timestamptz) to service_role;
+revoke all on function screening_v2.r1_meet_public_person_r1_check(uuid, text) from public, anon, authenticated;
+grant execute on function screening_v2.r1_meet_public_person_r1_check(uuid, text) to service_role;
 
 comment on function screening_v2.r1_meet_public_local_rows(text, text, integer) is
   '0144 (M035 S04 fix round, S12): the public R1 booking page''s read-only local match lookup. '
@@ -902,11 +1210,21 @@ comment on function screening_v2.r1_meet_public_import_application(text, text, t
   'reads, never from a typed value. Under a per-application advisory lock: holds over the Ashby '
   'person (dsar_hold: an erased link or the 0130 DSAR hold; then candidate_ineligible: a decision '
   'block), then an existing link is adopted unchanged (application_terminal, link_unbound or '
-  'exists), then the enabled live mapping of the job (mapping_unavailable), then the link is '
+  'exists), then one R1 per Ashby person (candidate_ineligible: a candidate of the person has a '
+  'completed or counted sales_r1 round), then the enabled live mapping of the job '
+  '(mapping_unavailable), then the link is '
   'inserted first (on conflict do nothing; a lost race writes nothing), then the shell candidate '
   '(phone_valid false; ashby_phone_applied_at only with a number) is bound to it. Never writes a '
   'resume ingestion, phone engagement, operation, queue, session, invite or consent row. Answers '
   '{status:imported|exists, candidate_id, application_link_id} | {status:refused, code} | '
   '{status:invalid_request, field}: ids only. Service-role only.';
+comment on function screening_v2.r1_meet_public_person_r1_check(uuid, text) is
+  '0144 (M035 S12 fix round): the public R1 booking page''s book-path lookup, one R1 per Ashby '
+  'person. For the Ashby link of p_ashby_application_id bound to p_candidate_id: refused '
+  'application_unknown when there is none; refused r1_completed when ANOTHER local candidate '
+  'linked to the same Ashby candidate id (case ignored) has a completed or counted sales_r1 round '
+  'of any channel; else eligible. The candidate''s own rounds are the 0143 precheck''s. Answers '
+  '{status:eligible} | {status:refused, code} | {status:invalid_request, field}: nothing about '
+  'the other rows. Writes, locks and stores nothing. Service-role only.';
 
 notify pgrst, 'reload schema';

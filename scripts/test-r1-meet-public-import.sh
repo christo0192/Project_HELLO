@@ -9,8 +9,10 @@
 # fence with the 0130 arms as regressions, v_ashby_application_impact and impact_application_rows
 # leaving an import out, the read-only r1_meet_public_local_rows lookup, and the
 # r1_meet_public_import_application RPC (validation, holds over the Ashby person, adoption of an
-# existing link, the mapping, the exact link and shell it writes, nothing else written, and the
-# privilege posture). The whole file runs in one transaction and is rolled back.
+# existing link, one R1 per Ashby person, the mapping, the exact link and shell it writes, nothing
+# else written, and the privilege posture), v_funnel_candidate and the funnel rollup leaving an
+# import out, and the book path's r1_meet_public_person_r1_check lookup. The whole file runs in
+# one transaction and is rolled back.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -26,4 +28,4 @@ docker exec -i "$SUPABASE_DB_CONTAINER" \
   psql -U postgres -d postgres -q -v ON_ERROR_STOP=1 \
   < "$TESTS/r1_meet_public_import_assert.sql"
 
-log 'PASS: R1 Meet public import intake, fences, profile claim, impact view, local lookup and import RPC assertions'
+log 'PASS: R1 Meet public import intake, fences, profile claim, impact and funnel views, local lookup, import RPC and person check assertions'

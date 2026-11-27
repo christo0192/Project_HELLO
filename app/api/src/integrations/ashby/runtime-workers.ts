@@ -1033,10 +1033,14 @@ export function buildAshbyHandlers(
       // invisible candidate behind.
       if (result.status === 'shell_unbound') throw new Error('ashby_import_shell_unbound');
       // 0144: the M035 public booking import owns this application, so the
-      // import did nothing at all. Metadata only, no identifier, so a stage
-      // webhook or reconciliation that reached it is visible in the logs.
+      // import did nothing at all: no resume ingestion, no profile step and
+      // never a Christy call, for good (the intake never changes). A stage
+      // webhook or reconciliation reaches this when HR moves such an
+      // application into the AI-screening stage, which HR may expect to start
+      // Christy, so it is a WARNING (S12 fix round F2; runbook
+      // ashby-runtime-activation.md §12). Metadata only, no identifier.
       if (result.status === 'skipped' && result.reason === 'r1_public_booking') {
-        logger.info('unknown_event', {
+        logger.warn('unknown_event', {
           error_category: 'ashby_import_skipped',
           error_type: 'r1_public_booking',
         });

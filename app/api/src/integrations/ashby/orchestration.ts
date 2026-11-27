@@ -86,6 +86,27 @@ export function isAshbyIntakeType(value: unknown): value is AshbyIntakeType {
   return typeof value === 'string' && (ASHBY_INTAKE_TYPES as readonly string[]).includes(value);
 }
 
+/**
+ * 0144 §3: the closed message (SQLSTATE P0001) the phone-engagement guard
+ * raises when a phone RPC (`ensure_ashby_phone_engagement`, reached through
+ * `request_candidate_phone_call` and `schedule_candidate_phone_appointment`)
+ * would give an `r1_public_booking` link an engagement. The whole transaction
+ * rolls back, so nothing was written.
+ */
+export const R1_PUBLIC_BOOKING_ENGAGEMENT_REFUSAL =
+  'r1_public_booking: a public booking import never gets a phone engagement';
+
+/**
+ * True for exactly that refusal as PostgREST relays it (`code` P0001 and the
+ * closed message), so a route can answer it as a plain refusal instead of an
+ * outage (S12 fix round F4). Any other database error is false.
+ */
+export function isR1PublicBookingEngagementRefusal(error: unknown): boolean {
+  if (error === null || typeof error !== 'object') return false;
+  const { code, message } = error as { code?: unknown; message?: unknown };
+  return code === 'P0001' && message === R1_PUBLIC_BOOKING_ENGAGEMENT_REFUSAL;
+}
+
 /** 0130 §1: the closed `profile_outcome` vocabulary on the link (a CHECK). */
 export type AshbyProfileOutcome =
   | 'applied'
