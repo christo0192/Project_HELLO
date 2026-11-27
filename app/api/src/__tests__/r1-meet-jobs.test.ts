@@ -5,8 +5,8 @@
  * Pinned here:
  *  - the queue name, the thirteen kinds, the attempts and the dedup keys, with the ones migration 0142
  *    hard-codes read from the SQL;
- *  - every `ashby_booked_tag` producer in ANY migration (S01's 0143), or, while there is none, that no
- *    migration names the kind at all (D-S11-14);
+ *  - every `ashby_booked_tag` producer in ANY migration (S01's 0143, on main since #450, so at least
+ *    its `add` and `remove` producers must exist) (D-S11-14);
  *  - the payloads the S03 receivers write, spelled out literally in S03's key order (S03 is not in this
  *    branch, so nothing of it is imported), plus `receipt_id` and `source` as `r1_meet_record_receipt`
  *    adds them;
@@ -958,7 +958,8 @@ describe('ashby_booked_tag (M035 S11)', () => {
  * THE 0143 PIN (D-S11-14), gate-free. Every `jsonb_build_object('kind', 'ashby_booked_tag'` in ANY
  * migration must be a well-formed producer: queue `r1-meet`, keys `kind, op, booking_id` in that order,
  * op `add` or `remove`, the dedup key built from the SAME row id and the SAME op, and the attempts of
- * the kind. With producers present both ops appear; with none, no migration names the kind at all.
+ * the kind. Both ops appear. (Before S01's 0143 reached main, #450, a dark branch accepted no producer
+ * as long as no migration named the kind; with 0143 on main the pin requires the producers.)
  */
 describe('the ashby_booked_tag producers of the migrations (M035 S11)', () => {
   const migrationsDir = path.resolve(here, '../../../supabase/migrations');
@@ -1019,25 +1020,22 @@ describe('the ashby_booked_tag producers of the migrations (M035 S11)', () => {
     for (const text of bad) expect(producersOf(text), text).toEqual({ occurrences: 1, wellFormed: [] });
   });
 
-  it('every producer in every migration is well formed, or (dark, before 0143) none names the kind', () => {
+  it('every producer in every migration is well formed, and 0143 holds both the add and the remove', () => {
     const migrations = readdirSync(migrationsDir)
       .filter((name) => name.endsWith('.sql'))
       .sort()
       .map((name) => ({ name, text: collapse(readFileSync(path.join(migrationsDir, name), 'utf8')) }));
     expect(migrations.map((migration) => migration.name)).toContain('0142_r1_meet_bookings.sql');
+    expect(migrations.map((migration) => migration.name)).toContain('0143_r1_meet_public_bookings.sql');
     const producers: Producer[] = [];
     for (const { name, text } of migrations) {
       const { occurrences, wellFormed } = producersOf(text);
       expect(wellFormed.length, `${name}: every ashby_booked_tag producer is well formed`).toBe(occurrences);
       producers.push(...wellFormed);
     }
-    if (producers.length > 0) {
-      expect([...new Set(producers.map((producer) => producer.op))].sort()).toEqual(['add', 'remove']);
-      for (const { op, key } of producers) expect(key, op).toBe(r1MeetDedupKeys.ashbyBookedTag(BOOKING, op));
-    } else {
-      // 0143 (S01) is the only producer; this branch flips by itself when it lands.
-      for (const { name, text } of migrations) expect(text.includes('ashby_booked_tag'), name).toBe(false);
-    }
+    // 0143's create RPC queues the `add`, its terminal trigger the `remove` (contracts 4.1, 3.1).
+    expect([...new Set(producers.map((producer) => producer.op))].sort()).toEqual(['add', 'remove']);
+    for (const { op, key } of producers) expect(key, op).toBe(r1MeetDedupKeys.ashbyBookedTag(BOOKING, op));
   });
 });
 

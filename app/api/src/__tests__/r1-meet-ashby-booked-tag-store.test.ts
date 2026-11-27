@@ -14,11 +14,11 @@
  *    another candidate's links never seen) and `newestPublicBooking` (created_at, then id, both
  *    descending; Ashby rows and other applications never answered);
  *  - schema pins: every booking column but `source` is a 0142 column; `source` is 0143's (contracts
- *    §3.1) when 0143 is in the migrations folder, else 0142 has none (the dark branch); the two link
- *    columns are 0029's.
+ *    §3.1; 0143 is on main since S01, #450, so the pin no longer has a dark branch) and 0142 has none;
+ *    the two link columns are 0029's.
  */
 
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -561,19 +561,16 @@ describe('the columns exist in the migrations', () => {
     expect(listed).toEqual([...R1_MEET_BOOKING_STATUSES]);
   });
 
-  it('source is the 0143 column of contracts 3.1 (or, while 0143 is not here, 0142 has none)', () => {
-    const names = readdirSync(MIGRATIONS);
-    if (existsSync(path.join(MIGRATIONS, PUBLIC_MIGRATION))) {
-      const sql = sqlOf(PUBLIC_MIGRATION);
-      expect(sql).toContain("add column if not exists source text not null default 'ashby'");
-      expect(sql).toMatch(/source in \(\s*'ashby'\s*,\s*'public_page'\s*\)/);
-      // The application id stays NOT NULL on every row (contracts 3.1): the store requires one.
-      expect(sql).not.toMatch(/alter column ashby_application_id drop not null/);
-    } else {
-      // The dark branch: S01's 0143 is not on this branch yet.
-      expect(declares(bookings0142, 'source', 'text')).toBe(false);
-      expect(names.some((name) => name.startsWith('0143_'))).toBe(false);
-    }
+  // S01's 0143 is on main (#450), so this pin no longer has its dark branch (0143 absent, 0142 with no
+  // source): it now requires the 0143 column outright.
+  it('source is the 0143 column of contracts 3.1, and 0142 has none', () => {
+    expect(readdirSync(MIGRATIONS)).toContain(PUBLIC_MIGRATION);
+    const sql = sqlOf(PUBLIC_MIGRATION);
+    expect(sql).toContain("add column if not exists source text not null default 'ashby'");
+    expect(sql).toMatch(/source in \(\s*'ashby'\s*,\s*'public_page'\s*\)/);
+    // The application id stays NOT NULL on every row (contracts 3.1): the store requires one.
+    expect(sql).not.toMatch(/alter column ashby_application_id drop not null/);
+    expect(declares(bookings0142, 'source', 'text')).toBe(false);
   });
 
   it('the two link columns, the provider and the unique application key are 0029 columns', () => {
