@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { R1BookErrorSummary, type R1BookErrorItem } from '../components/candidate-r1/R1BookErrorSummary';
 import { R1BookNotice } from '../components/candidate-r1/R1BookNotice';
 import { R1BookSlotPicker } from '../components/candidate-r1/R1BookSlotPicker';
@@ -98,7 +98,7 @@ type Stage = StageBody & { seq: number };
 
 type Panel = 'none' | 'move' | 'cancel';
 
-/** A focus move to make after the next commit: the first of `targets` that exists. */
+/** A focus move for the next commit (a layout effect): the first of `targets` that exists. */
 interface FocusRequest {
   targets: readonly string[];
   seq: number;
@@ -178,7 +178,8 @@ export function R1BookManagePage() {
     setFocusRequest({ targets, seq: focusSeqRef.current });
   };
 
-  useEffect(() => {
+  // A layout effect, so focus lands in the same commit that shows its target (as the cards do).
+  useLayoutEffect(() => {
     if (!focusRequest) return;
     for (const target of focusRequest.targets) {
       const element = target === SUMMARY ? summaryRef.current : document.getElementById(target);

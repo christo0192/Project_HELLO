@@ -160,6 +160,18 @@ function renderPage(strict = false) {
 
 const findForm = () => screen.findByRole('heading', { level: 1, name: R1_BOOK_COPY.form.title });
 const findH1 = (name: string) => screen.findByRole('heading', { level: 1, name });
+
+/**
+ * Waits for focus to land on the element. The pages move focus in a layout effect, in the commit
+ * that mounts the element (pinned in R1BookComponents.test.tsx). The check still waits instead of
+ * reading focus once: a one-shot read right after a find* raced on CI (PR #447) while the move
+ * ran in a passive effect, and a check should not depend on when effects are flushed.
+ */
+async function expectFocus(target: HTMLElement | null | Promise<HTMLElement>): Promise<void> {
+  const element = await target;
+  await waitFor(() => expect(element).toHaveFocus());
+}
+
 const field = (id: string) => document.getElementById(id) as HTMLInputElement;
 const nameInput = () => screen.getByLabelText(R1_BOOK_COPY.form.nameLabel) as HTMLInputElement;
 const emailInput = () => screen.getByLabelText(R1_BOOK_COPY.form.emailLabel) as HTMLInputElement;
@@ -253,7 +265,7 @@ describe('R1BookPage loading', () => {
   ] as const)('shows "not open yet" when %s answers booking_disabled, and never posts', async (_, route) => {
     h[route].mockRejectedValue(disabledError());
     renderPage();
-    expect(await findH1(R1_BOOK_COPY.states.notOpen.title)).toHaveFocus();
+    await expectFocus(findH1(R1_BOOK_COPY.states.notOpen.title));
     expect(screen.getByText(R1_BOOK_COPY.states.notOpen.body)).toBeVisible();
     expect(screen.queryByRole('button')).toBeNull();
     expect(h.book).not.toHaveBeenCalled();
@@ -272,7 +284,7 @@ describe('R1BookPage loading', () => {
   ] as const)('shows "not open yet" when %s answers 401 (the routes are not served yet), and never posts', async (_, route) => {
     h[route].mockRejectedValue(new R1ApiError('unauthorized', 401));
     renderPage();
-    expect(await findH1(R1_BOOK_COPY.states.notOpen.title)).toHaveFocus();
+    await expectFocus(findH1(R1_BOOK_COPY.states.notOpen.title));
     expect(screen.queryByRole('button')).toBeNull();
     expect(screen.queryByText(R1_BOOK_COPY.states.unavailable.title)).toBeNull();
     expect(h.book).not.toHaveBeenCalled();
@@ -287,9 +299,9 @@ describe('R1BookPage loading', () => {
     const user = setupUser();
     h.slots.mockRejectedValueOnce(error());
     renderPage();
-    expect(await findH1(R1_BOOK_COPY.states.unavailable.title)).toHaveFocus();
+    await expectFocus(findH1(R1_BOOK_COPY.states.unavailable.title));
     await user.click(screen.getByRole('button', { name: R1_BOOK_COPY.states.unavailable.action }));
-    expect(await findForm()).toHaveFocus();
+    await expectFocus(findForm());
     expect(h.consentTemplate).toHaveBeenCalledTimes(2);
     expect(h.slots).toHaveBeenCalledTimes(2);
     expect(liveRegion()).toHaveTextContent(R1_BOOK_COPY.live.updated);
@@ -303,7 +315,7 @@ describe('R1BookPage loading', () => {
     const user = setupUser();
     h.slots.mockResolvedValueOnce(grid());
     renderPage();
-    expect(await findH1(R1_BOOK_COPY.states.fullyBooked.title)).toHaveFocus();
+    await expectFocus(findH1(R1_BOOK_COPY.states.fullyBooked.title));
     expect(screen.getByText(R1_BOOK_COPY.states.fullyBooked.body)).toBeVisible();
     await user.click(screen.getByRole('button', { name: R1_BOOK_COPY.states.fullyBooked.action }));
     await findForm();
@@ -322,7 +334,7 @@ describe('R1BookPage form checks', () => {
     await user.click(submitButton());
 
     const summary = screen.getByRole('group', { name: R1_BOOK_COPY.errors.summaryTitle });
-    expect(summary).toHaveFocus();
+    await expectFocus(summary);
     const items = within(summary).getAllByRole('button');
     expect(items.map((item) => item.textContent)).toEqual([
       R1_BOOK_COPY.errors.name_required,
@@ -399,7 +411,7 @@ describe('R1BookPage booking', () => {
     await user.click(submitButton());
 
     const heading = await findH1(R1_BOOK_COPY.states.booked.title);
-    expect(heading).toHaveFocus();
+    await expectFocus(heading);
     expect(h.book).toHaveBeenCalledTimes(1);
     const [sent] = submissions();
     expect(Object.keys(sent).sort()).toEqual(
@@ -572,7 +584,7 @@ describe('R1BookPage request_id', () => {
     h.book.mockRejectedValueOnce(unavailableError());
     await openAndFill(user);
     await user.click(submitButton());
-    expect(await findH1(retryTitle)).toHaveFocus();
+    await expectFocus(findH1(retryTitle));
     expect(screen.queryByText(uncertainTitle)).toBeNull();
     await user.click(tryAgain());
     await findH1(R1_BOOK_COPY.states.booked.title);
@@ -587,7 +599,7 @@ describe('R1BookPage request_id', () => {
     h.book.mockRejectedValueOnce(networkError());
     await openAndFill(user);
     await user.click(submitButton());
-    expect(await findH1(uncertainTitle)).toHaveFocus();
+    await expectFocus(findH1(uncertainTitle));
     expect(screen.getByText(R1_BOOK_COPY.states.uncertain.body)).toBeVisible();
     expect(screen.queryByText(retryTitle)).toBeNull();
     expect(screen.queryByText(R1_BOOK_COPY.states.retry.body)).toBeNull();
@@ -616,7 +628,7 @@ describe('R1BookPage request_id', () => {
     await findH1(uncertainTitle);
     await user.click(screen.getByRole('button', { name: R1_BOOK_COPY.states.uncertain.back }));
     expect(await findForm()).toBeInTheDocument();
-    expect(nameInput()).toHaveFocus();
+    await expectFocus(nameInput());
     expect(nameInput().value).toBe(NAME);
     await user.type(emailInput(), 'x');
     await user.click(submitButton());
@@ -685,7 +697,7 @@ describe('R1BookPage request_id', () => {
     await waitFor(() => expect(h.book).toHaveBeenCalledTimes(2));
     // Still not confirmed: the first attempt may have booked.
     const again = await screen.findByRole('button', { name: R1_BOOK_COPY.states.uncertain.action });
-    expect(screen.getByRole('heading', { level: 1, name: uncertainTitle })).toHaveFocus();
+    await expectFocus(screen.getByRole('heading', { level: 1, name: uncertainTitle }));
     expect(screen.queryByText(retryTitle)).toBeNull();
 
     await user.click(again);
@@ -883,7 +895,7 @@ describe('R1BookPage refusals', () => {
     await openAndFill(user);
     await user.click(submitButton());
     const notice = await screen.findByText(R1_BOOK_COPY.inline.noticeChanged, { selector: '.r1-book__notice' });
-    expect(notice).toHaveFocus();
+    await expectFocus(notice);
     expect(h.consentTemplate).toHaveBeenCalledTimes(2);
     for (const box of screen.getAllByRole('checkbox')) expect(box).not.toBeChecked();
     expect(nameInput().value).toBe(NAME);
@@ -900,12 +912,12 @@ describe('R1BookPage refusals', () => {
     h.book.mockRejectedValueOnce(new R1ApiError('not_found', 404));
     await openAndFill(user);
     await user.click(submitButton());
-    expect(await findH1(R1_BOOK_COPY.states.notFound.title)).toHaveFocus();
+    await expectFocus(findH1(R1_BOOK_COPY.states.notFound.title));
     expect(screen.getByText(R1_BOOK_COPY.states.notFound.body)).toBeVisible();
     expect(document.body.textContent).not.toContain(EMAIL);
     await user.click(screen.getByRole('button', { name: R1_BOOK_COPY.states.notFound.action }));
     await findForm();
-    expect(nameInput()).toHaveFocus();
+    await expectFocus(nameInput());
     expect(nameInput().value).toBe(NAME);
     expect(emailInput().value).toBe(EMAIL);
     expect(phoneInput().value).toBe(PHONE);
@@ -925,7 +937,7 @@ describe('R1BookPage refusals', () => {
     h.book.mockRejectedValueOnce(new R1ApiError('already_booked', 409));
     await openAndFill(user);
     await user.click(submitButton());
-    expect(await findH1(R1_BOOK_COPY.states.alreadyBooked.title)).toHaveFocus();
+    await expectFocus(findH1(R1_BOOK_COPY.states.alreadyBooked.title));
     expect(screen.getByText(R1_BOOK_COPY.states.alreadyBooked.body)).toBeVisible();
     expect(document.querySelector('.r1-book__when')).toBeNull();
     const text = document.body.textContent ?? '';
@@ -949,7 +961,7 @@ describe('R1BookPage refusals', () => {
     h.book.mockRejectedValueOnce(disabledError());
     await openAndFill(user);
     await user.click(submitButton());
-    expect(await findH1(R1_BOOK_COPY.states.notOpen.title)).toHaveFocus();
+    await expectFocus(findH1(R1_BOOK_COPY.states.notOpen.title));
   });
 });
 
@@ -993,46 +1005,46 @@ describe('R1BookPage privacy and access', () => {
       renderPage();
       await findForm();
       await user.tab();
-      expect(nameInput()).toHaveFocus();
+      await expectFocus(nameInput());
       await user.keyboard(NAME);
       await user.tab();
-      expect(emailInput()).toHaveFocus();
+      await expectFocus(emailInput());
       await user.keyboard(EMAIL);
       await user.tab();
-      expect(phoneInput()).toHaveFocus();
+      await expectFocus(phoneInput());
       await user.keyboard(PHONE);
 
       await user.tab();
       const firstDay = document.querySelector<HTMLInputElement>('input[name="r1-book-day"]:checked');
-      expect(firstDay).toHaveFocus();
+      await expectFocus(firstDay);
       // The second day has no free time, so the arrow skips it.
       await user.keyboard('{ArrowRight}');
       const thirdDay = document.querySelector<HTMLInputElement>('input[name="r1-book-day"][value="2026-09-18"]');
-      expect(thirdDay).toHaveFocus();
+      await expectFocus(thirdDay);
       expect(thirdDay).toBeChecked();
 
       await user.tab();
       const third = GRID.days[2].slots[0];
       const time = screen.getByRole('radio', { name: formatIstTimeRange(third.start_at, third.end_at) });
-      expect(time).toHaveFocus();
+      await expectFocus(time);
       await user.keyboard(' ');
       expect(time).toBeChecked();
 
       await user.tab();
-      expect(screen.getByRole('region', { name: R1_BOOK_COPY.form.noticeRegionLabel })).toHaveFocus();
+      await expectFocus(screen.getByRole('region', { name: R1_BOOK_COPY.form.noticeRegionLabel }));
       for (const type of TEMPLATE.required_consents) {
         await user.tab();
-        expect(field(`r1-book-consent-${type}`)).toHaveFocus();
+        await expectFocus(field(`r1-book-consent-${type}`));
         await user.keyboard(' ');
       }
       await user.tab();
-      expect(field('r1-book-in-india')).toHaveFocus();
+      await expectFocus(field('r1-book-in-india'));
       await user.keyboard(' ');
 
       await user.tab();
-      expect(submitButton()).toHaveFocus();
+      await expectFocus(submitButton());
       await user.keyboard('{Enter}');
-      expect(await findH1(R1_BOOK_COPY.states.booked.title)).toHaveFocus();
+      await expectFocus(findH1(R1_BOOK_COPY.states.booked.title));
       expect(submissions()[0].slot_start).toBe(third.start_at);
       expect(submissions()[0].consent.consents).toEqual(TEMPLATE.required_consents);
       expect(pointer).not.toHaveBeenCalled();

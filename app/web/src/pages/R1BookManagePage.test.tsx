@@ -169,6 +169,18 @@ function openPage(hash = `#m=${TOKEN}`, strict = false) {
 
 const findH1 = (name: string) => screen.findByRole('heading', { level: 1, name });
 const findView = () => findH1(copy.view.title);
+
+/**
+ * Waits for focus to land on the element. The pages move focus in a layout effect, in the commit
+ * that mounts the element (pinned in R1BookComponents.test.tsx). The check still waits instead of
+ * reading focus once: a one-shot read right after a find* raced on CI (PR #447) while the move
+ * ran in a passive effect, and a check should not depend on when effects are flushed.
+ */
+async function expectFocus(target: HTMLElement | null | Promise<HTMLElement>): Promise<void> {
+  const element = await target;
+  await waitFor(() => expect(element).toHaveFocus());
+}
+
 const button = (name: string) => screen.getByRole('button', { name });
 const queryButton = (name: string) => screen.queryByRole('button', { name });
 const liveRegion = () => document.querySelector('p[aria-live="polite"]') as HTMLElement;
@@ -244,7 +256,7 @@ describe('R1BookManagePage token', () => {
     ['a token without m=', `#${'m'.repeat(43)}`],
   ])('reads %s as "no longer active" and calls nothing', async (_, hash) => {
     openPage(hash);
-    expect(await findH1(copy.inactive.title)).toHaveFocus();
+    await expectFocus(findH1(copy.inactive.title));
     expect(screen.getByText(copy.inactive.body)).toBeVisible();
     expect(screen.queryByRole('button')).toBeNull();
     expect(allCalls()).toBe(0);
@@ -298,7 +310,7 @@ describe('R1BookManagePage first read', () => {
   it('reads a 401 (the routes are not served yet) as "online changes are not available"', async () => {
     h.manage.mockRejectedValue(new R1ApiError('unauthorized', 401));
     openPage();
-    expect(await findH1(copy.disabled.title)).toHaveFocus();
+    await expectFocus(findH1(copy.disabled.title));
     expect(screen.queryByText(copy.unavailable.title)).toBeNull();
     expect(screen.queryByRole('button')).toBeNull();
   });
@@ -321,14 +333,14 @@ describe('R1BookManagePage first read', () => {
   it('reads 404 not_found as "no longer active"', async () => {
     h.manage.mockRejectedValue(notFoundError());
     openPage();
-    expect(await findH1(copy.inactive.title)).toHaveFocus();
+    await expectFocus(findH1(copy.inactive.title));
     expect(screen.queryByRole('button')).toBeNull();
   });
 
   it('reads 503 booking_disabled as "online changes are not available"', async () => {
     h.manage.mockRejectedValue(disabledError());
     openPage();
-    expect(await findH1(copy.disabled.title)).toHaveFocus();
+    await expectFocus(findH1(copy.disabled.title));
     expect(screen.getByText(copy.disabled.body)).toBeVisible();
     expect(screen.queryByRole('button')).toBeNull();
   });
@@ -343,9 +355,9 @@ describe('R1BookManagePage first read', () => {
     const user = setupUser();
     h.manage.mockRejectedValueOnce(error());
     openPage();
-    expect(await findH1(copy.unavailable.title)).toHaveFocus();
+    await expectFocus(findH1(copy.unavailable.title));
     await user.click(button(copy.unavailable.action));
-    expect(await findView()).toHaveFocus();
+    await expectFocus(findView());
     expect(h.manage).toHaveBeenCalledTimes(2);
     expect(h.manage.mock.calls[1]).toEqual([TOKEN]);
   });
@@ -356,7 +368,7 @@ describe('R1BookManagePage first read', () => {
 describe('R1BookManagePage view', () => {
   it('shows the time in IST, the join line and both changes', async () => {
     openPage();
-    expect(await findView()).toHaveFocus();
+    await expectFocus(findView());
     expect(screen.getByText(formatBookSlot(CURRENT_START, CURRENT_END))).toBeVisible();
     expect(screen.getByText(copy.view.join)).toBeVisible();
     const move = button(copy.view.move);
@@ -389,7 +401,7 @@ describe('R1BookManagePage view', () => {
       consent_current: true,
     }));
     openPage();
-    expect(await findView()).toHaveFocus();
+    await expectFocus(findView());
     expect(screen.queryByText(copy.unavailable.title)).toBeNull();
     expect(queryButton(copy.view.move)).toBeNull();
     expect(document.getElementById('r1-manage-moves-left')).toBeNull();
@@ -424,7 +436,7 @@ describe('R1BookManagePage view', () => {
   it('shows the starting copy and no action while the interview is in progress', async () => {
     h.manage.mockResolvedValue(makeView({ state: 'in_progress', consent_current: false }));
     openPage();
-    expect(await findH1(copy.inProgress.title)).toHaveFocus();
+    await expectFocus(findH1(copy.inProgress.title));
     expect(screen.getByText(formatBookSlot(CURRENT_START, CURRENT_END))).toBeVisible();
     expect(screen.getByText(copy.inProgress.body)).toBeVisible();
     expect(screen.queryByRole('button')).toBeNull();
@@ -441,7 +453,7 @@ describe('R1BookManagePage move', () => {
     await openMovePanel(user);
     expect(h.slots).toHaveBeenCalledTimes(1);
     expect(h.slots.mock.calls[0]).toEqual([]);
-    expect(screen.getByRole('heading', { level: 2, name: copy.movePanel.title })).toHaveFocus();
+    await expectFocus(screen.getByRole('heading', { level: 2, name: copy.movePanel.title }));
     const current = timeRadio(CURRENT_START)!;
     expect(current).toBeDisabled();
     expect(current.closest('label')).toHaveTextContent(R1_BOOK_COPY.form.currentTime);
@@ -454,7 +466,7 @@ describe('R1BookManagePage move', () => {
   it('moves after one wait for a young grid, then offers nothing further', async () => {
     const user = setupUser();
     await moveToTarget(user);
-    expect(await findH1(copy.moved.title)).toHaveFocus();
+    await expectFocus(findH1(copy.moved.title));
     expect(h.move).toHaveBeenCalledTimes(1);
     expect(h.move.mock.calls[0]).toEqual([TOKEN, TARGET_START, GRID.grid_token]);
     expect(sleepSpy).toHaveBeenCalledTimes(1);
@@ -481,7 +493,7 @@ describe('R1BookManagePage move', () => {
     await openMovePanel(user);
     await user.click(button(copy.movePanel.confirm));
     expect(screen.getByText(R1_BOOK_COPY.errors.slot_required)).toBeVisible();
-    expect(document.getElementById('r1-manage-slot-first')).toHaveFocus();
+    await expectFocus(document.getElementById('r1-manage-slot-first'));
     expect(h.move).not.toHaveBeenCalled();
     expect(sleepSpy).not.toHaveBeenCalled();
   });
@@ -546,7 +558,7 @@ describe('R1BookManagePage move', () => {
     const user = setupUser();
     h.move.mockRejectedValue(new R1ApiError('move_not_allowed', 409));
     await moveToTarget(user);
-    expect(await findH1(copy.notAllowed.title)).toHaveFocus();
+    await expectFocus(findH1(copy.notAllowed.title));
     expect(screen.getByText(copy.notAllowed.body)).toBeVisible();
     expect(screen.queryByRole('button')).toBeNull();
   });
@@ -555,21 +567,21 @@ describe('R1BookManagePage move', () => {
     const user = setupUser();
     h.move.mockRejectedValue(notFoundError());
     await moveToTarget(user);
-    expect(await findH1(copy.inactive.title)).toHaveFocus();
+    await expectFocus(findH1(copy.inactive.title));
   });
 
   it('reads 503 booking_disabled as "online changes are not available"', async () => {
     const user = setupUser();
     h.move.mockRejectedValue(disabledError());
     await moveToTarget(user);
-    expect(await findH1(copy.disabled.title)).toHaveFocus();
+    await expectFocus(findH1(copy.disabled.title));
   });
 
   it('cannot confirm a dropped move, and "Try again" repeats the same move', async () => {
     const user = setupUser();
     h.move.mockRejectedValueOnce(networkError());
     await moveToTarget(user);
-    expect(await findH1(copy.uncertain.title)).toHaveFocus();
+    await expectFocus(findH1(copy.uncertain.title));
     expect(screen.getByText(copy.uncertain.body)).toBeVisible();
     await user.click(button(copy.uncertain.action));
     await findH1(copy.moved.title);
@@ -581,7 +593,7 @@ describe('R1BookManagePage move', () => {
     const user = setupUser();
     h.move.mockRejectedValueOnce(unavailableError());
     await moveToTarget(user);
-    expect(await findH1(copy.unavailable.title)).toHaveFocus();
+    await expectFocus(findH1(copy.unavailable.title));
     await user.click(button(copy.unavailable.action));
     await findH1(copy.moved.title);
     expect(h.move.mock.calls).toEqual([
@@ -596,7 +608,7 @@ describe('R1BookManagePage move', () => {
     openPage();
     await findView();
     await user.click(button(copy.view.move));
-    expect(await findH1(copy.disabled.title)).toHaveFocus();
+    await expectFocus(findH1(copy.disabled.title));
   });
 
   it('reads an unavailable grid as unavailable, and "Try again" opens the panel again', async () => {
@@ -617,7 +629,7 @@ describe('R1BookManagePage move', () => {
     await openMovePanel(user);
     await user.click(button(copy.movePanel.keep));
     expect(screen.queryByRole('heading', { level: 2, name: copy.movePanel.title })).toBeNull();
-    expect(button(copy.view.move)).toHaveFocus();
+    await expectFocus(button(copy.view.move));
     expect(h.move).not.toHaveBeenCalled();
   });
 });
@@ -628,11 +640,11 @@ describe('R1BookManagePage cancel', () => {
   it('asks first, with the withdraw box unticked, and "Keep my interview" closes the panel', async () => {
     const user = setupUser();
     await openCancelPanel(user);
-    expect(screen.getByRole('heading', { level: 2, name: copy.cancelPanel.title })).toHaveFocus();
+    await expectFocus(screen.getByRole('heading', { level: 2, name: copy.cancelPanel.title }));
     expect(screen.getByText(copy.cancelPanel.body)).toBeVisible();
     expect(screen.getByRole('checkbox', { name: copy.cancelPanel.withdraw })).not.toBeChecked();
     await user.click(button(copy.cancelPanel.keep));
-    expect(button(copy.view.cancel)).toHaveFocus();
+    await expectFocus(button(copy.view.cancel));
     expect(h.cancel).not.toHaveBeenCalled();
   });
 
@@ -640,7 +652,7 @@ describe('R1BookManagePage cancel', () => {
     const user = setupUser();
     await openCancelPanel(user);
     await user.click(button(copy.cancelPanel.confirm));
-    expect(await findH1(copy.cancelled.title)).toHaveFocus();
+    await expectFocus(findH1(copy.cancelled.title));
     expect(h.cancel.mock.calls).toEqual([[TOKEN, false]]);
     expect(screen.getByText(copy.cancelled.body)).toBeVisible();
     expect(screen.queryByText(copy.cancelled.withdrawn)).toBeNull();
@@ -662,7 +674,7 @@ describe('R1BookManagePage cancel', () => {
     h.cancel.mockResolvedValue('already_cancelled');
     await openCancelPanel(user);
     await user.click(button(copy.cancelPanel.confirm));
-    expect(await findH1(copy.cancelled.title)).toHaveFocus();
+    await expectFocus(findH1(copy.cancelled.title));
     expect(screen.queryByText(copy.cancelled.withdrawn)).toBeNull();
   });
 
@@ -671,7 +683,7 @@ describe('R1BookManagePage cancel', () => {
     h.cancel.mockRejectedValue(new R1ApiError('cancel_not_allowed', 409));
     await openCancelPanel(user);
     await user.click(button(copy.cancelPanel.confirm));
-    expect(await findH1(copy.notAllowed.title)).toHaveFocus();
+    await expectFocus(findH1(copy.notAllowed.title));
   });
 
   it('reads 404 not_found as "no longer active"', async () => {
@@ -679,7 +691,7 @@ describe('R1BookManagePage cancel', () => {
     h.cancel.mockRejectedValue(notFoundError());
     await openCancelPanel(user);
     await user.click(button(copy.cancelPanel.confirm));
-    expect(await findH1(copy.inactive.title)).toHaveFocus();
+    await expectFocus(findH1(copy.inactive.title));
   });
 
   it('cannot confirm a dropped cancel, and "Try again" repeats it with the same arguments', async () => {
@@ -688,7 +700,7 @@ describe('R1BookManagePage cancel', () => {
     await openCancelPanel(user);
     await user.click(screen.getByRole('checkbox', { name: copy.cancelPanel.withdraw }));
     await user.click(button(copy.cancelPanel.confirm));
-    expect(await findH1(copy.uncertain.title)).toHaveFocus();
+    await expectFocus(findH1(copy.uncertain.title));
     await user.click(button(copy.uncertain.action));
     await findH1(copy.cancelled.title);
     expect(h.cancel.mock.calls).toEqual([
@@ -724,16 +736,16 @@ describe('R1BookManagePage re-consent', () => {
     await openReconsent();
     await user.click(button(copy.reconsent.submit));
     const summary = screen.getByRole('group', { name: R1_BOOK_COPY.errors.summaryTitle });
-    expect(summary).toHaveFocus();
+    await expectFocus(summary);
     const items = within(summary).getAllByRole('button');
     expect(items.map((item) => item.textContent)).toEqual([
       R1_BOOK_COPY.errors.consents_required,
       R1_BOOK_COPY.errors.in_india_required,
     ]);
     await user.click(items[0]);
-    expect(field(`r1-manage-consent-${TEMPLATE.required_consents[0]}`)).toHaveFocus();
+    await expectFocus(field(`r1-manage-consent-${TEMPLATE.required_consents[0]}`));
     await user.click(within(summary).getAllByRole('button')[1]);
-    expect(field('r1-manage-in-india')).toHaveFocus();
+    await expectFocus(field('r1-manage-in-india'));
     expect(field('r1-manage-in-india')).toHaveAttribute('aria-invalid', 'true');
     expect(h.consent).not.toHaveBeenCalled();
   });
@@ -759,7 +771,7 @@ describe('R1BookManagePage re-consent', () => {
     expect(screen.queryByRole('heading', { level: 2, name: copy.reconsent.title })).toBeNull();
     expect(screen.queryAllByRole('checkbox')).toHaveLength(0);
     expect(screen.getByText(copy.reconsent.done, NOTICE)).toBeVisible();
-    expect(screen.getByRole('heading', { level: 1, name: copy.view.title })).toHaveFocus();
+    await expectFocus(screen.getByRole('heading', { level: 1, name: copy.view.title }));
     expect(button(copy.view.move)).toBeVisible();
   });
 
@@ -771,7 +783,7 @@ describe('R1BookManagePage re-consent', () => {
     await tickEverything(user);
     await user.click(button(copy.reconsent.submit));
     const notice = await screen.findByText(R1_BOOK_COPY.inline.noticeChanged, NOTICE);
-    expect(notice).toHaveFocus();
+    await expectFocus(notice);
     expect(h.consentTemplate).toHaveBeenCalledTimes(2);
     for (const box of screen.getAllByRole('checkbox')) expect(box).not.toBeChecked();
     expect(liveRegion()).toHaveTextContent(R1_BOOK_COPY.inline.noticeChanged);
@@ -793,7 +805,7 @@ describe('R1BookManagePage re-consent', () => {
     await openReconsent();
     await tickEverything(user);
     await user.click(button(copy.reconsent.submit));
-    expect(await findH1(copy.notAllowed.title)).toHaveFocus();
+    await expectFocus(findH1(copy.notAllowed.title));
   });
 
   it('reads 404 not_found as "no longer active"', async () => {
@@ -802,7 +814,7 @@ describe('R1BookManagePage re-consent', () => {
     await openReconsent();
     await tickEverything(user);
     await user.click(button(copy.reconsent.submit));
-    expect(await findH1(copy.inactive.title)).toHaveFocus();
+    await expectFocus(findH1(copy.inactive.title));
   });
 
   it('cannot confirm a dropped consent, and "Try again" sends the same one', async () => {
@@ -811,7 +823,7 @@ describe('R1BookManagePage re-consent', () => {
     await openReconsent();
     await tickEverything(user);
     await user.click(button(copy.reconsent.submit));
-    expect(await findH1(copy.uncertain.title)).toHaveFocus();
+    await expectFocus(findH1(copy.uncertain.title));
     await user.click(button(copy.uncertain.action));
     await waitFor(() => expect(liveRegion()).toHaveTextContent(copy.reconsent.done));
     expect(h.consent.mock.calls[1]).toEqual(h.consent.mock.calls[0]);
@@ -822,7 +834,7 @@ describe('R1BookManagePage re-consent', () => {
     h.manage.mockResolvedValue(makeView({ consent_current: false }));
     h.consentTemplate.mockRejectedValue(disabledError());
     openPage();
-    expect(await findH1(copy.disabled.title)).toHaveFocus();
+    await expectFocus(findH1(copy.disabled.title));
   });
 
   it('reads an unavailable notice as unavailable, and "Try again" reads only the notice', async () => {
@@ -832,7 +844,7 @@ describe('R1BookManagePage re-consent', () => {
     openPage();
     await findH1(copy.unavailable.title);
     await user.click(button(copy.unavailable.action));
-    expect(await screen.findByRole('heading', { level: 2, name: copy.reconsent.title })).toHaveFocus();
+    await expectFocus(screen.findByRole('heading', { level: 2, name: copy.reconsent.title }));
     expect(h.consentTemplate).toHaveBeenCalledTimes(2);
     expect(h.manage).toHaveBeenCalledTimes(1);
   });

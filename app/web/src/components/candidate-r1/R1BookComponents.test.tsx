@@ -1,6 +1,6 @@
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { createRef, useState, type Ref } from 'react';
+import { createRef, useLayoutEffect, useState, type Ref } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { formatIstDayLabel, formatIstTimeRange } from '../../lib/ist-datetime';
 import type { R1ConsentTemplate } from '../../lib/r1/r1-api';
@@ -111,6 +111,31 @@ describe('R1BookStatusCard', () => {
     expect(container.querySelector('.r1-book__when')).toBeNull();
     expect(container.querySelector('.r1-book__actions')).toBeNull();
     expect(screen.queryByRole('button')).toBeNull();
+  });
+
+  it('moves focus inside the commit that mounts it, so nothing sees the card unfocused', () => {
+    // A sibling mounted after the card runs its layout effect in the same commit, after the
+    // card's, and before any passive effect or DOM observer. A find* that saw the card before its
+    // focus moved made a focus check fail on CI (PR #447); this pins the move into the commit.
+    const seen: { inCommit: Element | null } = { inCommit: null };
+    function CommitProbe() {
+      useLayoutEffect(() => {
+        seen.inCommit = document.activeElement;
+      }, []);
+      return null;
+    }
+    render(
+      <>
+        <R1BookStatusCard
+          id="book-unavailable-title"
+          eyebrow={R1_BOOK_COPY.states.unavailable.eyebrow}
+          title={R1_BOOK_COPY.states.unavailable.title}
+          body={[R1_BOOK_COPY.states.unavailable.body]}
+        />
+        <CommitProbe />
+      </>,
+    );
+    expect(seen.inCommit).toBe(screen.getByRole('heading', { level: 1 }));
   });
 
   it('takes focus once, on mount: a re-render does not pull focus back from a control', async () => {

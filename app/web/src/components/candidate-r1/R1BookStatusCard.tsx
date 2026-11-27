@@ -1,4 +1,4 @@
-import { useEffect, useRef, type ReactNode } from 'react';
+import { useLayoutEffect, useRef, type ReactNode } from 'react';
 
 interface R1BookStatusCardProps {
   /** The heading's id, which also labels the card. Unique on the page. */
@@ -20,12 +20,13 @@ interface R1BookStatusCardProps {
  * The heading takes focus once, when the card mounts, so a keyboard or screen reader user lands
  * on the outcome of what they just did instead of on a control that has gone. A page that shows
  * several states in the same place gives each its own `key`, so every new state mounts (and
- * focuses) its own card.
+ * focuses) its own card. The focus moves in a layout effect, inside the commit that mounts the
+ * card: there is no moment, painted or observable, in which the card is shown but unfocused.
  */
 export function R1BookStatusCard({ id, eyebrow, title, body, when, children }: R1BookStatusCardProps) {
   const headingRef = useRef<HTMLHeadingElement>(null);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     headingRef.current?.focus();
   }, []);
 

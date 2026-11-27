@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 import { R1BookErrorSummary, type R1BookErrorItem } from '../components/candidate-r1/R1BookErrorSummary';
 import { R1BookNotice } from '../components/candidate-r1/R1BookNotice';
@@ -122,7 +122,7 @@ type StageBody =
 /** `seq` keys each result card, so every new result mounts its own card and focuses its heading. */
 type Stage = StageBody & { seq: number };
 
-/** A focus move to make after the next commit: the error summary, or an element by id. */
+/** A focus move for the next commit (a layout effect): the error summary, or an element by id. */
 interface FocusRequest {
   target: string;
   seq: number;
@@ -195,7 +195,8 @@ export function R1BookPage() {
     setFocusRequest({ target, seq: focusSeqRef.current });
   };
 
-  useEffect(() => {
+  // A layout effect, so focus lands in the same commit that shows its target (as the cards do).
+  useLayoutEffect(() => {
     if (!focusRequest) return;
     if (focusRequest.target === SUMMARY) summaryRef.current?.focus();
     else document.getElementById(focusRequest.target)?.focus();
