@@ -14,6 +14,13 @@
  *     its row, in words that never print the code (D-S10-10).
  *   - A booking's source (M035) is not like that: it is required and one of its two values, so an
  *     absent one, or any other, refuses the page.
+ *   - A source reads as one of two plain words, "Ashby" or "Public link", never its code (M035 S08).
+ *   - A reason reads the same for both sources but one: a public booking was never in Ashby, so one
+ *     cancelled with `cancelled` says the Ashby application is no longer active (S05's pre-slot
+ *     re-check, the only path that cancels a public booking with that reason).
+ *   - The public booking link the staff page offers is the page's own origin plus `/book`, the one
+ *     public booking page. It is never a manage path, a token or a Meet link.
+ *   - Every word that names the interviewer says Lexy.
  *   - Every day and time is India time, named at each conversion (`ist-datetime`), never the host's.
  *
  * `r1-meet-bookings.test.ts` compares the three vocabularies and the eleven fields with openapi.yaml,
@@ -43,6 +50,7 @@ import type {
   R1MeetBookingsBody,
   R1MeetBookingsQuery,
 } from './r1-meet-bookings-types';
+import { R1_BOOK_PATH } from './r1/r1-book-link';
 
 // The wire shapes live in a module with no runtime import, so the e2e harness can type its fixture
 // against them; every caller keeps reading them from here.
@@ -190,15 +198,37 @@ const REASON_TEXT: Readonly<Record<R1MeetBookingReason, string | null>> = {
   multiple_humans: 'More than one person was in the meeting.',
   attempt_settled: 'The interview has ended.',
   flag_off: 'Google Meet interviews were turned off.',
-  candidate_cancelled: 'The candidate cancelled with the link in their invite.',
-  invite_undeliverable: 'Lexy’s calendar invite could not be sent.',
+  candidate_cancelled: 'The candidate cancelled it with the link in their calendar invite.',
+  invite_undeliverable: 'Lexy’s calendar invite could not be sent to the candidate.',
 };
 
-/** Why a booking is where it is, or null when there is nothing to say. Never the reason's code. */
-export function meetBookingReasonText(reason: string): string | null {
+// A public booking was never in Ashby, so "Cancelled in Ashby." would be false for it. S05's pre-slot
+// re-check is the only path that cancels a public booking with reason `cancelled`: its Ashby
+// application is no longer Active. Every other reason reads the same for both sources.
+const PUBLIC_REASON_TEXT: Readonly<Partial<Record<R1MeetBookingReason, string>>> = {
+  cancelled: 'Cancelled because the Ashby application is no longer active.',
+};
+
+/**
+ * Why a booking is where it is, or null when there is nothing to say. Never the reason's code. The
+ * source is required, so no caller can forget that one reason reads differently for a public booking.
+ */
+export function meetBookingReasonText(reason: string, source: R1MeetBookingSource): string | null {
+  const publicWords =
+    source === 'public_page' && Object.hasOwn(PUBLIC_REASON_TEXT, reason)
+      ? PUBLIC_REASON_TEXT[reason as R1MeetBookingReason]
+      : undefined;
+  if (publicWords !== undefined) return publicWords;
   return Object.hasOwn(REASON_TEXT, reason)
     ? REASON_TEXT[reason as R1MeetBookingReason]
     : 'This page does not know the reason.';
+}
+
+const SOURCE_TEXT: Readonly<Record<R1MeetBookingSource, string>> = { ashby: 'Ashby', public_page: 'Public link' };
+
+/** Where a booking came from, in words. The reader admits only the two sources; anything else never prints its code. */
+export function meetBookingSourceText(source: R1MeetBookingSource): string {
+  return Object.hasOwn(SOURCE_TEXT, source) ? SOURCE_TEXT[source] : 'Not recognised';
 }
 
 /** The status filter. `failed` covers both of its words, so its option says both. */
@@ -209,6 +239,16 @@ export const R1_MEET_STATUS_OPTIONS: ReadonlyArray<{ value: R1MeetBookingStatus 
     label: value === 'failed' ? 'Not completed or failed' : STATUS_TERM[value].label,
   })),
 ];
+
+/* ── The public booking link ──────────────────────────────────────── */
+
+/**
+ * The one public booking page's address, as the staff page's card shows it for the Ashby email
+ * template: this page's own origin plus `/book`. Never a manage path, a token or a Meet link.
+ */
+export function meetPublicBookingUrl(origin: string): string {
+  return `${origin}${R1_BOOK_PATH}`;
+}
 
 /* ── The times ────────────────────────────────────────────────────── */
 

@@ -354,9 +354,9 @@ describe('what never reaches the page', () => {
     expect(container.innerHTML).not.toContain(String(VERSION));
     expect(container.innerHTML).not.toContain('00000000-0000-4000-8000');
     // Not vacuous: every status and reason is on the page, in its words.
-    for (const { status, reason } of bookings) {
+    for (const { status, reason, source } of bookings) {
       expect(text).toContain(meetBookingTerm(status, reason).label);
-      expect(text).toContain(meetBookingReasonText(reason) ?? '');
+      expect(text).toContain(meetBookingReasonText(reason, source) ?? '');
     }
   });
 

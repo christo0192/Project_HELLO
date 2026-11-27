@@ -32,7 +32,7 @@ function BookingRow({ booking }: { booking: R1MeetBooking }) {
   const { candidate_id: candidateId, round_id: roundId } = booking;
   const slot = meetBookingSlot(booking.start_at, booking.end_at);
   const term = meetBookingTerm(booking.status, booking.reason);
-  const reason = meetBookingReasonText(booking.reason);
+  const reason = meetBookingReasonText(booking.reason, booking.source);
   return (
     <Tr>
       <Td className="py-2.5">
