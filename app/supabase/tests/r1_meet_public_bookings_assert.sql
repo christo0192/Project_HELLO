@@ -60,6 +60,14 @@
 --   T4-C r1_meet_public_reconsent (§20): the same notice, a newer release, after a withdrawal,
 --        consent_stale, consent_incomplete, booking_dispatched, not_found, every field, the
 --        catalog.
+--   T6-A the privilege proof by behaviour: anon and authenticated execute none of the eleven RPCs
+--        and none of the three helpers and cannot touch the throttle table; service_role runs
+--        every RPC to a closed answer (rolled back), is refused the helpers, and has select,
+--        insert, update and delete on the throttle table but no truncate; the sixteen functions
+--        0143 declares, once each.
+--   T6-B one candidate end to end (create, manage digest, manage read, invite, move, re-consent,
+--        bot, cancel with withdrawal, event cancelled, re-book on a new round, invite, purge, bot,
+--        the DSAR delete), with the exact job list of every step in creation order.
 --
 -- The clock is pinned: every time is written explicitly (p_now = 2026-12-01 04:00 UTC, 09:30 IST;
 -- the default slot is 2026-12-02 05:00-05:45 UTC, 10:30-11:15 IST); nothing asserts on now().
@@ -4327,6 +4335,510 @@ begin
     perform _r1_meet_public_tests.raises_as(role_name, 'T4-C execute r1_meet_public_reconsent',
       'select screening_v2.r1_meet_public_reconsent(null, null)', '42501');
   end loop;
+end;
+$$;
+
+-- =============================================================================================
+-- T6 fixtures. Fixture numbers 700-799 (7001-7999 for a second booking or request id of candidate
+-- n/10). The T6 clock starts at 2026-12-14 04:00 UTC (09:30 IST); T6-A books on IST 2026-12-19 and
+-- T6-B on IST 2026-12-16 .. 2026-12-18, days no earlier section books (T6-B checks that first).
+-- =============================================================================================
+
+-- Runs p_sql (one jsonb answer) AS p_role and returns the answer. The role switch and every write
+-- are undone: the inner block always ends in a rolled-back subtransaction (an answered statement
+-- raises a sentinel), so the call leaves nothing behind. Fails unless the switch happened and the
+-- statement answered (the 0142 suite's runs_as).
+create function _r1_meet_public_tests.runs_as(p_role text, p_label text, p_sql text)
+returns jsonb language plpgsql as $$
+declare
+  v_res jsonb;
+  v_before text := current_user;
+  v_switched boolean := false;
+  v_done boolean := false;
+  v_state text;
+  v_msg text;
+begin
+  begin
+    perform set_config('role', p_role, true);
+    v_switched := current_user = p_role;
+    execute p_sql into v_res;
+    v_done := true;
+    raise exception 'r1 meet public runs_as sentinel' using errcode = 'P0001';
+  exception when others then
+    get stacked diagnostics v_state = returned_sqlstate, v_msg = message_text;
+  end;
+  if not v_switched then
+    raise exception 'R1 MEET PUBLIC FAIL: % (could not switch to role %: %)', p_label, p_role, v_msg;
+  end if;
+  perform _r1_meet_public_tests.assert(p_label || ' runs as ' || p_role,
+    v_done and v_res is not null and current_user = v_before,
+    coalesce(v_state, 'null') || ': ' || coalesce(v_msg, 'null'));
+  return v_res;
+end;
+$$;
+
+-- The job rows (every queue, not only r1-meet) written since the previous call, as {name, payload,
+-- dedup_key, max_attempts} in creation order, and remembers them. Creation order is the inserting
+-- command's id (the cmin system column): this one transaction inserts every such row and never
+-- updates it, so cmin is the plain command counter, ascending in statement order (a job id is
+-- random and created_at is the transaction time, so neither can order them).
+create table _r1_meet_public_tests.t6_seen (id uuid primary key);
+
+create function _r1_meet_public_tests.t6_new_jobs() returns jsonb
+language plpgsql as $$
+declare
+  v_jobs jsonb;
+begin
+  select coalesce(jsonb_agg(jsonb_build_object('name', x.name, 'payload', x.payload,
+                                               'dedup_key', x.dedup_key, 'max_attempts', x.max_attempts)
+                            order by x.cmin::text::bigint, x.dedup_key collate "C"), '[]'::jsonb)
+    into v_jobs
+    from screening_v2.job_queue x
+   where not exists (select 1 from _r1_meet_public_tests.t6_seen s where s.id = x.id);
+  insert into _r1_meet_public_tests.t6_seen (id)
+  select x.id from screening_v2.job_queue x
+   where not exists (select 1 from _r1_meet_public_tests.t6_seen s where s.id = x.id);
+  return v_jobs;
+end;
+$$;
+
+-- An r1-meet job of contracts section 5 as t6_new_jobs lists it.
+create function _r1_meet_public_tests.t6_job(p_payload jsonb, p_dedup text) returns jsonb
+language sql immutable as $$
+  select _r1_meet_public_tests.job(p_payload, p_dedup) || '{"name": "r1-meet"}'::jsonb
+$$;
+
+-- The three jobs of a public create, in creation order (ensure_bot, calendar invite, tag add).
+create function _r1_meet_public_tests.t6_create_jobs(p_booking uuid) returns jsonb
+language sql immutable as $$
+  select jsonb_build_array(
+    _r1_meet_public_tests.t6_job(jsonb_build_object('kind', 'ensure_bot', 'booking_id', p_booking),
+                                 'r1-meet:ensure-bot:' || p_booking::text),
+    _r1_meet_public_tests.t6_job(jsonb_build_object('kind', 'calendar_sync', 'op', 'invite', 'booking_id', p_booking),
+                                 'r1-meet:calendar:' || p_booking::text || ':invite'),
+    _r1_meet_public_tests.t6_job(jsonb_build_object('kind', 'ashby_booked_tag', 'op', 'add', 'booking_id', p_booking),
+                                 'r1-meet:ashby-tag:' || p_booking::text || ':add'))
+$$;
+
+-- =============================================================================================
+-- T6-A. The privilege proof, by behaviour: anon and authenticated can execute none of the eleven
+-- RPCs and none of the three helpers, and can neither read nor write the throttle table (42501);
+-- service_role runs every RPC to a closed answer through its whole write path (each call rolled
+-- back), is refused the three helpers like every other API role (the RPCs call them as their
+-- owner), and selects, inserts, updates and deletes throttle rows but cannot truncate them; the
+-- eleven RPCs, the three helpers and the two trigger functions are each declared exactly once.
+-- =============================================================================================
+do $$
+declare
+  -- The eleven RPCs in file order, then the minimum call of each (every defaulted argument left out).
+  rpcs constant text[] := array[
+    'screening_v2.r1_meet_public_capacity(timestamptz, timestamptz, timestamptz)',
+    'screening_v2.r1_meet_public_precheck(uuid, text, timestamptz)',
+    'screening_v2.r1_meet_create_round_from_public(uuid, uuid, uuid, text, text, timestamptz, timestamptz, uuid, jsonb, integer, integer, integer, text, integer, timestamptz)',
+    'screening_v2.r1_meet_public_set_manage_digest(uuid, text, timestamptz)',
+    'screening_v2.r1_meet_public_manage_read(text, integer, integer, timestamptz)',
+    'screening_v2.r1_meet_public_move_booking(uuid, text, integer, timestamptz, timestamptz, integer, integer, integer, integer, integer, integer, timestamptz)',
+    'screening_v2.r1_meet_public_cancel_booking(text, boolean, integer, timestamptz)',
+    'screening_v2.r1_meet_public_reconsent(text, jsonb, timestamptz)',
+    'screening_v2.r1_meet_public_set_calendar_state(uuid, text[], text, timestamptz)',
+    'screening_v2.r1_meet_public_throttle_hit(text[], integer[], integer, timestamptz)',
+    'screening_v2.r1_meet_public_throttle_prune(integer, integer, timestamptz)'];
+  denied_calls constant text[] := array[
+    'select screening_v2.r1_meet_public_capacity(null, null)',
+    'select screening_v2.r1_meet_public_precheck(null, null)',
+    'select screening_v2.r1_meet_create_round_from_public(null, null, null, null, null, null, null, null, null, null, null, null)',
+    'select screening_v2.r1_meet_public_set_manage_digest(null, null)',
+    'select screening_v2.r1_meet_public_manage_read(null, null, null)',
+    'select screening_v2.r1_meet_public_move_booking(null, null, null, null, null, null, null, null, null, null)',
+    'select screening_v2.r1_meet_public_cancel_booking(null, null, null)',
+    'select screening_v2.r1_meet_public_reconsent(null, null)',
+    'select screening_v2.r1_meet_public_set_calendar_state(null, null, null)',
+    'select screening_v2.r1_meet_public_throttle_hit(null, null, null)',
+    'select screening_v2.r1_meet_public_throttle_prune(null, null)'];
+  helpers constant text[] := array[
+    'screening_v2.r1_meet_public_slot_count(timestamptz, timestamptz, uuid)',
+    'screening_v2.r1_meet_public_day_count(date, uuid)',
+    'screening_v2.r1_meet_public_refusal(uuid, text, timestamptz)'];
+  helper_calls constant text[] := array[
+    'select screening_v2.r1_meet_public_slot_count(null, null, null)',
+    'select screening_v2.r1_meet_public_day_count(null, null)',
+    'select screening_v2.r1_meet_public_refusal(null, null, null)'];
+  trigger_fns constant text[] := array[
+    'screening_v2.enqueue_r1_meet_public_terminal()',
+    'screening_v2.enqueue_r1_meet_calendar_purge()'];
+  t constant timestamptz := '2026-12-14 04:00:00+00';
+  s1 constant timestamptz := '2026-12-19 05:00:00+00';
+  s2 constant timestamptz := '2026-12-19 07:00:00+00';
+  s3 constant timestamptz := '2026-12-19 09:00:00+00';
+  booked constant uuid := _r1_meet_public_tests.id(40, 702);
+  throttle_row constant text := _r1_meet_public_tests.digest('t6-a-throttle');
+  before jsonb;
+  jobs_before jsonb;
+  res jsonb;
+  who text;
+  i integer;
+begin
+  -- (1) anon and authenticated: no RPC, no helper, no throttle row.
+  for i in 1 .. array_length(rpcs, 1) loop
+    foreach who in array array['anon', 'authenticated'] loop
+      perform _r1_meet_public_tests.raises_as(who, 'T6-A execute ' || split_part(rpcs[i], '(', 1),
+        denied_calls[i], '42501');
+    end loop;
+  end loop;
+  -- (2) The helpers: refused to every API role, service_role included.
+  for i in 1 .. array_length(helpers, 1) loop
+    foreach who in array array['anon', 'authenticated', 'service_role'] loop
+      perform _r1_meet_public_tests.raises_as(who, 'T6-A execute helper ' || split_part(helpers[i], '(', 1),
+        helper_calls[i], '42501');
+    end loop;
+  end loop;
+  -- (3) The throttle table: closed to anon and authenticated; service_role has select, insert,
+  -- update and delete (it bypasses RLS, as policy_tests.sql asserts) and no truncate.
+  insert into screening_v2.r1_meet_public_throttle (key_digest, bucket_start, hits)
+  values (throttle_row, t, 1);
+  foreach who in array array['anon', 'authenticated'] loop
+    perform _r1_meet_public_tests.raises_as(who, 'T6-A select from r1_meet_public_throttle',
+      'select count(*) from screening_v2.r1_meet_public_throttle', '42501');
+    perform _r1_meet_public_tests.raises_as(who, 'T6-A insert into r1_meet_public_throttle',
+      format('insert into screening_v2.r1_meet_public_throttle (key_digest, bucket_start, hits) values (%L, %L, 1)',
+             _r1_meet_public_tests.digest('t6-a-anon'), t), '42501');
+    perform _r1_meet_public_tests.raises_as(who, 'T6-A update r1_meet_public_throttle',
+      'update screening_v2.r1_meet_public_throttle set hits = hits + 1', '42501');
+    perform _r1_meet_public_tests.raises_as(who, 'T6-A delete from r1_meet_public_throttle',
+      'delete from screening_v2.r1_meet_public_throttle', '42501');
+    perform _r1_meet_public_tests.raises_as(who, 'T6-A truncate r1_meet_public_throttle',
+      'truncate screening_v2.r1_meet_public_throttle', '42501');
+  end loop;
+  perform _r1_meet_public_tests.assert('T6-A service_role bypasses RLS (Supabase; policy_tests.sql asserts the same)',
+    (select x.rolbypassrls from pg_roles x where x.rolname = 'service_role'));
+  res := _r1_meet_public_tests.runs_as('service_role', 'T6-A select a throttle row', format(
+    'select jsonb_build_object(''n'', count(*)) from screening_v2.r1_meet_public_throttle x where x.key_digest = %L',
+    throttle_row));
+  perform _r1_meet_public_tests.assert('T6-A ... and reads it', (res ->> 'n')::integer = 1, res::text);
+  res := _r1_meet_public_tests.runs_as('service_role', 'T6-A insert a throttle row', format(
+    'with w as (insert into screening_v2.r1_meet_public_throttle (key_digest, bucket_start, hits) '
+    || 'values (%L, %L, 1) returning 1) select jsonb_build_object(''n'', count(*)) from w',
+    _r1_meet_public_tests.digest('t6-a-service'), t));
+  perform _r1_meet_public_tests.assert('T6-A ... and it is written', (res ->> 'n')::integer = 1, res::text);
+  res := _r1_meet_public_tests.runs_as('service_role', 'T6-A update a throttle row', format(
+    'with w as (update screening_v2.r1_meet_public_throttle x set hits = x.hits + 1 where x.key_digest = %L '
+    || 'returning x.hits) select jsonb_build_object(''n'', count(*), ''hits'', max(w.hits)) from w', throttle_row));
+  perform _r1_meet_public_tests.assert('T6-A ... and it is counted up',
+    (res ->> 'n')::integer = 1 and (res ->> 'hits')::integer = 2, res::text);
+  res := _r1_meet_public_tests.runs_as('service_role', 'T6-A delete a throttle row', format(
+    'with w as (delete from screening_v2.r1_meet_public_throttle x where x.key_digest = %L returning 1) '
+    || 'select jsonb_build_object(''n'', count(*)) from w', throttle_row));
+  perform _r1_meet_public_tests.assert('T6-A ... and it is gone', (res ->> 'n')::integer = 1, res::text);
+  perform _r1_meet_public_tests.raises_as('service_role', 'T6-A truncate r1_meet_public_throttle',
+    'truncate screening_v2.r1_meet_public_throttle', '42501');
+
+  -- (4) service_role runs every RPC to a closed answer, the writers through their whole path: a
+  -- create (candidate 701), and the manage-digest RPCs on booking 702 (booked here, as postgres).
+  perform _r1_meet_public_tests.candidate(701);
+  perform _r1_meet_public_tests.candidate(702);
+  res := _r1_meet_public_tests.create(702, jsonb_build_object(
+    'start_at', s2, 'end_at', s2 + interval '45 minutes', 'now', t));
+  perform _r1_meet_public_tests.assert('T6-A fixture: booking 702 created',
+    _r1_meet_public_tests.outcome(res) = 'booked:created', res::text);
+  res := screening_v2.r1_meet_public_set_manage_digest(booked, _r1_meet_public_tests.md(702), t);
+  perform _r1_meet_public_tests.assert('T6-A fixture: booking 702 has its manage digest',
+    res = '{"status": "ok"}'::jsonb, res::text);
+  before := _r1_meet_public_tests.counts();
+  jobs_before := _r1_meet_public_tests.jobs_of(booked);
+
+  res := _r1_meet_public_tests.runs_as('service_role', 'T6-A r1_meet_public_capacity', format(
+    'select screening_v2.r1_meet_public_capacity(%L, %L, %L)',
+    '2026-12-18 18:30:00+00', '2026-12-19 18:30:00+00', t));
+  perform _r1_meet_public_tests.assert('T6-A service_role: capacity answers ok with booking 702''s interval and day',
+    res ->> 'status' = 'ok' and res -> 'intervals' = jsonb_build_array(jsonb_build_object(
+      'start_at', s2, 'end_at', s2 + interval '45 minutes'))
+    and res -> 'day_counts' = '[{"ist_date": "2026-12-19", "total": 1, "public": 1}]'::jsonb, res::text);
+  res := _r1_meet_public_tests.runs_as('service_role', 'T6-A r1_meet_public_precheck', format(
+    'select screening_v2.r1_meet_public_precheck(%L, %L, %L)',
+    _r1_meet_public_tests.id(10, 701), _r1_meet_public_tests.id(22, 701)::text, t));
+  perform _r1_meet_public_tests.assert('T6-A service_role: precheck answers eligible (the helper runs as the owner)',
+    res = '{"status": "eligible"}'::jsonb, res::text);
+  res := _r1_meet_public_tests.runs_as('service_role', 'T6-A r1_meet_create_round_from_public', format(
+    'select screening_v2.r1_meet_create_round_from_public(%L, %L, %L, %L, %L, %L, %L, %L, %L::jsonb, 2, 20, 20, '
+    || '''r1_dex_sales'', 7200, %L)',
+    _r1_meet_public_tests.id(40, 701), _r1_meet_public_tests.id(41, 701), _r1_meet_public_tests.id(10, 701),
+    _r1_meet_public_tests.id(22, 701)::text, 'https://meet.google.com/abc-defg-hij', s1, s1 + interval '45 minutes',
+    _r1_meet_public_tests.id(1, 1), _r1_meet_public_tests.form_consent()::text, t));
+  perform _r1_meet_public_tests.assert('T6-A service_role: create answers booked/created',
+    _r1_meet_public_tests.outcome(res) = 'booked:created'
+    and res ->> 'booking_id' = _r1_meet_public_tests.id(40, 701)::text, res::text);
+  res := _r1_meet_public_tests.runs_as('service_role', 'T6-A r1_meet_public_set_manage_digest', format(
+    'select screening_v2.r1_meet_public_set_manage_digest(%L, %L, %L)',
+    booked, _r1_meet_public_tests.digest('t6-a-rotated'), t));
+  perform _r1_meet_public_tests.assert('T6-A service_role: set_manage_digest answers ok',
+    res = '{"status": "ok"}'::jsonb, res::text);
+  res := _r1_meet_public_tests.runs_as('service_role', 'T6-A r1_meet_public_manage_read', format(
+    'select screening_v2.r1_meet_public_manage_read(%L, 3600, 3, %L)', _r1_meet_public_tests.md(702), t));
+  perform _r1_meet_public_tests.assert('T6-A service_role: manage_read answers ok for booking 702',
+    res ->> 'status' = 'ok' and res ->> 'booking_id' = booked::text and res -> 'consent_current' = 'true'::jsonb,
+    res::text);
+  res := _r1_meet_public_tests.runs_as('service_role', 'T6-A r1_meet_public_move_booking', format(
+    'select screening_v2.r1_meet_public_move_booking(%L, %L, 0, %L, %L, 2, 20, 20, 3, 3600, 7200, %L)',
+    booked, _r1_meet_public_tests.md(702), s3, s3 + interval '45 minutes', t));
+  perform _r1_meet_public_tests.assert('T6-A service_role: move answers moved (through the 0142 reschedule)',
+    res ->> 'status' = 'moved' and (res ->> 'move_count')::integer = 1, res::text);
+  res := _r1_meet_public_tests.runs_as('service_role', 'T6-A r1_meet_public_cancel_booking', format(
+    'select screening_v2.r1_meet_public_cancel_booking(%L, true, 3600, %L)', _r1_meet_public_tests.md(702), t));
+  perform _r1_meet_public_tests.assert('T6-A service_role: cancel answers cancelled (round cancel and withdrawal included)',
+    res = jsonb_build_object('status', 'cancelled', 'booking_id', booked), res::text);
+  res := _r1_meet_public_tests.runs_as('service_role', 'T6-A r1_meet_public_reconsent', format(
+    'select screening_v2.r1_meet_public_reconsent(%L, %L::jsonb, %L)',
+    _r1_meet_public_tests.md(702), _r1_meet_public_tests.form_consent()::text, t));
+  perform _r1_meet_public_tests.assert('T6-A service_role: reconsent answers ok',
+    res = '{"status": "ok"}'::jsonb, res::text);
+  res := _r1_meet_public_tests.runs_as('service_role', 'T6-A r1_meet_public_set_calendar_state', format(
+    'select screening_v2.r1_meet_public_set_calendar_state(%L, %L::text[], %L, %L)', booked, '{created}', 'invited', t));
+  perform _r1_meet_public_tests.assert('T6-A service_role: set_calendar_state answers ok',
+    res = '{"status": "ok", "calendar_state": "invited"}'::jsonb, res::text);
+  res := _r1_meet_public_tests.runs_as('service_role', 'T6-A r1_meet_public_throttle_hit', format(
+    'select screening_v2.r1_meet_public_throttle_hit(%L::text[], %L::integer[], 60, %L)',
+    array[_r1_meet_public_tests.digest('t6-a-hit')], array[5], t));
+  perform _r1_meet_public_tests.assert('T6-A service_role: throttle_hit answers ok with no key over',
+    res = '{"status": "ok", "over": []}'::jsonb, res::text);
+  res := _r1_meet_public_tests.runs_as('service_role', 'T6-A r1_meet_public_throttle_prune', format(
+    'select screening_v2.r1_meet_public_throttle_prune(3600, 10, %L)', t));
+  perform _r1_meet_public_tests.assert('T6-A service_role: throttle_prune answers ok',
+    res ->> 'status' = 'ok' and (res ->> 'deleted')::integer >= 0, res::text);
+  perform _r1_meet_public_tests.assert('T6-A the service_role calls left nothing behind (each rolled back)',
+    _r1_meet_public_tests.counts() = before and _r1_meet_public_tests.jobs_of(booked) = jobs_before
+    and not exists (select 1 from screening_v2.interview_rounds x where x.candidate_id = _r1_meet_public_tests.id(10, 701))
+    and (select x.status = 'pending' and x.version = 0 and x.move_count = 0 and x.calendar_state = 'created'
+                and x.manage_token_digest = _r1_meet_public_tests.md(702)
+           from screening_v2.r1_meet_bookings x where x.id = booked));
+
+  -- (5) Catalog: the sixteen functions 0143 declares, one overload each; the RPCs are service_role
+  -- only, the helpers and the trigger functions executable by no API role.
+  perform _r1_meet_public_tests.assert(
+    'T6-A the eleven RPCs, three helpers and two trigger functions are declared once each',
+    (select count(*) = 16 from pg_proc x
+      where x.pronamespace = 'screening_v2'::regnamespace
+        and x.proname in (select split_part(split_part(f, '(', 1), '.', 2)
+                            from unnest(rpcs || helpers || trigger_fns) f))
+    and (select bool_and(to_regprocedure(f) is not null) from unnest(rpcs || helpers || trigger_fns) f));
+  foreach who in array array['anon', 'authenticated', 'public'] loop
+    perform _r1_meet_public_tests.assert('T6-A ' || who || ' may execute none of the sixteen',
+      (select bool_and(not has_function_privilege(who, f, 'execute')) from unnest(rpcs || helpers || trigger_fns) f));
+  end loop;
+  perform _r1_meet_public_tests.assert('T6-A service_role may execute the eleven RPCs and none of the helpers',
+    (select bool_and(has_function_privilege('service_role', f, 'execute')) from unnest(rpcs) f)
+    and (select bool_and(not has_function_privilege('service_role', f, 'execute')) from unnest(helpers) f));
+end;
+$$;
+
+-- =============================================================================================
+-- T6-B. One candidate end to end, the way S05/S06 drive it: create -> manage digest -> manage
+-- read -> invite sent -> move -> re-consent -> bot attached -> cancel with withdrawal -> event
+-- cancelled -> re-book (a new round) -> invite sent -> the old event purged -> bot attached -> the
+-- DSAR delete of the candidate (cascade). Each step's job rows are checked exactly, in creation
+-- order, and so is the whole list at the end.
+-- =============================================================================================
+do $$
+declare
+  t0 constant timestamptz := '2026-12-14 04:00:00+00';
+  a_start constant timestamptz := '2026-12-16 05:00:00+00';
+  b_start constant timestamptz := '2026-12-17 06:00:00+00';
+  c_start constant timestamptz := '2026-12-18 05:00:00+00';
+  cand constant uuid := _r1_meet_public_tests.id(10, 700);
+  b1 constant uuid := _r1_meet_public_tests.id(40, 700);
+  b2 constant uuid := _r1_meet_public_tests.id(40, 7001);
+  bot1 constant uuid := _r1_meet_public_tests.id(30, 700);
+  bot2 constant uuid := _r1_meet_public_tests.id(30, 7001);
+  r1 uuid;
+  r2 uuid;
+  consent1 uuid;
+  consent2 uuid;
+  res jsonb;
+  got jsonb;
+  want jsonb;
+  story_got jsonb := '[]'::jsonb;
+  story_want jsonb := '[]'::jsonb;
+begin
+  -- (0) The story's days are free, the candidate is eligible, and the job baseline is taken.
+  perform _r1_meet_public_tests.candidate(700);
+  res := screening_v2.r1_meet_public_capacity('2026-12-15 18:30:00+00', '2026-12-18 18:30:00+00', t0);
+  perform _r1_meet_public_tests.assert('T6-B the story''s IST days 2026-12-16 .. 2026-12-18 start empty',
+    res -> 'intervals' = '[]'::jsonb
+    and res -> 'day_counts' = '[{"ist_date": "2026-12-16", "total": 0, "public": 0},
+                                {"ist_date": "2026-12-17", "total": 0, "public": 0},
+                                {"ist_date": "2026-12-18", "total": 0, "public": 0}]'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_precheck(cand, _r1_meet_public_tests.id(22, 700)::text, t0);
+  perform _r1_meet_public_tests.assert('T6-B precheck: candidate 700 is eligible', res = '{"status": "eligible"}'::jsonb,
+    res::text);
+  perform _r1_meet_public_tests.t6_new_jobs();
+
+  -- (1) create.
+  res := _r1_meet_public_tests.create(700, jsonb_build_object(
+    'start_at', a_start, 'end_at', a_start + interval '45 minutes', 'now', t0));
+  r1 := (res ->> 'round_id')::uuid;
+  perform _r1_meet_public_tests.assert('T6-B 1 create answers booked/created with exactly the contract fields',
+    res = jsonb_build_object('status', 'booked', 'result', 'created', 'booking_id', b1, 'round_id', r1,
+                             'candidate_id', cand, 'start_at', a_start, 'end_at', a_start + interval '45 minutes',
+                             'version', 0, 'key_attempt', 0,
+                             'round_expires_at', a_start + interval '45 minutes' + interval '7200 seconds')
+    and r1 is not null, res::text);
+  consent1 := _r1_meet_public_tests.live_consent(r1);
+  got := _r1_meet_public_tests.t6_new_jobs();
+  want := _r1_meet_public_tests.t6_create_jobs(b1);
+  perform _r1_meet_public_tests.assert('T6-B 1 ... jobs: ensure_bot, calendar invite, Ashby tag add', got = want, got::text);
+  story_got := story_got || got;
+  story_want := story_want || want;
+
+  -- (2) The manage digest, (3) the manage page.
+  res := screening_v2.r1_meet_public_set_manage_digest(b1, _r1_meet_public_tests.md(700), t0 + interval '1 minute');
+  perform _r1_meet_public_tests.assert('T6-B 2 set_manage_digest answers ok', res = '{"status": "ok"}'::jsonb, res::text);
+  res := screening_v2.r1_meet_public_manage_read(_r1_meet_public_tests.md(700), 3600, 3, t0 + interval '2 minutes');
+  perform _r1_meet_public_tests.assert('T6-B 3 manage_read answers the full manage view',
+    res = jsonb_build_object('status', 'ok', 'booking_id', b1, 'booking_status', 'pending', 'version', 0,
+                             'has_bot', false, 'start_at', a_start, 'end_at', a_start + interval '45 minutes',
+                             'can_move', true, 'can_cancel', true, 'moves_left', 3, 'consent_current', true),
+    res::text);
+  got := _r1_meet_public_tests.t6_new_jobs();
+  perform _r1_meet_public_tests.assert('T6-B 2-3 ... no job', got = '[]'::jsonb, got::text);
+
+  -- (4) S05 sent the invite.
+  res := screening_v2.r1_meet_public_set_calendar_state(b1, '{created}', 'invited', t0 + interval '3 minutes');
+  perform _r1_meet_public_tests.assert('T6-B 4 the invite is sent: calendar invited',
+    res = '{"status": "ok", "calendar_state": "invited"}'::jsonb
+    and (select x.invite_sent_at = t0 + interval '3 minutes' from screening_v2.r1_meet_bookings x where x.id = b1),
+    res::text);
+
+  -- (5) move to another IST day.
+  res := _r1_meet_public_tests.move(700, jsonb_build_object(
+    'start_at', b_start, 'end_at', b_start + interval '45 minutes', 'now', t0 + interval '4 minutes'));
+  perform _r1_meet_public_tests.assert('T6-B 5 move answers moved with exactly the contract fields',
+    res = jsonb_build_object('status', 'moved', 'booking_id', b1, 'start_at', b_start,
+                             'end_at', b_start + interval '45 minutes', 'version', 1, 'key_attempt', 0,
+                             'move_count', 1), res::text);
+  got := _r1_meet_public_tests.t6_new_jobs();
+  want := jsonb_build_array(_r1_meet_public_tests.t6_job(
+    jsonb_build_object('kind', 'calendar_sync', 'op', 'move', 'booking_id', b1),
+    'r1-meet:calendar:' || b1::text || ':move:1'));
+  perform _r1_meet_public_tests.assert(
+    'T6-B 4-5 ... jobs: calendar move:1 only (the pending ensure_bot absorbs the move''s)', got = want, got::text);
+  story_got := story_got || got;
+  story_want := story_want || want;
+
+  -- (6) re-consent on the same notice.
+  res := _r1_meet_public_tests.reconsent(700, jsonb_build_object('now', t0 + interval '5 minutes'));
+  consent2 := _r1_meet_public_tests.live_consent(r1);
+  perform _r1_meet_public_tests.assert('T6-B 6 reconsent answers ok: the first consent superseded, a new one live',
+    res = '{"status": "ok"}'::jsonb and consent2 is distinct from consent1
+    and (select x.withdrawn_at = t0 + interval '5 minutes' and x.proof ->> 'decision' = 'superseded'
+           from screening_v2.interview_round_consents x where x.id = consent1)
+    and _r1_meet_public_tests.form_consent_ok(consent2, _r1_meet_public_tests.id(3, 1), t0 + interval '5 minutes'),
+    res::text);
+
+  -- (7) The bot is attached (0142 r1_meet_set_bot).
+  res := screening_v2.r1_meet_set_bot(b1, 'attach', 1, 0, bot1, t0 + interval '6 minutes');
+  perform _r1_meet_public_tests.assert('T6-B 7 the bot is attached: bot_scheduled',
+    res ->> 'status' = 'ok' and res ->> 'booking_status' = 'bot_scheduled', res::text);
+  got := _r1_meet_public_tests.t6_new_jobs();
+  perform _r1_meet_public_tests.assert('T6-B 6-7 ... no job (a superseded consent erases nothing)',
+    got = '[]'::jsonb, got::text);
+
+  -- (8) The candidate cancels, withdrawing the consent.
+  res := _r1_meet_public_tests.cancel(700, jsonb_build_object('withdraw', true, 'now', t0 + interval '7 minutes'));
+  perform _r1_meet_public_tests.assert('T6-B 8 cancel answers cancelled: booking, round and consent closed',
+    res = jsonb_build_object('status', 'cancelled', 'booking_id', b1)
+    and (select x.status = 'cancelled' and x.reason = 'candidate_cancelled' and x.updated_at = t0 + interval '7 minutes'
+           from screening_v2.r1_meet_bookings x where x.id = b1)
+    and (select x.status = 'cancelled' from screening_v2.interview_rounds x where x.id = r1)
+    and (select x.proof ->> 'decision' = 'withdrawn' from screening_v2.interview_round_consents x where x.id = consent2),
+    res::text);
+  got := _r1_meet_public_tests.t6_new_jobs();
+  want := jsonb_build_array(
+    _r1_meet_public_tests.t6_job(jsonb_build_object('kind', 'calendar_sync', 'op', 'cancel', 'booking_id', b1),
+                                 'r1-meet:calendar:' || b1::text || ':cancel'),
+    _r1_meet_public_tests.t6_job(jsonb_build_object('kind', 'ashby_booked_tag', 'op', 'remove', 'booking_id', b1),
+                                 'r1-meet:ashby-tag:' || b1::text || ':remove'),
+    jsonb_build_object('name', 'r1.recording.erase',
+                       'payload', jsonb_build_object('round_id', r1, 'reason', 'consent_withdrawn'),
+                       'dedup_key', 'r1.recording.erase:' || consent2::text, 'max_attempts', 5),
+    _r1_meet_public_tests.release_job(b1, bot1) || '{"name": "r1-meet"}'::jsonb);
+  perform _r1_meet_public_tests.assert(
+    'T6-B 8 ... jobs: calendar cancel, tag removal, recording erase, bot release (no round_cancelled)',
+    got = want and not _r1_meet_public_tests.round_cancelled_job(b1), got::text);
+  story_got := story_got || got;
+  story_want := story_want || want;
+  res := screening_v2.r1_meet_public_manage_read(_r1_meet_public_tests.md(700), 3600, 3, t0 + interval '7 minutes');
+  perform _r1_meet_public_tests.assert('T6-B 8 ... and the manage link is dead: not_found',
+    res = '{"status": "not_found"}'::jsonb, res::text);
+
+  -- (9) S05 cancelled the event.
+  res := screening_v2.r1_meet_public_set_calendar_state(b1, '{created,invited}', 'cancelled', t0 + interval '8 minutes');
+  perform _r1_meet_public_tests.assert('T6-B 9 the event is cancelled: calendar cancelled',
+    res = '{"status": "ok", "calendar_state": "cancelled"}'::jsonb, res::text);
+
+  -- (10) The candidate books again: a cancel is not a completed R1, so a NEW round.
+  res := screening_v2.r1_meet_public_precheck(cand, _r1_meet_public_tests.id(22, 700)::text, t0 + interval '9 minutes');
+  perform _r1_meet_public_tests.assert('T6-B 10 precheck after the cancel: eligible', res = '{"status": "eligible"}'::jsonb,
+    res::text);
+  res := _r1_meet_public_tests.create(700, jsonb_build_object(
+    'booking_id', b2, 'request_id', _r1_meet_public_tests.id(41, 7001),
+    'start_at', c_start, 'end_at', c_start + interval '45 minutes', 'now', t0 + interval '9 minutes'));
+  r2 := (res ->> 'round_id')::uuid;
+  perform _r1_meet_public_tests.assert('T6-B 10 the re-book answers booked/created on a new round',
+    _r1_meet_public_tests.outcome(res) = 'booked:created' and res ->> 'booking_id' = b2::text
+    and r2 is not null and r2 is distinct from r1, res::text);
+  res := screening_v2.r1_meet_public_set_manage_digest(b2, _r1_meet_public_tests.md(7001), t0 + interval '9 minutes');
+  perform _r1_meet_public_tests.assert('T6-B 10 ... with its own manage digest', res = '{"status": "ok"}'::jsonb,
+    res::text);
+  got := _r1_meet_public_tests.t6_new_jobs();
+  want := _r1_meet_public_tests.t6_create_jobs(b2);
+  perform _r1_meet_public_tests.assert('T6-B 9-10 ... jobs: the second booking''s ensure_bot, calendar invite, tag add',
+    got = want, got::text);
+  story_got := story_got || got;
+  story_want := story_want || want;
+
+  -- (11) S05 sent the second invite, (12) the retention purge of the first event, (13) a bot.
+  res := screening_v2.r1_meet_public_set_calendar_state(b2, '{created}', 'invited', t0 + interval '10 minutes');
+  perform _r1_meet_public_tests.assert('T6-B 11 the second invite is sent', res ->> 'calendar_state' = 'invited',
+    res::text);
+  res := screening_v2.r1_meet_public_set_calendar_state(b1, '{cancelled}', 'purged', t0 + interval '11 minutes');
+  perform _r1_meet_public_tests.assert('T6-B 12 the first event is purged: calendar purged',
+    res = '{"status": "ok", "calendar_state": "purged"}'::jsonb, res::text);
+  perform _r1_meet_public_tests.assert(
+    'T6-B 12 ... the calendar moves after the cancel left its updated_at at the cancel (R19)',
+    (select x.updated_at = t0 + interval '7 minutes' and x.invite_sent_at = t0 + interval '3 minutes'
+       from screening_v2.r1_meet_bookings x where x.id = b1));
+  res := screening_v2.r1_meet_set_bot(b2, 'attach', 0, 0, bot2, t0 + interval '12 minutes');
+  perform _r1_meet_public_tests.assert('T6-B 13 the second bot is attached', res ->> 'booking_status' = 'bot_scheduled',
+    res::text);
+  got := _r1_meet_public_tests.t6_new_jobs();
+  perform _r1_meet_public_tests.assert('T6-B 11-13 ... no job', got = '[]'::jsonb, got::text);
+
+  -- (14) The DSAR delete of the candidate cascades both bookings, both rounds and every consent.
+  delete from screening_v2.candidates x where x.id = cand;
+  perform _r1_meet_public_tests.assert('T6-B 14 the candidate delete cascades the bookings, rounds and consents',
+    not exists (select 1 from screening_v2.r1_meet_bookings x where x.id in (b1, b2))
+    and not exists (select 1 from screening_v2.interview_rounds x where x.id in (r1, r2))
+    and not exists (select 1 from screening_v2.interview_round_consents x where x.round_id in (r1, r2)));
+  got := _r1_meet_public_tests.t6_new_jobs();
+  want := jsonb_build_array(
+    _r1_meet_public_tests.release_job(b2, bot2) || '{"name": "r1-meet"}'::jsonb,
+    _r1_meet_public_tests.purge_job(b2) || '{"name": "r1-meet"}'::jsonb);
+  perform _r1_meet_public_tests.assert(
+    'T6-B 14 ... jobs: the second bot''s release and its event purge (the purged first event and its pending bot release add none)',
+    got = want, got::text);
+  story_got := story_got || got;
+  story_want := story_want || want;
+
+  perform _r1_meet_public_tests.assert('T6-B the story wrote exactly these 13 jobs, in this order', story_got = story_want
+    and jsonb_array_length(story_got) = 13, story_got::text);
+end;
+$$;
+
+do $$
+declare
+  n integer;
+begin
+  select count(*) into n from _r1_meet_public_tests.passed;
+  raise notice 'R1 MEET PUBLIC: % assertions passed', n;
 end;
 $$;
 

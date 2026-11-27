@@ -2039,3 +2039,331 @@ describe('migration 0143: T5 two-session race harness (CI)', () => {
     expect(ci.split('scripts/test-r1-meet-public-concurrency.sh').length - 1).toBe(3);
   });
 });
+
+// ── T6: the final function list, the privilege proof, the story, the brief's cases and the docs ──
+
+/** The two trigger functions, the three helpers and the eleven RPCs, each as `name(types)`. */
+const T6_TRIGGER_FNS = ['enqueue_r1_meet_public_terminal()', 'enqueue_r1_meet_calendar_purge()'] as const;
+const T6_HELPERS = [
+  'r1_meet_public_slot_count(timestamptz, timestamptz, uuid)',
+  'r1_meet_public_day_count(date, uuid)',
+  'r1_meet_public_refusal(uuid, text, timestamptz)',
+] as const;
+const T6_RPCS = [
+  'r1_meet_public_capacity(timestamptz, timestamptz, timestamptz)',
+  'r1_meet_public_precheck(uuid, text, timestamptz)',
+  'r1_meet_create_round_from_public(uuid, uuid, uuid, text, text, timestamptz, timestamptz, uuid, jsonb, integer, integer, integer, text, integer, timestamptz)',
+  'r1_meet_public_set_manage_digest(uuid, text, timestamptz)',
+  'r1_meet_public_manage_read(text, integer, integer, timestamptz)',
+  'r1_meet_public_move_booking(uuid, text, integer, timestamptz, timestamptz, integer, integer, integer, integer, integer, integer, timestamptz)',
+  'r1_meet_public_cancel_booking(text, boolean, integer, timestamptz)',
+  'r1_meet_public_reconsent(text, jsonb, timestamptz)',
+  'r1_meet_public_set_calendar_state(uuid, text[], text, timestamptz)',
+  'r1_meet_public_throttle_hit(text[], integer[], integer, timestamptz)',
+  'r1_meet_public_throttle_prune(integer, integer, timestamptz)',
+] as const;
+const nameOf = (sig: string): string => sig.slice(0, sig.indexOf('('));
+
+/** Every `create or replace function` of 0143 in file order, as `name(types)` (the 0142 pin method). */
+function declaredFunctions(): string[] {
+  // Lazy up to the first " ) returns": a parameter default such as now() cannot end the list early.
+  return [...code.matchAll(/create or replace function screening_v2\.([a-z0-9_]+)\(([\s\S]*?) ?\) returns /g)]
+    .map((m) => {
+      const params = m[2]!.trim();
+      const types = params === '' ? '' : params.split(', ').map((p) => p.split(' ')[1]).join(', ');
+      return `${m[1]}(${types})`;
+    });
+}
+
+/** How many arguments a call of `name` needs at least (the parameters without a default). */
+function requiredArgs(name: string): number {
+  const m = new RegExp(`create or replace function screening_v2\\.${name}\\(([\\s\\S]*?) ?\\) returns `).exec(code);
+  expect(m, name).not.toBeNull();
+  const params = m![1]!.trim();
+  return params === '' ? 0 : params.split(', ').filter((p) => !p.includes(' default ')).length;
+}
+
+/** The arguments of a one-call SQL text such as `select screening_v2.f(null, null)`. */
+const nullArgs = (call: string): number => (/\(([^)]*)\)$/.exec(call)![1]!.match(/\bnull\b/g) ?? []).length;
+
+/** The cases of the S01 brief's TESTS list, each with suite labels (or label fragments) that cover it. */
+const BRIEF_CASES: ReadonlyArray<readonly [string, readonly string[]]> = [
+  ['source and id CHECKs both ways', [
+    'T1-B an Ashby booking without source reads ashby and passes',
+    'T1-B an Ashby booking without ',
+    'T1-B a public booking with an Ashby event id',
+    'T1-B a valid public booking passes with no Ashby event, schedule or scheduler',
+    'T1-B an Ashby booking without ashby_application_id',
+  ]],
+  ['existing rows validate', [
+    'T1-C the thirteen family bookings exist',
+    ' validates over every booking of every family',
+    'T1-A every booking that predates this run reads source ashby with no public column',
+  ]],
+  ['event-id pin', [
+    'T1-D a public booking carries its id without dashes as the event id',
+    'T1-D the dashed booking id as the event id',
+    'T1-D an Ashby booking with an event id (even the pinned one)',
+  ]],
+  ['public-column CHECK', [
+    'T1-E an Ashby booking with a calendar state',
+    'T1-E a public booking without a request id',
+    'T1-E an invite time on a created event',
+    'T1-E a second booking with the same manage digest',
+  ]],
+  ['the new reason pairs accepted and others refused', [
+    'T1-F a public booking accepts cancelled/candidate_cancelled and failed/invite_undeliverable',
+    'T1-F failed/candidate_cancelled',
+    'T1-F cancelled/invite_undeliverable',
+    'T1-F all 38 (status, reason) pairs are accepted',
+  ]],
+  ['triggers per terminal status: public enqueues, Ashby does not, completed does not; purge on a candidate-cascade delete', [
+    'T1-G pending -> ',
+    'T1-G an Ashby booking that is cancelled queues none of the new kinds',
+    'T1-G in_call -> completed/attempt_settled queues nothing',
+    'T1-G a candidate delete cascades the public booking',
+    'T1-G ... and queues the bot release and the calendar purge, exactly',
+    'T6-B 14 the candidate delete cascades the bookings, rounds and consents',
+  ]],
+  ['every RPC answer and refusal', [
+    'T2-B the precheck writes nothing',
+    'T3-D precheck and create agree for candidate ',
+    'T4-A every field wrong from ',
+    'T6-A service_role: ',
+  ]],
+  ['replay (same and other candidate)', [
+    'T3-B the same submit again answers replayed with the booking and its slot, exactly',
+    'T3-B the same request id for another candidate: invalid_request request_id',
+  ]],
+  ['slot_full and day_full at the limits', [
+    'T3-C two seats and two live bookings in the slot',
+    'T3-C the public count at the public day limit',
+    'T3-C the total at the bot day limit',
+    "T4-A the day''s own counts (the booking included) as the limits, one seat",
+  ]],
+  ['consent stale / incomplete / no India tick', [
+    'T3-E another notice version than the newest',
+    'T3-E a required consent not granted',
+    'T3-E no India tick',
+    'T4-C a stale notice and no India tick: consent_stale first',
+  ]],
+  ['live browser round, completed R1, grant-retake re-link', [
+    'T2-B a live browser round: already_booked',
+    'T2-B a completed R1 and no live round: r1_completed',
+    'T3-F HR grants the retake: the round is invited again and the candidate eligible',
+    "T3-F after HR''s grant-retake the public submit re-links the round",
+  ]],
+  ['exact job payloads and dedup keys', [
+    'T3-A the booking queues exactly the ensure_bot, calendar invite and Ashby tag add jobs',
+    'T1-G ... and queues the calendar cancel and the tag removal',
+    "T4-A ... the jobs: the create''s three and calendar move:1 (the pending ensure_bot absorbed the move''s)",
+    "T4-B ... the jobs: the create''s three, the calendar cancel, the tag removal and the bot release (0142 key)",
+    'T6-B the story wrote exactly these 13 jobs, in this order',
+  ]],
+  ['cancel leaves no round_cancelled job', [
+    "T4-B ... and no round_cancelled job (0142''s trigger found no live booking on the round)",
+    'T6-B 8 ... jobs: calendar cancel, tag removal, recording erase, bot release (no round_cancelled)',
+  ]],
+  ['privileges for anon and authenticated', [
+    'T1-A r1_meet_public_throttle grants nothing to ',
+    'T6-A execute ',
+    'T6-A execute helper ',
+    'T6-A select from r1_meet_public_throttle',
+    ' may execute none of the sixteen',
+  ]],
+];
+
+describe('migration 0143: T6 the final function list, the privilege proof and the story', () => {
+  const suite = read('app/supabase/tests/r1_meet_public_bookings_assert.sql');
+  const suite0142 = read('app/supabase/tests/r1_meet_bookings_assert.sql');
+  const proof = (): string => blockOf(suite, '-- T6-A. ', '-- T6-B. ');
+  const story = (): string => blockOf(suite, '-- T6-B. ', "raise notice 'R1 MEET PUBLIC: % assertions passed', n;");
+
+  it('ends with exactly the two trigger functions, the three helpers and the eleven RPCs, in file order', () => {
+    expect(declaredFunctions()).toEqual([...T6_TRIGGER_FNS, ...T6_HELPERS, ...T6_RPCS]);
+    // The same signatures the T2-T4 pins declare, so the lists cannot drift apart.
+    const pinned = [...T2_FUNCTIONS, ...T4_FUNCTIONS].map((f) => `${f.name}(${f.types})`);
+    pinned.push(`${CREATE}(${CREATE_TYPES})`);
+    expect([...pinned].sort()).toEqual([...T6_HELPERS, ...T6_RPCS].sort());
+  });
+
+  it('gives every RPC one revoke, one grant to service_role and a comment; the helpers and triggers no grant', () => {
+    for (const sig of T6_RPCS) {
+      expect(code, sig).toContain(`revoke all on function screening_v2.${sig} from public, anon, authenticated;`);
+      expect(code.split(`grant execute on function screening_v2.${sig} to service_role;`), sig).toHaveLength(2);
+      expect(code, sig).toContain(`comment on function screening_v2.${sig} is`);
+    }
+    for (const sig of T6_HELPERS) {
+      expect(code, sig).toContain(`revoke all on function screening_v2.${sig} from public, anon, authenticated, service_role;`);
+      expect(code, sig).toContain(`comment on function screening_v2.${sig} is`);
+    }
+    for (const sig of T6_TRIGGER_FNS) {
+      expect(code, sig).toContain(`revoke all on function screening_v2.${sig} from public, anon, authenticated;`);
+      expect(code, sig).toContain(`comment on function screening_v2.${sig} is`);
+    }
+    // Statement counts on the top level (comment texts emptied, so a comment cannot fake one).
+    expect(topBare.match(/\bgrant execute on function\b/g)).toHaveLength(T6_RPCS.length);
+    expect(topBare.match(/\brevoke all on function\b/g)).toHaveLength(T6_RPCS.length + T6_HELPERS.length + T6_TRIGGER_FNS.length);
+    expect(topBare.match(/\bcomment on function\b/g)).toHaveLength(T6_RPCS.length + T6_HELPERS.length + T6_TRIGGER_FNS.length);
+    // Every grant is to service_role, and the only non-function grant is the throttle table's.
+    const grants = [...topBare.matchAll(/\bgrant [^;]*;/g)].map((m) => m[0]);
+    expect(grants).toHaveLength(T6_RPCS.length + 1);
+    for (const grant of grants) expect(grant, grant).toMatch(/ to service_role;$/);
+    expect(grants.filter((g) => !g.startsWith('grant execute on function screening_v2.')))
+      .toEqual(['grant select, insert, update, delete on screening_v2.r1_meet_public_throttle to service_role;']);
+  });
+
+  it('T6-A proves the privileges by behaviour over exactly these functions', () => {
+    const text = proof();
+    const listed = (name: string): string[] =>
+      quoted(new RegExp(`${name} constant text\\[\\] := array\\[([\\s\\S]*?)\\];`).exec(text)![1]!);
+    expect(listed('rpcs')).toEqual(T6_RPCS.map((s) => `screening_v2.${s}`));
+    expect(listed('helpers')).toEqual(T6_HELPERS.map((s) => `screening_v2.${s}`));
+    expect(listed('trigger_fns')).toEqual(T6_TRIGGER_FNS.map((s) => `screening_v2.${s}`));
+    // One denied call per function, in the same order, with exactly the arguments it requires.
+    for (const [calls, sigs] of [[listed('denied_calls'), T6_RPCS], [listed('helper_calls'), T6_HELPERS]] as const) {
+      expect(calls.map((c) => /screening_v2\.([a-z0-9_]+)\(/.exec(c)![1])).toEqual(sigs.map(nameOf));
+      for (let i = 0; i < sigs.length; i++) expect(nullArgs(calls[i]!), sigs[i]).toBe(requiredArgs(nameOf(sigs[i]!)));
+    }
+    // anon and authenticated are refused every RPC; every API role, service_role included, every helper.
+    expect(text).toContain("for i in 1 .. array_length(rpcs, 1) loop\n    foreach who in array array['anon', 'authenticated'] loop\n"
+      + "      perform _r1_meet_public_tests.raises_as(who, 'T6-A execute ' || split_part(rpcs[i], '(', 1),\n"
+      + "        denied_calls[i], '42501');");
+    expect(text).toContain("for i in 1 .. array_length(helpers, 1) loop\n    foreach who in array array['anon', 'authenticated', 'service_role'] loop\n"
+      + "      perform _r1_meet_public_tests.raises_as(who, 'T6-A execute helper ' || split_part(helpers[i], '(', 1),\n"
+      + "        helper_calls[i], '42501');");
+    // The throttle table: every verb refused to anon and authenticated; service_role has the four DML verbs only.
+    for (const verb of ['select from', 'insert into', 'update', 'delete from', 'truncate']) {
+      expect(text, verb).toContain(`perform _r1_meet_public_tests.raises_as(who, 'T6-A ${verb} r1_meet_public_throttle',`);
+    }
+    for (const verb of ['select', 'insert', 'update', 'delete']) {
+      expect(text, verb).toContain(`_r1_meet_public_tests.runs_as('service_role', 'T6-A ${verb} a throttle row'`);
+    }
+    expect(text).toContain("perform _r1_meet_public_tests.raises_as('service_role', 'T6-A truncate r1_meet_public_throttle',");
+    expect(text).toContain("(select x.rolbypassrls from pg_roles x where x.rolname = 'service_role')");
+    // service_role runs every RPC once, and every call is rolled back.
+    for (const sig of T6_RPCS) {
+      expect(text, sig).toContain(`_r1_meet_public_tests.runs_as('service_role', 'T6-A ${nameOf(sig)}', format(`);
+      expect(text, sig).toContain(`'select screening_v2.${nameOf(sig)}(`);
+    }
+    expect(text).toContain('_r1_meet_public_tests.counts() = before and _r1_meet_public_tests.jobs_of(booked) = jobs_before');
+    expect(text).toContain("'T6-A the eleven RPCs, three helpers and two trigger functions are declared once each'");
+    expect(text).toContain('(select count(*) = 16 from pg_proc x');
+  });
+
+  it('T6-A runs every service_role call through a copy of the 0142 suite\'s runs_as (rolled back by a sentinel)', () => {
+    const ours = blockOf(suite, 'create function _r1_meet_public_tests.runs_as(', '$$;');
+    const theirs = blockOf(suite0142, 'create function _r1_meet_tests.runs_as(', '$$;');
+    expect(ours).toBe(theirs
+      .replaceAll('_r1_meet_tests.', '_r1_meet_public_tests.')
+      .replace("'r1 meet runs_as sentinel'", "'r1 meet public runs_as sentinel'")
+      .replace("'R1 MEET FAIL: ", "'R1 MEET PUBLIC FAIL: "));
+    expect(ours).toContain("raise exception 'r1 meet public runs_as sentinel' using errcode = 'P0001';");
+  });
+
+  it('T6-B tells one candidate\'s story through the RPCs in order, checking every step\'s jobs in creation order', () => {
+    const text = story();
+    inOrder(text, [
+      'screening_v2.r1_meet_public_capacity(',
+      'screening_v2.r1_meet_public_precheck(',
+      '_r1_meet_public_tests.t6_new_jobs();',
+      '_r1_meet_public_tests.create(700,',
+      'screening_v2.r1_meet_public_set_manage_digest(b1,',
+      'screening_v2.r1_meet_public_manage_read(',
+      "screening_v2.r1_meet_public_set_calendar_state(b1, '{created}', 'invited',",
+      '_r1_meet_public_tests.move(700,',
+      '_r1_meet_public_tests.reconsent(700,',
+      "screening_v2.r1_meet_set_bot(b1, 'attach',",
+      "_r1_meet_public_tests.cancel(700, jsonb_build_object('withdraw', true,",
+      "screening_v2.r1_meet_public_set_calendar_state(b1, '{created,invited}', 'cancelled',",
+      'screening_v2.r1_meet_public_precheck(',
+      "_r1_meet_public_tests.create(700, jsonb_build_object(\n    'booking_id', b2,",
+      "screening_v2.r1_meet_public_set_calendar_state(b2, '{created}', 'invited',",
+      "screening_v2.r1_meet_public_set_calendar_state(b1, '{cancelled}', 'purged',",
+      "screening_v2.r1_meet_set_bot(b2, 'attach',",
+      'delete from screening_v2.candidates x where x.id = cand;',
+    ]);
+    // Steps 1-14 in order, and the whole list at the end.
+    inOrder(text, ['T6-B 1 ', 'T6-B 2 ', 'T6-B 3 ', 'T6-B 4 ', 'T6-B 5 ', 'T6-B 6 ', 'T6-B 7 ', 'T6-B 8 ', 'T6-B 9 ',
+      'T6-B 10 ', 'T6-B 11 ', 'T6-B 12 ', 'T6-B 13 ', 'T6-B 14 ', 'T6-B the story wrote exactly these 13 jobs, in this order']);
+    expect(text.match(/story_got := story_got \|\| got;/g)).toHaveLength(5);
+    expect(text.match(/story_want := story_want \|\| want;/g)).toHaveLength(5);
+    expect(text).toContain('story_got = story_want\n    and jsonb_array_length(story_got) = 13');
+    // Creation order is the inserting command id; each step reads only the jobs written since the last.
+    const helper = blockOf(suite, 'create function _r1_meet_public_tests.t6_new_jobs()', '$$;');
+    expect(helper).toContain('order by x.cmin::text::bigint, x.dedup_key collate "C"');
+    expect(helper).toContain('where not exists (select 1 from _r1_meet_public_tests.t6_seen s where s.id = x.id);');
+    expect(helper).toContain('insert into _r1_meet_public_tests.t6_seen (id)');
+    // The create's expected jobs are in the order the create inserts them (ensure_bot, invite, tag add).
+    const createKinds = [...functionBody(CREATE).matchAll(/insert into screening_v2\.job_queue [^;]*'kind', '([a-z_]+)'(?:, 'op', '([a-z]+)')?/g)]
+      .map((m) => `${m[1]}${m[2] ? `:${m[2]}` : ''}`);
+    expect(createKinds).toEqual(['ensure_bot', 'calendar_sync:invite', 'ashby_booked_tag:add']);
+    const expected = blockOf(suite, 'create function _r1_meet_public_tests.t6_create_jobs(', '$$;');
+    inOrder(expected, ["'kind', 'ensure_bot'", "'kind', 'calendar_sync', 'op', 'invite'", "'kind', 'ashby_booked_tag', 'op', 'add'"]);
+    // The cancel step: the terminal trigger's two rows, then the recording erase, then the bot release.
+    inOrder(text, ["'op', 'cancel'", "'op', 'remove'", "'name', 'r1.recording.erase'", 'release_job(b1, bot1)']);
+    // The DSAR delete: the 0142 bot release, then the purge (trigger name order).
+    inOrder(text, ['release_job(b2, bot2)', 'purge_job(b2)']);
+  });
+
+  it('covers the T6 sections in order, after T4, as the suite\'s last sections', () => {
+    let last = suite.indexOf('-- T4-C. ');
+    for (const section of ['-- T6-A. ', '-- T6-B. ']) {
+      expect(suite.split(section).length - 1, section).toBe(1);
+      expect(suite.indexOf(section), section).toBeGreaterThan(last);
+      last = suite.indexOf(section);
+    }
+    expect(suite.indexOf("raise notice 'R1 MEET PUBLIC: % assertions passed', n;")).toBeGreaterThan(last);
+    expect(suite.trimEnd().split('\n').at(-1)).toBe('rollback;');
+    for (const label of [
+      'T6-A service_role bypasses RLS (Supabase; policy_tests.sql asserts the same)',
+      'T6-A service_role: precheck answers eligible (the helper runs as the owner)',
+      'T6-A service_role: create answers booked/created',
+      'T6-A service_role: move answers moved (through the 0142 reschedule)',
+      'T6-A service_role: cancel answers cancelled (round cancel and withdrawal included)',
+      'T6-A the service_role calls left nothing behind (each rolled back)',
+      'T6-A service_role may execute the eleven RPCs and none of the helpers',
+      "T6-B the story''s IST days 2026-12-16 .. 2026-12-18 start empty",
+      'T6-B 1 ... jobs: ensure_bot, calendar invite, Ashby tag add',
+      'T6-B 3 manage_read answers the full manage view',
+      "T6-B 4-5 ... jobs: calendar move:1 only (the pending ensure_bot absorbs the move''s)",
+      'T6-B 6 reconsent answers ok: the first consent superseded, a new one live',
+      'T6-B 8 ... and the manage link is dead: not_found',
+      'T6-B 10 the re-book answers booked/created on a new round',
+      'T6-B 12 ... the calendar moves after the cancel left its updated_at at the cancel (R19)',
+      "T6-B 14 ... jobs: the second bot''s release and its event purge (the purged first event and its pending bot release add none)",
+    ]) {
+      expect(suite, label).toContain(label);
+    }
+  });
+
+  it('names a labelled assertion for every case of the S01 brief\'s TESTS list', () => {
+    for (const [testCase, labels] of BRIEF_CASES) {
+      for (const label of labels) expect(suite, `${testCase}: ${label}`).toContain(label);
+    }
+    // The cases the SQL suite cannot show are pinned elsewhere: the 0142 suite (its full-row insert
+    // and its name guard, above), the TST-15 self-tests (P9 and N10, the sanction test above), the
+    // jobs.ts parsers (the T3 and T4 job tests above) and the two-session race (the T5 block above).
+    expect(BRIEF_CASES).toHaveLength(14);
+  });
+
+  it('names every closed status, refusal code and invalid_request field of the eleven RPCs and the refusal helper', () => {
+    const checked = suite.replace(/^\s*--.*$/gm, '');
+    const has = (forms: string[]): boolean => forms.some((f) => checked.includes(f));
+    for (const sig of [...T6_RPCS, T6_HELPERS[2]]) {
+      const body = functionBody(nameOf(sig));
+      const codes = new Set([...body.matchAll(/'status', 'refused', 'code', '([a-z0-9_]+)'/g),
+        ...body.matchAll(/return '([a-z0-9_]+)';/g)].map((m) => m[1]!));
+      const statuses = new Set([...body.matchAll(/'status', '([a-z0-9_]+)'/g)].map((m) => m[1]!));
+      const fields = new Set([...body.matchAll(/'field', '([a-z0-9_]+)'/g)].map((m) => m[1]!));
+      expect(codes.size + statuses.size, sig).toBeGreaterThan(0);
+      for (const c of codes) expect(has([`'refused:${c}'`, `"code": "${c}"`, `) = '${c}'`, `'code', '${c}'`]), `${sig} code ${c}`).toBe(true);
+      for (const s of statuses) {
+        expect(has([`'${s}:`, `"status": "${s}"`, `'status' = '${s}'`, `'status', '${s}'`]), `${sig} status ${s}`).toBe(true);
+      }
+      for (const f of fields) {
+        expect(has([`'invalid_request:${f}'`, `"field": "${f}"`, `'${f}',`, `'${f}']`]), `${sig} field ${f}`).toBe(true);
+      }
+    }
+  });
+});
