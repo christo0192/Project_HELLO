@@ -11,13 +11,17 @@
  *  - every way a public booking ends before its slot (candidate or HR cancel, a failure, a drain) loses
  *    the tag in one pass, one write each; a later pass reads the page again but asks Ashby nothing;
  *  - it NEVER adds and never removes a tag the candidate still wants (another booking stands), with no
- *    Ashby read at all; within the day back it decides as the queued job (a failure that was never an
- *    interview loses the tag, a drain after the start or a no-show keeps it); Ashby rows, live and
- *    completed bookings and slots more than a day back are never paged;
+ *    Ashby read at all; within the 7 days back it decides as the queued job (a failure that was never
+ *    an interview loses the tag, a drain after the start or a no-show keeps it); a booking drained
+ *    days before a slot that has since passed is still reached; Ashby rows, live and completed
+ *    bookings and slots more than 7 days back are never paged;
  *  - Ashby's switches off, a throwing switch or no usable key: not even a read;
  *  - pages of 10 from a cursor that wraps; the pass budget; a wait ends the pass and holds it for the
- *    wait's seconds (one permission alert per hour, not per bucket); a run that throws is one warning
- *    and is tried again after the wrap;
+ *    wait's seconds (one permission alert per hour, not per bucket) and the cursor moves past that
+ *    booking, so one booking that waits on every run never stalls the ones after it (fix round 3); a
+ *    run that throws is one warning and is tried again after the wrap;
+ *  - a cycle (wrap to wrap) that ran no booking holds the catch-up for an hour with no page read (all
+ *    settled, or an empty window); a cycle that ran one does not (fix round 3);
  *  - the sweep tick runs it after the drain, under the drain's gate only (status exactly `disabled`, a
  *    Recall key), once per bucket and again while there is more; never with an active lane, for an
  *    `invalid` flag, with Meet on, or without a key; it never throws;
@@ -54,6 +58,7 @@ const NOW_MS = Date.parse(HARNESS_NOW);
 const SECOND_MS = 1000;
 const MINUTE_MS = 60 * SECOND_MS;
 const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
 const iso = (ms: number): string => new Date(ms).toISOString();
 /** The logger's own rule for a string value (`lib/logger.ts`): a safe identifier of at most 64. */
 const LOG_SAFE = /^[a-zA-Z0-9_:.-]{1,64}$/;
@@ -203,21 +208,30 @@ describe('the Meet-off catch-up pass (PR #453 review S11-R2)', () => {
     expect(w.fake.requests).toEqual([]);
   });
 
-  it('pages only public bookings that ended, their slot at most a day back', async () => {
+  it('pages only public bookings that ended, their slot at most 7 days back', async () => {
     const w = newWorld();
     person(w, { booking: { status: 'drained', ...AHEAD, source: 'ashby' } });
     person(w, { booking: { status: 'pending', ...AHEAD } });
     person(w, { booking: { status: 'completed', ...AHEAD } });
-    // A slot that began more than a day ago is left to the queued job.
-    const old = person(w, { booking: { status: 'failed', reason: 'in_past', startAt: iso(NOW_MS - 25 * HOUR_MS), updatedAt: HARNESS_NOW } });
+    // A slot that began more than 7 days ago is left to the queued job (and the runbook's list).
+    const old = person(w, { booking: { status: 'failed', reason: 'in_past', startAt: iso(NOW_MS - 7 * DAY_MS - HOUR_MS), updatedAt: HARNESS_NOW } });
     expect(await catchUp(w)()).toEqual(report(0, 0, 0, false));
     expect(w.fake.requests).toEqual([]);
     expect(w.tables.calls).toHaveLength(1);
-    expect(w.tables.calls[0]!.filters).toContainEqual({ op: 'gt', column: 'start_at', value: iso(NOW_MS - 24 * HOUR_MS) });
+    expect(w.tables.calls[0]!.filters).toContainEqual({ op: 'gt', column: 'start_at', value: iso(NOW_MS - 7 * DAY_MS) });
     expect(hasDex(w, old.candidateId)).toBe(true);
   });
 
-  it('within the day back it decides as the queued job: never an interview loses the tag, a started one keeps it', async () => {
+  it('still reaches a booking drained before its slot when that slot passed days ago (the pass was blocked meanwhile)', async () => {
+    const w = newWorld();
+    // Drained four days ago, a day before its slot; Ashby writes were off until now.
+    const late = person(w, { booking: { status: 'drained', startAt: iso(NOW_MS - 3 * DAY_MS), updatedAt: iso(NOW_MS - 4 * DAY_MS) } });
+    expect(await catchUp(w)()).toEqual(report(1, 1, 0, false));
+    expect(hasDex(w, late.candidateId)).toBe(false);
+    expect(removes(w)).toHaveLength(1);
+  });
+
+  it('within the 7 days back it decides as the queued job: never an interview loses the tag, a started one keeps it', async () => {
     const w = newWorld();
     // Maintenance failed a booking that never got a bot `in_past`, 30 minutes after its slot ended.
     const neverInterviewed = person(w, {
@@ -286,7 +300,7 @@ describe('the Meet-off catch-up pass (PR #453 review S11-R2)', () => {
     expect(pages(w)[1]!.filters).toContainEqual({ op: 'gt', column: 'id', value: first.bookingId });
   });
 
-  it("a wait ends the pass and holds it for the wait's seconds; the cursor stays on that booking", async () => {
+  it("a wait ends the pass and holds it for the wait's seconds; the next pass goes on after that booking", async () => {
     const w = newWorld();
     const [first, second] = [drainedPerson(w), drainedPerson(w)];
     w.fake.next('/candidate.info', { status: 429 });
@@ -299,10 +313,63 @@ describe('the Meet-off catch-up pass (PR #453 review S11-R2)', () => {
     expect(await pass()).toEqual(report(0, 0, 0, false));
     expect(w.tables.calls).toHaveLength(calls);
     w.h.advance(SECOND_MS);
-    expect(await pass()).toEqual(report(2, 2, 0, false));
+    // The page after the wait starts AFTER the waiting booking; the wrap brings it back.
+    expect(await pass()).toEqual(report(1, 1, 0, false));
+    expect([hasDex(w, first.candidateId), hasDex(w, second.candidateId)]).toEqual([true, false]);
+    expect(await pass()).toEqual(report(1, 1, 0, false));
     expect([hasDex(w, first.candidateId), hasDex(w, second.candidateId)]).toEqual([false, false]);
-    // The page after the wait started from the first booking again.
-    expect(pages(w).map((call) => call.filters.some((filter) => filter.column === 'id'))).toEqual([false, false]);
+    expect(pages(w).map((call) => call.filters.find((filter) => filter.column === 'id')?.value ?? null)).toEqual([
+      null,
+      first.bookingId,
+      null,
+    ]);
+  });
+
+  it('one booking that waits on every run never stalls the ones after it, and each wait still holds the pass', async () => {
+    const w = newWorld();
+    // A < B by id; every candidate.info of A answers a 5xx (`ashby_unavailable`, 30 s), so A never settles.
+    const [a, b] = [drainedPerson(w), drainedPerson(w)];
+    expect(a.bookingId < b.bookingId).toBe(true);
+    w.fake.onRequest((request) => {
+      if (request.path === '/candidate.info' && request.body.id === a.candidateId) w.fake.next('/candidate.info', { status: 503 });
+    });
+    const infosOfA = () => w.fake.requestsOf('/candidate.info').filter((request) => request.body.id === a.candidateId).length;
+    const pass = catchUp(w);
+    const held = async (seconds: number): Promise<void> => {
+      // Within the hold: not even a read.
+      const calls = w.tables.calls.length;
+      w.h.advance((seconds - 1) * SECOND_MS);
+      expect(await pass()).toEqual(report(0, 0, 0, false));
+      expect(w.tables.calls).toHaveLength(calls);
+      w.h.advance(SECOND_MS);
+    };
+
+    expect(await pass()).toEqual(report(0, 0, 0, false));
+    expect(infosOfA()).toBe(1);
+    await held(30);
+    // After the hold the next pass reaches B and removes its tag.
+    expect(await pass()).toEqual(report(1, 1, 0, false));
+    expect([hasDex(w, a.candidateId), hasDex(w, b.candidateId)]).toEqual([true, false]);
+    // After the wrap A is tried again (and waits again, held again); B is settled and never asked again.
+    const requestsOfB = w.fake.requests.filter((request) => (request.body.id ?? request.body.candidateId) === b.candidateId).length;
+    expect(await pass()).toEqual(report(0, 0, 0, false));
+    expect(infosOfA()).toBe(2);
+    await held(30);
+    expect(await pass()).toEqual(report(0, 0, 0, false));
+    expect(await pass()).toEqual(report(0, 0, 0, false));
+    expect(infosOfA()).toBe(3);
+    await held(30);
+    expect(w.fake.requests.filter((request) => (request.body.id ?? request.body.candidateId) === b.candidateId)).toHaveLength(requestsOfB);
+    expect(hasDex(w, a.candidateId)).toBe(true);
+    expect(removes(w).map((request) => request.body.candidateId)).toEqual([b.candidateId]);
+    // A cycle that ran A is never idle: the pages go on (from the start, after A, from the start, after A).
+    expect(pages(w).map((call) => call.filters.find((filter) => filter.column === 'id')?.value ?? null)).toEqual([
+      null,
+      a.bookingId,
+      null,
+      a.bookingId,
+      null,
+    ]);
   });
 
   it('a permission fault alerts once per hour of hold, not once per bucket', async () => {
@@ -319,9 +386,14 @@ describe('the Meet-off catch-up pass (PR #453 review S11-R2)', () => {
       expect(await pass()).toEqual(report(0, 0, 0, false));
     }
     expect(permission()).toHaveLength(1);
+    // After the hour the pass goes on after the booking (nothing more: the wrap), and the next bucket
+    // tries it again.
+    w.h.advance(15 * MINUTE_MS);
+    expect(await pass()).toEqual(report(0, 0, 0, false));
     w.h.advance(15 * MINUTE_MS);
     expect(await pass()).toEqual(report(1, 1, 0, false));
     expect(hasDex(w, p.candidateId)).toBe(false);
+    expect(permission()).toHaveLength(1);
   });
 
   it('a run that throws is one warning with its closed code; the others go on and it is tried after the wrap', async () => {
@@ -348,8 +420,66 @@ describe('the Meet-off catch-up pass (PR #453 review S11-R2)', () => {
     expect(await pass()).toEqual(report(1, 1, 0, false));
   });
 
-  it('its bounds are frozen: 10 a page, 40 s a pass, 1000 settled bookings remembered, a day of slots back', () => {
-    expect(R1_MEET_ASHBY_TAG_MEET_OFF).toEqual({ limit: 10, budgetMs: 40 * SECOND_MS, rememberMax: 1000, lookbackMs: 24 * HOUR_MS });
+  it('a cycle that found nothing to do holds the catch-up for an hour: 25 settled bookings, no read meanwhile', async () => {
+    const w = newWorld();
+    Array.from({ length: 25 }, () => drainedPerson(w));
+    const pass = catchUp(w);
+    // The first cycle settles all 25 (three pages); a cycle that ran bookings does not idle-hold.
+    expect([await pass(), await pass(), await pass()]).toEqual([report(10, 10, 0, true), report(10, 10, 0, true), report(5, 5, 0, false)]);
+    const requests = w.fake.requests.length;
+    // The second cycle runs nothing: three reads, then the idle hold.
+    expect([await pass(), await pass(), await pass()]).toEqual([report(0, 0, 0, true), report(0, 0, 0, true), report(0, 0, 0, false)]);
+    expect(pages(w)).toHaveLength(6);
+    for (let minute = 1; minute < 60; minute += 1) {
+      w.h.advance(MINUTE_MS);
+      expect(await pass()).toEqual(report(0, 0, 0, false));
+    }
+    expect(pages(w)).toHaveLength(6);
+    // After the hour, one new cycle (three reads), then held again.
+    w.h.advance(MINUTE_MS);
+    expect([await pass(), await pass(), await pass()]).toEqual([report(0, 0, 0, true), report(0, 0, 0, true), report(0, 0, 0, false)]);
+    expect(pages(w)).toHaveLength(9);
+    w.h.advance(MINUTE_MS);
+    expect(await pass()).toEqual(report(0, 0, 0, false));
+    expect(pages(w)).toHaveLength(9);
+    expect(w.fake.requests).toHaveLength(requests);
+  });
+
+  it('an empty window idle-holds for an hour after its one read', async () => {
+    const w = newWorld();
+    const pass = catchUp(w);
+    expect(await pass()).toEqual(report(0, 0, 0, false));
+    expect(pages(w)).toHaveLength(1);
+    w.h.advance(59 * MINUTE_MS);
+    expect(await pass()).toEqual(report(0, 0, 0, false));
+    expect(pages(w)).toHaveLength(1);
+    w.h.advance(MINUTE_MS);
+    expect(await pass()).toEqual(report(0, 0, 0, false));
+    expect(pages(w)).toHaveLength(2);
+    expect(w.fake.requests).toEqual([]);
+  });
+
+  it('a cycle that ran a booking does not idle-hold: the next pass reads at once', async () => {
+    const w = newWorld();
+    const p = drainedPerson(w);
+    const pass = catchUp(w);
+    expect(await pass()).toEqual(report(1, 1, 0, false));
+    expect(hasDex(w, p.candidateId)).toBe(false);
+    // The next cycle reads at once (and, having run nothing, holds after it).
+    expect(await pass()).toEqual(report(0, 0, 0, false));
+    expect(pages(w)).toHaveLength(2);
+    expect(await pass()).toEqual(report(0, 0, 0, false));
+    expect(pages(w)).toHaveLength(2);
+  });
+
+  it('its bounds are frozen: 10 a page, 40 s a pass, 1000 settled bookings remembered, 7 days of slots back, an hour idle', () => {
+    expect(R1_MEET_ASHBY_TAG_MEET_OFF).toEqual({
+      limit: 10,
+      budgetMs: 40 * SECOND_MS,
+      rememberMax: 1000,
+      lookbackMs: 7 * DAY_MS,
+      idleHoldMs: HOUR_MS,
+    });
     expect(Object.isFrozen(R1_MEET_ASHBY_TAG_MEET_OFF)).toBe(true);
   });
 });
@@ -406,6 +536,32 @@ describe('the r1-sweep tick runs the catch-up after the drain, under the drain g
     expect(await tick()).toBe(true);
     expect(people.filter((p) => !hasDex(w, p.candidateId))).toHaveLength(12);
     expect(await tick()).toBe(false);
+  });
+
+  it('a minute tick goes quiet for an hour once a cycle found nothing to do, then runs one new cycle', async () => {
+    const w = newWorld();
+    Array.from({ length: 25 }, () => drainedPerson(w));
+    const tick = sweep(w, () => DISABLED);
+    // One tick a minute until the second cycle (all 25 settled by the first) wraps: six page reads.
+    for (let minute = 0; pages(w).length < 6; minute += 1) {
+      expect(minute).toBeLessThan(40);
+      await tick();
+      w.h.advance(MINUTE_MS);
+    }
+    const requests = w.fake.requests.length;
+    // The wrap was a minute ago: no page read for the rest of the hour.
+    for (let minute = 1; minute < 60; minute += 1) {
+      await tick();
+      w.h.advance(MINUTE_MS);
+    }
+    expect(pages(w)).toHaveLength(6);
+    // Then, at the first bucket after the hour, ONE new cycle (three reads), and quiet again.
+    for (let minute = 60; minute < 80; minute += 1) {
+      await tick();
+      w.h.advance(MINUTE_MS);
+    }
+    expect(pages(w)).toHaveLength(9);
+    expect(w.fake.requests).toHaveLength(requests);
   });
 
   it('never for `invalid`, with Meet on and no lane, without a Recall key, or with an active lane: zero reads', async () => {

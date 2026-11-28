@@ -28,10 +28,14 @@
  *
  * WHAT "DARK" MEANS HERE (D-S06-32): never enabled and no key = zero queries and zero calls, ever. A key
  * with the flag off = at most two narrow booking reads per bucket, and no outbound call unless a booking
- * still holds a bot (then only GET, DELETE and leave_call); while Ashby's own write switches are on with
- * a usable Ashby key, one more narrow read of public bookings (the booked tag's catch-up, below), and
- * an Ashby call only for a public booking that ended (its slot at most a day back). Nothing is
- * created, armed or queued while off.
+ * still holds a bot (then only GET, DELETE and leave_call). The booked tag's catch-up (below) adds, only
+ * while Meet is deliberately off with a usable Recall key AND Ashby's own write switches are on with a
+ * usable Ashby key: at most one page of ended public bookings read per tick while a cycle is in
+ * progress (a new cycle at most once per 15-minute bucket, and at most hourly once a cycle found
+ * nothing to do), plus, per booking it runs, the booked-tag converge's narrow reads; it may call Ashby
+ * `candidate.info` and `candidate.removeTag` (and `application.info` when a link has no Ashby
+ * candidate id) only for public bookings that ended (their slot at most 7 days back). It never adds a
+ * tag, never writes our database and queues nothing. Nothing is created, armed or queued while off.
  *
  * DEX'S SCORECARD TO ASHBY (M034 S09, D-S09-12): the lane's flow ports carry `feedback`, the ports of
  * the `scorecard_feedback` job and of the maintenance re-drive: the form setting
@@ -46,7 +50,7 @@
  * `ashby_key_missing`), and a null is NOT remembered, so a key set later is picked up by the next job.
  * A built port is kept. The Ashby client it holds makes one attempt per call (the queue retries).
  *
- * THE DEX R1 BOOKED TAG (M035 S11): the lane's flow ports carry `ashbyTag`, the ports of the
+ * THE LEXY R1 BOOKED TAG (M035 S11): the lane's flow ports carry `ashbyTag`, the ports of the
  * `ashby_booked_tag` job: the booked-tag store over the same client, Ashby's own switches (read per
  * job, the same two as the scorecard), and the Ashby tag port, built on the first job that needs it
  * from the existing Ashby runtime config (same `ASHBY_API_KEY`, no new secret): null while no usable
@@ -54,9 +58,11 @@
  * THE MEET-OFF CATCH-UP (M035 S11, PR #453 review S11-R2): with no lane, nothing runs the tag jobs
  * the drain's moves queue, so the Meet-off branch of the sweep tick runs one bounded remove-only pass
  * of `ashby-booked-tag-meet-off.ts` right after the drain's, under the drain's gate (status exactly
- * `disabled`, a usable Recall key), once per bucket and again on the next tick while there is more:
- * the same tag ports (`createR1MeetAshbyTagPorts`, built on the first pass), so Ashby's switches and
- * key hold it exactly as they hold the job. It never adds the tag and queues nothing.
+ * `disabled`, a usable Recall key), once per bucket and again on the next tick while there is more
+ * (the pass itself holds after a wait, and for an hour after a cycle that found nothing to do): the
+ * same tag ports (`createR1MeetAshbyTagPorts`, built on the first pass), so Ashby's switches and key
+ * hold it exactly as they hold the job. It never adds the tag, never writes our database and queues
+ * nothing.
  *
  * MULTI-MACHINE (D-S06-35): correctness comes from the leases, the RPCs' compare-and-sets and the dedup
  * keys; the hot window and the bucket memory are per process and only shape cadence.

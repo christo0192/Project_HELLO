@@ -38,7 +38,9 @@
  *   6  candidate_links_overflow WANTED, as above; more than 25 linked applications: alert, `ignored`
  *                               (the lane never decides from a partial list).
  *      tag_wanted_held          a remove-only run (only the Meet-off catch-up, PR #453 review S11-R2)
- *                               whose candidate still wants the tag: `ignored`, no Ashby read.
+ *                               whose candidate still wants the tag: `ignored`, no tag read or write
+ *                               (at most the one `application.info` lookup of step 5, when the
+ *                               booking's link has no Ashby candidate id).
  *   7  tag_present / tag_absent `candidate.info` already holds the wanted state: `processed`, ZERO
  *                               writes.
  *   8  wanted: resolve the tag id (cached, then once FRESH on a miss): `tag_not_found` and
@@ -263,13 +265,17 @@ export interface R1MeetAshbyTagRunOptions {
   /**
    * Never ADD the tag (PR #453 review S11-R2, `ashby-booked-tag-meet-off.ts`): while Meet is off the
    * catch-up only takes tags away from public bookings that ended. A candidate who still wants the
-   * tag is left as is (`ignored('tag_wanted_held')`, before any Ashby read); the queued job converges
-   * it once Meet is back on.
+   * tag is left as is (`ignored('tag_wanted_held')`, before any tag read or write; at most one
+   * `application.info` lookup when the booking's link has no Ashby candidate id); the queued job
+   * converges it once Meet is back on.
    */
   readonly removeOnly?: boolean;
 }
 
-/** What a remove-only run answers when the candidate still wants the tag (no Ashby read, no write). */
+/**
+ * What a remove-only run answers when the candidate still wants the tag: no tag read or write (at most
+ * one `application.info` lookup when the booking's link has no Ashby candidate id).
+ */
 export const R1_MEET_ASHBY_TAG_WANTED_HELD = 'tag_wanted_held';
 
 /**
