@@ -600,8 +600,11 @@ async function settleOwedRelease(deps: R1MeetFlowDeps, booking: R1MeetBooking, m
   return r1MeetProcessed(marked ? `released_${released.outcome}` : 'released_unmarked');
 }
 
-/** Recall release, then the cancel RPC, then set_bot('release'). Re-reads the booking first. */
-async function cancelFlow(
+/**
+ * Recall release, then the cancel RPC, then set_bot('release'). Re-reads the booking first.
+ * Exported for the public pre-slot re-check of `maintenance.ts` (M035 S05, D-S05-21); unchanged.
+ */
+export async function cancelFlow(
   deps: R1MeetFlowDeps,
   bookingId: string,
   reason: R1MeetCancelReason,
