@@ -5,9 +5,8 @@
  *
  * THE S09 SEAM. The registry is built from a list (`R1_MEET_DEFINITIONS`); a kind may appear once only,
  * and a duplicate throws at construction, so a second definition can never silently shadow the first.
- * S09 registers its `scorecard_feedback` definition (`feedback.ts`) after the S06 kinds, and M035 S05
- * its `calendar_sync` definition (`calendar-sync.ts`) right after that one (contracts section 5: S11's
- * `ashby_booked_tag` follows), and nothing else.
+ * S09 registers `scorecard_feedback` after the S06 kinds. Contracts section 5 then requires
+ * M035 S05 `calendar_sync`, followed by S11 `ashby_booked_tag` LAST.
  *
  * CLOSED FAILURES (D-S06-5). A payload whose kind this build does not know throws `r1_meet_unknown_kind`
  * (a kind a rolling deploy has not shipped yet survives a few retries), and one its parser refuses
@@ -31,6 +30,7 @@
 import type { QueueHandlerResult } from '../../queue/runner.js';
 import type { QueueJob } from '../../queue/types.js';
 import { r1MeetCalendarSyncDefinition } from './calendar-sync.js';
+import { r1MeetAshbyBookedTagDefinition } from './ashby-booked-tag.js';
 import { r1MeetDrainDefinition } from './drain.js';
 import { R1_MEET_EVENT_DEFINITIONS } from './event-handler.js';
 import { r1MeetScorecardFeedbackDefinition } from './feedback.js';
@@ -59,6 +59,8 @@ export const R1_MEET_DEFINITIONS: readonly R1MeetJobDefinition[] = Object.freeze
   r1MeetDrainDefinition as R1MeetJobDefinition,
   r1MeetScorecardFeedbackDefinition as R1MeetJobDefinition,
   r1MeetCalendarSyncDefinition as R1MeetJobDefinition,
+  // M035 S11: the Lexy R1 Booked tag lane, registered after S05's calendar kind, so it is now the last.
+  r1MeetAshbyBookedTagDefinition as R1MeetJobDefinition,
 ]);
 
 /** The deferral of a job claimed just before Meet turned off. */

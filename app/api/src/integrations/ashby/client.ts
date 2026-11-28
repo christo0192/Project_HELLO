@@ -733,10 +733,11 @@ export class AshbyClient {
    * Add one tag to a candidate. The body is EXACTLY `{candidateId, tagId}`: the
    * endpoint sets additionalProperties false, so there is no `extra`.
    *
-   * `idempotent: true` is safe only because the one caller, the verdict-tag lane,
-   * reads candidate.info and writes the difference. Ashby documents no behaviour
-   * for a repeat, so a retried add after a lost response can only meet a tag the
-   * lane wanted there anyway.
+   * `idempotent: true` is safe only because both callers, the Christy verdict-tag
+   * lane and the R1 Meet 'Lexy R1: Booked' lane (M035 S11), read candidate.info
+   * and write the difference. Ashby documents no behaviour for a repeat, so a
+   * retried add after a lost response can only meet a tag the lane wanted there
+   * anyway.
    */
   async candidateAddTag<T = OpaqueRecord>(
     candidateId: string,

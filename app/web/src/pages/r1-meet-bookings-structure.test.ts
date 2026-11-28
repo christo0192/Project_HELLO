@@ -47,6 +47,7 @@ const FILES = [
   'src/components/r1/MeetBookingsFilters.tsx',
   'src/components/r1/MeetBookingsTable.tsx',
   'src/components/r1/ViaMeetTag.tsx',
+  'src/components/r1/MeetBookingsPublicLink.tsx',
 ];
 
 interface Guard {
@@ -117,6 +118,22 @@ const GUARDS: Guard[] = [
     pattern: /\bDex\b/,
     caught: ['Dex', 'Dex scheduled', 'with Dex as an interviewer'],
   },
+  {
+    // M035 S08: the public booking link card shows the one public page, and nothing of a booking's own.
+    what: 'a manage link or token, the public booking flag, the booking API client or a clipboard read',
+    pattern: /book\/manage|R1_BOOK_MANAGE_PATH|captureManageToken|isManageToken|manage_token|#m=|R1_MEET_PUBLIC|r1-book-api|readText/,
+    caught: [
+      "'/book/manage'",
+      'R1_BOOK_MANAGE_PATH',
+      'captureManageToken(window)',
+      'isManageToken(value)',
+      'manage_token_digest',
+      '`#m=${token}`',
+      'R1_MEET_PUBLIC_BOOKING_ENABLED',
+      "from '../lib/r1/r1-book-api'",
+      'navigator.clipboard.readText()',
+    ],
+  },
 ];
 
 describe('the Meet staff surfaces are the files this guard reads', () => {
@@ -174,6 +191,21 @@ describe('the Meet staff surfaces keep to their boundary', () => {
       expect(code(read(file)), `${file} hard-codes an API path`).not.toMatch(API_PATH);
     }
     expect(code(read(LIB))).toContain("R1_MEET_BOOKINGS_PATH = '/api/interview-rounds/meet-bookings'");
+  });
+
+  it('builds the public link from this page\'s own origin and the one book path', () => {
+    const card = code(read('src/components/r1/MeetBookingsPublicLink.tsx'));
+    expect(card).toContain('window.location.origin');
+    expect(card).toContain('meetPublicBookingUrl(');
+    expect(card).toMatch(/import \{ meetPublicBookingUrl \} from '\.\.\/\.\.\/lib\/r1-meet-bookings';/);
+    // The lib takes the path from the one module that names it, and nothing else from there.
+    const lib = code(read(LIB));
+    expect(lib).toContain("import { R1_BOOK_PATH } from './r1/r1-book-link';");
+    expect(lib.match(/from '\.\/r1\/r1-book-link'/g)).toHaveLength(1);
+    // Shown only while the last answer says Meet is on, so the loading and off pages are as they were.
+    const page = code(read(PAGE));
+    expect(page).toMatch(/\{meetOn === true && \(\s*<div className="mt-4">\s*<MeetBookingsPublicLink \/>\s*<\/div>\s*\)\}/);
+    expect(page.match(/<MeetBookingsPublicLink\b/g)).toHaveLength(1);
   });
 
   it('keeps the wire shapes free of runtime imports, so the e2e harness can read them', () => {

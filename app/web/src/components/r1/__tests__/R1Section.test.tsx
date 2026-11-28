@@ -1261,7 +1261,7 @@ describe('a round held over Google Meet', () => {
   it.each<[string, Partial<R1Round>]>([
     ['a browser round', { channel: 'browser' }],
     ['a null channel', { channel: null }],
-    ['no channel at all (every API today)', {}],
+    ['no channel at all (an older API)', {}],
     ['a channel this page does not know', { channel: 'zoom' as unknown as R1Round['channel'] }],
   ])('is not marked for %s, which keeps its link words and its Reissue', async (_name, over) => {
     const row = await rowOf(over);
@@ -1286,42 +1286,77 @@ describe('a round held over Google Meet', () => {
     expect(row).not.toHaveTextContent('Link open');
   });
 
-  it('cancels with words about Ashby, not a link', async () => {
+  it('cancels with words true for both ways it can be booked, never about its own link', async () => {
     const user = userEvent.setup();
     await rowOf({ channel: 'meet' });
     await user.click(await screen.findByRole('button', { name: 'Cancel round' }));
     const well = await screen.findByRole('group', { name: 'Cancel this R1 round?' });
+    // Nobody started it and no attempt counted, so it is not an R1: the public link takes the candidate
+    // again, and HR is told so (with the flag hedge, as the panel cannot read the public booking flag).
     expect(well).toHaveTextContent(
-      'Its reserved minutes are released. The interview stays in Ashby until it is cancelled there.',
+      'Its reserved minutes are released. If the candidate booked it on the public booking link, it comes ' +
+        'off Lexy’s calendar unless the slot has started. If it was scheduled in Ashby, it stays there until ' +
+        'it is cancelled there. The candidate can still book a new interview on the public booking link if ' +
+        'public booking is switched on and their Ashby application is active.',
     );
-    expect(well).not.toHaveTextContent(/link/i);
+    // The public booking link is where it is booked, not a link of the round's own: no browser-link words.
+    expect(well).not.toHaveTextContent(/link stops working|original link|reissue/i);
     expect(well).not.toHaveTextContent(/does not end a call/);
   });
 
-  it('warns that cancelling does not end a call that is already running', async () => {
+  it('warns that cancelling does not end a call that is already running, for both ways it can be booked', async () => {
     const user = userEvent.setup();
     await rowOf({ channel: 'meet', status: 'in_progress' });
     await user.click(await screen.findByRole('button', { name: 'Cancel round' }));
-    expect(await screen.findByRole('group', { name: 'Cancel this R1 round?' })).toHaveTextContent(
+    const well = await screen.findByRole('group', { name: 'Cancel this R1 round?' });
+    expect(well).toHaveTextContent(
       'Its reserved minutes are released. This does not end a call that is already running. ' +
-        'The interview stays in Ashby until it is cancelled there.',
+        'If the candidate booked it on the public booking link, it comes off Lexy’s calendar unless the ' +
+        'slot has started. If it was scheduled in Ashby, it stays there until it is cancelled there.',
     );
+    // A round in progress may count its attempt before the cancel lands: no promise of a new booking.
+    expect(well).not.toHaveTextContent(/book a new interview/);
   });
 
-  it('grants the retake with words about scheduling it in Ashby, not a link', async () => {
+  it('promises no new booking when cancelling a retake: its counted attempt ends the public path', async () => {
+    const user = userEvent.setup();
+    await rowOf({ channel: 'meet', status: 'invited', attempts_counted: 1 });
+    await user.click(await screen.findByRole('button', { name: 'Cancel round' }));
+    const well = await screen.findByRole('group', { name: 'Cancel this R1 round?' });
+    expect(well).toHaveTextContent('If it was scheduled in Ashby, it stays there until it is cancelled there.');
+    expect(well).not.toHaveTextContent(/book a new interview/);
+  });
+
+  it('tells nothing of the public link when cancelling a browser round', async () => {
+    const user = userEvent.setup();
+    await rowOf({ channel: 'browser' });
+    await user.click(await screen.findByRole('button', { name: 'Cancel round' }));
+    const well = await screen.findByRole('group', { name: 'Cancel this R1 round?' });
+    expect(well).toHaveTextContent(
+      'The link stops working and its reserved minutes are released. A new round can be sent afterwards.',
+    );
+    expect(well).not.toHaveTextContent(/public booking/);
+  });
+
+  it('grants the retake with words true for both ways it can be booked, never about its own link', async () => {
     const user = userEvent.setup();
     await rowOf({ channel: 'meet', status: 'completed', attempts_counted: 1 });
     await user.click(await screen.findByRole('button', { name: 'Grant retake' }));
     const well = await screen.findByRole('group', { name: 'Grant the one retake?' });
+    // The panel cannot read the public booking flag, so the public path is said with its condition.
     expect(well).toHaveTextContent(
-      'The round opens again for 72 hours. Schedule the retake in Ashby with Lexy before then; there is no link.',
+      'The round opens again for 72 hours. Before then, you can schedule the retake in Ashby with Lexy, or ' +
+        'the candidate can book it on the public booking link if public booking is switched on.',
     );
-    expect(well).not.toHaveTextContent(/original link/);
+    expect(well).not.toHaveTextContent(/original link|reissue/i);
     api.listR1Rounds.mockResolvedValue({ rounds: [round({ channel: 'meet', status: 'invited', attempts_counted: 1 })] });
     await user.click(within(well).getByRole('button', { name: 'Grant retake' }));
     expect(api.grantR1Retake).toHaveBeenCalledWith('round-1');
     expect(
-      await screen.findByText('Retake granted. Schedule it in Ashby with Lexy within 72 hours.'),
+      await screen.findByText(
+        'Retake granted. Within 72 hours, you can schedule it in Ashby with Lexy, or the candidate can book ' +
+          'it on the public booking link if public booking is switched on.',
+      ),
     ).toBeInTheDocument();
     expect(screen.queryByText(/original link works again/)).not.toBeInTheDocument();
   });

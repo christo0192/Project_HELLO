@@ -4185,7 +4185,9 @@ and bill. Drain first, then turn the flag off.
    never cuts a live interview. It logs `r1_meet_drain_pass` (`settled_<n>`). Keep `RECALL_API_KEY`
    set until the confirm query returns no rows. It runs in the R1 runtime or, with R1 off, in the
    standalone recording runtime, which exists only when the R2 recording configuration is enabled
-   (production has it). With neither there is no host loop, so drain first.
+   (production has it). With neither there is no host loop, so drain first. The same tick then runs
+   the "Lexy R1: Booked" tag's Meet-off catch-up (remove-only; see "Switches" in the booked-tag
+   section below).
 5. **What never drains.**
    - A Meet configuration that is `invalid` (a typo, a malformed secret): draining would cancel
      every booked interview, so fix the value instead.
@@ -4223,6 +4225,7 @@ and bill. Drain first, then turn the flag off.
 | `r1_meet_bot_waiting_room` | Dex's bot reported `bot.in_waiting_room` (`error_type` = the booking's source, M035 S02): the meeting is not OPEN, or nobody has admitted Dex. The booking stays live; the bot waits up to 600 s. One line per processed event; a retried job may repeat it, never drop it. ERROR level for `public_page`; for `ashby` the same line is a WARNING (admitting Dex is HR's normal step there; a bot nobody admits still raises `r1_meet_bot_admission_blocked`) | `public_page`: fix the Dex unit's Meet settings at once, before more candidates are stranded (access Open, people who are not signed in may join, waiting room off, the host need not join first). `ashby`: someone in the meeting must admit Dex |
 | `r1_meet_bot_admission_blocked` | The bot never got in (`error_type` = the Recall sub-code: a waiting-room timeout, `bot_kicked_from_waiting_room`, `meeting_not_started`, `google_meet_bot_blocked`, `google_meet_knocking_disabled`, `google_meet_sign_in_missing_login_credentials`, `google_meet_organisation_restricted`); `failed/bot_fatal`, never a candidate no-show. Once per booking | Fix the Meet settings (as above; a meeting restricted to the organisation, or one that needs a signed-in user, also refuses a guest bot); HR re-books the candidate |
 | `r1_meet_bot_sign_in_failed` | Signed-in mode only (`R1_MEET_GOOGLE_LOGIN_GROUP_ID` set): the bot could not sign in to Google (`error_type` = the Recall sub-code); `failed/bot_fatal`. Once per booking | Check the Recall Google Login Group and its login, the Legacy SSO profile and certificate, and the concurrent sign-in count (30 per account); or unset the login group to go back to the guest bot. HR re-books |
+| `r1_meet_ashby_tag_failed` | The Lexy R1 Booked tag lane (M035 S11) could not set the tag: `error_type` `tag_not_found` or `tag_ambiguous` (the tag is missing, archived or duplicated in Ashby), `permission_denied` (+`http_status`: the key lacks `candidatesWrite` or `hiringProcessMetadataRead`), `ashby_key_missing`, `candidate_id_missing`, `candidate_links_overflow`, `write_rejected`, or an Ashby refusal `<category>[:<code>]` | See "R1 public booking: the Lexy R1 Booked tag" |
 
 Warnings: `r1_meet_receipt_finish_failed`, `r1_meet_maintenance_had_errors` (`error_type` = the
 failed steps), `r1_meet_attempt_ended_enqueue_failed` (maintenance re-drives it),
@@ -4937,6 +4940,252 @@ names the variable, never the value); nothing is clamped, and Meet for existing 
 `R1_MEET_PUBLIC_BOOKING_ENABLED=true` goes LAST: only after S06 has merged, the live spike has passed
 and the go-live gate (the Legal-approved consent notice) is met. Turning it off again stops new
 bookings at once (every public route answers `booking_disabled`); booked interviews still finish.
+
+## R1 public booking: the "Lexy R1: Booked" tag in Ashby (M035 S11, dark)
+
+S11 keeps one Ashby candidate tag, `Lexy R1: Booked`, in step with the public Lexy booking link. The
+owner's decision (M035 roadmap section 2, item 5): "Booked tag + scorecard (Recommended)": a "Lexy
+R1: Booked" tag on the candidate when they book, removed when the booking is cancelled by the
+candidate or HR, or fails before the interview; Lexy's scorecard as application feedback afterwards
+(the S09 section above). There is no Ashby interview-schedule mirror. The code is
+`app/api/src/lib/r1/meet/`: `ashby-booked-tag.ts` (the `ashby_booked_tag` job),
+`ashby-booked-tag-ashby.ts` (the Ashby port), `ashby-booked-tag-store.ts` (the reads) and
+`ashby-booked-tag-meet-off.ts` (the Meet-off catch-up, under Switches).
+
+### What it does, and when
+
+- **Dark.** Only public bookings ever get a tag job, and only migration 0143 queues one: the
+  public create RPC queues `op: 'add'` for every booking, and the terminal-status trigger queues
+  `op: 'remove'` when a public booking first becomes `cancelled`, `failed` or `drained` (a candidate
+  cancel, an HR cancel, every failure and the drain). Only the public booking page calls that RPC,
+  and it is off until `R1_MEET_PUBLIC_BOOKING_ENABLED=true`. The job runs on the `r1-meet` lane, so
+  `R1_ENABLED` and `R1_MEET_ENABLED` must be on too. The job does NOT read the public flag: a job
+  queued just before the flag went off still runs, so a cancel after that still removes the tag.
+- **The rule.** Every run reads the database and decides again. `op` is only a hint. For each
+  Ashby application, its newest public booking wants the tag when it is live, `completed`, or
+  `failed` / `drained` at or after its start time. A `cancelled` booking does not, and nor does one
+  that failed or was drained before its start. A booking that failed with a reason that means no
+  interview could have happened never wants it, whatever the time: `in_past` (it never got a bot;
+  maintenance fails such a booking 30 minutes after its slot ENDS), `bot_create_failed`,
+  `round_expired` and `invite_undeliverable`. The other failures (`no_show`, `bot_fatal`,
+  `admission_refused`, `multiple_humans`) follow a bot that was sent to the interview, so they keep
+  the start-time rule. A tag sits on the whole candidate, not on one application, so the tag is
+  wanted when ANY application of that Ashby candidate wants it: the booking's own application and
+  every application linked to the same Ashby candidate (at most 25; the Ashby candidate id is
+  matched in any case, as the 0143 booking rules match it).
+- **Writes.** The job reads the candidate's tags first. If Ashby already matches, it writes
+  nothing (`tag_present` or `tag_absent`). Otherwise it adds the one tag, or removes every
+  `Lexy R1: Booked` tag on the candidate (archived copies too, at most 5 a run). Then it looks once
+  more, at Ashby AND at the database. It finishes (`tag_added` or `tag_removed`) only when both
+  still agree. If a recruiter or a new booking changed things meanwhile, it waits a minute
+  (`tag_contended`) and decides again.
+- **Ashby-scheduled bookings** (HR booked the Lexy interview in Ashby) never get this tag: such a
+  job ends `ignored` (`ashby_booking`) with no Ashby call.
+- **Where the candidate id comes from.** The application link's Ashby candidate id, else one
+  `application.info` read. The lane never writes to our database.
+
+### Setup (the Ashby admin, once)
+
+1. In Ashby, create ONE candidate tag titled exactly `Lexy R1: Booked`. Upper and lower case
+   matter; spaces before or after the title are ignored. Keep it active (not archived).
+2. The lane never creates, renames or archives a tag. Without the tag, every booking alerts
+   `tag_not_found` and waits an hour. Two active tags with that title alert `tag_ambiguous` (archive
+   one). The tag id is cached for 5 minutes, and a miss is read once more fresh, so a fix counts at
+   the next run.
+3. The key is the existing `ASHBY_API_KEY` (no new secret). It needs `candidatesWrite`
+   (`candidate.addTag`, `candidate.removeTag`) and `hiringProcessMetadataRead`
+   (`candidateTag.list`), plus the candidate reads the Christy tag lane already uses
+   (`candidate.info`, `application.info`).
+
+### What it never touches
+
+Any other tag. Christy's verdict tags, Referral and every other tag are dropped from what the job
+reads before it decides anything, and it only ever sends the id of `Lexy R1: Booked`. The job calls
+five Ashby endpoints and no other: `application.info`, `candidate.info`, `candidateTag.list`,
+`candidate.addTag` and `candidate.removeTag`. Its log lines hold closed words, counts and an HTTP
+status only: never an id, a name, an email or the tag's title.
+
+### Waits, and what each needs
+
+Each wait is a deferral within the shared bound (30 deferrals or a 60-minute streak). Past it the
+job throws the closed code, retries (10 attempts) and then dead-letters (alert `r1_meet_job_failed`
+with `ashby_booked_tag:<code>`).
+
+| Wait (`defer_reason`) | Seconds | Means | Needs | Thrown past the bound |
+|---|---|---|---|---|
+| `ashby_inactive` | 3600 | Ashby's own write switches are off (warning `r1_meet_ashby_tag_ashby_inactive`) | Turn Ashby writes back on | `r1_meet_ashby_tag_ashby_inactive` |
+| `ashby_key_missing` | 3600 | No usable `ASHBY_API_KEY` (alert `ashby_key_missing`) | Set the key | `r1_meet_ashby_tag_key_missing` |
+| `ashby_permission_denied` | 3600 | Ashby answered 401 or 403, or a missing endpoint permission (alert `permission_denied`) | Fix the key's permissions (setup step 3) | `r1_meet_ashby_tag_permission_denied` |
+| `tag_not_found` | 3600 | No active tag titled `Lexy R1: Booked` (alert `tag_not_found`) | Create it (setup step 1) | `r1_meet_ashby_tag_not_found` |
+| `tag_ambiguous` | 3600 | Two or more active tags with that title (alert `tag_ambiguous`) | Archive the extra ones | `r1_meet_ashby_tag_ambiguous` |
+| `ashby_rate_limited` | 60, backing off to 300 | Ashby answered 429 | Nothing; it retries | `r1_meet_ashby_tag_rate_limited` |
+| `ashby_unavailable` | 30, backing off to 300 | A 5xx, a timeout (5 s per call), a network fault, a malformed answer, a catalogue that could not be read in full, or the run's 20 s budget ran out | Nothing; it retries | `r1_meet_ashby_tag_unavailable` |
+| `tag_contended` | 60 | The tag or a booking changed while the job wrote | Nothing; it decides again | `r1_meet_ashby_tag_contended` |
+
+The two transient waits back off while they repeat: each new wait is as long as the job has
+already waited in that streak, between the base and 300 s (30, 30, 60, 120, 240, 300, ... s for
+`ashby_unavailable`). The tag jobs share the `r1-meet` lane (two slots) with the jobs of live
+interviews, so a slow Ashby costs the lane fewer and fewer runs, each at most 20 s.
+
+Terminal answers with no wait: `ignored` with `booking_missing`, `ashby_booking`,
+`candidate_id_missing` (alert), `candidate_links_overflow` (alert: more than 25 applications are
+linked to one Ashby candidate; fix the tag by hand), `ashby_rejected` (alert: Ashby refused a read
+for good, `error_type` `<category>[:<code>]`), `ashby_request_invalid` (alert) and
+`tag_write_rejected` (alert `write_rejected`: Ashby refused the write twice). An unwired build
+throws `r1_meet_ashby_tag_unwired` (a build bug: deploy the build that wires it). A database
+fault throws `r1_meet_db_error` and retries.
+
+### Switches
+
+- **Ashby's own switches hold every tag write.** The "stop all Ashby writes" rollback of
+  `ashby-runtime-activation.md` section 6 (unset `ASHBY_RUNTIME_ENABLED`, or
+  `ASHBY_INTEGRATION_ENABLED=false`) stops these writes too, and so does an unusable
+  `ASHBY_WEBHOOK_SECRET`. Tag jobs then wait an hour at a time (`ashby_inactive`) and keep their
+  intent through a short rollback. A rollback longer than about 10 hours dead-letters them (replay
+  below).
+- **Turning the public link off** (`R1_MEET_PUBLIC_BOOKING_ENABLED=false`) stops new bookings, and
+  so new `add` jobs; jobs already queued still run.
+- **Turning Meet off** (`R1_MEET_ENABLED=false`) stops the lane: every `r1-meet` job, tag jobs
+  included, waits until it is back on. The drain backstop still drains future public bookings
+  while Meet is off, and 0143 queues a tag `remove` job for each that nothing runs. So the same
+  `r1-sweep` tick runs the **Meet-off catch-up** right after each drain pass, under the drain's own
+  gate (Meet status exactly `disabled` and a usable Recall key; nothing at all for a malformed
+  flag): it pages the public bookings that ended (`cancelled`, `failed`, `drained`) whose slot
+  starts at most 7 days back, 10 at a time, and runs the tag job's own rule on each, ONLY to remove
+  the tag. So it removes exactly what the queued `remove` jobs would: a booking that ended before
+  its start, or failed without ever being an interview. It never adds one: a candidate whose
+  interview's time had come, or who still has a booking that stands, keeps the tag as it is
+  (`tag_wanted_held`: no tag read or write; at most one `application.info` lookup when the
+  booking's link has no Ashby candidate id), and the queued jobs settle that when Meet is back on.
+  Ashby's own switches and key hold it exactly as they hold the job: with Ashby writes off or no
+  usable `ASHBY_API_KEY` it does not even read. It may call Ashby `candidate.info` and
+  `candidate.removeTag` (and `application.info` when a link has no Ashby candidate id) only for
+  public bookings that ended. It never writes our database and queues nothing.
+  - **Its cadence, per machine.** A cycle walks every ended public booking in the window, by id,
+    one page of 10 per tick (the `r1-sweep` tick comes about once a minute), possibly over several
+    ticks. A new cycle starts at most once per 15-minute bucket, and at most once an hour after a
+    cycle that found nothing to do (every booking already settled, or none in the window): during
+    that hour it reads nothing. Per booking it runs, it makes the tag job's own narrow reads (the
+    booking, its link, the candidate's other applications and their newest public bookings).
+  - **Its bounds.** Each machine asks Ashby about a booking once (it remembers up to 1000 it
+    settled; a restart forgets them), runs at most 40 s a pass (no run starts unless a whole 20 s
+    run still fits), and after a wait (Ashby throttling or down, a malformed or slow answer, which
+    may be one candidate's record alone, a permission fault, or a contended write) holds
+    for that wait's seconds (30 s to an hour, the waits table above, with no back-off), so an alert
+    fires at most once per wait. The next pass goes on AFTER the booking that waited, and that
+    booking is tried again on the next cycle, so one booking that keeps waiting never holds up the
+    others.
+  - **Its own lines.** `r1_meet_ashby_tag_meet_off_pass` (info, `removed_<n>`) and
+    `r1_meet_ashby_tag_meet_off_error` (warning; `page` when the page could not be read, else the
+    closed code of the run that threw, which is tried again on the next cycle). The queued jobs are
+    left alone: when Meet is back on they find the tag gone and finish `tag_absent`.
+
+### Read-only check
+
+```sql
+-- tag jobs waiting, and why (counts only)
+select payload->>'op' as op, status, defer_reason, count(*) from screening_v2.job_queue
+ where name = 'r1-meet' and payload->>'kind' = 'ashby_booked_tag'
+   and status in ('pending', 'active', 'delayed')
+ group by 1, 2, 3 order by 1, 2, 3;
+-- tag dead letters by closed code
+select error_message, count(*), max(moved_at) from screening_v2.job_dlq
+ where name = 'r1-meet' and payload->>'kind' = 'ashby_booked_tag'
+ group by 1 order by 3 desc;
+-- the dead letters themselves, newest first (ids only, for the replay below)
+select id as dlq_id, payload->>'op' as op, error_message, moved_at from screening_v2.job_dlq
+ where name = 'r1-meet' and payload->>'kind' = 'ashby_booked_tag'
+ order by moved_at desc limit 50;
+```
+
+Do not join these to candidates: the ids are enough to act on.
+
+### Replay and manual re-drive
+
+Nothing re-drives a dead-lettered tag job by itself. After fixing the cause, replay it with the
+existing primitive (it resets the dedup key): `select screening_v2.replay_dlq_job('<dlq id>');`.
+
+To re-check one booking by hand (for example after someone changed the tag in Ashby), queue one job
+in the Supabase SQL editor. Write the booking id in lower case, in both places:
+
+```sql
+insert into screening_v2.job_queue (name, payload, dedup_key, max_attempts)
+values ('r1-meet',
+        jsonb_build_object('kind', 'ashby_booked_tag', 'op', 'add', 'booking_id', '<booking id>'::uuid),
+        'r1-meet:ashby-tag:<booking id>:add',
+        10)
+on conflict do nothing;
+```
+
+`op` does not matter: the job reads the database and converges either way, so an `add` job also
+removes a tag that should not be there. If a job with the same key is already waiting, the insert
+does nothing (that job runs anyway).
+
+### Known limits
+
+- **A DSAR delete** removes the booking and queues no tag job: the tag stays in Ashby, like
+  Christy's tags (Ashby-side HR data). Remove it there by hand if the request covers Ashby.
+- **A late bot release.** Releasing the bot of a finished booking also bumps its `updated_at`. A
+  booking that failed after its bot was sent (`no_show`, `bot_fatal`, `admission_refused`,
+  `multiple_humans`) shortly before its start, whose bot release landed after the start, reads as
+  "failed after the start" and KEEPS the tag. The rule leans toward keeping: a tag wrongly removed
+  from a live booking is the worse mistake. Remove it by hand if it matters. A failure that was
+  never an interview (`in_past`, `bot_create_failed`, `round_expired`, `invite_undeliverable`) is
+  not affected: it never keeps the tag.
+- **A Meet-off drain without a Recall key, with Ashby writes off, or past the catch-up's 7 days.**
+  The Meet-off catch-up runs only under the drain backstop's gate and only while Ashby writes are
+  on with a usable `ASHBY_API_KEY`. So with `R1_MEET_ENABLED=false` AND no usable
+  `RECALL_API_KEY` (nothing drains then either), or with Ashby writes off or no usable Ashby key, a
+  public booking that ended without an interview keeps the tag until Meet is back on, or until the
+  catch-up can run again. The catch-up pages only bookings whose slot is at most 7 days back: a
+  booking whose slot is more than 7 days back when the catch-up can next run (for example, Ashby
+  writes stayed off for more than a week after the drain) keeps the tag until Meet is back on (its
+  queued `remove` job converges it then). A remove-only catch-up never reads the tag catalogue, so
+  the catalogue's waits (`tag_not_found`, `tag_ambiguous`) never hold it. A booking that ends
+  behind the cursor of a cycle with nothing to do, or during the catch-up's idle hour, loses the
+  tag at the next cycle: up to about 75 minutes (the rest of that cycle, the hour and one
+  15-minute bucket), plus one r1-sweep tick (about a minute) per page of 10 ended bookings ahead
+  of it in the window, so about 30 minutes more for 300 bookings. If the TAs rely on the tag meanwhile, list the public bookings that ended without an
+  interview (cancelled, ended before their start, or failed with a reason that was never an
+  interview) whose `remove` job still waits, newest first, skipping any application that was
+  booked again (Ashby application ids only):
+
+  ```sql
+  select b.ashby_application_id, b.updated_at as ended_at
+    from screening_v2.r1_meet_bookings b
+    join screening_v2.job_queue j
+      on j.dedup_key = 'r1-meet:ashby-tag:' || b.id::text || ':remove'
+     and j.status in ('pending', 'delayed')
+   where b.source = 'public_page' and b.status in ('cancelled', 'failed', 'drained')
+     and (b.status = 'cancelled' or b.updated_at < b.start_at
+          or b.reason in ('in_past', 'bot_create_failed', 'round_expired', 'invite_undeliverable'))
+     and not exists (
+       select 1 from screening_v2.r1_meet_bookings n
+        where n.source = 'public_page' and n.ashby_application_id = b.ashby_application_id
+          and n.created_at > b.created_at)
+   order by b.updated_at desc limit 100;
+  ```
+
+  Open each application in Ashby and remove `Lexy R1: Booked` from its candidate (leave it if the
+  same candidate has another Lexy booking that stands). Leave the queued jobs alone: when Meet comes
+  back they find the tag gone and finish `tag_absent`. A booking whose slot is more than 7 days
+  back when the catch-up can next run is left to them and to this remedy (the list has no slot
+  bound).
+- **Same queue priority as the interview jobs.** 0143 queues the tag jobs at the default priority,
+  the same as the Recall and bridge jobs of live interviews, and the lane claims by priority, then
+  age. A burst of tag jobs (a drain, or many cancellations at once) is claimed in turn with them.
+  The 5 s per call, the 20 s run budget and the back-off above bound what the burst costs. A lower
+  queue priority for tag jobs needs a migration that changes 0143's two producers; none is
+  planned in M035.
+- **No automatic re-drive.** A dead-lettered tag job stays dead until the replay or the manual
+  insert above.
+- **A long Ashby rollback.** Tag jobs held for more than about 10 hours dead-letter; replay them
+  once Ashby writes are back on.
+- **Live-spike items.** Whether `candidate.info` lists the tag right after the add (the final look
+  relies on it; a lag only costs one `tag_contended` wait), and what Ashby answers to an add of a
+  tag the candidate already has (the job never sends one after it reads the tag present).
+
+---
 
 ## R1 public booking: Lexy's calendar invites (M035 S05, dark)
 

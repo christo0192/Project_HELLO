@@ -11,9 +11,18 @@
  * distinct requests here; the unit test pins exactly one.
  */
 import { auditA11y } from './fixtures/axe';
-import { R1_CANDIDATE_ID, R1_ROUND_ID, STAR_CANDIDATE_ID, istToUtcMs, r1MeetBooking } from './fixtures/data';
+import {
+  ABANDONED_CANDIDATE_ID,
+  DIALED_CANDIDATE_ID,
+  LEGACY_CANDIDATE_ID,
+  R1_CANDIDATE_ID,
+  R1_ROUND_ID,
+  STAR_CANDIDATE_ID,
+  istToUtcMs,
+  r1MeetBooking,
+} from './fixtures/data';
 import { meetBookingsCursor } from './fixtures/api-router';
-import { FROZEN_NOW_MS } from './fixtures/env';
+import { FROZEN_NOW_MS, MOCK_API_ORIGIN } from './fixtures/env';
 import { expect, test, type AppHarness, type RecordedCall } from './fixtures/harness';
 import { horizontalOverflow } from './fixtures/layout';
 
@@ -193,6 +202,117 @@ test.describe('the Meet bookings page', () => {
     await expect(page).toHaveURL(/\/interviews\/meet-bookings$/);
     await expect(page.getByText('No matching candidate')).toBeVisible();
     await expect(page.getByRole('table', { name: 'Meet bookings' }).locator('tbody tr')).toHaveCount(6);
+    app.expectHealthy();
+  });
+
+  // M035 S08: the public booking link next to Ashby. Own rows, so the shared list and its counts stay as they are.
+  test('says where each booking came from, at both widths, and passes axe', async ({ app, page }, testInfo) => {
+    const slot = (hours: number) => ({ start_at: iso(FROZEN_NOW_MS + hours * HOUR), end_at: iso(FROZEN_NOW_MS + (hours + 0.5) * HOUR) });
+    app.db.r1.meet.bookings = [
+      r1MeetBooking(400, { ...slot(2), source: 'ashby', status: 'pending', reason: 'eligible', candidate_id: STAR_CANDIDATE_ID }),
+      // A public booking always has its candidate: the booking page imports them before it books.
+      r1MeetBooking(401, { ...slot(4), source: 'public_page', status: 'pending', reason: 'eligible', candidate_id: LEGACY_CANDIDATE_ID }),
+      r1MeetBooking(402, { ...slot(6), source: 'public_page', status: 'failed', reason: 'invite_undeliverable', candidate_id: DIALED_CANDIDATE_ID }),
+      r1MeetBooking(403, { ...slot(8), source: 'public_page', status: 'cancelled', reason: 'candidate_cancelled', candidate_id: ABANDONED_CANDIDATE_ID }),
+    ];
+    await app.goto(ADDRESS);
+
+    const table = page.getByRole('table', { name: 'Meet bookings' });
+    const rows = table.locator('tbody tr');
+    await expect(rows).toHaveText([/Booked/, /Booked/, /Not completed/, /Cancelled/]);
+    await expect(rows.nth(2)).toContainText('Lexy’s calendar invite could not be sent to the candidate.');
+    await expect(rows.nth(3)).toContainText('The candidate cancelled it with the link in their calendar invite.');
+
+    const sourceHeader = table.locator('thead th').filter({ hasText: /^Source$/ });
+    await expect(sourceHeader).toHaveCount(1);
+    const words = ['Ashby', 'Public link', 'Public link', 'Public link'];
+    if (page.viewportSize()!.width >= 768) {
+      // A column of its own, in words.
+      await expect(table.getByRole('columnheader', { name: 'Source', exact: true })).toBeVisible();
+      for (const [i, word] of words.entries()) {
+        await expect(rows.nth(i).locator('td').nth(3)).toHaveText(word);
+        // The narrow-width line is there, out of sight.
+        await expect(rows.nth(i).getByText(`Source: ${word}`, { exact: true })).toHaveCount(1);
+        await expect(rows.nth(i).getByText(`Source: ${word}`, { exact: true })).toBeHidden();
+      }
+    } else {
+      // No room for the column: the slot says it, as a line of its own.
+      await expect(sourceHeader).toBeHidden();
+      for (const [i, word] of words.entries()) {
+        await expect(rows.nth(i).locator('td')).toHaveCount(5);
+        await expect(rows.nth(i).locator('td').nth(3)).toBeHidden();
+        await expect(rows.nth(i).getByText(`Source: ${word}`, { exact: true })).toBeVisible();
+      }
+    }
+
+    const text = await page.getByRole('main').innerText();
+    for (const code of ['public_page', 'candidate_cancelled', 'invite_undeliverable']) expect(text).not.toContain(code);
+
+    await noSideways(app);
+    await auditA11y(page, testInfo, 'r1-meet-bookings-sources', { strict: true });
+    app.expectHealthy();
+  });
+
+  test('the public booking link card shows this site\'s /book and copies it', async ({ app, page }, testInfo) => {
+    // A clipboard that only records, so no browser permission is asked for.
+    await page.addInitScript(() => {
+      const copied: string[] = [];
+      (window as unknown as { __copied: string[] }).__copied = copied;
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: {
+          writeText(text: string) {
+            copied.push(text);
+            return Promise.resolve();
+          },
+        },
+      });
+    });
+    const asked = (calls: readonly RecordedCall[]) => [...new Set(calls.map((call) => `${call.method} ${call.url.split('?')[0]}`))].sort();
+
+    // What the page asks for with no card: the same page on a server with Meet off.
+    app.db.r1.meet.enabled = false;
+    await app.goto(ADDRESS);
+    await expect(page.getByTestId('meet-status')).toHaveText('Google Meet interviews are off.');
+    const withoutCard = asked(app.calls);
+    expect(withoutCard).toContain(`GET ${MOCK_API_ORIGIN}${MEET_PATH}`);
+
+    app.db.r1.meet.enabled = true;
+    const from = app.calls.length;
+    await app.goto(ADDRESS);
+
+    const url = `${new URL(page.url()).origin}/book`;
+    await expect(page.getByRole('heading', { level: 2, name: 'Public booking link' })).toBeVisible();
+    const field = page.getByLabel('Link for candidates');
+    await expect(field).toHaveValue(url);
+    await expect(field).toHaveJSProperty('readOnly', true);
+    await expect(field).not.toBeEditable();
+
+    const before = app.calls.length;
+    await page.getByRole('button', { name: 'Copy link' }).click();
+    await expect(page.getByText('Link copied to the clipboard.', { exact: true })).toBeVisible();
+    expect(await page.evaluate(() => (window as unknown as { __copied: string[] }).__copied)).toEqual([url]);
+    await app.settle();
+
+    // The card is static: the copy sends nothing, and the page asks for nothing beyond the Meet bookings
+    // reads and the shell's own, exactly what it asks for without the card (so no public booking API).
+    expect(app.calls.slice(before)).toEqual([]);
+    expect(asked(app.calls.slice(from))).toEqual(withoutCard);
+    expect(await page.content()).not.toContain('/book/manage');
+
+    await noSideways(app);
+    await auditA11y(page, testInfo, 'r1-meet-bookings-public-link', { strict: true });
+    app.expectHealthy();
+  });
+
+  test('a server with Meet off shows no public booking link', async ({ app, page }) => {
+    app.db.r1.meet.enabled = false;
+    await app.goto(ADDRESS);
+    await expect(page.getByTestId('meet-status')).toHaveText('Google Meet interviews are off.');
+    await app.settle();
+    await expect(page.getByRole('heading', { name: 'Public booking link' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Copy link' })).toHaveCount(0);
+    await expect(page.getByLabel('Link for candidates')).toHaveCount(0);
     app.expectHealthy();
   });
 });

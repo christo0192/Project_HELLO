@@ -146,7 +146,9 @@ describe('opening the page', () => {
     open();
     await table();
     expect(
-      screen.getByText('Interviews with Lexy over Google Meet, scheduled in Ashby. Times are India Standard Time.'),
+      screen.getByText(
+        'Interviews with Lexy over Google Meet, booked by candidates on the public booking link or scheduled in Ashby. Times are India Standard Time.',
+      ),
     ).toBeInTheDocument();
     const trail = screen.getByRole('navigation', { name: 'Breadcrumb' });
     expect(trail).toHaveTextContent('R1 interviews / Meet bookings');
@@ -202,18 +204,18 @@ describe('opening the page', () => {
 });
 
 describe('a row', () => {
-  it('gives the slot, the way to the candidate, the status and why, and when it was made and changed', async () => {
+  it('gives the slot, the way to the candidate, the status and why, where it came from, and when it was made and changed', async () => {
     const row = booking({ status: 'blocked', reason: 'round_active', round_id: ROUND });
     mockApi.listR1MeetBookings.mockResolvedValue(body({ bookings: [row] }));
     open();
     await table();
     expect(screen.getAllByRole('columnheader').map((header) => header.textContent)).toEqual([
-      'Slot (IST)', 'Candidate', 'Status', 'Created and updated',
+      'Slot (IST)', 'Candidate', 'Status', 'Source', 'Created and updated',
     ]);
     const slot = meetBookingSlot(row.start_at, row.end_at);
     const [line] = bodyRows();
     const cells = within(line).getAllByRole('cell');
-    expect(cells).toHaveLength(4);
+    expect(cells).toHaveLength(5);
     // The link's name says "to", which a screen reader speaks; the cell keeps the dash, which the eye reads.
     expect(slot.text).toMatch(/^Wed,? 25 Nov 2026, 14:30 to 15:00 IST$/);
     expect(cells[0]).toHaveTextContent(slot.day);
@@ -224,11 +226,80 @@ describe('a row', () => {
     const review = within(cells[1]).getByRole('link', { name: `Open R1 review for ${slot.text}` });
     expect(review).toHaveAttribute('href', `/interviews/${ROUND}`);
     expect(cells[2]).toHaveTextContent('Status: BlockedThe candidate already has an R1 round open.');
-    expect(cells[3]).toHaveTextContent('Created 20 Nov 2026, 10:30 IST');
-    expect(cells[3]).toHaveTextContent('Updated 21 Nov 2026, 11:45 IST');
-    // The same two stamps sit under the slot at the width that has no fourth column.
-    expect(cells[0]).toHaveTextContent('Created 20 Nov 2026, 10:30 IST');
+    expect(cells[3].textContent).toBe('Ashby');
     expect(cells[3]).toHaveClass('hidden', 'md:table-cell');
+    expect(cells[4]).toHaveTextContent('Created 20 Nov 2026, 10:30 IST');
+    expect(cells[4]).toHaveTextContent('Updated 21 Nov 2026, 11:45 IST');
+    // The source and the same two stamps sit under the slot at the width that has no fourth or fifth column.
+    expect(cells[0]).toHaveTextContent('Source: Ashby');
+    expect(cells[0]).toHaveTextContent('Created 20 Nov 2026, 10:30 IST');
+    expect(cells[4]).toHaveClass('hidden', 'md:table-cell');
+  });
+
+  it('says where a booking came from, in words, at both widths', async () => {
+    const fromAshby = booking({ status: 'pending', reason: 'eligible' });
+    const fromLink = booking({
+      id: uuid(2),
+      status: 'pending',
+      reason: 'eligible',
+      source: 'public_page',
+      start_at: '2026-11-26T09:00:00.000Z',
+      end_at: '2026-11-26T09:30:00.000Z',
+    });
+    mockApi.listR1MeetBookings.mockResolvedValue(body({ bookings: [fromAshby, fromLink] }));
+    const { container } = open();
+    await table();
+    const [ashbyLine, linkLine] = bodyRows();
+    const expected: Array<[HTMLElement, string]> = [[ashbyLine, 'Ashby'], [linkLine, 'Public link']];
+    for (const [line, words] of expected) {
+      const cells = within(line).getAllByRole('cell');
+      expect(cells[3].textContent).toBe(words);
+      expect(cells[3]).toHaveClass('hidden', 'md:table-cell');
+      // Plain text: colour carries the state families, and the source is none of them.
+      for (const wash of ['bg-moving-soft', 'bg-ready-soft', 'bg-unresolved-soft', 'bg-closed-soft', '--c-negative']) {
+        expect(cells[3].outerHTML).not.toContain(wash);
+      }
+      const narrow = within(cells[0]).getByText(`Source: ${words}`);
+      expect(narrow.closest('.md\\:hidden')).not.toBeNull();
+    }
+    const text = container.querySelector('[data-candidate-shell]')!.textContent ?? '';
+    expect(text).not.toContain('public_page');
+  });
+
+  it('says why a public booking was cancelled, which was never in Ashby', async () => {
+    const fromLink = booking({ status: 'cancelled', reason: 'cancelled', source: 'public_page' });
+    const fromAshby = booking({
+      id: uuid(2),
+      status: 'cancelled',
+      reason: 'cancelled',
+      start_at: '2026-11-26T09:00:00.000Z',
+      end_at: '2026-11-26T09:30:00.000Z',
+    });
+    mockApi.listR1MeetBookings.mockResolvedValue(body({ bookings: [fromLink, fromAshby] }));
+    open();
+    await table();
+    const [linkLine, ashbyLine] = bodyRows();
+    expect(linkLine).toHaveTextContent('Status: Cancelled');
+    expect(linkLine).toHaveTextContent('Cancelled because the Ashby application is no longer active.');
+    expect(linkLine).not.toHaveTextContent('Cancelled in Ashby.');
+    expect(ashbyLine).toHaveTextContent('Status: Cancelled');
+    expect(ashbyLine).toHaveTextContent('Cancelled in Ashby.');
+    expect(ashbyLine).not.toHaveTextContent('no longer active');
+  });
+
+  it.each([
+    ['cancelled', 'candidate_cancelled', 'Cancelled', 'bg-closed-soft', 'The candidate cancelled it with the link in their calendar invite.'],
+    ['failed', 'invite_undeliverable', 'Not completed', 'bg-unresolved-soft', 'Lexy’s calendar invite could not be sent to the candidate.'],
+  ])('prints a public booking %s (%s) as "%s" on its family\'s wash, with its sentence', async (status, reason, word, wash, sentence) => {
+    mockApi.listR1MeetBookings.mockResolvedValue(body({ bookings: [booking({ status, reason, source: 'public_page' })] }));
+    open();
+    await table();
+    const [line] = bodyRows();
+    const tag = within(line).getByText(word);
+    expect(tag).toHaveClass(wash);
+    expect(tag).toHaveTextContent(`Status: ${word}`);
+    expect(within(line).getAllByRole('cell')[2]).toHaveTextContent(sentence);
+    expect(line).not.toHaveTextContent(reason);
   });
 
   it('says when no candidate matched, and has no review to open without a round', async () => {
@@ -333,7 +404,7 @@ describe('a row', () => {
 });
 
 describe('what never reaches the page', () => {
-  it('prints no id, version, status code or reason code, whichever of them a booking has', async () => {
+  it('prints no id, version, status code, reason code or source code, whichever of them a booking has', async () => {
     const VERSION = 987654321;
     const bookings = R1_MEET_BOOKING_REASONS.map((reason, index) =>
       booking({
@@ -342,6 +413,7 @@ describe('what never reaches the page', () => {
         status: R1_MEET_BOOKING_STATUSES[index % R1_MEET_BOOKING_STATUSES.length],
         reason,
         version: VERSION,
+        source: index % 2 ? 'public_page' : 'ashby',
       }));
     mockApi.listR1MeetBookings.mockResolvedValue(body({ bookings }));
     const { container } = open();
@@ -354,9 +426,9 @@ describe('what never reaches the page', () => {
     expect(container.innerHTML).not.toContain(String(VERSION));
     expect(container.innerHTML).not.toContain('00000000-0000-4000-8000');
     // Not vacuous: every status and reason is on the page, in its words.
-    for (const { status, reason } of bookings) {
+    for (const { status, reason, source } of bookings) {
       expect(text).toContain(meetBookingTerm(status, reason).label);
-      expect(text).toContain(meetBookingReasonText(reason) ?? '');
+      expect(text).toContain(meetBookingReasonText(reason, source) ?? '');
     }
   });
 
@@ -420,7 +492,88 @@ describe('whether Meet is on', () => {
     expect(screen.queryByRole('table')).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
     expect(within(screen.getByTestId('meet-status').parentElement!).queryByRole('button')).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Public booking link' })).toBeNull();
     expect(container.textContent).not.toMatch(/R1_MEET|_ENABLED|VITE_|\benv\b|\bflag\b/i);
+    await settle();
+    expect(asked()).toBe(1);
+  });
+});
+
+describe('the public booking link card', () => {
+  const card = () => screen.queryByRole('heading', { name: 'Public booking link' });
+  const here = () => `${window.location.origin}/book`;
+
+  it('is not there while the first answer is out', async () => {
+    mockApi.listR1MeetBookings.mockReturnValue(new Promise(() => undefined));
+    open();
+    expect(card()).toBeNull();
+    await settle();
+    expect(card()).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Copy link' })).toBeNull();
+  });
+
+  it('is not there after a read that failed: nothing said Meet is on', async () => {
+    mockApi.listR1MeetBookings.mockRejectedValue(failure(503, 'service_unavailable'));
+    open();
+    await screen.findByRole('alert');
+    expect(card()).toBeNull();
+    expect(screen.queryByLabelText('Link for candidates')).toBeNull();
+  });
+
+  it('is there, under the line, once the answer says Meet is on, with this site\'s /book', async () => {
+    open();
+    await table();
+    const heading = card();
+    expect(heading).not.toBeNull();
+    expect(heading).toHaveProperty('tagName', 'H2');
+    const field = screen.getByLabelText('Link for candidates');
+    expect(field).toHaveValue(here());
+    expect(field).toHaveAttribute('readonly');
+    // Under the status line and above the filters, in reading order.
+    const order = (a: Element, b: Element) => a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING;
+    expect(order(screen.getByTestId('meet-status'), heading!)).toBeTruthy();
+    expect(order(heading!, screen.getByRole('group', { name: 'Bookings to show' }))).toBeTruthy();
+  });
+
+  it('is there with an empty list too', async () => {
+    mockApi.listR1MeetBookings.mockResolvedValue(body({ bookings: [] }));
+    open();
+    await screen.findByText('No Meet booking from today on.');
+    expect(card()).not.toBeNull();
+  });
+
+  it('stays through a change of filter whose read is still out, like the line it sits under', async () => {
+    open();
+    await table();
+    mockApi.listR1MeetBookings.mockReturnValue(new Promise(() => undefined));
+    await pickOption(userEvent.setup(), /^Status/, 'Blocked');
+    await screen.findByRole('status', { name: 'Loading Meet bookings' });
+    expect(card()).not.toBeNull();
+    expect(screen.getByLabelText('Link for candidates')).toHaveValue(here());
+  });
+
+  it('goes when Meet was turned off between two pages', async () => {
+    mockApi.listR1MeetBookings
+      .mockResolvedValueOnce(body({ bookings: [booking()], next_cursor: 'cursor-1' }))
+      .mockResolvedValueOnce(OFF);
+    open();
+    await table();
+    expect(card()).not.toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: 'Load more' }));
+    await waitFor(() => expect(screen.getByTestId('meet-status')).toHaveTextContent('Google Meet interviews are off.'));
+    expect(card()).toBeNull();
+  });
+
+  it('copies the address and asks the API nothing for it', async () => {
+    const user = userEvent.setup();
+    const writeText = vi.spyOn(navigator.clipboard, 'writeText');
+    open();
+    await table();
+    expect(asked()).toBe(1);
+    await user.click(screen.getByRole('button', { name: 'Copy link' }));
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(writeText).toHaveBeenCalledWith(here());
+    expect(await screen.findByText('Link copied to the clipboard.')).toBeInTheDocument();
     await settle();
     expect(asked()).toBe(1);
   });
@@ -618,7 +771,9 @@ describe('loading, empty and failed', () => {
     open();
     expect(await screen.findByText('No Meet booking from today on.')).toBeInTheDocument();
     expect(
-      screen.getByText('A booking appears when an interview is scheduled in Ashby with Lexy as an interviewer.'),
+      screen.getByText(
+        'A booking appears when a candidate books on the public booking link, or when an interview is scheduled in Ashby with Lexy as an interviewer.',
+      ),
     ).toBeInTheDocument();
     expect(screen.getByTestId('meet-status')).toHaveTextContent('Google Meet interviews are on.');
     expect(screen.queryByText(/^Showing/)).toBeNull();
