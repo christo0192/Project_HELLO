@@ -2445,7 +2445,7 @@ describe('a round held over Google Meet', () => {
   it.each<[string, Partial<R1ReviewResponse['round']>]>([
     ['a browser round', { channel: 'browser' }],
     ['a null channel', { channel: null }],
-    ['no channel at all (every API today)', {}],
+    ['no channel at all (an older API)', {}],
     ['a channel this page does not know', { channel: 'zoom' as unknown as R1ReviewResponse['round']['channel'] }],
   ])('is not marked for %s, and adds no empty item', async (_name, over) => {
     await opened(review({ round: { ...review().round, ...over } }));
