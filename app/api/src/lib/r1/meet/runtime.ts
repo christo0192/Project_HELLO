@@ -37,6 +37,11 @@
  * candidate id) only for public bookings that ended (their slot at most 7 days back). It never adds a
  * tag, never writes our database and queues nothing. Nothing is created, armed or queued while off.
  *
+ * LEXY'S CALENDAR (M035 S05): the lane carries lazy calendar and Ashby read ports for public
+ * bookings. With Lexy's Google settings present, the flag-off drain also cancels drained public
+ * events inline and reads one more narrow drift list per pass. No settings means no extra reads or
+ * calls. This calendar cleanup never writes to Ashby; the booked-tag catch-up belongs to S11.
+ *
  * DEX'S SCORECARD TO ASHBY (M034 S09, D-S09-12): the lane's flow ports carry `feedback`, the ports of
  * the `scorecard_feedback` job and of the maintenance re-drive: the form setting
  * (`getR1MeetFeedbackConfig`, read per job), the feedback store over the same client, the Dex user and
@@ -72,6 +77,8 @@
  */
 
 import { isAshbyWebhookActive, loadAshbyConfig, loadAshbyRuntimeConfig } from '../../../integrations/ashby/config.js';
+import { createAshbyClient } from '../../../integrations/ashby/client.js';
+import { getR1MeetGoogle } from '../../../integrations/google/client.js';
 import { createRecallClient } from '../../../integrations/recall/client.js';
 import type { Queue } from '../../queue/index.js';
 import { createQueueRunner, type QueueRunnerEvent, type QueueRunnerHandle } from '../../queue/runner.js';
@@ -87,15 +94,21 @@ import {
 import { createR1MeetBookedTagStore } from './ashby-booked-tag-store.js';
 import {
   getR1MeetFeedbackConfig,
+  getR1MeetPublicConfig,
+  getR1MeetPublicDrainConfig,
   r1MeetActive,
   r1MeetDrainAllowed,
   type R1MeetConfig,
   type R1MeetDrainConfig,
+  type R1MeetPublicConfig,
+  type R1MeetPublicDrainConfig,
 } from './config.js';
+import { r1MeetGoogleClientLogger, type R1MeetCalendarDeps, type R1MeetCalendarAshby } from './calendar-sync.js';
+import { createR1MeetCalendarStore } from './public/calendar-store.js';
 import { createR1MeetDispatcher } from './dispatcher.js';
 import { R1_MEET_DRAIN, drainR1Meet, type R1MeetDrainPorts } from './drain.js';
 import type { R1MeetFeedbackDeps } from './feedback.js';
-import { createR1MeetAshbyFeedbackPort, type R1MeetAshbyFeedbackPort } from './feedback-ashby.js';
+import { createR1MeetAshbyFeedbackPort, r1MeetAshbyClientLogger, type R1MeetAshbyFeedbackPort } from './feedback-ashby.js';
 import { createR1MeetFeedbackStore } from './feedback-store.js';
 import { R1_MEET_QUEUE, r1MeetJobs, type R1MeetJobSpec } from './jobs.js';
 import {
@@ -154,6 +167,7 @@ export interface R1MeetLaneDeps {
    * enabled Meet config, the feedback form setting and the Ashby runtime config (see the header).
    */
   readonly feedback?: R1MeetFeedbackDeps;
+  readonly calendar?: R1MeetCalendarDeps;
   /**
    * Test seam (M035 S11): the ports of the "Lexy R1: Booked" tag job. Production builds them from the
    * same client and the Ashby runtime config (`createR1MeetAshbyTagPorts`, see the header).
@@ -228,6 +242,54 @@ export function createR1MeetFeedbackPorts(
     },
     dexUserId: meet.ashby.dexUserId,
     bridgePageUrl: meet.bridgePageUrl,
+  });
+}
+
+/** Lazy public calendar ports: constructing them performs no database or outbound call. */
+export function createR1MeetCalendarPorts(
+  client: Db,
+  log: R1MeetLog,
+  seams: {
+    readonly publicConfig?: () => R1MeetPublicConfig;
+    readonly drainConfig?: () => R1MeetPublicDrainConfig;
+  } = {},
+): R1MeetCalendarDeps {
+  const publicConfig = seams.publicConfig ?? getR1MeetPublicConfig;
+  const drainConfig = seams.drainConfig ?? getR1MeetPublicDrainConfig;
+  const googleLogger = r1MeetGoogleClientLogger(log);
+  let ashby: R1MeetCalendarAshby | null = null;
+  return Object.freeze({
+    store: createR1MeetCalendarStore(client),
+    publicConfig,
+    google: () => {
+      try {
+        const config = publicConfig();
+        const drain = config.status === 'on' ? null : drainConfig();
+        const settings = config.status === 'on' ? config.google : drain?.available ? drain.google : null;
+        if (settings === null) return null;
+        const meetMode = config.status === 'on' ? config.meetMode : 'calendar';
+        const google = getR1MeetGoogle({ settings, meetMode, logger: googleLogger });
+        return Object.freeze({ calendar: google.calendar, meetMode });
+      } catch {
+        return null;
+      }
+    },
+    ashby: () => {
+      if (ashby !== null) return ashby;
+      try {
+        const config = loadAshbyRuntimeConfig();
+        if (!config.apiKeyConfigured) return null;
+        ashby = createAshbyClient({
+          apiKey: config.apiKey,
+          maxAttempts: 1,
+          timeoutMs: 5000,
+          logger: r1MeetAshbyClientLogger(log),
+        });
+      } catch {
+        return null;
+      }
+      return ashby;
+    },
   });
 }
 
@@ -310,6 +372,7 @@ export function createR1MeetLane(deps: R1MeetLaneDeps): R1MeetLane | null {
       },
       // M034 S09: Dex's scorecard to Ashby (the `scorecard_feedback` job and the maintenance re-drive).
       feedback: deps.feedback ?? createR1MeetFeedbackPorts(deps.client, meet, log),
+      calendar: deps.calendar ?? createR1MeetCalendarPorts(deps.client, log),
       // M035 S11: the "Lexy R1: Booked" tag of public bookings (the `ashby_booked_tag` job).
       ashbyTag: deps.ashbyTag ?? createR1MeetAshbyTagPorts(deps.client, log),
     }));
@@ -395,6 +458,7 @@ export interface R1MeetSweepTickDeps {
   /** Test seam: production builds the drain's Recall client from `drainConfig` on first use. */
   readonly recall?: R1MeetRecall;
   readonly log?: R1MeetLog;
+  readonly calendar?: R1MeetCalendarDeps;
   /**
    * Test seam (M035 S11): the tag ports of the Meet-off catch-up. Production builds them on the first
    * pass with `createR1MeetAshbyTagPorts` (see the header).
@@ -454,6 +518,7 @@ export function createR1MeetSweepTick(deps: R1MeetSweepTickDeps): () => Promise<
         }),
       now: deps.now,
       log: logger(),
+      calendar: deps.calendar ?? createR1MeetCalendarPorts(deps.client, logger()),
     };
     try {
       const report = await drainR1Meet(ports, {

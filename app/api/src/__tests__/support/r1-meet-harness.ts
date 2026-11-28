@@ -133,6 +133,8 @@ export interface HarnessOptions {
   readonly random?: (bytes: number) => Buffer;
   /** The Recall client deadline (a timeout test uses a few ms). */
   readonly timeoutMs?: number;
+  /** Fire the two 0143 triggers in the fake (M035 S05; `R1MeetFakeDbOptions.publicTriggers`). Off by default. */
+  readonly publicTriggers?: boolean;
 }
 
 function canned(status: number, body: unknown = undefined, headers: Record<string, string> = {}): RecallTransportResponse {
@@ -148,7 +150,7 @@ export function createR1MeetHarness(options: HarnessOptions = {}): R1MeetHarness
   const logs: LogLine[] = [];
   const hot: number[] = [];
   const sleeps: number[] = [];
-  const db = createR1MeetFakeDb({ timeline, now: () => nowMs });
+  const db = createR1MeetFakeDb({ timeline, now: () => nowMs, publicTriggers: options.publicTriggers === true });
   const recall = createFakeRecall({ now: () => new Date(nowMs) });
   const interceptors: Array<{ match: (req: RecallTransportRequest, op: RecallOp) => boolean; response: InterceptResponse }> = [];
   const requests: R1MeetHarness['requests'] = [];

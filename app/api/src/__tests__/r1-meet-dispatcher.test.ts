@@ -4,9 +4,8 @@
  *
  * Pinned (D-S06-4..6, D-S06-33):
  *  - the registry holds every kind of the job contract once; a duplicate definition throws at
- *    construction, and an added kind is dispatched (the S09 seam); S09's `scorecard_feedback` is
- *    registered after the S06 kinds and its jobs reach its definition; M035 S11's `ashby_booked_tag`
- *    is registered LAST and its jobs reach its definition;
+ *    construction, and an added kind is dispatched (the S09 seam); the registry ends with
+ *    scorecard_feedback, calendar_sync, ashby_booked_tag, and jobs reach all three definitions;
  *  - an unknown kind and a malformed payload throw their closed codes, alert, and dead-letter under
  *    that code; a throw that is not an `R1MeetJobError` becomes `r1_meet_unexpected_error`;
  *  - a receipt ends `processed` / `ignored` when the job is done, `failed` only on the FINAL attempt of
@@ -20,6 +19,7 @@ import { Queue } from '../lib/queue/index.js';
 import { MemoryAdapter } from '../lib/queue/memory-adapter.js';
 import { createQueueRunner } from '../lib/queue/runner.js';
 import type { QueueJob } from '../lib/queue/types.js';
+import { r1MeetCalendarSyncDefinition } from '../lib/r1/meet/calendar-sync.js';
 import {
   R1_MEET_DEFINITIONS,
   R1_MEET_INACTIVE,
@@ -130,15 +130,15 @@ describe('the registry (D-S06-4)', () => {
     expect(Object.isFrozen(dispatcher.kinds)).toBe(true);
   });
 
-  it('registers S09 scorecard_feedback after the S06 kinds, and S11 ashby_booked_tag LAST (M035 S11)', () => {
-    expect(R1_MEET_DEFINITIONS.at(-1)?.kind).toBe('ashby_booked_tag');
+  it('registers scorecard_feedback, calendar_sync, then ashby_booked_tag LAST (contracts section 5)', () => {
+    // M035 S05 integrates S11: both appended definitions remain, in the shared contract order.
+    expect(R1_MEET_DEFINITIONS.at(-3)).toBe(r1MeetScorecardFeedbackDefinition);
+    expect(R1_MEET_DEFINITIONS.at(-2)).toBe(r1MeetCalendarSyncDefinition);
     expect(R1_MEET_DEFINITIONS.at(-1)).toBe(r1MeetAshbyBookedTagDefinition);
-    expect(R1_MEET_DEFINITIONS.at(-2)?.kind).toBe('scorecard_feedback');
-    expect(R1_MEET_DEFINITIONS.at(-2)).toBe(r1MeetScorecardFeedbackDefinition);
     const { dispatcher } = world();
-    expect(dispatcher.kinds.at(-1)).toBe('ashby_booked_tag');
-    expect(dispatcher.kinds.at(-2)).toBe('scorecard_feedback');
-    expect(dispatcher.kinds.slice(0, -2)).not.toContain('scorecard_feedback');
+    expect(dispatcher.kinds.slice(-3)).toEqual(['scorecard_feedback', 'calendar_sync', 'ashby_booked_tag']);
+    expect(dispatcher.kinds.slice(0, -3)).not.toContain('scorecard_feedback');
+    expect(dispatcher.kinds.slice(0, -2)).not.toContain('calendar_sync');
     expect(dispatcher.kinds.slice(0, -1)).not.toContain('ashby_booked_tag');
   });
 
@@ -197,6 +197,17 @@ describe('closed failures (D-S06-5)', () => {
     expect(h.requests).toEqual([]);
   });
 
+  it('a calendar_sync job is dispatched to the S05 definition (M035 S05)', async () => {
+    // The harness wires no calendar ports, so the definition answers its own closed code: proof that
+    // the job reached it (parsed), and not the unknown-kind path. Nothing is read.
+    const { h, dispatcher } = world();
+    const spec = r1MeetJobs.calendarSync('invite', fixtureId());
+    const error = await dispatcher.handle(jobOf({ ...spec.payload })).catch((thrown: unknown) => thrown);
+    expect(error).toBeInstanceOf(R1MeetJobError);
+    expect((error as R1MeetJobError).code).toBe('r1_meet_calendar_unwired');
+    expect(jobLines(h).map((line) => line.meta.error_type)).toEqual(['calendar_sync:r1_meet_calendar_unwired']);
+  });
+
   it('an ashby_booked_tag job is dispatched to the S11 definition (M035 S11)', async () => {
     // The harness wires no tag ports, so the definition answers its own closed code: proof that the
     // job reached it (parsed), and not the unknown-kind path.
@@ -226,6 +237,24 @@ describe('closed failures (D-S06-5)', () => {
     }
     expect(h.db.calls).toEqual([]);
     expect(h.requests).toEqual([]);
+  });
+
+
+  it('a malformed calendar_sync payload throws r1_meet_malformed_payload and alerts (M035 S05)', async () => {
+    const { h, dispatcher } = world();
+    for (const payload of [
+      { kind: 'calendar_sync', op: 'delete', booking_id: fixtureId() },
+      { kind: 'calendar_sync', op: 'invite' },
+      { kind: 'calendar_sync', op: 'INVITE', booking_id: fixtureId() },
+    ]) {
+      h.logs.length = 0;
+      const error = await dispatcher.handle(jobOf(payload)).catch((thrown: unknown) => thrown);
+      expect((error as Error).message).toBe('r1_meet_malformed_payload');
+      expect(h.logs.filter((line) => line.level === 'error').map((line) => line.meta)).toEqual([
+        { error_category: 'r1_meet_malformed_payload', error_type: 'calendar_sync' },
+      ]);
+    }
+    expect(h.db.calls).toEqual([]);
   });
 
   it('a malformed scorecard_feedback payload throws r1_meet_malformed_payload and alerts (M034 S09)', async () => {

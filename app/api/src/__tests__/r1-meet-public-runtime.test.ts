@@ -432,8 +432,9 @@ describe('maintenance over a public booking, as over an Ashby one', () => {
 
   it.each([
     ['pending', 'in_past', false],
-    ['bot_scheduled', 'no_show', true],
-    ['bot_joining', 'no_show', true],
+    // S09-R5: these bots never entered the meeting, so the bot failed, not the candidate.
+    ['bot_scheduled', 'bot_fatal', true],
+    ['bot_joining', 'bot_fatal', true],
     ['human_present', 'bot_fatal', true],
     ['in_call', 'admission_refused', true],
   ] as const)('an overdue %s booking (slot ended 31 min ago) -> failed/%s', async (state, reason, holdsBot) => {
@@ -449,8 +450,23 @@ describe('maintenance over a public booking, as over an Ashby one', () => {
       expect(payloads(h, 'bot_release')).toEqual(
         holdsBot ? [{ kind: 'bot_release', recall_bot_id: b.botId, booking_id: b.id }] : [],
       );
-      // Maintenance never calls Recall itself: the queued release does.
-      expect(h.requests).toEqual([]);
+      // S05 asks Recall once for a pre-call verdict; release remains queued.
+      expect(h.requests.map((r) => r.op)).toEqual(['bot_scheduled', 'bot_joining'].includes(state) ? ['get'] : []);
+      return observe(w, [b], [report]);
+    });
+  });
+
+  it.each(['bot_scheduled', 'bot_joining'] as const)('an overdue %s with in-call history is a no-show for both sources', async (state) => {
+    await twins(async (w) => {
+      const { h } = w;
+      const b = await booked(w, state);
+      h.recall.setStatus(b.botId!, 'in_call_not_recording');
+      h.advance(MIN + 45 * MIN + 31 * MIN);
+      const report = await runR1MeetMaintenance(h.deps, 1);
+      expect(report.failed).toEqual([]);
+      expect(h.db.booking(b.id)).toMatchObject({ status: 'failed', reason: 'no_show' });
+      expect(h.requests.map((r) => r.op)).toEqual(['get']);
+      expect(payloads(h, 'bot_release')).toEqual([{ kind: 'bot_release', recall_bot_id: b.botId, booking_id: b.id }]);
       return observe(w, [b], [report]);
     });
   });

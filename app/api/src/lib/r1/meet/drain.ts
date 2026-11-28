@@ -28,6 +28,11 @@
  *   raises one `r1_meet_drain_failed` alert per pass.
  * OWED RELEASES (terminal bookings still holding a bot) are released and recorded too.
  *
+ * LEXY'S CALENDAR (M035 S05): with usable Google settings, a public booking's winning terminal
+ * move also cancels its future event inline, best effort. One extra bounded drift list catches up
+ * failed cancellations while the lane is off, inside this pass's budget. Calendar failures raise
+ * one drift alert per pass and never count as Recall drain failures. No calendar work is queued here.
+ *
  * WHAT IT NEVER DOES: create, arm or enqueue anything. With no bot to remove it makes no outbound call
  * at all, only the two narrow reads and the status moves.
  *
@@ -36,6 +41,13 @@
  */
 
 import { isRecallError } from '../../../integrations/recall/errors.js';
+import { isGoogleError } from '../../../integrations/google/errors.js';
+import {
+  cancelR1MeetPublicCalendarEvent,
+  R1_MEET_PUBLIC_CALENDAR_ALERTS,
+  type R1MeetCalendarDeps,
+  type R1MeetCalendarGoogle,
+} from './calendar-sync.js';
 import {
   R1MeetJobError,
   R1_MEET_RPC_UNEXPECTED,
@@ -89,6 +101,7 @@ export interface R1MeetDrainPorts {
   readonly recall: R1MeetReleasePort;
   readonly now: () => number;
   readonly log: R1MeetLog;
+  readonly calendar?: Pick<R1MeetCalendarDeps, 'store' | 'google'>;
 }
 
 export interface R1MeetDrainOptions {
@@ -148,7 +161,12 @@ async function resultStands(ports: R1MeetDrainPorts, booking: R1MeetBooking, ses
   return booking.roundId !== null && (await ports.store.roundStart(booking.roundId, ports.now())) === 'complete';
 }
 
-async function drainBooking(ports: R1MeetDrainPorts, booking: R1MeetBooking, force: boolean): Promise<Settled> {
+async function drainBooking(
+  ports: R1MeetDrainPorts,
+  booking: R1MeetBooking,
+  force: boolean,
+  cancelCalendar: (bookingId: string) => Promise<void>,
+): Promise<Settled> {
   let completed = false;
   if (booking.sessionId !== null) {
     const session = await ports.store.sessionStatus(booking.sessionId);
@@ -169,6 +187,7 @@ async function drainBooking(ports: R1MeetDrainPorts, booking: R1MeetBooking, for
   // Someone else moved it (an event, a cancel): the next pass reads it again.
   if (answer.status === 'status_conflict' || answer.status === 'not_found') return 'skipped';
   if (answer.status !== 'ok') throw new R1MeetJobError(R1_MEET_RPC_UNEXPECTED);
+  if (booking.source === 'public_page') await cancelCalendar(booking.id);
   if (answer.recallBotId !== null) await markReleased(ports, booking);
   return completed ? 'completed' : 'drained';
 }
@@ -190,6 +209,25 @@ export async function drainR1Meet(ports: R1MeetDrainPorts, options: R1MeetDrainO
     tally.failed += 1;
     failure ??= isRecallError(error) ? `${error.operation}:${error.category}` : 'database';
   };
+  let calendarFailure: string | null = null;
+  const noteCalendarFailure = (error: unknown): void => {
+    calendarFailure ??= `drain:${isGoogleError(error) ? error.code : 'database'}`;
+  };
+  const calendar = ports.calendar;
+  let google: R1MeetCalendarGoogle | null = null;
+  try {
+    google = calendar?.google() ?? null;
+  } catch (error) {
+    noteCalendarFailure(error);
+  }
+  const cancelCalendar = async (bookingId: string): Promise<void> => {
+    if (calendar === undefined || google === null) return;
+    try {
+      await cancelR1MeetPublicCalendarEvent(calendar, google, bookingId, ports.now());
+    } catch (error) {
+      noteCalendarFailure(error);
+    }
+  };
 
   for (const booking of bookings) {
     if (ports.now() >= deadline) {
@@ -197,7 +235,7 @@ export async function drainR1Meet(ports: R1MeetDrainPorts, options: R1MeetDrainO
       break;
     }
     try {
-      const settled = await drainBooking(ports, booking, options.force);
+      const settled = await drainBooking(ports, booking, options.force, cancelCalendar);
       if (settled === 'failed') failure ??= 'leave:unstarted';
       tally[settled] += 1;
     } catch (error) {
@@ -224,6 +262,34 @@ export async function drainR1Meet(ports: R1MeetDrainPorts, options: R1MeetDrainO
     }
   }
 
+  // The trigger's cancel jobs cannot run while Meet is off. Allow the same ten-minute settling
+  // window as public maintenance, then retry one narrow page inline, with no new queue work.
+  if (calendar !== undefined && google !== null) {
+    if (ports.now() >= deadline) {
+      more = true;
+    } else {
+      try {
+        const drift = await calendar.store.listCalendarDrift({
+          startAfter: toIso(ports.now()),
+          updatedBefore: toIso(ports.now() - 10 * MINUTE_MS),
+          limit: options.limit,
+        });
+        if (drift.length >= options.limit) more = true;
+        for (const booking of drift) {
+          if (ports.now() >= deadline) {
+            more = true;
+            break;
+          }
+          await cancelCalendar(booking.id);
+        }
+      } catch (error) {
+        noteCalendarFailure(error);
+      }
+    }
+  }
+  if (calendarFailure !== null) {
+    ports.log.error({ error_category: R1_MEET_PUBLIC_CALENDAR_ALERTS.calendarDrift, error_type: calendarFailure });
+  }
   if (failure !== null) ports.log.error({ error_category: R1_MEET_ALERTS.drainFailed, error_type: failure });
   return Object.freeze({ ...tally, more });
 }

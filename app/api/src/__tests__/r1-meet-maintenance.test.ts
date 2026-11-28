@@ -324,3 +324,106 @@ describe('isolation and the prune cadence', () => {
     expect(h.db.booking(young.id as string)).toBeDefined();
   });
 });
+
+describe('S09-R5: the overdue pre-call verdict', () => {
+  async function botRow(h: R1MeetHarness, endedAgoMs = 31 * MINUTE) {
+    const booking = await h.createBooking();
+    await ensureBot(h.deps, booking.bookingId, h.meta());
+    const row = h.db.tables.r1_meet_bookings.find((r) => r.id === booking.bookingId)!;
+    Object.assign(row, { start_at: iso(h.now() - endedAgoMs - 45 * MINUTE), end_at: iso(h.now() - endedAgoMs) });
+    return row;
+  }
+
+  it.each(['in_call_recording', 'in_call_not_recording'])('%s history proves a no-show, one GET and a queued release', async (code) => {
+    const h = createR1MeetHarness();
+    const row = await botRow(h);
+    h.recall.setStatus(row.recall_bot_id as string, code);
+    expect((await runR1MeetMaintenance(h.deps, 1)).counts.overdue).toBe(1);
+    expect(statusOf(h, row)).toEqual(['failed', 'no_show']);
+    expect(h.requests.filter((r) => r.op === 'get')).toHaveLength(1);
+    expect(queued(h, 'bot_release')).toHaveLength(1);
+    expect(h.alerts()).toEqual([]);
+  });
+
+  it.each(['no_entry', 'fatal', 'admission', 'sign_in'])('%s history fails the bot, with an admission/sign-in alert only after a winning move', async (mode) => {
+    const h = createR1MeetHarness();
+    const row = await botRow(h);
+    const botId = row.recall_bot_id as string;
+    if (mode !== 'no_entry') h.recall.setStatus(botId, 'in_call_not_recording');
+    const subCode = mode === 'admission' ? 'google_meet_bot_blocked' : mode === 'sign_in' ? 'google_meet_sign_in_missing_recovery_credentials' : null;
+    if (mode !== 'no_entry') h.recall.setStatus(botId, mode === 'fatal' ? 'fatal' : 'call_ended', subCode);
+    await runR1MeetMaintenance(h.deps, 1);
+    expect(statusOf(h, row)).toEqual(['failed', 'bot_fatal']);
+    const alerts = h.logs.filter((l) => l.level === 'error');
+    expect(alerts).toEqual(subCode === null ? [] : [{ level: 'error', meta: {
+      error_category: mode === 'admission' ? 'r1_meet_bot_admission_blocked' : 'r1_meet_bot_sign_in_failed', error_type: subCode,
+    } }]);
+    await runR1MeetMaintenance(h.deps, 2);
+    expect(h.logs.filter((l) => l.level === 'error')).toEqual(alerts);
+  });
+
+  it('Recall 5xx inside six hours keeps the booking live and reports overdue', async () => {
+    const h = createR1MeetHarness();
+    const row = await botRow(h, 30 * MINUTE + 6 * HOUR - 1);
+    h.intercept('get', { status: 503 });
+    const report = await runR1MeetMaintenance(h.deps, 1);
+    expect(report.failed).toEqual(['overdue']);
+    expect(report.counts.overdue).toBe(0);
+    expect(statusOf(h, row)).toEqual(['bot_scheduled', 'eligible']);
+    expect(queued(h, 'bot_release')).toEqual([]);
+    h.intercept('get', { status: 503 });
+    await r1MeetMaintenanceDefinition.run(h.deps, { kind: 'maintenance', bucket: 1 }, h.meta());
+    expect(h.logs).toContainEqual({ level: 'warn', meta: { error_category: 'r1_meet_maintenance_had_errors', error_type: 'overdue' } });
+  });
+
+  it.each([0, 1])('Recall 5xx at/past the six-hour tail (%i ms) fails the bot, never no-show', async (offset) => {
+    const h = createR1MeetHarness();
+    const row = await botRow(h, 30 * MINUTE + 6 * HOUR + offset);
+    h.intercept('get', { status: 503 });
+    expect((await runR1MeetMaintenance(h.deps, 1)).failed).toEqual([]);
+    expect(statusOf(h, row)).toEqual(['failed', 'bot_fatal']);
+    expect(queued(h, 'bot_release')).toHaveLength(1);
+  });
+
+  it('404 means no-show and an isolated failure never stops the next row', async () => {
+    const h = createR1MeetHarness();
+    const first = seed(h, 'bot_joining', ended(2 * HOUR));
+    const next = seed(h, 'bot_scheduled', ended(HOUR));
+    h.intercept('get', { status: 503 });
+    expect((await runR1MeetMaintenance(h.deps, 1)).failed).toEqual(['overdue']);
+    expect(statusOf(h, first)).toEqual(['bot_joining', 'eligible']);
+    expect(statusOf(h, next)).toEqual(['failed', 'no_show']);
+    expect(h.requests.filter((r) => r.op === 'get')).toHaveLength(2);
+  });
+
+  it('at most ten verdict GETs, oldest first, remaining bots wait for the next bucket', async () => {
+    const h = createR1MeetHarness();
+    const rows = Array.from({ length: 15 }, (_, i) => seed(h, 'bot_scheduled', ended(HOUR + i * MINUTE)));
+    expect((await runR1MeetMaintenance(h.deps, 1)).counts.overdue).toBe(10);
+    expect(h.requests.filter((r) => r.op === 'get')).toHaveLength(10);
+    expect(rows.filter((r) => h.db.booking(r.id as string)!.status === 'bot_scheduled')).toHaveLength(5);
+    expect(rows.slice(0, 5).every((r) => h.db.booking(r.id as string)!.status === 'bot_scheduled')).toBe(true);
+    expect((await runR1MeetMaintenance(h.deps, 2)).counts.overdue).toBe(5);
+  });
+
+  it('no verdict starts at the thirty-second budget; non-bot overdue rows still settle', async () => {
+    const h = createR1MeetHarness();
+    for (let i = 0; i < 5; i += 1) await botRow(h, HOUR + i * MINUTE);
+    const pending = seed(h, 'pending', ended(31 * MINUTE));
+    h.afterRecall = (op) => { if (op === 'get') h.advance(10_000); };
+    expect((await runR1MeetMaintenance(h.deps, 1)).counts.overdue).toBe(4);
+    expect(h.requests.filter((r) => r.op === 'get')).toHaveLength(3);
+    expect(statusOf(h, pending)).toEqual(['failed', 'in_past']);
+  });
+
+  it('a lost compare-and-set emits no admission alert', async () => {
+    const h = createR1MeetHarness();
+    const row = await botRow(h);
+    h.recall.setStatus(row.recall_bot_id as string, 'fatal', 'google_meet_bot_blocked');
+    h.afterRecall = (op) => {
+      if (op === 'get') Object.assign(h.db.tables.r1_meet_bookings.find((r) => r.id === row.id)!, { status: 'cancelled', reason: 'cancelled' });
+    };
+    expect((await runR1MeetMaintenance(h.deps, 1)).counts.overdue).toBe(0);
+    expect(h.alerts()).toEqual([]);
+  });
+});

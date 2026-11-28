@@ -11,12 +11,28 @@
  * counters, the slot) rolls everything back and answers `{ data: null, error: { code: '23514' } }`,
  * a unique index `23505`, and the create RPC's own `raise` `P0001`.
  *
- * Of migration 0143 (M035) it ports only what the runtime reads (M035 S02): the booking `source`
- * column (`'ashby'` on every row the create RPC and `seedBooking` write), `chk_r1_meet_bookings_source`
- * and `chk_r1_meet_bookings_source_ids` (the three Ashby schedule ids all set for `ashby`, all null for
+ * Of migration 0143 (M035) it ports what the runtime reads (M035 S02): the booking `source` column
+ * (`'ashby'` on every row the create RPC and `seedBooking` write), `chk_r1_meet_bookings_source` and
+ * `chk_r1_meet_bookings_source_ids` (the three Ashby schedule ids all set for `ashby`, all null for
  * `public_page`), the two status/reason pairs it adds (`cancelled`/`candidate_cancelled`,
- * `failed`/`invite_undeliverable`), and `seedPublicBooking`. Not the calendar, manage or request
- * columns, and not the public create RPC.
+ * `failed`/`invite_undeliverable`), and `seedPublicBooking`.
+ *
+ * And its calendar half (M035 S05): the six public columns (`google_calendar_event_id`,
+ * `calendar_state`, `invite_sent_at`, `public_request_id`, `manage_token_digest`, `move_count`; their
+ * Ashby values null and 0, a public seed's event id the booking id without dashes, `created` and a
+ * fresh request id), their CHECKs (`chk_r1_meet_bookings_calendar_event_id`, `_calendar_state`,
+ * `_manage_digest`, `_move_count`, `_public_columns`) appended after the 0142 ones so no earlier
+ * violation name changes, the unique indexes `uq_r1_meet_bookings_manage_digest` and
+ * `uq_r1_meet_bookings_public_request`, the `r1_meet_public_throttle` table (its two CHECKs and its
+ * primary key), a `candidates` table (`id`, `email`: what the invite reads), and the RPCs
+ * `r1_meet_public_set_manage_digest`, `r1_meet_public_set_calendar_state` and
+ * `r1_meet_public_throttle_prune` in 0143's refusal order. The two 0143 triggers
+ * (`enqueue_r1_meet_public_terminal`, `enqueue_r1_meet_calendar_purge`) are OPT-IN
+ * (`createR1MeetFakeDb({ publicTriggers: true })`): every transaction then diffs the public rows'
+ * statuses before and after its work, and the rows it deleted, so RPCs, table updates and
+ * `deleteBooking` all fire them. Off by default, so the M034 suites and S02's Ashby/public twin suite
+ * queue exactly what they did. NOT ported: the public create, capacity, precheck, manage read, move,
+ * cancel, reconsent and throttle-hit RPCs (S06 adds the ones it calls).
  *
  * What it is NOT: the SQL. `r1_send_round` (capacity, holds, the month counter) is a knob
  * (`settings.sendRound`), and so are the consent template and the sales_r1 role. The SQL itself is
@@ -26,8 +42,9 @@
  * Test aids: `failNext(rpcOrTable, mode)` (`error`: the next call answers a DB error and writes
  * nothing; `lost`: an RPC commits, then the answer is lost), `calls` (every rpc and table call),
  * an optional shared `timeline` (`db:<rpc>`, `db:set_bot:<action>`, `db:transition:<to>`,
- * `queue:<kind>`), seeding helpers, the two 0142 triggers (`deleteBooking`, `cancelRound`), and the
- * bridge page's half (`claimTicket`, `bind`).
+ * `queue:<kind>`), seeding helpers (`seedCandidate`, `linkAshbyCandidate` and `seedThrottle` for
+ * 0143), the two 0142 triggers (`deleteBooking`, `cancelRound`), and the bridge page's half
+ * (`claimTicket`, `bind`).
  *
  * Never shipped: `tsconfig.build.json` excludes `src/__tests__`. Ids are generated in the namespace
  * `7f000000-0000-4000-9000-…`, apart from the fixtures' `7f000000-0000-4000-8000-…`.
@@ -95,6 +112,19 @@ export const FAKE_SEND_ROUND_REFUSALS = Object.freeze([
 ] as const);
 export type FakeSendRoundAnswer = 'ok' | (typeof FAKE_SEND_ROUND_REFUSALS)[number] | 'unexpected';
 
+/** `chk_r1_meet_bookings_calendar_state` (0143 §1). */
+export const FAKE_CALENDAR_STATES = Object.freeze(['created', 'invited', 'cancelled', 'purged'] as const);
+
+/**
+ * `r1_meet_public_set_calendar_state`'s `v_allowed` (0143 §21): the states `p_from` may list for each
+ * `p_to`.
+ */
+export const FAKE_CALENDAR_ALLOWED_FROM: Readonly<Record<'invited' | 'cancelled' | 'purged', readonly string[]>> = Object.freeze({
+  invited: Object.freeze(['created', 'invited']),
+  cancelled: Object.freeze(['created', 'invited']),
+  purged: Object.freeze(['created', 'invited', 'cancelled']),
+});
+
 const TERMINAL = ['completed', 'cancelled', 'failed', 'drained'];
 const DISPATCHED = ['bot_joining', 'human_present', 'in_call'];
 const HOLDS_BOT = ['bot_scheduled', ...DISPATCHED];
@@ -102,6 +132,26 @@ const ROUND_BOUND = ['pending', 'bot_scheduled', 'bot_joining', 'human_present',
 const BOTLESS = ['pending', 'blocked', 'unmatched_application', 'unmapped_scheduler'];
 const LIVE_SESSION = ['created', 'waiting', 'in_progress'];
 const LIVE_JOB = ['pending', 'active', 'delayed'];
+/** The calendar states in which Lexy's event still exists (both 0143 triggers, §3 and §4). */
+const EVENT_EXISTS = ['created', 'invited'];
+/** 0143 §3's WHEN: the statuses a public booking "ends unused" in. */
+const PUBLIC_UNUSED_END = ['cancelled', 'failed', 'drained'];
+
+/**
+ * The two 0143 triggers as this port fires them (pinned to the migration text by
+ * r1-meet-fake-db.test.ts): §3 when the new status is one of `newStatuses` and the old one is none of
+ * `oldNotIn`, its cancel job only while the event state is one of `cancelWhen`; §4 when a deleted
+ * public row's event state is one of `when`.
+ */
+export const FAKE_PUBLIC_TRIGGER_RULES = Object.freeze({
+  terminal: Object.freeze({
+    newStatuses: Object.freeze([...PUBLIC_UNUSED_END]),
+    oldNotIn: Object.freeze([...TERMINAL]),
+    cancelWhen: Object.freeze([...EVENT_EXISTS]),
+  }),
+  purge: Object.freeze({ when: Object.freeze([...EVENT_EXISTS]) }),
+});
+
 const UUID_I = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MEET = /^https:\/\/meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3}$/;
 const HEX64 = /^[a-f0-9]{64}$/;
@@ -203,6 +253,10 @@ export interface FakeTables {
   ashby_application_links: Row[];
   job_queue: Row[];
   interview_round_consents: Row[];
+  /** `screening_v2.candidates`, the two columns the public invite reads (`id`, `email`). M035 S05. */
+  candidates: Row[];
+  /** `screening_v2.r1_meet_public_throttle` (0143 §2). M035 S05. */
+  r1_meet_public_throttle: Row[];
 }
 
 function checkBooking(b: Row): void {
@@ -250,6 +304,35 @@ function checkBooking(b: Row): void {
       && (b.ticket_digest === null || [...HOLDS_BOT, ...TERMINAL].includes(b.status)),
     'chk_r1_meet_bookings_ticket',
   );
+  // 0143 §1 (M035 S05): the public columns, appended so every earlier violation keeps its name.
+  check(
+    b.google_calendar_event_id === null || b.google_calendar_event_id === String(b.id).toLowerCase().replace(/-/g, ''),
+    'chk_r1_meet_bookings_calendar_event_id',
+  );
+  check(b.calendar_state === null || (FAKE_CALENDAR_STATES as readonly string[]).includes(b.calendar_state), 'chk_r1_meet_bookings_calendar_state');
+  check(b.manage_token_digest === null || (typeof b.manage_token_digest === 'string' && HEX64.test(b.manage_token_digest)), 'chk_r1_meet_bookings_manage_digest');
+  check(Number.isInteger(b.move_count) && b.move_count >= 0 && b.move_count <= 10, 'chk_r1_meet_bookings_move_count');
+  check(
+    (b.source === 'ashby'
+      && b.google_calendar_event_id === null
+      && b.calendar_state === null
+      && b.invite_sent_at === null
+      && b.public_request_id === null
+      && b.manage_token_digest === null
+      && b.move_count === 0)
+      || (b.source === 'public_page'
+        && b.google_calendar_event_id !== null
+        && b.calendar_state !== null
+        && b.public_request_id !== null
+        && (b.invite_sent_at === null || ['invited', 'cancelled', 'purged'].includes(b.calendar_state))),
+    'chk_r1_meet_bookings_public_columns',
+  );
+}
+
+/** `r1_meet_public_throttle` (0143 §2): the key digest and the hit count. */
+function checkThrottle(t: Row): void {
+  check(typeof t.key_digest === 'string' && HEX64.test(t.key_digest), 'chk_r1_meet_public_throttle_key');
+  check(Number.isInteger(t.hits) && t.hits >= 0, 'chk_r1_meet_public_throttle_hits');
 }
 
 /**
@@ -297,6 +380,11 @@ function validate(tables: FakeTables): void {
     (j) => (j.dedup_key && LIVE_JOB.includes(j.status) ? j.dedup_key : null),
     'uq_job_queue_dedup_active',
   );
+  // 0143 (M035 S05): appended after the 0142 checks, so their violation names never change.
+  checkUnique(bookings, (b) => b.manage_token_digest ?? null, 'uq_r1_meet_bookings_manage_digest');
+  checkUnique(bookings, (b) => b.public_request_id ?? null, 'uq_r1_meet_bookings_public_request');
+  for (const throttle of tables.r1_meet_public_throttle) checkThrottle(throttle);
+  checkUnique(tables.r1_meet_public_throttle, (t) => `${String(t.key_digest)}|${String(ts(t.bucket_start))}`, 'pk_r1_meet_public_throttle');
 }
 
 // ── The fake ────────────────────────────────────────────────────────────────
@@ -339,11 +427,21 @@ export interface R1MeetFakeDb {
   seedBooking(row: Partial<Row>): Row;
   /**
    * A public-page booking (M035, 0143): `source = 'public_page'` and the Ashby columns other than the
-   * application id NULL (event, schedule, scheduler, stage, interview, updated_at). `row` may override
-   * any of them (a test of the 0143 CHECKs does). The calendar, manage and request columns of 0143 are
-   * not part of this port (S05/S06 extend it when they read them).
+   * application id NULL (event, schedule, scheduler, stage, interview, updated_at), and the calendar
+   * defaults the public create writes (M035 S05): `google_calendar_event_id` = the booking id without
+   * dashes, `calendar_state` `created`, a fresh `public_request_id`. `row` may override any of them
+   * (a test of the 0143 CHECKs does).
    */
   seedPublicBooking(row: Partial<Row>): Row;
+  /** A `candidates` row (`id`, `email`; M035 S05): the local email the invite falls back to. PII-free fixtures only. */
+  seedCandidate(row: Partial<Row>): Row;
+  /**
+   * Sets `external_candidate_id` (the Ashby candidate id) on the Ashby link of `applicationId`
+   * (M035 S05). Only this sets the column: `linkApplication` rows keep their four keys.
+   */
+  linkAshbyCandidate(applicationId: string, ashbyCandidateId: string | null): Row;
+  /** A `r1_meet_public_throttle` row (`key_digest`, `bucket_start`, `hits`), through the 0143 CHECKs (M035 S05). */
+  seedThrottle(row: Partial<Row>): Row;
   addRound(row?: Partial<Row>): Row;
   addSession(row: Partial<Row> & { interview_round_id: string }): Row;
   /** The attempt of a session (`interview_round_attempts`, keyed by `session_id`), as `r1_settle_attempt` leaves it. */
@@ -353,7 +451,10 @@ export interface R1MeetFakeDb {
   enqueue(spec: FakeEnqueueSpec, options?: { readonly scheduledAt?: string | Date }): Row;
   /** Job rows of the `r1-meet` queue, optionally of one `kind`. */
   jobs(kind?: string): Row[];
-  /** A DSAR-style delete: the 0142 §5 trigger queues a `bot_release` for a bot the row held. */
+  /**
+   * A DSAR-style delete: the 0142 §5 trigger queues a `bot_release` for a bot the row held (and, with
+   * `publicTriggers`, 0143 §4 a `calendar_sync` purge for a public row whose event exists).
+   */
   deleteBooking(id: string): void;
   /** HR cancels a Meet round in the app: the 0142 §6 trigger queues `round_cancelled` jobs. */
   cancelRound(roundId: string): void;
@@ -367,11 +468,18 @@ export interface R1MeetFakeDbOptions {
   readonly timeline?: string[];
   /** Clock of job and seed rows (RPCs only use their `p_now`). */
   readonly now?: () => number;
+  /**
+   * Fire the two 0143 triggers (M035 S05): a public booking that first becomes cancelled, failed or
+   * drained queues the calendar cancel (event still there) and the Ashby tag removal; a deleted public
+   * booking whose event exists queues the calendar purge. Off by default.
+   */
+  readonly publicTriggers?: boolean;
 }
 
 export function createR1MeetFakeDb(options: R1MeetFakeDbOptions = {}): R1MeetFakeDb {
   const clock = options.now ?? (() => Date.parse('2030-01-01T10:00:00.000Z'));
   const timeline = options.timeline;
+  const publicTriggers = options.publicTriggers === true;
   let tables: FakeTables = {
     r1_meet_bookings: [],
     r1_meet_receipts: [],
@@ -381,6 +489,8 @@ export function createR1MeetFakeDb(options: R1MeetFakeDbOptions = {}): R1MeetFak
     ashby_application_links: [],
     job_queue: [],
     interview_round_consents: [],
+    candidates: [],
+    r1_meet_public_throttle: [],
   };
   const users = new Set<string>();
   const settings: FakeDbSettings = { sendRound: 'ok', consentTemplate: true, roleConfigured: true, phoneBlock: null };
@@ -395,11 +505,55 @@ export function createR1MeetFakeDb(options: R1MeetFakeDbOptions = {}): R1MeetFak
     return queue.shift()!;
   };
 
+  /**
+   * The two 0143 triggers (§3, §4), fired after a transaction's work from the diff of the bookings
+   * before and after it (only when `publicTriggers`). Row by row, in the order the rows had before:
+   *  - deleted, public, event `created`/`invited`: §4 queues `calendar_sync` purge;
+   *  - still there, public, now cancelled/failed/drained and before neither of the four terminal
+   *    statuses: §3 queues `calendar_sync` cancel while the event exists, then always
+   *    `ashby_booked_tag` remove.
+   * Ids only, max_attempts 10, `on conflict do nothing` (a live job with the key wins). A row inserted
+   * by this transaction fires neither (neither trigger is on insert).
+   */
+  function firePublicTriggers(before: readonly Row[]): void {
+    const { terminal, purge } = FAKE_PUBLIC_TRIGGER_RULES;
+    for (const old of before) {
+      const row = tables.r1_meet_bookings.find((b) => b.id === old.id);
+      if (row === undefined) {
+        if (old.source === 'public_page' && purge.when.includes(old.calendar_state)) {
+          insertJob(
+            { kind: 'calendar_sync', op: 'purge', booking_id: old.id },
+            `r1-meet:calendar:${String(old.id)}:purge`,
+            10,
+            iso(clock()),
+          );
+        }
+        continue;
+      }
+      if (row.source !== 'public_page' || !terminal.newStatuses.includes(row.status) || terminal.oldNotIn.includes(old.status)) continue;
+      if (terminal.cancelWhen.includes(row.calendar_state)) {
+        insertJob(
+          { kind: 'calendar_sync', op: 'cancel', booking_id: row.id },
+          `r1-meet:calendar:${String(row.id)}:cancel`,
+          10,
+          iso(clock()),
+        );
+      }
+      insertJob(
+        { kind: 'ashby_booked_tag', op: 'remove', booking_id: row.id },
+        `r1-meet:ashby-tag:${String(row.id)}:remove`,
+        10,
+        iso(clock()),
+      );
+    }
+  }
+
   /** One transaction: everything rolls back on a refusal of the database. */
   function transaction<T>(work: () => T): { ok: true; value: T } | { ok: false; error: SqlError } {
     const snapshot = clone(tables);
     try {
       const value = work();
+      if (publicTriggers) firePublicTriggers(snapshot.r1_meet_bookings);
       validate(tables);
       return { ok: true, value };
     } catch (error) {
@@ -729,6 +883,13 @@ export function createR1MeetFakeDb(options: R1MeetFakeDbOptions = {}): R1MeetFak
         created_at: iso(now),
         updated_at: iso(now),
         source: 'ashby',
+        // 0143's public columns at their column defaults (an Ashby row: null, move_count 0).
+        google_calendar_event_id: null,
+        calendar_state: null,
+        invite_sent_at: null,
+        public_request_id: null,
+        manage_token_digest: null,
+        move_count: 0,
       };
       tables.r1_meet_bookings.push(row);
     }
@@ -1120,6 +1281,88 @@ export function createR1MeetFakeDb(options: R1MeetFakeDbOptions = {}): R1MeetFak
     return { status: 'ok', deleted: victims.length };
   };
 
+  // ── 0143's calendar half (M035 S05) ───────────────────────────────────────
+
+  /** A Postgres `integer` argument: null stays null, anything but a whole number fails the cast. */
+  const intArg = (value: unknown): number | null => {
+    if (value === null || value === undefined) return null;
+    if (typeof value !== 'number' || !Number.isInteger(value)) throw new SqlError('22P02', 'invalid_integer');
+    return value;
+  };
+
+  /** §16. The first refusal wins: invalid_request (booking_id, digest, now) | not_found | not_public | booking_terminal | ok. */
+  const setManageDigest: Rpc = (a) => {
+    const bookingId = uuidArg(a.p_booking_id);
+    if (bookingId === null) return { status: 'invalid_request', field: 'booking_id' };
+    if (typeof a.p_digest !== 'string' || !HEX64.test(a.p_digest)) return { status: 'invalid_request', field: 'digest' };
+    if (a.p_now === null || a.p_now === undefined) return { status: 'invalid_request', field: 'now' };
+    ts(a.p_now);
+    const b = findBooking(bookingId);
+    if (!b) return { status: 'not_found' };
+    if (b.source !== 'public_page') return { status: 'not_public' };
+    if (TERMINAL.includes(b.status)) return { status: 'booking_terminal' };
+    // updated_at is NOT changed (it records status changes only). A digest on another booking is
+    // uq_r1_meet_bookings_manage_digest (23505) at validate.
+    b.manage_token_digest = a.p_digest;
+    return { status: 'ok' };
+  };
+
+  /**
+   * §21. The first refusal wins: invalid_request (booking_id, to, from, now) | not_found | not_public |
+   * state_conflict (+current) | ok (+calendar_state). No status change, so the §3 trigger never fires.
+   */
+  const setCalendarState: Rpc = (a) => {
+    const bookingId = uuidArg(a.p_booking_id);
+    if (bookingId === null) return { status: 'invalid_request', field: 'booking_id' };
+    const to = a.p_to;
+    if (typeof to !== 'string' || !Object.prototype.hasOwnProperty.call(FAKE_CALENDAR_ALLOWED_FROM, to)) {
+      return { status: 'invalid_request', field: 'to' };
+    }
+    const allowed = FAKE_CALENDAR_ALLOWED_FROM[to as keyof typeof FAKE_CALENDAR_ALLOWED_FROM];
+    const from = a.p_from;
+    // `array_ndims(p_from) is distinct from 1`: not an array, an empty one (ndims null) or a nested one.
+    if (!Array.isArray(from) || from.length === 0 || from.some((item) => Array.isArray(item))) {
+      return { status: 'invalid_request', field: 'from' };
+    }
+    if (
+      from.length > 3
+      || from.some((item) => item === null || item === undefined)
+      || !from.every((item) => allowed.includes(String(item)))
+    ) {
+      return { status: 'invalid_request', field: 'from' };
+    }
+    if (a.p_now === null || a.p_now === undefined) return { status: 'invalid_request', field: 'now' };
+    const now = ts(a.p_now)!;
+    const b = findBooking(bookingId);
+    if (!b) return { status: 'not_found' };
+    if (b.source !== 'public_page') return { status: 'not_public' };
+    // `calendar_state <> all(p_from)`: a NULL state compares as unknown and does not refuse (a public
+    // row never has one: chk_r1_meet_bookings_public_columns).
+    if (b.calendar_state !== null && !from.map(String).includes(b.calendar_state)) {
+      return { status: 'state_conflict', current: b.calendar_state };
+    }
+    b.calendar_state = to;
+    if (to === 'invited') b.invite_sent_at = b.invite_sent_at ?? now;
+    return { status: 'ok', calendar_state: to };
+  };
+
+  /** §23. invalid_request (older_than, limit, now) | ok (+deleted): oldest buckets first, up to p_limit. */
+  const throttlePrune: Rpc = (a) => {
+    const olderThan = intArg(a.p_older_than_sec);
+    if (olderThan === null || olderThan < 3600 || olderThan > 31536000) return { status: 'invalid_request', field: 'older_than' };
+    const limit = intArg(a.p_limit);
+    if (limit === null || limit < 1 || limit > 5000) return { status: 'invalid_request', field: 'limit' };
+    if (a.p_now === null || a.p_now === undefined) return { status: 'invalid_request', field: 'now' };
+    const cutoff = ms(ts(a.p_now)) - olderThan * 1000;
+    const victims = tables.r1_meet_public_throttle
+      .filter((t) => ms(t.bucket_start) < cutoff)
+      .sort((x, y) => ms(x.bucket_start) - ms(y.bucket_start) || compare(x.key_digest, y.key_digest))
+      .slice(0, limit);
+    const gone = new Set(victims);
+    tables.r1_meet_public_throttle = tables.r1_meet_public_throttle.filter((t) => !gone.has(t));
+    return { status: 'ok', deleted: victims.length };
+  };
+
   const RPCS: Record<string, Rpc> = {
     r1_meet_create_round_from_ashby: createRound,
     r1_meet_reschedule_booking: reschedule,
@@ -1132,6 +1375,9 @@ export function createR1MeetFakeDb(options: R1MeetFakeDbOptions = {}): R1MeetFak
     r1_meet_record_receipt: recordReceipt,
     r1_meet_prune_receipts: prune('r1_meet_receipts'),
     r1_meet_prune_bookings: prune('r1_meet_bookings'),
+    r1_meet_public_set_manage_digest: setManageDigest,
+    r1_meet_public_set_calendar_state: setCalendarState,
+    r1_meet_public_throttle_prune: throttlePrune,
   };
 
   const failure = (code: string, message: string): FakeAnswer => ({ data: null, error: { code, message } });
@@ -1359,6 +1605,13 @@ export function createR1MeetFakeDb(options: R1MeetFakeDbOptions = {}): R1MeetFak
     created_at: iso(clock()),
     updated_at: iso(clock()),
     source: 'ashby',
+    // 0143 (M035 S05): the public columns at their Ashby values.
+    google_calendar_event_id: null,
+    calendar_state: null,
+    invite_sent_at: null,
+    public_request_id: null,
+    manage_token_digest: null,
+    move_count: 0,
   });
 
   const commit = (work: () => void): void => {
@@ -1385,7 +1638,7 @@ export function createR1MeetFakeDb(options: R1MeetFakeDbOptions = {}): R1MeetFak
     },
     seedBooking(row) {
       const booking: Row = { ...BOOKING_DEFAULTS(), ...row };
-      for (const key of ['start_at', 'end_at', 'ashby_updated_at', 'ticket_not_before', 'ticket_expires_at', 'ticket_claimed_at', 'created_at', 'updated_at']) {
+      for (const key of ['start_at', 'end_at', 'ashby_updated_at', 'ticket_not_before', 'ticket_expires_at', 'ticket_claimed_at', 'created_at', 'updated_at', 'invite_sent_at']) {
         booking[key] = ts(booking[key]);
       }
       if (booking.round_id !== null && booking.candidate_id === null) {
@@ -1397,6 +1650,8 @@ export function createR1MeetFakeDb(options: R1MeetFakeDbOptions = {}): R1MeetFak
       return findBooking(booking.id)!;
     },
     seedPublicBooking(row) {
+      // The id first: the event id is derived from it (chk_r1_meet_bookings_calendar_event_id).
+      const id = typeof row.id === 'string' ? row.id : newId();
       return fake.seedBooking({
         source: 'public_page',
         ashby_interview_event_id: null,
@@ -1405,8 +1660,33 @@ export function createR1MeetFakeDb(options: R1MeetFakeDbOptions = {}): R1MeetFak
         ashby_interview_stage_id: null,
         ashby_interview_id: null,
         ashby_updated_at: null,
+        id,
+        google_calendar_event_id: id.toLowerCase().replace(/-/g, ''),
+        calendar_state: 'created',
+        public_request_id: newId(),
         ...row,
       });
+    },
+    seedCandidate(row) {
+      const candidate: Row = { id: newId(), email: null, ...row };
+      tables.candidates.push(candidate);
+      return candidate;
+    },
+    linkAshbyCandidate(applicationId, ashbyCandidateId) {
+      const link = tables.ashby_application_links.find(
+        (l) => l.provider === 'ashby' && l.external_application_id === applicationId,
+      );
+      if (!link) throw new Error('fake db: no ashby link for that application');
+      link.external_candidate_id = ashbyCandidateId;
+      return link;
+    },
+    seedThrottle(row) {
+      const throttle: Row = { key_digest: null, bucket_start: iso(clock()), hits: 0, ...row };
+      throttle.bucket_start = ts(throttle.bucket_start);
+      commit(() => {
+        tables.r1_meet_public_throttle.push(throttle);
+      });
+      return throttle;
     },
     addRound(row = {}) {
       const round: Row = {

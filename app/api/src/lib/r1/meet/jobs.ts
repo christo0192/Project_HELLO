@@ -1,6 +1,6 @@
 /**
- * The `r1-meet` job contract (M034 S06, dark; S09 adds the twelfth kind, M035 S11 the thirteenth): the
- * one queue name, the thirteen job kinds, a strict parser per kind, the dedup keys and attempts, and
+ * The `r1-meet` job contract (M034 S06, dark; S09 and M035 S05/S11 add kinds): the
+ * one queue name, the fourteen job kinds, a strict parser per kind, the dedup keys and attempts, and
  * the small shared vocabulary of the handlers (job facts, results, errors, the deferral bound). Nothing
  * here registers a queue, reads an environment variable or performs I/O.
  *
@@ -19,6 +19,12 @@
  *    `r1_meet_record_receipt` (one receipt per booking and assessment, so `receipt_id` and `source`
  *    are added as for S03), or an operator's manual re-post, built by `r1MeetJobs.scorecardFeedback`.
  *    Its payload is ids only: `booking_id` and `assessment_id`.
+ *  - `calendar_sync` (M035 S05, public-page bookings only): migration 0143 writes every one of them,
+ *    with the keys and attempts below: the public create RPC (`invite`), the public move RPC (`move`,
+ *    keyed by the move count after the move), the terminal trigger (`cancel`) and the delete trigger
+ *    (`purge`); S05's public maintenance re-drives `invite`, `cancel` and `purge` through
+ *    `r1MeetJobs.calendarSync`. Its payload is `{kind, op, booking_id}`: an op word and an id, never
+ *    an email, a token or a Meet link.
  *  - `ashby_booked_tag` (M035 S11): migration 0143's public create RPC (`op: 'add'`) and its
  *    terminal-status trigger (`op: 'remove'`); `r1MeetJobs.ashbyBookedTag` builds the same payload for
  *    tests and an operator's re-drive. Ids and a closed op only; the handler treats `op` as a hint and
@@ -61,9 +67,8 @@ import { parseR1MeetInstant } from './ticket.js';
 export const R1_MEET_QUEUE = 'r1-meet' as const;
 
 /**
- * Every job kind this build handles. S09 appends `scorecard_feedback` LAST and adds its own definition
- * to the dispatcher. Frozen.
- * M035 S11 appends `ashby_booked_tag` after it (and registers its definition last).
+ * Every job kind this build handles, frozen. Contracts section 5 fixes the appended order:
+ * `scorecard_feedback`, then M035 S05 `calendar_sync`, then S11 `ashby_booked_tag` last.
  */
 export const R1_MEET_JOB_KINDS = Object.freeze([
   'ashby_schedule',
@@ -78,14 +83,16 @@ export const R1_MEET_JOB_KINDS = Object.freeze([
   'maintenance',
   'drain',
   'scorecard_feedback',
+  'calendar_sync',
   'ashby_booked_tag',
 ] as const);
 export type R1MeetJobKind = (typeof R1_MEET_JOB_KINDS)[number];
 
 /**
  * Attempts per kind. The first two are fixed by `r1_meet_record_receipt` (0142 §18), the next two by
- * the 0142 triggers (whose `bot_release` S06 also writes), `drain` by the runbook's SQL, and
- * `scorecard_feedback` again by `r1_meet_record_receipt` (0142:1818), which writes it. Frozen.
+ * the 0142 triggers (whose `bot_release` S06 also writes), `drain` by the runbook's SQL,
+ * `scorecard_feedback` again by `r1_meet_record_receipt` (0142:1818), which writes it, and
+ * `calendar_sync` by migration 0143. Frozen.
  */
 export const R1_MEET_JOB_MAX_ATTEMPTS: Readonly<Record<R1MeetJobKind, number>> = Object.freeze({
   ashby_schedule: 5,
@@ -101,6 +108,8 @@ export const R1_MEET_JOB_MAX_ATTEMPTS: Readonly<Record<R1MeetJobKind, number>> =
   drain: 10,
   // Fixed by r1_meet_record_receipt (0142:1818): the job it inserts always has max_attempts 5.
   scorecard_feedback: 5,
+  // Fixed by 0143: the create and move RPCs and both triggers insert 10.
+  calendar_sync: 10,
   // Fixed by 0143: the create RPC and the terminal trigger insert 10.
   ashby_booked_tag: 10,
 });
@@ -128,6 +137,15 @@ export type R1MeetRecallParticipantEvent = (typeof R1_MEET_RECALL_PARTICIPANT_EV
 export const R1_MEET_SCHEDULE_SCOPE_DECISIONS = Object.freeze(['cancelled', 'dex_absent'] as const);
 export type R1MeetScheduleScopeDecision = (typeof R1_MEET_SCHEDULE_SCOPE_DECISIONS)[number];
 
+/**
+ * The four operations of a `calendar_sync` job on Lexy's calendar event of a public booking (M035 S05):
+ * send the invite, move the event, cancel it before its slot, purge it after retention or a delete.
+ * Frozen.
+ */
+export const R1_MEET_CALENDAR_OPS = Object.freeze(['invite', 'move', 'cancel', 'purge'] as const);
+export type R1MeetCalendarOp = (typeof R1_MEET_CALENDAR_OPS)[number];
+/** `chk_r1_meet_bookings_move_count` (0143): a move job's counter is the count after its move. */
+export const R1_MEET_MAX_MOVE_COUNT = 10;
 /** What an `ashby_booked_tag` job asks for (M035 S11): a hint only, the handler converges. Frozen. */
 export const R1_MEET_ASHBY_TAG_OPS = Object.freeze(['add', 'remove'] as const);
 export type R1MeetAshbyTagOp = (typeof R1_MEET_ASHBY_TAG_OPS)[number];
@@ -201,7 +219,11 @@ export interface R1MeetAshbyWholeScheduleJob {
 
 export type R1MeetAshbyScheduleJob = R1MeetAshbyEventJob | R1MeetAshbyWholeScheduleJob;
 
-/** A participant of a real-time event. Recall documents no `is_bot`, so null is the usual value. */
+/**
+ * A participant of a real-time event. `isBot` is true when Recall itself says bot, or when the receiver
+ * found that the display name is this bot's own (M035 S09; the name is never kept); null when neither
+ * is known, the usual value for a person.
+ */
 export interface R1MeetParticipant {
   readonly id: number | null;
   readonly isHost: boolean | null;
@@ -276,6 +298,13 @@ export interface R1MeetScorecardFeedbackJob {
   /** Lower-cased. */
   readonly assessmentId: string;
 }
+/** Keep Lexy's calendar event of one public booking in step with it (M035 S05). */
+export interface R1MeetCalendarSyncJob {
+  readonly kind: 'calendar_sync';
+  readonly op: R1MeetCalendarOp;
+  readonly bookingId: string;
+}
+
 /** Converge the "Lexy R1: Booked" tag of this public booking's Ashby candidate (M035 S11). */
 export interface R1MeetAshbyBookedTagJob {
   readonly kind: 'ashby_booked_tag';
@@ -298,6 +327,7 @@ export interface R1MeetJobByKind {
   readonly maintenance: R1MeetMaintenanceJob;
   readonly drain: R1MeetDrainJob;
   readonly scorecard_feedback: R1MeetScorecardFeedbackJob;
+  readonly calendar_sync: R1MeetCalendarSyncJob;
   readonly ashby_booked_tag: R1MeetAshbyBookedTagJob;
 }
 
@@ -541,6 +571,16 @@ export const parseScorecardFeedbackJob = parserOf('scorecard_feedback', (fields)
   assessmentId: uuid(fields.assessment_id),
 }));
 
+/**
+ * The op (exactly one of the four lower-case words) and the booking id. The move count is in the dedup
+ * key only, never in the payload (0143), so nothing else is read.
+ */
+export const parseCalendarSyncJob = parserOf('calendar_sync', (fields) => ({
+  kind: 'calendar_sync',
+  op: oneOf(fields.op, R1_MEET_CALENDAR_OPS),
+  bookingId: uuid(fields.booking_id),
+}));
+
 /** Ids and a closed op only (M035 S11): `op` is exactly `add` or `remove`, case-sensitive. */
 export const parseAshbyBookedTagJob = parserOf('ashby_booked_tag', (fields) => ({
   kind: 'ashby_booked_tag',
@@ -563,6 +603,7 @@ export const R1_MEET_JOB_PARSERS: { readonly [K in R1MeetJobKind]: R1MeetJobPars
     maintenance: parseMaintenanceJob,
     drain: parseDrainJob,
     scorecard_feedback: parseScorecardFeedbackJob,
+    calendar_sync: parseCalendarSyncJob,
     ashby_booked_tag: parseAshbyBookedTagJob,
   });
 
@@ -613,6 +654,12 @@ export const r1MeetDedupKeys = Object.freeze({
   /** A manual re-post (S09). The trigger's own jobs carry the receipt's key, `r1-meet:receipt:<id>`. */
   scorecardFeedback: (bookingId: string, assessmentId: string): string =>
     `r1-meet:scorecard-feedback:${bookingId.toLowerCase()}:${assessmentId.toLowerCase()}`,
+  /**
+   * M035 S05: the keys 0143 prints, `'r1-meet:calendar:' || id::text || ':<op>'`, and for a move
+   * `':move:' || move_count::text` (the count after that move), so every move is its own job.
+   */
+  calendarSync: (bookingId: string, op: R1MeetCalendarOp, moveCount?: number): string =>
+    `r1-meet:calendar:${bookingId.toLowerCase()}:${op}${op === 'move' ? `:${String(moveCount)}` : ''}`,
   /** M035 S11: one live job per booking and op; 0143 prints the same key from `uuid::text`. */
   ashbyBookedTag: (bookingId: string, op: R1MeetAshbyTagOp): string =>
     `r1-meet:ashby-tag:${bookingId.toLowerCase()}:${op}`,
@@ -668,6 +715,29 @@ export const r1MeetJobs = Object.freeze({
       { kind: 'scorecard_feedback', booking_id: bookingId, assessment_id: assessmentId },
       r1MeetDedupKeys.scorecardFeedback(bookingId, assessmentId),
     ),
+  /**
+   * M035 S05: the job 0143 writes, in 0143's `jsonb_build_object` key order (kind, op, booking_id), for
+   * the public maintenance re-drives and tests. A `move` needs its move count (a safe integer 1..10,
+   * the count after the move); any other op takes none. A wrong count is a `TypeError`: a caller bug.
+   */
+  calendarSync: (op: R1MeetCalendarOp, bookingId: string, moveCount?: number): R1MeetJobSpec => {
+    if (op === 'move') {
+      if (
+        typeof moveCount !== 'number'
+        || !Number.isSafeInteger(moveCount)
+        || moveCount < 1
+        || moveCount > R1_MEET_MAX_MOVE_COUNT
+      ) {
+        throw new TypeError('r1_meet_calendar_move_count');
+      }
+    } else if (moveCount !== undefined) {
+      throw new TypeError('r1_meet_calendar_move_count');
+    }
+    return spec(
+      { kind: 'calendar_sync', op, booking_id: bookingId },
+      r1MeetDedupKeys.calendarSync(bookingId, op, moveCount),
+    );
+  },
   /** M035 S11: tests and an operator's re-drive. The key order is 0143's `jsonb_build_object`. */
   ashbyBookedTag: (op: R1MeetAshbyTagOp, bookingId: string): R1MeetJobSpec =>
     spec({ kind: 'ashby_booked_tag', op, booking_id: bookingId }, r1MeetDedupKeys.ashbyBookedTag(bookingId, op)),

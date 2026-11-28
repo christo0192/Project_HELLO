@@ -5184,3 +5184,116 @@ does nothing (that job runs anyway).
 - **Live-spike items.** Whether `candidate.info` lists the tag right after the add (the final look
   relies on it; a lag only costs one `tag_contended` wait), and what Ashby answers to an add of a
   tag the candidate already has (the job never sends one after it reads the tag present).
+
+---
+
+## R1 public booking: Lexy's calendar invites (M035 S05, dark)
+
+S05 keeps the event created by the public booking page in step with its booking. It adds no route,
+queue, environment setting or migration. New bookings remain behind `R1_MEET_PUBLIC_BOOKING_ENABLED`
+(default off), on top of Meet and R1. Keep that flag off until the Legal-approved consent notice and
+the live-spike gates have passed. Existing public bookings can still receive calendar cleanup when
+the public flag is off. S05 reads Ashby only; S11 owns the `Lexy R1: Booked` tag and its removal.
+
+The `calendar_sync` job uses Lexy's Google account through the shared Google client. Its payload is
+only `{kind, op, booking_id}`; moves add their count to the dedup key, never to the payload. It has
+10 attempts plus bounded deferrals. An Ashby-source booking is ignored without a Google call.
+
+| Operation | What happens |
+| --- | --- |
+| `invite` | Read the event first. An existing attendee proves delivery and repairs `calendar_state` without another send. Otherwise resolve the on-file email from fresh Ashby `candidate.info` (link candidate id, else `application.info`), falling back to `candidates.email`. Store the new manage-token digest before sending the description and sole attendee with `sendUpdates=all`, then mark `invited`. |
+| `move` | Read the current booking and event. Matching start/end times mean it is already moved. Otherwise rotate the manage digest and send the current times and description with `sendUpdates=all`; attendees are preserved. A stale move job converges to the latest slot. |
+| `cancel` | Only terminal public bookings, `created` or `invited`, strictly before `start_at`: DELETE with `sendUpdates=all`, then mark `cancelled`. This also notifies an attendee whose earlier invite succeeded but whose state update was lost. After start, leave the event for retention. |
+| `purge` | Never delete a live booking's event. Derive the event id from the booking UUID without dashes, even after the row is gone. A present terminal row before start uses `all`; otherwise `none`. Mark a remaining row `purged`; 404/410 are done. |
+
+If Ashby is unavailable, invite delivery waits in two-minute increments until 30 minutes before
+start, then tries the local on-file email and alerts. No usable email, a missing/cancelled event,
+or no attendee by 15 minutes before start ends an undispatched booking `failed/invite_undeliverable`.
+A held bot is queued for release. Dispatched or in-call bookings are never cut by this deadline.
+Quota, timeout, malformed response and service failures wait 5..300 seconds; auth/setup failures
+wait an hour and alert, with bounded deferrals and no tight retry loop.
+
+The personal manage link is `<web origin>/book/manage#m=<token>`, in the event description only.
+The 43-character token comes from 32 random bytes. Only its HMAC-SHA256 digest, domain
+`hello:r1:meet-manage:v1`, is stored in our database. Each new invite or actual move send rotates
+it; a successful replay does not. The link expires at slot end and terminal bookings refuse it
+(candidate cancellation can answer `already_cancelled` before the end). Anyone holding the link
+can change the booking: never paste a token, digest, invite description or email into a log or ticket.
+Help goes to the hiring team's original email; calendar invite replies are not monitored.
+
+Maintenance runs after the existing Meet steps and scorecard re-drive. Each list has at most 20
+rows. Its separate warning is `r1_meet_public_maintenance_had_errors`, with failed step words joined
+by `:` (at most 59 characters); the existing maintenance warning is unchanged.
+
+| Step | Predicate and action |
+| --- | --- |
+| `invite` | Undispatched live `created` bookings older than 2 minutes, start more than 15 minutes away: enqueue the deduplicated invite. |
+| `undeliverable` | Undispatched live `created` bookings starting within 15 minutes: fail the invite and release any held bot. |
+| `drift` | `cancelled`, `failed` or `drained`, `created`/`invited`, future start and unchanged for more than 10 minutes: enqueue cancel; one `queued_<n>` drift alert per pass. |
+| `retention` | Terminal `created`/`invited` events with end older than `calendarRetentionDays`: enqueue purge. Use the configured days while public booking is on, otherwise 30. |
+| `recheck` | Public config on and `preSlotRecheck`: live undispatched starts in [105, 120) minutes. Read `application.info`; a readable non-Active status cancels with reason `cancelled`. Any error or missing status cancels nothing. One attempt, 5 seconds per call, no new call after the 20-second step budget. |
+| `throttle_prune` | Every 24th 15-minute bucket, delete throttle entries older than 2 days, at most four calls of 5000 rows. |
+
+All steps need calendar ports. All except `recheck` also need usable Google settings; `recheck`
+needs the public flag on. The overdue classic step now checks Recall history for pre-call bots:
+history that entered the call supports `no_show`; otherwise `bot_fatal`. A 404 remains `no_show`.
+Other Recall failures keep the booking live for six hours beyond the usual end-plus-30-minute
+deadline, then fail it `bot_fatal`. At most 10 history reads, none started after 30 seconds.
+
+Both drain doors cancel future public events inline after a winning terminal move: the operator
+job while Meet is on, and the existing flag-off backstop (Meet exactly disabled, usable Recall key).
+The backstop keeps its 10-booking/40-second bound and five-minute untouched guard. With Google
+settings available it also reads one bounded drift page and retries cancellations inside the same
+budget. A full page or exhausted budget sets `more`; failed calendar work raises one drift alert
+but does not fail the Recall drain. The trigger's queued cancel then finds `not_owed` if the inline
+delete already succeeded. S05 never explicitly queues from the drain. When merging S11, preserve
+its remove-only `tags(bucket)` immediately after `drain(bucket)` under its existing gate.
+
+| Alert or warning | `error_type` | Action |
+| --- | --- | --- |
+| `r1_meet_public_invite_undeliverable` | `no_email`, `event_gone`, `invite_deadline` | Inspect the ids/states below. Correct the on-file contact in Ashby or resolve the removed event with HR; the terminal booking is not automatically resurrected. |
+| `r1_meet_public_calendar_drift` | `queued_<n>` or `drain:<Google error code>` / `drain:database` | A future terminal booking still owes deletion. Restore Google/database access; the next catch-up retries. Check before the slot starts, after which cancel deliberately does nothing. |
+| `r1_meet_public_meet_link_changed` | `invite`, `move` | Stop public booking and investigate the Calendar-mode Meet link with the spike procedure. S05 does not reschedule the bot or replace the stored link. |
+| `r1_meet_public_google_auth_failed` | Google operation, e.g. `token.refresh`, `calendar.patch`, `calendar.delete` | Renew Lexy's OAuth grant using the account procedure above, verify organizer identity, then allow bounded retries. |
+| `r1_meet_public_setup_error` | `google_setup_forbidden`, `google_unauthorized`, `google_unconfigured`, `manage_key_missing` | Check API/scopes/account credentials or `WORKER_CONTEXT_SECRET` as named. Never send an invite without a stored digest. |
+| `r1_meet_public_ashby_unavailable` | `invite_fallback` | Ashby could not supply the fresh email inside the final 30-minute window; the local on-file email was tried. Restore Ashby reads. |
+| `r1_meet_public_maintenance_had_errors` | `invite:undeliverable:drift:retention:recheck:throttle_prune` (failed subset) | Check the corresponding dependency and subsequent maintenance pass. One row's failure does not stop the other rows. |
+| `r1_meet_profile_unknown` | absent | Correct the configured objective profile; the calendar job refuses unknown interviewer copy. |
+
+`drain:<Google error code>` uses only `unauthorized`, `auth_revoked`, `setup_forbidden`, `quota`,
+`not_found`, `already_exists`, `invalid_request`, `unavailable`, `timeout`, `malformed_response`.
+Google diagnostics are `r1_meet_google_ok` / `r1_meet_google_failed` with the operation and optional
+closed code plus HTTP status, never the request body. Exhausted jobs use the existing
+`r1_meet_job_failed` alert and DLQ workflow. S09's waiting-room alert is already source-aware:
+`public_page` is an error, `ashby` a warning; overdue admission/sign-in failures use its existing
+closed sub-code alerts.
+
+Read-only investigation (ids, states and timestamps only; do not select email, Meet URL or digest):
+
+```sql
+select id, status, reason, calendar_state, start_at
+from screening_v2.r1_meet_bookings
+where source = 'public_page'
+  and status in ('cancelled', 'failed', 'drained')
+  and calendar_state in ('created', 'invited')
+  and start_at > now()
+order by start_at
+limit 100;
+
+select id, status, reason, calendar_state, start_at
+from screening_v2.r1_meet_bookings
+where source = 'public_page'
+  and reason = 'invite_undeliverable'
+order by start_at desc
+limit 100;
+```
+
+Known limits: a DSAR deletion of a future booking leaves no row to decide whether to send a
+cancellation, so purge uses `none` and the candidate is not notified. While Meet is off, calendar
+catch-up needs Lexy's Google settings and the existing drain's usable Recall key; after-start
+events and retention wait until the lane runs again. Mail clients preserving the manage link's
+`#m=` fragment remains unverified until live spike S4. The raw manage token is present in Google
+and in the candidate's mailbox; purging our event does not erase mailbox copies. A pre-slot
+application recheck cancels the booking but leaves the round's hold until it lapses (usually at
+most about two hours after the slot). A Google deletion failure that persists until start can no
+longer notify through the cancel path; HR must coordinate with the candidate.
