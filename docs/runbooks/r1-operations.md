@@ -5069,8 +5069,8 @@ fault throws `r1_meet_db_error` and retries.
     booking, its link, the candidate's other applications and their newest public bookings).
   - **Its bounds.** Each machine asks Ashby about a booking once (it remembers up to 1000 it
     settled; a restart forgets them), runs at most 40 s a pass (no run starts unless a whole 20 s
-    run still fits), and after a wait (Ashby throttling or down, a permission fault, the tag
-    missing from the catalogue, a contended write, or a fault of that one candidate's record) holds
+    run still fits), and after a wait (Ashby throttling or down, a malformed or slow answer, which
+    may be one candidate's record alone, a permission fault, or a contended write) holds
     for that wait's seconds (30 s to an hour, the waits table above, with no back-off), so an alert
     fires at most once per wait. The next pass goes on AFTER the booking that waited, and that
     booking is tried again on the next cycle, so one booking that keeps waiting never holds up the
@@ -5140,9 +5140,12 @@ does nothing (that job runs anyway).
   catch-up can run again. The catch-up pages only bookings whose slot is at most 7 days back: a
   booking whose slot is more than 7 days back when the catch-up can next run (for example, Ashby
   writes stayed off for more than a week after the drain) keeps the tag until Meet is back on (its
-  queued `remove` job converges it then). A booking that ended during the catch-up's idle hour
-  loses the tag at the next cycle, about 75 minutes later at most (a few minutes more on a long
-  list). If the TAs rely on the tag meanwhile, list the public bookings that ended without an
+  queued `remove` job converges it then). A remove-only catch-up never reads the tag catalogue, so
+  the catalogue's waits (`tag_not_found`, `tag_ambiguous`) never hold it. A booking that ends
+  behind the cursor of a cycle with nothing to do, or during the catch-up's idle hour, loses the
+  tag at the next cycle: up to about 75 minutes (the rest of that cycle, the hour and one
+  15-minute bucket), plus one r1-sweep tick (about a minute) per page of 10 ended bookings ahead
+  of it in the window, so about 30 minutes more for 300 bookings. If the TAs rely on the tag meanwhile, list the public bookings that ended without an
   interview (cancelled, ended before their start, or failed with a reason that was never an
   interview) whose `remove` job still waits, newest first, skipping any application that was
   booked again (Ashby application ids only):

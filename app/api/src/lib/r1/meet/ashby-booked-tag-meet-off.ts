@@ -34,18 +34,26 @@
  * budget (`R1_MEET_ASHBY_TAG_RUN_MS`) still fits into the pass's (`budgetMs`, the drain backstop's
  * 40 s). A booking whose run settled (`processed` or `ignored`) is remembered by this process (at
  * most `rememberMax`, the oldest forgotten first): a later pass reads its row again but never asks
- * Ashby about it again. A wait (`defer`: Ashby throttling or down, a permission fault, the tag not in
- * the catalogue, a contended write, or a fault of that one candidate's record) ends the pass AND
- * holds the catch-up for that wait's seconds, so a setup alert fires at most once per wait, as the
- * job's own does; the cursor moves past that booking, so one booking that keeps waiting never stalls
- * the ones after it (it is tried again after the cursor wraps). A run that throws
+ * Ashby about it again. A wait (`defer`: Ashby throttling, Ashby down or a malformed or slow answer,
+ * which may be one candidate's record alone, a permission fault, or a contended write; and, only when
+ * a switch or the key goes away between this pass's check and the run's, `ashby_inactive` or
+ * `ashby_key_missing`) ends the pass AND holds the catch-up for that wait's seconds, so a setup alert
+ * fires at most once per wait, as the job's own does; the cursor moves past that booking, so one
+ * booking that keeps waiting never stalls the ones after it (it is tried again after the cursor
+ * wraps). A remove-only run never reads the tag catalogue (a remove matches the title on the
+ * candidate, and `tag_wanted_held` answers before the add path's lookup), so the catalogue's own
+ * waits (`tag_not_found`, `tag_ambiguous`, a truncated catalogue) never hold it. A run that throws
  * (`r1_meet_db_error`, ...) is one warning with its closed code; that booking is skipped for this
  * round and tried again after the cursor wraps.
  *
  * IDLE. A CYCLE runs from one wrap to the next (it may take several passes). A cycle that wraps having
  * run no booking (every one already settled, or none in the window) holds the catch-up for
  * `idleHoldMs` (an hour): no page is read meanwhile. A cycle that ran at least one booking (settled,
- * waiting or thrown) does not, so the next cycle starts at the next bucket.
+ * waiting or thrown) does not, so the next cycle starts at the next bucket. So a booking that ends
+ * behind the cursor of a cycle with nothing to do, or during the hour, waits for the next cycle: when
+ * nothing waits, the rest of that cycle, the hour, up to one 15-minute bucket, and the next cycle's
+ * pages up to it (one page per tick; together about one walk of the window), so about 75 minutes
+ * plus a tick per page of ended bookings in the window (the runbook's Known limit).
  *
  * MULTI-MACHINE. Each process keeps its own cursor, memory and hold; two machines may converge the
  * same booking, which the run tolerates (a refused remove looks again before it alerts).
