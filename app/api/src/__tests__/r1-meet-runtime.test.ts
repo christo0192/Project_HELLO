@@ -25,6 +25,11 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRecallClient, type RecallTransport } from '../integrations/recall/client.js';
+import { createAshbyClient } from '../integrations/ashby/client.js';
+import { getR1MeetGoogle, resetR1MeetGoogleCache } from '../integrations/google/client.js';
+import type { R1MeetCalendarDeps } from '../lib/r1/meet/calendar-sync.js';
+import { getR1MeetPublicConfig, type R1MeetPublicConfig, type R1MeetPublicDrainConfig } from '../lib/r1/meet/config.js';
+import { calendarWorldGoogleSettings, createR1MeetCalendarWorld } from './support/r1-meet-calendar-world.js';
 import { Queue } from '../lib/queue/index.js';
 import { MemoryAdapter } from '../lib/queue/memory-adapter.js';
 import { notifyR1MeetAttemptEnded } from '../lib/r1/meet/attempt-ended.js';
@@ -37,6 +42,7 @@ import type { R1MeetFlowDeps, R1MeetJobDefinition } from '../lib/r1/meet/recall-
 import {
   R1_MEET_LANE,
   createR1MeetFeedbackPorts,
+  createR1MeetCalendarPorts,
   createR1MeetLane,
   createR1MeetSweepTick,
   withR1MeetStorageTick,
@@ -65,6 +71,15 @@ import {
 vi.mock('../lib/r1/meet/feedback-ashby.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/r1/meet/feedback-ashby.js')>();
   return { ...actual, createR1MeetAshbyFeedbackPort: vi.fn(actual.createR1MeetAshbyFeedbackPort) };
+});
+
+vi.mock('../integrations/google/client.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../integrations/google/client.js')>();
+  return { ...actual, getR1MeetGoogle: vi.fn(actual.getR1MeetGoogle) };
+});
+vi.mock('../integrations/ashby/client.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../integrations/ashby/client.js')>();
+  return { ...actual, createAshbyClient: vi.fn(actual.createAshbyClient) };
 });
 
 const SECOND = 1000;
@@ -799,5 +814,179 @@ describe('M034 S09: the feedback ports of the lane', () => {
     for (const id of [lost.bookingId, lost.assessmentId]) expect(logs).not.toContain(id);
     // No Ashby port was needed to queue it.
     expect(factory).not.toHaveBeenCalled();
+  });
+});
+
+describe('M035 S05: the calendar ports', () => {
+  const googleFactory = vi.mocked(getR1MeetGoogle);
+  const ashbyFactory = vi.mocked(createAshbyClient);
+  const quiet = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+  beforeEach(() => {
+    googleFactory.mockClear();
+    ashbyFactory.mockClear();
+    quiet.info.mockClear();
+    quiet.warn.mockClear();
+    quiet.error.mockClear();
+    resetR1MeetGoogleCache();
+    // Any accidental outbound request fails locally, before it could reach a real vendor.
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('unexpected network'));
+  });
+  afterEach(() => resetR1MeetGoogleCache());
+
+  async function laneCalendar(given?: R1MeetCalendarDeps): Promise<R1MeetCalendarDeps> {
+    const w = world();
+    let seen: R1MeetCalendarDeps | undefined;
+    const probe: R1MeetJobDefinition<{ kind: 'probe' }> = {
+      kind: 'probe',
+      parse: () => ({ kind: 'probe' }),
+      run: async (deps) => { seen = deps.calendar; return r1MeetProcessed('probe'); },
+    };
+    const lane = createR1MeetLane({
+      r1Config: () => R1_ON, meetConfig: () => MEET_ON, client: w.db.client,
+      queue: w.queue, owner: 'calendar-probe', now: () => w.clock.ms,
+      definitions: [probe as R1MeetJobDefinition], log: quiet,
+      ...(given === undefined ? {} : { calendar: given }),
+    })!;
+    await w.queue.enqueue(R1_MEET_QUEUE, { kind: 'probe' });
+    await lane.tick();
+    await settle(lane);
+    await lane.stop();
+    expect(seen).toBeDefined();
+    return seen!;
+  }
+
+  it('the lane honours the calendar seam and otherwise builds lazy production ports', async () => {
+    const w = createR1MeetCalendarWorld();
+    expect(await laneCalendar(w.calendar)).toBe(w.calendar);
+    expect(typeof (await laneCalendar()).store.getBooking).toBe('function');
+    expect(googleFactory).not.toHaveBeenCalled();
+    expect(ashbyFactory).not.toHaveBeenCalled();
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('public off and no drain credentials: null, no factory and no database read', () => {
+    const db = createR1MeetFakeDb();
+    const ports = createR1MeetCalendarPorts(db.client, quiet, {
+      publicConfig: () => ({ status: 'off' }), drainConfig: () => ({ available: false }),
+    });
+    expect(ports.google()).toBeNull();
+    expect(googleFactory).not.toHaveBeenCalled();
+    expect(db.calls).toEqual([]);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('drain credentials are read each call; calendar mode, stable logger, no transport or now', () => {
+    const db = createR1MeetFakeDb();
+    let drain: R1MeetPublicDrainConfig = { available: false };
+    const ports = createR1MeetCalendarPorts(db.client, quiet, {
+      publicConfig: () => ({ status: 'off' }), drainConfig: () => drain,
+    });
+    expect(ports.google()).toBeNull();
+    drain = { available: true, google: calendarWorldGoogleSettings() };
+    expect(ports.google()!.meetMode).toBe('calendar');
+    expect(ports.google()).not.toBeNull();
+    const options = googleFactory.mock.calls[0]![0];
+    expect(Object.keys(options).sort()).toEqual(['logger', 'meetMode', 'settings']);
+    expect(options.settings).toBe(drain.google);
+    expect(googleFactory.mock.calls[1]![0].logger).toBe(options.logger);
+    drain = { available: false };
+    expect(ports.google()).toBeNull();
+    expect(googleFactory).toHaveBeenCalledTimes(2);
+    expect(db.calls).toEqual([]);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it.each(['calendar', 'space'] as const)('public on uses its Google settings and %s mode before drain config', (meetMode) => {
+    const google = calendarWorldGoogleSettings();
+    if (google.authMode !== 'oauth_refresh') throw new Error('fixture mode');
+    const source = {
+      R1_MEET_PUBLIC_BOOKING_ENABLED: 'true', R1_MEET_ENABLED: 'true',
+      R1_MEET_GOOGLE_MEET_MODE: meetMode,
+      RECALL_API_KEY: FAKE_RECALL_API_KEY,
+      RECALL_WEBHOOK_SECRET: ['whsec', Buffer.alloc(32, 1).toString('base64')].join('_'),
+      R1_MEET_ASHBY_DEX_USER_ID: DEX_ID, R1_MEET_SERVICE_USER_ID: STAFF_USER_ID,
+      R1_MEET_GOOGLE_DEX_EMAIL: google.dexEmail, R1_MEET_GOOGLE_OAUTH_CLIENT_ID: google.clientId,
+      R1_MEET_GOOGLE_OAUTH_CLIENT_SECRET: google.clientSecret,
+      R1_MEET_GOOGLE_OAUTH_REFRESH_TOKEN: google.refreshToken, WEB_ORIGIN: WEB_ORIGIN_FIXTURE,
+    };
+    const config = getR1MeetPublicConfig(source);
+    expect(config.status).toBe('on');
+    if (config.status !== 'on') throw new Error('fixture config');
+    let current: R1MeetPublicConfig = config;
+    const drain = vi.fn(() => ({ available: false as const }));
+    const ports = createR1MeetCalendarPorts(createR1MeetFakeDb().client, quiet, {
+      publicConfig: () => current, drainConfig: drain,
+    });
+    expect(ports.publicConfig()).toBe(config);
+    expect(ports.google()!.meetMode).toBe(meetMode);
+    expect(googleFactory.mock.calls[0]![0].settings).toBe(config.google);
+    expect(drain).not.toHaveBeenCalled();
+    current = { status: 'off' };
+    expect(ports.google()).toBeNull();
+    expect(drain).toHaveBeenCalledOnce();
+  });
+
+  it('a throwing Google factory returns null and is retried on the next call', () => {
+    const ports = createR1MeetCalendarPorts(createR1MeetFakeDb().client, quiet, {
+      publicConfig: () => ({ status: 'off' }),
+      drainConfig: () => ({ available: true, google: calendarWorldGoogleSettings() }),
+    });
+    googleFactory.mockImplementationOnce(() => { throw new Error('refused'); });
+    expect(ports.google()).toBeNull();
+    expect(ports.google()).not.toBeNull();
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('Ashby null is not cached; a usable read client is built once with one attempt and five seconds', () => {
+    vi.stubEnv('ASHBY_API_KEY', '');
+    const db = createR1MeetFakeDb();
+    const ports = createR1MeetCalendarPorts(db.client, quiet);
+    expect(ports.ashby()).toBeNull();
+    expect(ashbyFactory).not.toHaveBeenCalled();
+    vi.stubEnv('ASHBY_API_KEY', 'k'.repeat(24));
+    const port = ports.ashby();
+    expect(port).not.toBeNull();
+    expect(ports.ashby()).toBe(port);
+    expect(ashbyFactory).toHaveBeenCalledOnce();
+    expect(ashbyFactory.mock.calls[0]![0]).toMatchObject({ maxAttempts: 1, timeoutMs: 5000 });
+    expect(db.calls).toEqual([]);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('an Ashby client refusal returns null without remembering it', () => {
+    vi.stubEnv('ASHBY_API_KEY', 'k'.repeat(24));
+    const ports = createR1MeetCalendarPorts(createR1MeetFakeDb().client, quiet);
+    ashbyFactory.mockImplementationOnce(() => { throw new Error('refused'); });
+    expect(ports.ashby()).toBeNull();
+    expect(ports.ashby()).not.toBeNull();
+    expect(ashbyFactory).toHaveBeenCalledTimes(2);
+  });
+
+  it('the Google logger emits closed operation/code words and status only', () => {
+    const ports = createR1MeetCalendarPorts(createR1MeetFakeDb().client, quiet, {
+      publicConfig: () => ({ status: 'off' }),
+      drainConfig: () => ({ available: true, google: calendarWorldGoogleSettings() }),
+    });
+    ports.google();
+    const logger = googleFactory.mock.calls[0]![0].logger!;
+    logger.event({ operation: 'calendar.delete', outcome: 'success', httpStatus: 204, durationMs: 1 });
+    logger.event({ operation: 'calendar.delete', outcome: 'failure', code: 'unavailable', httpStatus: 503, durationMs: 1 });
+    expect(quiet.info).toHaveBeenCalledWith({ error_category: 'r1_meet_google_ok', error_type: 'calendar.delete', http_status: 204 });
+    expect(quiet.warn).toHaveBeenCalledWith({ error_category: 'r1_meet_google_failed', error_type: 'calendar.delete:unavailable', http_status: 503 });
+  });
+
+  it('the sweep tick hands its calendar seam to the flag-off drain', async () => {
+    const w = createR1MeetCalendarWorld();
+    const b = await w.seed();
+    w.h.advance(6 * MINUTE);
+    const tick = createR1MeetSweepTick({
+      lane: null, meetConfig: () => MEET_OFF, drainConfig: () => KEY, client: w.h.db.client,
+      now: w.h.now, recall: w.deps.recall, log: w.deps.log, calendar: w.calendar,
+    });
+    expect(await tick()).toBe(true);
+    expect(w.h.db.booking(b.bookingId)!.calendar_state).toBe('cancelled');
+    expect(w.writes()).toHaveLength(1);
+    expect(googleFactory).not.toHaveBeenCalled();
+    expect(ashbyFactory).not.toHaveBeenCalled();
   });
 });

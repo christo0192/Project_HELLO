@@ -793,6 +793,16 @@ closed words only: `ensure_bot`, `calendar_sync` (`invite`, `move`, `cancel`, `p
 `ashby_booked_tag` (`add`, `remove`) and `bot_release`. No payload carries the Meet URL, a
 digest, a request id, an IP prefix, a user agent, a name, an email or a phone number.
 
+**Calendar delivery (M035 S05).** Lexy's event receives the on-file email as its only attendee
+(fresh Ashby primary email, otherwise the local candidate email), never a typed form value. Its
+description contains joining instructions, the AI and recording disclosure, and a personal manage
+link. The raw manage token is Secret: it exists transiently in memory and is sent only to Google
+as processor and to the candidate's mailbox in the invite; our database stores only its HMAC
+digest, never the raw token. A changed invite rotates that digest before sending. The event is
+purged after the configured calendar retention period (30 days by default); deletion after a
+subject-erasure cascade uses the booking-derived event id and no candidate data. Purging the
+Google event does not erase copies already delivered to a mailbox.
+
 ## Classification summary
 
 | Level | Count | Examples |
