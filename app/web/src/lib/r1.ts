@@ -28,9 +28,10 @@
  *    offered a reissue (the database refuses one) and its words never talk of
  *    a link of its own (naming the public booking link, where it is booked, is
  *    fine).
- *    Only exactly `'meet'` counts: a round without `channel` (every staff read
- *    today), null, `'browser'` or a value this page does not know reads as a
- *    browser round, unchanged.
+ *    Only exactly `'meet'` counts: a round without `channel` (an older API;
+ *    the staff round and queue reads always send `'meet'` or `'browser'`),
+ *    null, `'browser'` or a value this page does not know reads as a browser
+ *    round, unchanged.
  */
 import type {
   R1AvailabilityState,

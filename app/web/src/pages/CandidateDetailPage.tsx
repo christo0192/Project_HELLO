@@ -1113,6 +1113,15 @@ function PhoneCycleCard({
       setSlotDialogOpen(false);
       load();
     } catch (e) {
+      if (e instanceof ApiError && e.message === "not_phone_screened") {
+        // The same permanent refusal as the phone request: no slot can ever
+        // be booked for a public R1 booking import, so the grid is no use.
+        // Close it, or the words land behind the modal; nothing to re-read.
+        setSelectedSlot(null);
+        setSlotDialogOpen(false);
+        setMessage(phoneErrorMessage(e));
+        return;
+      }
       setMessage(e instanceof ApiError
         ? duplicateHoldErrorMessage(e.message) ?? e.message
         : "The appointment could not be saved.");

@@ -1138,6 +1138,38 @@ describe('CandidateDetailPage', () => {
     expect(mockApi.requestCandidatePhoneCall).toHaveBeenCalledTimes(1);
   });
 
+  it('a slot booking answered not_phone_screened closes the grid and says why in the same words', async () => {
+    const { ApiError } = await import('../api');
+    mockApi.getPhoneSlots.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      date: '2026-08-28',
+      window: { time_zone: 'Asia/Kolkata', open_ist: '09:00:00', close_ist: '21:00:00', temporary_247_until_ist: null },
+      slot_seconds: 1800,
+      max_concurrent: 10,
+      booked_total: 0,
+      occupancy_truncated: false,
+      slots: [{
+        starts_at: '2026-08-28T04:00:00.000Z', ends_at: '2026-08-28T04:30:00.000Z',
+        ist_start: '09:30', ist_end: '10:00', booked: 0, remaining: 10, bookable: true, refusals: [],
+      }],
+    });
+    mockApi.scheduleCandidatePhoneAppointment.mockRejectedValueOnce(new ApiError('not_phone_screened', 409));
+    renderDetailPage("candidate-1", "?tab=overview");
+    await screen.findByText('Jane Doe');
+    await userEvent.click(await screen.findByRole('button', { name: 'Book a slot' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Book a slot' });
+    await userEvent.click(await within(dialog).findByRole('radio'));
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Book slot' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Book a slot' })).not.toBeInTheDocument());
+    const status = await screen.findByRole('status');
+    expect(status).toHaveTextContent(
+      'This candidate came in through the public R1 booking link and is not phone-screened, so no phone call was booked or requested.',
+    );
+    expect(status).not.toHaveTextContent('not_phone_screened');
+    expect(mockApi.scheduleCandidatePhoneAppointment).toHaveBeenCalledTimes(1);
+  });
+
   it('C3: no re-screen recommendation for a decision-graded (or ungraded) scorecard', async () => {
     mockApi.getCandidatePhoneScreenings.mockResolvedValue({
       ok: true, enabled: true, current_cycle: 1,

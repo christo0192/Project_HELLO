@@ -8,7 +8,10 @@
  *  - The address is this page's own origin plus `/book` (`meetPublicBookingUrl`), the same page for every
  *    candidate. It never names a manage link, a token or a Meet link.
  *  - The outcome of a copy is announced politely, in a line mounted for the life of the card, and stays
- *    until the next press (no timer clears it).
+ *    until the next press (no timer clears it). Every press puts a new text node in that line, so a
+ *    second copy in a row is announced too (the same words in the same node would change nothing).
+ *  - The hint states the condition (bookings only while public booking is switched on), never a state:
+ *    the card cannot read the flag, so the words hold before and after go-live alike.
  *  - When the clipboard is refused, or there is none, the field takes the focus with the address
  *    selected, so it can be copied by hand.
  *
@@ -30,16 +33,17 @@ const COPY_WORDS: Readonly<Record<CopyState, string>> = {
 export function MeetBookingsPublicLink() {
   const headingId = `meet-public-link-${useId().replace(/:/g, '')}-heading`;
   const boxRef = useRef<HTMLElement>(null);
-  const [copy, setCopy] = useState<CopyState>('idle');
+  // `press` counts presses: the key of the announced words, so each outcome is a new node.
+  const [copy, setCopy] = useState<{ state: CopyState; press: number }>({ state: 'idle', press: 0 });
   const url = meetPublicBookingUrl(window.location.origin);
 
   async function copyLink() {
     try {
       // A browser with no clipboard API throws here too, and gets the same way out.
       await navigator.clipboard.writeText(url);
-      setCopy('copied');
+      setCopy(({ press }) => ({ state: 'copied', press: press + 1 }));
     } catch {
-      setCopy('refused');
+      setCopy(({ press }) => ({ state: 'refused', press: press + 1 }));
       // TextField takes no ref, so the field is found in the card.
       const input = boxRef.current?.querySelector('input');
       input?.focus();
@@ -56,7 +60,7 @@ export function MeetBookingsPublicLink() {
         <Field
           id="meet-bookings-public-link"
           label="Link for candidates"
-          hint="Paste it into the Ashby email template. Candidates can book only once public booking is switched on."
+          hint="Paste it into the Ashby email template. Candidates can book on it only while public booking is switched on."
           className="min-w-0 flex-1 basis-64"
         >
           {({ id, describedBy }) => (
@@ -80,9 +84,9 @@ export function MeetBookingsPublicLink() {
           Copy link
         </Button>
       </div>
-      {/* Mounted for the life of the card, so the announcement is reliable. */}
+      {/* Mounted for the life of the card, so the announcement is reliable; a new node per press. */}
       <p aria-live="polite" className="mt-2 min-h-5 text-sm text-ink-secondary">
-        {COPY_WORDS[copy]}
+        {copy.state !== 'idle' && <span key={copy.press}>{COPY_WORDS[copy.state]}</span>}
       </p>
     </section>
   );

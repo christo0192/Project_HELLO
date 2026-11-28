@@ -8,7 +8,8 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { MeetBookingsPublicLink } from '../MeetBookingsPublicLink';
 
-const HINT = 'Paste it into the Ashby email template. Candidates can book only once public booking is switched on.';
+// A condition, never a state: true before and after go-live (the card cannot read the flag).
+const HINT = 'Paste it into the Ashby email template. Candidates can book on it only while public booking is switched on.';
 const COPIED = 'Link copied to the clipboard.';
 const REFUSED = 'Copy failed. The link is selected; press Ctrl+C (or Cmd+C) to copy it.';
 const url = () => `${window.location.origin}/book`;
@@ -108,6 +109,22 @@ describe('the public booking link card', () => {
     expect(writeText).toHaveBeenCalledTimes(2);
     expect(live()).toHaveTextContent(COPIED);
     expect(live()).not.toHaveTextContent('Copy failed');
+  });
+
+  it('announces a second copy in a row too: each press puts new words in the live line', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(navigator.clipboard, 'writeText');
+    const { live } = show();
+    await user.click(copyButton());
+    const first = live().firstElementChild;
+    expect(first).toHaveTextContent(COPIED);
+    await user.click(copyButton());
+    const second = live().firstElementChild;
+    expect(second).toHaveTextContent(COPIED);
+    // The same words in the same node would be no change for a screen reader to announce.
+    expect(second).not.toBe(first);
+    expect(first).not.toBeInTheDocument();
+    expect(live().children).toHaveLength(1);
   });
 
   it('selects the whole address when the field takes the focus', () => {

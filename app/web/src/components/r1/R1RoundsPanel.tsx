@@ -27,7 +27,12 @@
  * and has no candidate link: no Reissue, "Open until" for its expiry, and its
  * cancel and retake words cover both ways it can be booked (by the candidate on
  * the public booking link, or by HR in Ashby). The panel cannot tell which: the
- * round reads carry no source, so the same words must be true for either.
+ * round reads carry no source, so the same words must be true for either. Nor
+ * can it tell whether public booking is switched on (a flag of its own on top of
+ * Meet, read by no staff page), so every word about booking on the public link
+ * says "if public booking is switched on". Cancelling an unstarted Meet round
+ * with no counted attempt says the candidate can still book a new interview
+ * there: such a round is not an R1, so the public link takes them again.
  * A round without `channel: 'meet'` reads exactly as before.
  *
  * Recordings: one chip per attempt that has anything to say (a recording in any
@@ -72,6 +77,25 @@ interface Pending {
   action: RoundAction;
 }
 
+/**
+ * Public booking is a flag of its own on top of Meet, and no staff read carries it: every word about
+ * booking on the public link holds whether it is on or off.
+ */
+const IF_PUBLIC_ON = 'if public booking is switched on';
+
+/**
+ * Cancelling a Meet round nobody has started, with no counted attempt, does not end the candidate's R1:
+ * such a round is not an R1 (contracts §9, S01-R1), so the public link books them again while their
+ * Ashby application is active. Said only then: a counted attempt (a cancelled retake) ends the public
+ * path, and a round in progress may count one before the cancel lands.
+ */
+function rebookNote(round: R1Round): string {
+  return round.status === 'invited' && round.attempts_counted === 0
+    ? ` The candidate can still book a new interview on the public booking link ${IF_PUBLIC_ON} and their ` +
+        'Ashby application is active.'
+    : '';
+}
+
 const CONFIRM_COPY: Record<
   RoundAction,
   { title: string; body: (round: R1Round) => ReactNode; confirm: string; keep: string }
@@ -90,7 +114,7 @@ const CONFIRM_COPY: Record<
       isMeetRound(round)
         ? `Its reserved minutes are released. ${runningCallNote(round)}If the candidate booked it on the ` +
           'public booking link, it comes off Lexy’s calendar unless the slot has started. If it was ' +
-          'scheduled in Ashby, it stays there until it is cancelled there.'
+          `scheduled in Ashby, it stays there until it is cancelled there.${rebookNote(round)}`
         : `The link stops working and its reserved minutes are released. ${runningCallNote(round)}` +
           'A new round can be sent afterwards.',
     confirm: 'Cancel round',
@@ -100,8 +124,8 @@ const CONFIRM_COPY: Record<
     title: 'Grant the one retake?',
     body: (round) =>
       isMeetRound(round)
-        ? `The round opens again for ${R1_LINK_VALID_HOURS} hours. Before then, the candidate can book ` +
-          'the retake on the public booking link, or you can schedule it in Ashby with Lexy.'
+        ? `The round opens again for ${R1_LINK_VALID_HOURS} hours. Before then, you can schedule the ` +
+          `retake in Ashby with Lexy, or the candidate can book it on the public booking link ${IF_PUBLIC_ON}.`
         : 'The candidate can use their original link again for ' +
           `${R1_LINK_VALID_HOURS} hours. A retake can be granted once.`,
     confirm: 'Grant retake',
@@ -210,8 +234,8 @@ export function R1RoundsPanel({
         await api.grantR1Retake(round.id);
         onMessage(
           isMeetRound(round)
-            ? `Retake granted. Within ${R1_LINK_VALID_HOURS} hours, the candidate can book it on the ` +
-                'public booking link, or you can schedule it in Ashby with Lexy.'
+            ? `Retake granted. Within ${R1_LINK_VALID_HOURS} hours, you can schedule it in Ashby with ` +
+                `Lexy, or the candidate can book it on the public booking link ${IF_PUBLIC_ON}.`
             : 'Retake granted. The candidate’s original link works again for ' +
                 `${R1_LINK_VALID_HOURS} hours; reissue a link if you no longer have it.`,
         );

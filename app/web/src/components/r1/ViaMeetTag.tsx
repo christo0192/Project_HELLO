@@ -13,7 +13,7 @@ import { Tag } from '../design/candidate';
 import { isMeetRound } from '../../lib/r1';
 
 export interface ViaMeetTagProps {
-  /** The round's `channel`, as the API sent it (absent from every staff read today). */
+  /** The round's `channel`, as the API sent it (absent only from an older API). */
   channel?: string | null;
   className?: string;
 }
