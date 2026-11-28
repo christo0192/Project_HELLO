@@ -1,10 +1,12 @@
 /**
  * M034 S06 T1: the `r1-meet` job contract (lib/r1/meet/jobs.ts). M034 S09 T1 adds the twelfth kind,
- * `scorecard_feedback`.
+ * `scorecard_feedback`; M035 S11 T1 the thirteenth, `ashby_booked_tag`.
  *
  * Pinned here:
- *  - the queue name, the twelve kinds, the attempts and the dedup keys, with the ones migration 0142
+ *  - the queue name, the thirteen kinds, the attempts and the dedup keys, with the ones migration 0142
  *    hard-codes read from the SQL;
+ *  - every `ashby_booked_tag` producer in ANY migration (S01's 0143, on main since #450, so at least
+ *    its `add` and `remove` producers must exist) (D-S11-14);
  *  - the payloads the S03 receivers write, spelled out literally in S03's key order (S03 is not in this
  *    branch, so nothing of it is imported), plus `receipt_id` and `source` as `r1_meet_record_receipt`
  *    adds them;
@@ -15,7 +17,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { R1_MEET_ASHBY_MAX_EVENTS, R1_MEET_DEX_EVENT_DECISIONS } from '../lib/r1/meet/ashby-schedule.js';
@@ -23,6 +25,7 @@ import { R1_MEET_BOOKING_REASONS } from '../lib/r1/meet/bookings-read.js';
 import { R1_MEET_REALTIME_EVENTS } from '../lib/r1/meet/recall-bot.js';
 import {
   R1MeetJobError,
+  R1_MEET_ASHBY_TAG_OPS,
   R1_MEET_DB_ERROR,
   R1_MEET_DEFER_MAX_COUNT,
   R1_MEET_DEFER_MAX_MS,
@@ -41,6 +44,7 @@ import {
   R1_MEET_SCHEDULE_SCOPE_DECISIONS,
   R1_MEET_UNKNOWN_KIND,
   canDeferR1MeetJob,
+  parseAshbyBookedTagJob,
   parseAshbyScheduleJob,
   parseDrainJob,
   parseRecallEventJob,
@@ -53,6 +57,7 @@ import {
   r1MeetPayloadKind,
   r1MeetProcessed,
   r1MeetReceiptId,
+  type R1MeetAshbyTagOp,
   type R1MeetJobKind,
 } from '../lib/r1/meet/jobs.js';
 import { isValidDeferReason } from '../lib/queue/types.js';
@@ -211,7 +216,7 @@ const sql = readFileSync(path.resolve(here, '../../../supabase/migrations/0142_r
   .replace(/\s+/g, ' ');
 
 describe('the r1-meet queue contract', () => {
-  it('has one queue, twelve kinds and one parser per kind', () => {
+  it('has one queue, thirteen kinds and one parser per kind', () => {
     expect(R1_MEET_QUEUE).toBe('r1-meet');
     expect([...R1_MEET_JOB_KINDS]).toEqual([
       'ashby_schedule',
@@ -226,6 +231,7 @@ describe('the r1-meet queue contract', () => {
       'maintenance',
       'drain',
       'scorecard_feedback',
+      'ashby_booked_tag',
     ]);
     expect(Object.keys(R1_MEET_JOB_PARSERS)).toEqual([...R1_MEET_JOB_KINDS]);
     expect(Object.keys(R1_MEET_JOB_MAX_ATTEMPTS)).toEqual([...R1_MEET_JOB_KINDS]);
@@ -250,6 +256,7 @@ describe('the r1-meet queue contract', () => {
       maintenance: 3,
       drain: 10,
       scorecard_feedback: 5,
+      ashby_booked_tag: 10,
     });
     expect(sql).toContain(
       "values ('r1-meet', jsonb_build_object('kind', 'bot_release', 'recall_bot_id', old.recall_bot_id, 'booking_id', old.id), "
@@ -653,6 +660,12 @@ const SIMPLE: Array<{ kind: R1MeetJobKind; payload: Payload; parsed: Payload; ba
     parsed: { kind: 'scorecard_feedback', bookingId: BOOKING, assessmentId: ASSESSMENT },
     bad: { booking_id: NOT_UUIDS, assessment_id: NOT_UUIDS },
   },
+  {
+    kind: 'ashby_booked_tag',
+    payload: { kind: 'ashby_booked_tag', op: 'add', booking_id: BOOKING },
+    parsed: { kind: 'ashby_booked_tag', op: 'add', bookingId: BOOKING },
+    bad: { op: [null, 'Add', 'ADD', 'delete', 'remove ', '', 1, true], booking_id: NOT_UUIDS },
+  },
 ];
 
 describe('the kinds of the triggers, S06 and the operator', () => {
@@ -778,6 +791,8 @@ describe('dedup keys and the jobs S06 writes', () => {
         { bookingId: BOOKING, assessmentId: ASSESSMENT },
         `r1-meet:scorecard-feedback:${BOOKING}:${ASSESSMENT}`,
       ],
+      [r1MeetJobs.ashbyBookedTag('add', BOOKING), { op: 'add', bookingId: BOOKING }, `r1-meet:ashby-tag:${BOOKING}:add`],
+      [r1MeetJobs.ashbyBookedTag('remove', BOOKING), { op: 'remove', bookingId: BOOKING }, `r1-meet:ashby-tag:${BOOKING}:remove`],
     ] as const;
     for (const [spec, parsed, key] of specs) {
       const kind = spec.payload.kind;
@@ -788,6 +803,18 @@ describe('dedup keys and the jobs S06 writes', () => {
       // Ids, counters and closed words only: no URL, no address, no free text.
       for (const value of Object.values(spec.payload)) expect(String(value), kind).toMatch(/^[a-z0-9_-]+$/);
     }
+    // M035 S11: an upper-case id still parses to the lower-cased job and key; the payload keys are in
+    // the order of 0143's jsonb_build_object.
+    const tag = r1MeetJobs.ashbyBookedTag('remove', BOOKING.toUpperCase());
+    expect(Object.keys(tag.payload)).toEqual(['kind', 'op', 'booking_id']);
+    expect(parseAshbyBookedTagJob(JSON.parse(JSON.stringify(tag.payload)))).toStrictEqual({
+      kind: 'ashby_booked_tag',
+      op: 'remove',
+      bookingId: BOOKING,
+    });
+    expect(tag.dedupKey).toBe(`r1-meet:ashby-tag:${BOOKING}:remove`);
+    expect(tag.maxAttempts).toBe(R1_MEET_JOB_MAX_ATTEMPTS.ashby_booked_tag);
+    expect(Object.keys(r1MeetJobs.ashbyBookedTag('add', BOOKING).payload)).toEqual(['kind', 'op', 'booking_id']);
   });
 });
 
@@ -862,6 +889,153 @@ describe('scorecard_feedback (M034 S09)', () => {
     // One key per (booking, assessment): a new assessment of the same booking is a new job.
     expect(r1MeetDedupKeys.scorecardFeedback(BOOKING, SESSION)).not.toBe(key);
     expect(r1MeetDedupKeys.scorecardFeedback(ROUND, ASSESSMENT)).not.toBe(key);
+  });
+});
+
+describe('ashby_booked_tag (M035 S11)', () => {
+  /** What 0143's create RPC (`add`) and terminal trigger (`remove`) insert: ids and a closed op. */
+  const tagJob = (over: Payload = {}): Payload => ({ kind: 'ashby_booked_tag', op: 'add', booking_id: BOOKING, ...over });
+
+  it('parses both ops, ids lower-cased, frozen, through the registered parser', () => {
+    expect([...R1_MEET_ASHBY_TAG_OPS]).toEqual(['add', 'remove']);
+    expect(Object.isFrozen(R1_MEET_ASHBY_TAG_OPS)).toBe(true);
+    for (const op of R1_MEET_ASHBY_TAG_OPS) {
+      const job = parseAshbyBookedTagJob(tagJob({ op, booking_id: BOOKING.toUpperCase() }));
+      expect(job, op).toStrictEqual({ kind: 'ashby_booked_tag', op, bookingId: BOOKING });
+      expect(Object.isFrozen(job), op).toBe(true);
+      expect(Object.keys(job!), op).toEqual(['kind', 'op', 'bookingId']);
+    }
+    expect(R1_MEET_JOB_PARSERS.ashby_booked_tag).toBe(parseAshbyBookedTagJob);
+    expect(R1_MEET_JOB_MAX_ATTEMPTS.ashby_booked_tag).toBe(10);
+  });
+
+  it('is not a job of any other kind, and no other kind is one of it', () => {
+    for (const kind of ['ashby-booked-tag', 'Ashby_booked_tag', 'ashby_booked_tag ', 'ashby_tag', null]) {
+      expect(parseAshbyBookedTagJob(tagJob({ kind })), String(kind)).toBeNull();
+    }
+    for (const other of R1_MEET_JOB_KINDS) {
+      if (other === 'ashby_booked_tag') continue;
+      expect(parseAshbyBookedTagJob(tagJob({ kind: other })), other).toBeNull();
+      expect(parseAshbyBookedTagJob(VALID_BY_KIND[other]), `${other} payload`).toBeNull();
+      const parseOther = R1_MEET_JOB_PARSERS[other] as (payload: unknown) => unknown;
+      expect(parseOther(tagJob()), other).toBeNull();
+      expect(parseOther(tagJob({ op: 'remove' })), other).toBeNull();
+    }
+  });
+
+  it('keeps its dedup key apart from every other key family: one per booking and op', () => {
+    /** `r1-meet:<family>:` of a key. */
+    const family = (key: string): string => key.slice(0, key.indexOf(':', 'r1-meet:'.length) + 1);
+    const others = [
+      r1MeetDedupKeys.botRelease(BOOKING),
+      r1MeetDedupKeys.roundCancelled(BOOKING),
+      r1MeetDedupKeys.rerun(BOOKING, 1),
+      r1MeetDedupKeys.ensureBot(BOOKING),
+      r1MeetDedupKeys.attemptEnded(BOOKING),
+      r1MeetDedupKeys.bridgeCheck(BOOKING, 1, 1),
+      r1MeetDedupKeys.multiHuman(BOOKING, 1),
+      r1MeetDedupKeys.maintenance(1),
+      r1MeetDedupKeys.scorecardFeedback(BOOKING, ASSESSMENT),
+      `r1-meet:receipt:${RECEIPT}`,
+    ];
+    for (const op of R1_MEET_ASHBY_TAG_OPS) {
+      const key = r1MeetDedupKeys.ashbyBookedTag(BOOKING.toUpperCase(), op);
+      expect(key, op).toBe(`r1-meet:ashby-tag:${BOOKING}:${op}`);
+      expect(key, op).toMatch(/^r1-meet:ashby-tag:[0-9a-f-]{36}:(add|remove)$/);
+      expect(key, op).toHaveLength('r1-meet:ashby-tag:'.length + 36 + 1 + op.length);
+      expect(family(key), op).toBe('r1-meet:ashby-tag:');
+      for (const other of others) {
+        expect(key.startsWith(family(other)), other).toBe(false);
+        expect(other.startsWith(family(key)), other).toBe(false);
+      }
+    }
+    expect(r1MeetDedupKeys.ashbyBookedTag(BOOKING, 'add')).not.toBe(r1MeetDedupKeys.ashbyBookedTag(BOOKING, 'remove'));
+    expect(r1MeetDedupKeys.ashbyBookedTag(ROUND, 'add')).not.toBe(r1MeetDedupKeys.ashbyBookedTag(BOOKING, 'add'));
+  });
+});
+
+/**
+ * THE 0143 PIN (D-S11-14), gate-free. Every `jsonb_build_object('kind', 'ashby_booked_tag'` in ANY
+ * migration must be a well-formed producer: queue `r1-meet`, keys `kind, op, booking_id` in that order,
+ * op `add` or `remove`, the dedup key built from the SAME row id and the SAME op, and the attempts of
+ * the kind. Both ops appear. (Before S01's 0143 reached main, #450, a dark branch accepted no producer
+ * as long as no migration named the kind; with 0143 on main the pin requires the producers.)
+ */
+describe('the ashby_booked_tag producers of the migrations (M035 S11)', () => {
+  const migrationsDir = path.resolve(here, '../../../supabase/migrations');
+  /** As `sql` above: whole-line comments stripped, whitespace collapsed. */
+  const collapse = (text: string): string =>
+    text.replace(/\r\n/g, '\n').replace(/^\s*--.*$/gm, '').replace(/\s+/g, ' ');
+
+  const OCCURRENCE = /jsonb_build_object\(\s*'kind'\s*,\s*'ashby_booked_tag'/g;
+  const PRODUCER =
+    /\(\s*'r1-meet'\s*,\s*jsonb_build_object\(\s*'kind'\s*,\s*'ashby_booked_tag'\s*,\s*'op'\s*,\s*'(add|remove)'\s*,\s*'booking_id'\s*,\s*([a-z_]+)\.id\s*\)\s*,\s*'r1-meet:ashby-tag:'\s*\|\|\s*\2\.id::text\s*\|\|\s*':\1'\s*,\s*(\d+)\s*\)/g;
+  /** The literal halves of the SQL key, around the row id. */
+  const KEY_TEXT = /'(r1-meet:ashby-tag:)'\s*\|\|\s*[a-z_]+\.id::text\s*\|\|\s*'(:(?:add|remove))'/;
+
+  interface Producer {
+    readonly op: R1MeetAshbyTagOp;
+    /** The dedup key the SQL builds for the id BOOKING. */
+    readonly key: string;
+  }
+
+  function producersOf(text: string): { readonly occurrences: number; readonly wellFormed: readonly Producer[] } {
+    const occurrences = (text.match(OCCURRENCE) ?? []).length;
+    const wellFormed: Producer[] = [];
+    for (const match of text.matchAll(PRODUCER)) {
+      if (Number(match[3]) !== R1_MEET_JOB_MAX_ATTEMPTS.ashby_booked_tag) continue;
+      const halves = KEY_TEXT.exec(match[0]);
+      if (halves === null) continue;
+      wellFormed.push({ op: match[1] as R1MeetAshbyTagOp, key: `${halves[1]}${BOOKING}${halves[2]}` });
+    }
+    return { occurrences, wellFormed };
+  }
+
+  it('takes the S01 inserts and refuses a wrong op in the key, a wrong row and wrong attempts (control)', () => {
+    const good =
+      "values ('r1-meet', jsonb_build_object('kind', 'ashby_booked_tag', 'op', 'add', 'booking_id', v_booking.id), "
+      + "'r1-meet:ashby-tag:' || v_booking.id::text || ':add', 10) on conflict do nothing";
+    const goodTrigger = collapse(
+      "values ('r1-meet',\n          jsonb_build_object('kind', 'ashby_booked_tag', 'op', 'remove', 'booking_id', new.id),\n"
+      + "          'r1-meet:ashby-tag:' || new.id::text || ':remove', 10)\n  on conflict do nothing;",
+    );
+    const bad = [
+      // The key says remove for an add job.
+      good.replace("|| ':add'", "|| ':remove'"),
+      // The payload names one row, the key another.
+      "values ('r1-meet', jsonb_build_object('kind', 'ashby_booked_tag', 'op', 'remove', 'booking_id', old.id), "
+      + "'r1-meet:ashby-tag:' || new.id::text || ':remove', 10) on conflict do nothing",
+      // Attempts that are not the kind's.
+      good.replace("':add', 10)", "':add', 5)"),
+    ];
+    for (const text of bad) expect(text).not.toBe(good);
+    expect(producersOf(good)).toEqual({
+      occurrences: 1,
+      wellFormed: [{ op: 'add', key: r1MeetDedupKeys.ashbyBookedTag(BOOKING, 'add') }],
+    });
+    expect(producersOf(goodTrigger)).toEqual({
+      occurrences: 1,
+      wellFormed: [{ op: 'remove', key: r1MeetDedupKeys.ashbyBookedTag(BOOKING, 'remove') }],
+    });
+    for (const text of bad) expect(producersOf(text), text).toEqual({ occurrences: 1, wellFormed: [] });
+  });
+
+  it('every producer in every migration is well formed, and 0143 holds both the add and the remove', () => {
+    const migrations = readdirSync(migrationsDir)
+      .filter((name) => name.endsWith('.sql'))
+      .sort()
+      .map((name) => ({ name, text: collapse(readFileSync(path.join(migrationsDir, name), 'utf8')) }));
+    expect(migrations.map((migration) => migration.name)).toContain('0142_r1_meet_bookings.sql');
+    expect(migrations.map((migration) => migration.name)).toContain('0143_r1_meet_public_bookings.sql');
+    const producers: Producer[] = [];
+    for (const { name, text } of migrations) {
+      const { occurrences, wellFormed } = producersOf(text);
+      expect(wellFormed.length, `${name}: every ashby_booked_tag producer is well formed`).toBe(occurrences);
+      producers.push(...wellFormed);
+    }
+    // 0143's create RPC queues the `add`, its terminal trigger the `remove` (contracts 4.1, 3.1).
+    expect([...new Set(producers.map((producer) => producer.op))].sort()).toEqual(['add', 'remove']);
+    for (const { op, key } of producers) expect(key, op).toBe(r1MeetDedupKeys.ashbyBookedTag(BOOKING, op));
   });
 });
 

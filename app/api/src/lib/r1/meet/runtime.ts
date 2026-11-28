@@ -22,12 +22,20 @@
  *                          the dedup key holds it across machines until it runs. `R1_MEET_ENABLED`
  *                          deliberately off (status exactly `disabled`) with a usable Recall key: one
  *                          bounded drain pass (`drain.ts`: 10 bookings, 40 s, untouched for 5 minutes),
- *                          once per bucket unless rows remain. Anything else (never configured, a
+ *                          once per bucket unless rows remain, then one bounded pass of the booked
+ *                          tag's Meet-off catch-up (below). Anything else (never configured, a
  *                          malformed flag): nothing at all, not even a read. It never throws.
  *
  * WHAT "DARK" MEANS HERE (D-S06-32): never enabled and no key = zero queries and zero calls, ever. A key
  * with the flag off = at most two narrow booking reads per bucket, and no outbound call unless a booking
- * still holds a bot (then only GET, DELETE and leave_call). Nothing is created, armed or queued while off.
+ * still holds a bot (then only GET, DELETE and leave_call). The booked tag's catch-up (below) adds, only
+ * while Meet is deliberately off with a usable Recall key AND Ashby's own write switches are on with a
+ * usable Ashby key: at most one page of ended public bookings read per tick while a cycle is in
+ * progress (a new cycle at most once per 15-minute bucket, and at most hourly once a cycle found
+ * nothing to do), plus, per booking it runs, the booked-tag converge's narrow reads; it may call Ashby
+ * `candidate.info` and `candidate.removeTag` (and `application.info` when a link has no Ashby
+ * candidate id) only for public bookings that ended (their slot at most 7 days back). It never adds a
+ * tag, never writes our database and queues nothing. Nothing is created, armed or queued while off.
  *
  * DEX'S SCORECARD TO ASHBY (M034 S09, D-S09-12): the lane's flow ports carry `feedback`, the ports of
  * the `scorecard_feedback` job and of the maintenance re-drive: the form setting
@@ -42,6 +50,20 @@
  * `ashby_key_missing`), and a null is NOT remembered, so a key set later is picked up by the next job.
  * A built port is kept. The Ashby client it holds makes one attempt per call (the queue retries).
  *
+ * THE LEXY R1 BOOKED TAG (M035 S11): the lane's flow ports carry `ashbyTag`, the ports of the
+ * `ashby_booked_tag` job: the booked-tag store over the same client, Ashby's own switches (read per
+ * job, the same two as the scorecard), and the Ashby tag port, built on the first job that needs it
+ * from the existing Ashby runtime config (same `ASHBY_API_KEY`, no new secret): null while no usable
+ * key exists (not remembered), kept once built; its client makes one attempt per call.
+ * THE MEET-OFF CATCH-UP (M035 S11, PR #453 review S11-R2): with no lane, nothing runs the tag jobs
+ * the drain's moves queue, so the Meet-off branch of the sweep tick runs one bounded remove-only pass
+ * of `ashby-booked-tag-meet-off.ts` right after the drain's, under the drain's gate (status exactly
+ * `disabled`, a usable Recall key), once per bucket and again on the next tick while there is more
+ * (the pass itself holds after a wait, and for an hour after a cycle that found nothing to do): the
+ * same tag ports (`createR1MeetAshbyTagPorts`, built on the first pass), so Ashby's switches and key
+ * hold it exactly as they hold the job. It never adds the tag, never writes our database and queues
+ * nothing.
+ *
  * MULTI-MACHINE (D-S06-35): correctness comes from the leases, the RPCs' compare-and-sets and the dedup
  * keys; the hot window and the bucket memory are per process and only shape cadence.
  *
@@ -54,6 +76,15 @@ import { createRecallClient } from '../../../integrations/recall/client.js';
 import type { Queue } from '../../queue/index.js';
 import { createQueueRunner, type QueueRunnerEvent, type QueueRunnerHandle } from '../../queue/runner.js';
 import type { supabase } from '../../supabase.js';
+import type { R1MeetAshbyTagDeps } from './ashby-booked-tag.js';
+import { createR1MeetAshbyTagPort, type R1MeetAshbyTagPort } from './ashby-booked-tag-ashby.js';
+import {
+  R1_MEET_ASHBY_TAG_MEET_OFF_ERROR,
+  R1_MEET_ASHBY_TAG_MEET_OFF_PASS,
+  createR1MeetAshbyTagMeetOffPass,
+  type R1MeetAshbyTagMeetOffReport,
+} from './ashby-booked-tag-meet-off.js';
+import { createR1MeetBookedTagStore } from './ashby-booked-tag-store.js';
 import {
   getR1MeetFeedbackConfig,
   r1MeetActive,
@@ -123,6 +154,11 @@ export interface R1MeetLaneDeps {
    * enabled Meet config, the feedback form setting and the Ashby runtime config (see the header).
    */
   readonly feedback?: R1MeetFeedbackDeps;
+  /**
+   * Test seam (M035 S11): the ports of the "Lexy R1: Booked" tag job. Production builds them from the
+   * same client and the Ashby runtime config (`createR1MeetAshbyTagPorts`, see the header).
+   */
+  readonly ashbyTag?: R1MeetAshbyTagDeps;
 }
 
 export interface R1MeetLaneTick {
@@ -150,6 +186,19 @@ export interface R1MeetLane {
 }
 
 /**
+ * Ashby's own write switches, read on every call: the integration master switch with a usable webhook
+ * secret AND `ASHBY_RUNTIME_ENABLED`, the switches every other Ashby write honours (see the header). A
+ * switch that cannot be read is off. Shared by Lexy's scorecard and the booked tag.
+ */
+function ashbyWritesActive(): boolean {
+  try {
+    return isAshbyWebhookActive(loadAshbyConfig()) && loadAshbyRuntimeConfig().runtimeEnabled;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The production ports of Dex's scorecard feedback (M034 S09, see the header). Ashby's switches are
  * read per job (a switch that cannot be read is off). The Ashby port is built lazily from
  * `loadAshbyRuntimeConfig()`: null while no usable key is configured (not remembered, so a key set
@@ -164,13 +213,7 @@ export function createR1MeetFeedbackPorts(
   return Object.freeze({
     config: () => getR1MeetFeedbackConfig(),
     store: createR1MeetFeedbackStore(client),
-    ashbyActive: (): boolean => {
-      try {
-        return isAshbyWebhookActive(loadAshbyConfig()) && loadAshbyRuntimeConfig().runtimeEnabled;
-      } catch {
-        return false;
-      }
-    },
+    ashbyActive: ashbyWritesActive,
     ashby: (): R1MeetAshbyFeedbackPort | null => {
       if (port !== null) return port;
       const ashby = loadAshbyRuntimeConfig();
@@ -185,6 +228,33 @@ export function createR1MeetFeedbackPorts(
     },
     dexUserId: meet.ashby.dexUserId,
     bridgePageUrl: meet.bridgePageUrl,
+  });
+}
+
+/**
+ * The production ports of the "Lexy R1: Booked" tag job (M035 S11, see the header): the booked-tag
+ * store over the same client (building it queries nothing), Ashby's own switches read per job, and
+ * the Ashby tag port built lazily from `loadAshbyRuntimeConfig()`: null while no usable key is
+ * configured or the client refuses it (not remembered, so a key set later counts at the next job),
+ * kept once built.
+ */
+export function createR1MeetAshbyTagPorts(client: Db, log: R1MeetLog): R1MeetAshbyTagDeps {
+  let port: R1MeetAshbyTagPort | null = null;
+  return Object.freeze({
+    store: createR1MeetBookedTagStore(client),
+    ashbyActive: ashbyWritesActive,
+    ashby: (): R1MeetAshbyTagPort | null => {
+      if (port !== null) return port;
+      const ashby = loadAshbyRuntimeConfig();
+      if (!ashby.apiKeyConfigured) return null;
+      try {
+        port = createR1MeetAshbyTagPort({ apiKey: ashby.apiKey, log });
+      } catch {
+        // The client refused the key: as unusable as none (the job alerts `ashby_key_missing`).
+        return null;
+      }
+      return port;
+    },
   });
 }
 
@@ -240,6 +310,8 @@ export function createR1MeetLane(deps: R1MeetLaneDeps): R1MeetLane | null {
       },
       // M034 S09: Dex's scorecard to Ashby (the `scorecard_feedback` job and the maintenance re-drive).
       feedback: deps.feedback ?? createR1MeetFeedbackPorts(deps.client, meet, log),
+      // M035 S11: the "Lexy R1: Booked" tag of public bookings (the `ashby_booked_tag` job).
+      ashbyTag: deps.ashbyTag ?? createR1MeetAshbyTagPorts(deps.client, log),
     }));
 
   const dispatcher = createR1MeetDispatcher({
@@ -323,6 +395,11 @@ export interface R1MeetSweepTickDeps {
   /** Test seam: production builds the drain's Recall client from `drainConfig` on first use. */
   readonly recall?: R1MeetRecall;
   readonly log?: R1MeetLog;
+  /**
+   * Test seam (M035 S11): the tag ports of the Meet-off catch-up. Production builds them on the first
+   * pass with `createR1MeetAshbyTagPorts` (see the header).
+   */
+  readonly ashbyTag?: R1MeetAshbyTagDeps;
 }
 
 /** The `r1-sweep` loop's Meet half (see the header): maintenance while active, the drain while off. */
@@ -331,6 +408,9 @@ export function createR1MeetSweepTick(deps: R1MeetSweepTickDeps): () => Promise<
   let drainBucket = -1;
   let drainMore = false;
   let ports: R1MeetDrainPorts | null = null;
+  let tagBucket = -1;
+  let tagMore = false;
+  let tagPass: (() => Promise<R1MeetAshbyTagMeetOffReport>) | null = null;
   let log: R1MeetLog | null = deps.log ?? null;
   const logger = (): R1MeetLog => (log ??= createR1MeetLog());
 
@@ -394,11 +474,39 @@ export function createR1MeetSweepTick(deps: R1MeetSweepTickDeps): () => Promise<
     }
   };
 
+  // The booked tag's Meet-off catch-up (M035 S11, see the header): the drain's gate, its own bucket.
+  const tags = async (bucket: number): Promise<boolean> => {
+    if (!r1MeetDrainAllowed(deps.meetConfig())) return false;
+    if (bucket === tagBucket && !tagMore) return false;
+    if (!deps.drainConfig().available) return false;
+    tagBucket = bucket;
+    tagMore = false;
+    tagPass ??= createR1MeetAshbyTagMeetOffPass({
+      ashbyTag: deps.ashbyTag ?? createR1MeetAshbyTagPorts(deps.client, logger()),
+      now: deps.now,
+      log: logger(),
+    });
+    try {
+      const report = await tagPass();
+      tagMore = report.more;
+      if (report.settled > 0) {
+        logger().info({ error_category: R1_MEET_ASHBY_TAG_MEET_OFF_PASS, error_type: `removed_${report.removed}` });
+      }
+      return report.removed > 0;
+    } catch {
+      // The page could not be read: the next bucket tries again.
+      logger().warn({ error_category: R1_MEET_ASHBY_TAG_MEET_OFF_ERROR, error_type: 'page' });
+      return false;
+    }
+  };
+
   return async () => {
     try {
       const bucket = Math.floor(deps.now() / R1_MEET_LANE.sweepBucketMs);
       if (deps.lane !== null && deps.lane.active()) return await maintain(deps.lane, bucket);
-      return await drain(bucket);
+      const drained = await drain(bucket);
+      const tagged = await tags(bucket);
+      return drained || tagged;
     } catch {
       // Never throws: this tick shares a loop with the recording sweep.
       return false;

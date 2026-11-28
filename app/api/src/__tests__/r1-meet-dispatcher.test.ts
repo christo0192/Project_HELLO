@@ -5,7 +5,8 @@
  * Pinned (D-S06-4..6, D-S06-33):
  *  - the registry holds every kind of the job contract once; a duplicate definition throws at
  *    construction, and an added kind is dispatched (the S09 seam); S09's `scorecard_feedback` is
- *    registered last and its jobs reach its definition;
+ *    registered after the S06 kinds and its jobs reach its definition; M035 S11's `ashby_booked_tag`
+ *    is registered LAST and its jobs reach its definition;
  *  - an unknown kind and a malformed payload throw their closed codes, alert, and dead-letter under
  *    that code; a throw that is not an `R1MeetJobError` becomes `r1_meet_unexpected_error`;
  *  - a receipt ends `processed` / `ignored` when the job is done, `failed` only on the FINAL attempt of
@@ -26,6 +27,7 @@ import {
   R1_MEET_UNEXPECTED_ERROR,
   createR1MeetDispatcher,
 } from '../lib/r1/meet/dispatcher.js';
+import { r1MeetAshbyBookedTagDefinition } from '../lib/r1/meet/ashby-booked-tag.js';
 import { r1MeetScorecardFeedbackDefinition } from '../lib/r1/meet/feedback.js';
 import {
   R1MeetJobError,
@@ -128,12 +130,16 @@ describe('the registry (D-S06-4)', () => {
     expect(Object.isFrozen(dispatcher.kinds)).toBe(true);
   });
 
-  it('registers S09 scorecard_feedback LAST, after the S06 kinds (M034 S09)', () => {
-    expect(R1_MEET_DEFINITIONS.at(-1)?.kind).toBe('scorecard_feedback');
-    expect(R1_MEET_DEFINITIONS.at(-1)).toBe(r1MeetScorecardFeedbackDefinition);
+  it('registers S09 scorecard_feedback after the S06 kinds, and S11 ashby_booked_tag LAST (M035 S11)', () => {
+    expect(R1_MEET_DEFINITIONS.at(-1)?.kind).toBe('ashby_booked_tag');
+    expect(R1_MEET_DEFINITIONS.at(-1)).toBe(r1MeetAshbyBookedTagDefinition);
+    expect(R1_MEET_DEFINITIONS.at(-2)?.kind).toBe('scorecard_feedback');
+    expect(R1_MEET_DEFINITIONS.at(-2)).toBe(r1MeetScorecardFeedbackDefinition);
     const { dispatcher } = world();
-    expect(dispatcher.kinds.at(-1)).toBe('scorecard_feedback');
-    expect(dispatcher.kinds.slice(0, -1)).not.toContain('scorecard_feedback');
+    expect(dispatcher.kinds.at(-1)).toBe('ashby_booked_tag');
+    expect(dispatcher.kinds.at(-2)).toBe('scorecard_feedback');
+    expect(dispatcher.kinds.slice(0, -2)).not.toContain('scorecard_feedback');
+    expect(dispatcher.kinds.slice(0, -1)).not.toContain('ashby_booked_tag');
   });
 
   it('refuses a duplicate definition at construction (the one-definition seam)', () => {
@@ -187,6 +193,37 @@ describe('closed failures (D-S06-5)', () => {
     expect((error as R1MeetJobError).code).toBe('r1_meet_feedback_unwired');
     expect(jobLines(h).map((line) => line.meta.error_type)).toEqual(['scorecard_feedback:r1_meet_feedback_unwired']);
     expect(h.alerts()).toEqual([]);
+    expect(h.db.calls).toEqual([]);
+    expect(h.requests).toEqual([]);
+  });
+
+  it('an ashby_booked_tag job is dispatched to the S11 definition (M035 S11)', async () => {
+    // The harness wires no tag ports, so the definition answers its own closed code: proof that the
+    // job reached it (parsed), and not the unknown-kind path.
+    const { h, dispatcher } = world();
+    const error = await dispatcher.handle(jobOf(r1MeetJobs.ashbyBookedTag('add', fixtureId()).payload)).catch((thrown: unknown) => thrown);
+    expect(error).toBeInstanceOf(R1MeetJobError);
+    expect((error as R1MeetJobError).code).toBe('r1_meet_ashby_tag_unwired');
+    expect(jobLines(h).map((line) => line.meta.error_type)).toEqual(['ashby_booked_tag:r1_meet_ashby_tag_unwired']);
+    expect(h.alerts()).toEqual([]);
+    expect(h.db.calls).toEqual([]);
+    expect(h.requests).toEqual([]);
+  });
+
+  it('a malformed ashby_booked_tag payload throws r1_meet_malformed_payload and alerts (M035 S11)', async () => {
+    const { h, dispatcher } = world();
+    for (const payload of [
+      { kind: 'ashby_booked_tag', op: 'ADD', booking_id: fixtureId() },
+      { kind: 'ashby_booked_tag', op: 'add', booking_id: 'not-a-uuid' },
+      { kind: 'ashby_booked_tag', booking_id: fixtureId() },
+    ]) {
+      h.logs.length = 0;
+      const error = await dispatcher.handle(jobOf(payload)).catch((thrown: unknown) => thrown);
+      expect((error as Error).message).toBe('r1_meet_malformed_payload');
+      expect(h.logs.filter((line) => line.level === 'error').map((line) => line.meta)).toEqual([
+        { error_category: 'r1_meet_malformed_payload', error_type: 'ashby_booked_tag' },
+      ]);
+    }
     expect(h.db.calls).toEqual([]);
     expect(h.requests).toEqual([]);
   });

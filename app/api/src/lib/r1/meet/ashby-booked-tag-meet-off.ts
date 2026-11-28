@@ -1,0 +1,233 @@
+/**
+ * The Meet-off catch-up of the "Lexy R1: Booked" tag (M035 S11, dark; PR #453 review S11-R2).
+ *
+ * WHY. While `R1_MEET_ENABLED` is deliberately off there is no `r1-meet` lane (`runtime.ts`:
+ * `createR1MeetLane` answers null), yet the `r1-sweep` drain backstop (`drain.ts`, door (b)) keeps
+ * moving future public bookings to `drained/flag_off`, and 0143's terminal trigger queues a tag
+ * `remove` job for each. Nothing claims those jobs until Meet is back on, so a candidate whose
+ * interview the rollback cancelled would keep "Lexy R1: Booked" in Ashby for as long as Meet stays
+ * off. Owner decision 5 says the tag goes when the booking "fails before the interview", and the
+ * drain's owner (M035 S05) never writes to Ashby, so this lane does it itself.
+ *
+ * WHAT. One bounded pass, run by the `r1-sweep` tick right after the drain backstop's pass and under
+ * the same gate (`runtime.ts`: Meet status exactly `disabled` and a usable Recall key; once per
+ * 15-minute bucket, again on the next tick while there is more). It pages the public bookings that
+ * ENDED (`cancelled`, `failed`, `drained`) whose slot starts no earlier than `lookbackMs` (7 days)
+ * ago (`endedBookings`, by id, from a cursor kept across passes that wraps to the start after a
+ * short page; the days back cover a booking drained before its slot that the pass reaches only
+ * after the slot began, for example because Ashby writes were off for a while), and runs the tag
+ * job's own converge on each (`runR1MeetAshbyBookedTag` with `removeOnly`): a fresh read, the
+ * candidate-wide WANTED rule (so a failure after a bot was sent, or a drain after the start, keeps
+ * the tag exactly as the queued job would), Ashby's own write switches, the same Ashby port and
+ * client, a remove per Lexy tag, the final look. It NEVER adds: a candidate who still wants the tag
+ * (another of their bookings stands, or the interview's time had come) is left as is
+ * (`tag_wanted_held`: no tag read or write; at most one `application.info` lookup when the
+ * booking's link has no Ashby candidate id), and the queued jobs converge that once Meet is back
+ * on. Every removal it makes is one the queued `remove` job would make. It queues, creates and arms
+ * nothing, and leaves the queued jobs alone: when Meet is back on they find the tag gone and finish
+ * `tag_absent`. A booking whose slot is more than `lookbackMs` back when the catch-up can next run
+ * is never paged: it keeps the tag until Meet is back on (its queued `remove` job converges it
+ * then), or until someone removes it by hand (the runbook's ids-only list).
+ *
+ * BOUNDS. Before ANY read: Ashby's switches on and a usable key, else the pass does nothing (zero
+ * queries, zero calls). A page holds `limit` (10) bookings; a run starts only while a whole run's
+ * budget (`R1_MEET_ASHBY_TAG_RUN_MS`) still fits into the pass's (`budgetMs`, the drain backstop's
+ * 40 s). A booking whose run settled (`processed` or `ignored`) is remembered by this process (at
+ * most `rememberMax`, the oldest forgotten first): a later pass reads its row again but never asks
+ * Ashby about it again. A wait (`defer`: Ashby throttling, Ashby down or a malformed or slow answer,
+ * which may be one candidate's record alone, a permission fault, or a contended write; and, only when
+ * a switch or the key goes away between this pass's check and the run's, `ashby_inactive` or
+ * `ashby_key_missing`) ends the pass AND holds the catch-up for that wait's seconds, so a setup alert
+ * fires at most once per wait, as the job's own does; the cursor moves past that booking, so one
+ * booking that keeps waiting never stalls the ones after it (it is tried again after the cursor
+ * wraps). A remove-only run never reads the tag catalogue (a remove matches the title on the
+ * candidate, and `tag_wanted_held` answers before the add path's lookup), so the catalogue's own
+ * waits (`tag_not_found`, `tag_ambiguous`, a truncated catalogue) never hold it. A run that throws
+ * (`r1_meet_db_error`, ...) is one warning with its closed code; that booking is skipped for this
+ * round and tried again after the cursor wraps.
+ *
+ * IDLE. A CYCLE runs from one wrap to the next (it may take several passes). A cycle that wraps having
+ * run no booking (every one already settled, or none in the window) holds the catch-up for
+ * `idleHoldMs` (an hour): no page is read meanwhile. A cycle that ran at least one booking (settled,
+ * waiting or thrown) does not, so the next cycle starts at the next bucket. So a booking that ends
+ * behind the cursor of a cycle with nothing to do, or during the hour, waits for the next cycle: when
+ * nothing waits, the rest of that cycle, the hour, up to one 15-minute bucket, and the next cycle's
+ * pages up to it (one page per tick; together about one walk of the window), so about 75 minutes
+ * plus a tick per page of ended bookings in the window (the runbook's Known limit).
+ *
+ * MULTI-MACHINE. Each process keeps its own cursor, memory and hold; two machines may converge the
+ * same booking, which the run tolerates (a refused remove looks again before it alerts).
+ *
+ * LOGS. The run's own lines (closed words, counts, an HTTP status), plus
+ * `r1_meet_ashby_tag_meet_off_error` with a closed code and the pass line
+ * `r1_meet_ashby_tag_meet_off_pass` (`removed_<n>`). Never an id, a name or the tag's title.
+ *
+ * Loading this module performs no I/O: every port is an argument.
+ */
+
+import { R1_MEET_ASHBY_TAG_RUN_MS } from './ashby-booked-tag-ashby.js';
+import { runR1MeetAshbyBookedTag, type R1MeetAshbyTagDeps } from './ashby-booked-tag.js';
+import { R1MeetJobError, R1_MEET_JOB_MAX_ATTEMPTS, type R1MeetJobMeta, type R1MeetJobResult } from './jobs.js';
+import type { R1MeetLog } from './recall-actions.js';
+
+/** The catch-up's bounds (see the header). Frozen. */
+export const R1_MEET_ASHBY_TAG_MEET_OFF = Object.freeze({
+  /** Bookings per page (one read). */
+  limit: 10,
+  /** The wall-clock budget of one pass: no run starts unless a whole run still fits. */
+  budgetMs: 40_000,
+  /** Settled bookings this process remembers. */
+  rememberMax: 1000,
+  /** Bookings whose slot started up to this long ago are still paged (a slot that passed first). */
+  lookbackMs: 7 * 24 * 60 * 60 * 1000,
+  /** A cycle that wrapped having run no booking holds the catch-up this long (no page read). */
+  idleHoldMs: 60 * 60 * 1000,
+});
+
+/**
+ * The warning of a run that threw (its booking is skipped for this round; `error_type` its closed
+ * code) or of a page that could not be read (`runtime.ts`, `error_type: 'page'`).
+ */
+export const R1_MEET_ASHBY_TAG_MEET_OFF_ERROR = 'r1_meet_ashby_tag_meet_off_error';
+
+/** The info line of a pass that settled a booking (`runtime.ts`, `error_type: 'removed_<n>'`). */
+export const R1_MEET_ASHBY_TAG_MEET_OFF_PASS = 'r1_meet_ashby_tag_meet_off_pass';
+
+/** What the catch-up runs with. Production builds it in `runtime.ts` (`createR1MeetSweepTick`). */
+export interface R1MeetAshbyTagMeetOffDeps {
+  readonly ashbyTag: R1MeetAshbyTagDeps;
+  /** Epoch ms. */
+  readonly now: () => number;
+  readonly log: R1MeetLog;
+}
+
+/** One pass's outcome. Counts only. */
+export interface R1MeetAshbyTagMeetOffReport {
+  /** Runs that removed the tag (`tag_removed`). */
+  readonly removed: number;
+  /** Bookings whose run settled this pass (`processed` or `ignored`), the removals included. */
+  readonly settled: number;
+  /** Runs that threw (skipped for this round). */
+  readonly failed: number;
+  /** A full page, or the budget ran out first: the next tick goes on. */
+  readonly more: boolean;
+}
+
+const IDLE: R1MeetAshbyTagMeetOffReport = Object.freeze({ removed: 0, settled: 0, failed: 0, more: false });
+
+function report(removed: number, settled: number, failed: number, more: boolean): R1MeetAshbyTagMeetOffReport {
+  return Object.freeze({ removed, settled, failed, more });
+}
+
+/** Ashby's switches on AND a usable key; a switch or a port that throws counts as off. */
+function ashbyUsable(tag: R1MeetAshbyTagDeps): boolean {
+  try {
+    return tag.ashbyActive() === true && tag.ashby() !== null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The meta of a catch-up run: a first delivery that never waited. The run consults it only for its
+ * deferral bound and back-off, so a wait is always answered (never thrown) and its delay is the base.
+ */
+function catchUpMeta(nowMs: number): R1MeetJobMeta {
+  return Object.freeze({
+    attempts: 1,
+    maxAttempts: R1_MEET_JOB_MAX_ATTEMPTS.ashby_booked_tag,
+    deferCount: 0,
+    deferredAt: null,
+    createdAt: new Date(nowMs).toISOString(),
+    isRerun: false,
+    finalAttempt: false,
+    lastDeferReason: null,
+    lastError: null,
+  });
+}
+
+/**
+ * The catch-up (see the header): a function that runs one pass per call and keeps its cursor, its
+ * memory of settled bookings, whether the current cycle ran a booking, and its hold between calls. A
+ * failed page read throws (the caller logs it); nothing else does.
+ */
+export function createR1MeetAshbyTagMeetOffPass(
+  deps: R1MeetAshbyTagMeetOffDeps,
+): () => Promise<R1MeetAshbyTagMeetOffReport> {
+  const bounds = R1_MEET_ASHBY_TAG_MEET_OFF;
+  let cursor: string | null = null;
+  let holdUntilMs = Number.NEGATIVE_INFINITY;
+  // Whether the current cycle (from the last wrap) ran any booking: a cycle that ran none idle-holds.
+  let cycleRan = false;
+  const settledIds = new Set<string>();
+
+  const remember = (id: string): void => {
+    settledIds.add(id);
+    while (settledIds.size > bounds.rememberMax) {
+      const oldest = settledIds.values().next();
+      if (oldest.done === true) break;
+      settledIds.delete(oldest.value);
+    }
+  };
+
+  return async () => {
+    const startedMs = deps.now();
+    if (startedMs < holdUntilMs) return IDLE;
+    const tag = deps.ashbyTag;
+    // Ashby's switches off or no usable key: not even a read.
+    if (!ashbyUsable(tag)) return IDLE;
+
+    const ids = await tag.store.endedBookings({
+      startAfterIso: new Date(startedMs - bounds.lookbackMs).toISOString(),
+      afterId: cursor,
+      limit: bounds.limit,
+    });
+    let removed = 0;
+    let settled = 0;
+    let failed = 0;
+    for (const id of ids) {
+      if (!settledIds.has(id)) {
+        // A run starts only while a whole run's budget still fits (the cursor stays before it).
+        if (deps.now() - startedMs + R1_MEET_ASHBY_TAG_RUN_MS > bounds.budgetMs) return report(removed, settled, failed, true);
+        cycleRan = true;
+        let result: R1MeetJobResult;
+        try {
+          result = await runR1MeetAshbyBookedTag(
+            deps,
+            { kind: 'ashby_booked_tag', op: 'remove', bookingId: id },
+            catchUpMeta(deps.now()),
+            { removeOnly: true },
+          );
+        } catch (error) {
+          failed += 1;
+          deps.log.warn({
+            error_category: R1_MEET_ASHBY_TAG_MEET_OFF_ERROR,
+            error_type: error instanceof R1MeetJobError ? error.code : 'unexpected',
+          });
+          cursor = id;
+          continue;
+        }
+        if (result.outcome === 'defer') {
+          // Not ready: hold for the run's own wait. The next pass goes on AFTER this booking (it is
+          // tried again after the wrap), so one booking that keeps waiting never stalls the rest.
+          holdUntilMs = deps.now() + result.delaySeconds * 1000;
+          cursor = id;
+          return report(removed, settled, failed, false);
+        }
+        remember(id);
+        settled += 1;
+        if (result.code === 'tag_removed') removed += 1;
+      }
+      cursor = id;
+    }
+    if (ids.length < bounds.limit) {
+      // The last page: the cycle is over, and the next one starts from the first booking again. A
+      // cycle that ran no booking (all settled, or none in the window) holds for `idleHoldMs`.
+      cursor = null;
+      if (!cycleRan) holdUntilMs = deps.now() + bounds.idleHoldMs;
+      cycleRan = false;
+      return report(removed, settled, failed, false);
+    }
+    return report(removed, settled, failed, true);
+  };
+}

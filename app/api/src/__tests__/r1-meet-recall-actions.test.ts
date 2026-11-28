@@ -305,8 +305,9 @@ describe('the Recall client logger adapter', () => {
   });
 });
 
-describe('R1_MEET_ALERTS: closed words, append-only (plan 2.6, M035 S09 D-S09-4)', () => {
-  it('the 16 M034 words in their order, then the three S09 ones; frozen; every word a logger safe identifier', () => {
+// M035 S11 (contracts section 9): `ashbyTagFailed` is appended after the three S09 words.
+describe('R1_MEET_ALERTS: closed words, append-only (plan 2.6, M035 S09 D-S09-4, M035 S11)', () => {
+  it('the 16 M034 words in their order, then the three S09 ones, then the S11 one; frozen; every word a logger safe identifier', () => {
     expect(Object.entries(R1_MEET_ALERTS)).toEqual([
       ['botCapReached', 'r1_meet_bot_cap_reached'],
       ['botCreateFailed', 'r1_meet_bot_create_failed'],
@@ -327,6 +328,7 @@ describe('R1_MEET_ALERTS: closed words, append-only (plan 2.6, M035 S09 D-S09-4)
       ['botWaitingRoom', 'r1_meet_bot_waiting_room'],
       ['botAdmissionBlocked', 'r1_meet_bot_admission_blocked'],
       ['botSignInFailed', 'r1_meet_bot_sign_in_failed'],
+      ['ashbyTagFailed', 'r1_meet_ashby_tag_failed'],
     ]);
     expect(Object.isFrozen(R1_MEET_ALERTS)).toBe(true);
     // Copied from lib/logger.ts:111 (SAFE_IDENT_RE): an error_category that fails it is dropped.

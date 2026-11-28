@@ -64,7 +64,14 @@
  * runner is ticked by the `r1-storage` loop (kept at its base cadence while a Meet call is live), and
  * the `r1-sweep` loop queues one Meet maintenance job per bucket. With the Meet flag deliberately off
  * and a Recall key still set, the same `r1-sweep` tick (here, or in the standalone storage runtime)
- * runs the bounded drain backstop that removes any bot left behind. Never configured: nothing at all.
+ * runs the bounded drain backstop that removes any bot left behind, and then (M035 S11) the "Lexy R1:
+ * Booked" tag's Meet-off catch-up: only while Ashby's own write switches are on with a usable Ashby
+ * key, it reads at most one page of ended public bookings per tick while a cycle is in progress (a
+ * new cycle at most once per 15-minute bucket, and at most hourly once a cycle found nothing to do),
+ * plus, per booking, the booked-tag converge's narrow reads; it may call Ashby `candidate.info` and
+ * `candidate.removeTag` (and `application.info` when a link has no Ashby candidate id) only for public
+ * bookings that ended; it never adds a tag, never writes our database and queues nothing. Never
+ * configured: nothing at all.
  *
  * M034 S09 (dark): the assessment handler's `onResult` is the Meet scorecard-ready hook
  * (`./meet/feedback-notify.ts`), fire-and-forget. For a Meet round whose assessment settled it queues

@@ -41,6 +41,7 @@ import type { RecallClient, RecallClientLogger } from '../../../integrations/rec
 import { isRecallError, type RecallErrorCategory } from '../../../integrations/recall/errors.js';
 import type { RecallBot } from '../../../integrations/recall/types.js';
 import { createLogger } from '../../logger.js';
+import type { R1MeetAshbyTagDeps } from './ashby-booked-tag.js';
 import type { R1MeetMultiHumanPolicy } from './config.js';
 import type { R1MeetFeedbackDeps } from './feedback.js';
 import {
@@ -121,6 +122,12 @@ export interface R1MeetFlowDeps {
    * harnesses compile unchanged; absent, a `scorecard_feedback` job throws `r1_meet_feedback_unwired`.
    */
   readonly feedback?: R1MeetFeedbackDeps;
+  /**
+   * The ports of the "Lexy R1: Booked" tag lane (M035 S11, `ashby-booked-tag.ts`): the booked-tag
+   * store, Ashby's own write switches and the Ashby tag port. Optional so the S06 flows and harnesses
+   * compile unchanged; absent, an `ashby_booked_tag` job throws `r1_meet_ashby_tag_unwired`.
+   */
+  readonly ashbyTag?: R1MeetAshbyTagDeps;
 }
 
 /**
@@ -159,6 +166,8 @@ export const R1_MEET_ALERTS = Object.freeze({
   botAdmissionBlocked: 'r1_meet_bot_admission_blocked',
   /** M035 S09: the signed-in bot could not sign in to Google (`error_type` = the Recall sub-code). */
   botSignInFailed: 'r1_meet_bot_sign_in_failed',
+  /** M035 S11: the Lexy R1 Booked tag could not be set up or written (`error_type` closed). */
+  ashbyTagFailed: 'r1_meet_ashby_tag_failed',
 } as const);
 
 /**
