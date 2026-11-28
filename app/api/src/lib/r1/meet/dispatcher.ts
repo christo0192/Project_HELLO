@@ -5,7 +5,9 @@
  *
  * THE S09 SEAM. The registry is built from a list (`R1_MEET_DEFINITIONS`); a kind may appear once only,
  * and a duplicate throws at construction, so a second definition can never silently shadow the first.
- * S09 registers its `scorecard_feedback` definition (`feedback.ts`) LAST in that list, and nothing else.
+ * S09 registers its `scorecard_feedback` definition (`feedback.ts`) after the S06 kinds, and M035 S05
+ * its `calendar_sync` definition (`calendar-sync.ts`) right after that one (contracts section 5: S11's
+ * `ashby_booked_tag` follows), and nothing else.
  *
  * CLOSED FAILURES (D-S06-5). A payload whose kind this build does not know throws `r1_meet_unknown_kind`
  * (a kind a rolling deploy has not shipped yet survives a few retries), and one its parser refuses
@@ -28,6 +30,7 @@
 
 import type { QueueHandlerResult } from '../../queue/runner.js';
 import type { QueueJob } from '../../queue/types.js';
+import { r1MeetCalendarSyncDefinition } from './calendar-sync.js';
 import { r1MeetDrainDefinition } from './drain.js';
 import { R1_MEET_EVENT_DEFINITIONS } from './event-handler.js';
 import { r1MeetScorecardFeedbackDefinition } from './feedback.js';
@@ -45,13 +48,17 @@ import { R1_MEET_ALERTS, type R1MeetFlowDeps, type R1MeetJobDefinition } from '.
 import type { R1MeetReceiptFinal } from './runtime-store.js';
 import { R1_MEET_SCHEDULE_DEFINITIONS } from './schedule-handler.js';
 
-/** Every kind this build handles, one definition each; S09's `scorecard_feedback` is last. Frozen. */
+/**
+ * Every kind this build handles, one definition each: S09's `scorecard_feedback`, then M035 S05's
+ * `calendar_sync`, after the S06 kinds. Frozen.
+ */
 export const R1_MEET_DEFINITIONS: readonly R1MeetJobDefinition[] = Object.freeze([
   ...R1_MEET_SCHEDULE_DEFINITIONS,
   ...R1_MEET_EVENT_DEFINITIONS,
   r1MeetMaintenanceDefinition as R1MeetJobDefinition,
   r1MeetDrainDefinition as R1MeetJobDefinition,
   r1MeetScorecardFeedbackDefinition as R1MeetJobDefinition,
+  r1MeetCalendarSyncDefinition as R1MeetJobDefinition,
 ]);
 
 /** The deferral of a job claimed just before Meet turned off. */

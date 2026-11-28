@@ -1,10 +1,11 @@
 /**
  * M034 S06 T1: the `r1-meet` job contract (lib/r1/meet/jobs.ts). M034 S09 T1 adds the twelfth kind,
- * `scorecard_feedback`.
+ * `scorecard_feedback`; M035 S05 T3 the thirteenth, `calendar_sync`, whose four producers live in
+ * migration 0143 (pinned to its text below).
  *
  * Pinned here:
- *  - the queue name, the twelve kinds, the attempts and the dedup keys, with the ones migration 0142
- *    hard-codes read from the SQL;
+ *  - the queue name, the thirteen kinds, the attempts and the dedup keys, with the ones migrations 0142
+ *    and 0143 hard-code read from the SQL;
  *  - the payloads the S03 receivers write, spelled out literally in S03's key order (S03 is not in this
  *    branch, so nothing of it is imported), plus `receipt_id` and `source` as `r1_meet_record_receipt`
  *    adds them;
@@ -23,6 +24,7 @@ import { R1_MEET_BOOKING_REASONS } from '../lib/r1/meet/bookings-read.js';
 import { R1_MEET_REALTIME_EVENTS } from '../lib/r1/meet/recall-bot.js';
 import {
   R1MeetJobError,
+  R1_MEET_CALENDAR_OPS,
   R1_MEET_DB_ERROR,
   R1_MEET_DEFER_MAX_COUNT,
   R1_MEET_DEFER_MAX_MS,
@@ -30,6 +32,7 @@ import {
   R1_MEET_JOB_MAX_ATTEMPTS,
   R1_MEET_JOB_PARSERS,
   R1_MEET_MALFORMED_PAYLOAD,
+  R1_MEET_MAX_MOVE_COUNT,
   R1_MEET_MAX_TICKET_ARMS,
   R1_MEET_MAX_VERSION,
   R1_MEET_QUEUE,
@@ -42,6 +45,7 @@ import {
   R1_MEET_UNKNOWN_KIND,
   canDeferR1MeetJob,
   parseAshbyScheduleJob,
+  parseCalendarSyncJob,
   parseDrainJob,
   parseRecallEventJob,
   parseScorecardFeedbackJob,
@@ -209,9 +213,14 @@ const sql = readFileSync(path.resolve(here, '../../../supabase/migrations/0142_r
   .replace(/\r\n/g, '\n')
   .replace(/^\s*--.*$/gm, '')
   .replace(/\s+/g, ' ');
+/** Migration 0143 (M035 S01), normalised like 0142 above: the four producers of `calendar_sync`. */
+const sql0143 = readFileSync(path.resolve(here, '../../../supabase/migrations/0143_r1_meet_public_bookings.sql'), 'utf8')
+  .replace(/\r\n/g, '\n')
+  .replace(/^\s*--.*$/gm, '')
+  .replace(/\s+/g, ' ');
 
 describe('the r1-meet queue contract', () => {
-  it('has one queue, twelve kinds and one parser per kind', () => {
+  it('has one queue, thirteen kinds and one parser per kind', () => {
     expect(R1_MEET_QUEUE).toBe('r1-meet');
     expect([...R1_MEET_JOB_KINDS]).toEqual([
       'ashby_schedule',
@@ -226,6 +235,7 @@ describe('the r1-meet queue contract', () => {
       'maintenance',
       'drain',
       'scorecard_feedback',
+      'calendar_sync',
     ]);
     expect(Object.keys(R1_MEET_JOB_PARSERS)).toEqual([...R1_MEET_JOB_KINDS]);
     expect(Object.keys(R1_MEET_JOB_MAX_ATTEMPTS)).toEqual([...R1_MEET_JOB_KINDS]);
@@ -250,6 +260,7 @@ describe('the r1-meet queue contract', () => {
       maintenance: 3,
       drain: 10,
       scorecard_feedback: 5,
+      calendar_sync: 10,
     });
     expect(sql).toContain(
       "values ('r1-meet', jsonb_build_object('kind', 'bot_release', 'recall_bot_id', old.recall_bot_id, 'booking_id', old.id), "
@@ -653,6 +664,12 @@ const SIMPLE: Array<{ kind: R1MeetJobKind; payload: Payload; parsed: Payload; ba
     parsed: { kind: 'scorecard_feedback', bookingId: BOOKING, assessmentId: ASSESSMENT },
     bad: { booking_id: NOT_UUIDS, assessment_id: NOT_UUIDS },
   },
+  {
+    kind: 'calendar_sync',
+    payload: { kind: 'calendar_sync', op: 'invite', booking_id: BOOKING },
+    parsed: { kind: 'calendar_sync', op: 'invite', bookingId: BOOKING },
+    bad: { op: ['Invite', 'INVITE', 'delete', 'move ', '', 1, null, ['invite'], {}], booking_id: NOT_UUIDS },
+  },
 ];
 
 describe('the kinds of the triggers, S06 and the operator', () => {
@@ -761,6 +778,10 @@ describe('dedup keys and the jobs S06 writes', () => {
     expect(r1MeetDedupKeys.scorecardFeedback(BOOKING.toUpperCase(), ASSESSMENT.toUpperCase())).toBe(
       `r1-meet:scorecard-feedback:${BOOKING}:${ASSESSMENT}`,
     );
+    expect(r1MeetDedupKeys.calendarSync(BOOKING.toUpperCase(), 'invite')).toBe(`r1-meet:calendar:${BOOKING}:invite`);
+    expect(r1MeetDedupKeys.calendarSync(BOOKING.toUpperCase(), 'move', 2)).toBe(`r1-meet:calendar:${BOOKING}:move:2`);
+    expect(r1MeetDedupKeys.calendarSync(BOOKING.toUpperCase(), 'cancel')).toBe(`r1-meet:calendar:${BOOKING}:cancel`);
+    expect(r1MeetDedupKeys.calendarSync(BOOKING.toUpperCase(), 'purge')).toBe(`r1-meet:calendar:${BOOKING}:purge`);
   });
 
   it('builds payloads that parse back, with the key and the attempts of their kind', () => {
@@ -778,6 +799,10 @@ describe('dedup keys and the jobs S06 writes', () => {
         { bookingId: BOOKING, assessmentId: ASSESSMENT },
         `r1-meet:scorecard-feedback:${BOOKING}:${ASSESSMENT}`,
       ],
+      [r1MeetJobs.calendarSync('invite', BOOKING), { op: 'invite', bookingId: BOOKING }, `r1-meet:calendar:${BOOKING}:invite`],
+      [r1MeetJobs.calendarSync('move', BOOKING, 3), { op: 'move', bookingId: BOOKING }, `r1-meet:calendar:${BOOKING}:move:3`],
+      [r1MeetJobs.calendarSync('cancel', BOOKING), { op: 'cancel', bookingId: BOOKING }, `r1-meet:calendar:${BOOKING}:cancel`],
+      [r1MeetJobs.calendarSync('purge', BOOKING), { op: 'purge', bookingId: BOOKING }, `r1-meet:calendar:${BOOKING}:purge`],
     ] as const;
     for (const [spec, parsed, key] of specs) {
       const kind = spec.payload.kind;
@@ -862,6 +887,105 @@ describe('scorecard_feedback (M034 S09)', () => {
     // One key per (booking, assessment): a new assessment of the same booking is a new job.
     expect(r1MeetDedupKeys.scorecardFeedback(BOOKING, SESSION)).not.toBe(key);
     expect(r1MeetDedupKeys.scorecardFeedback(ROUND, ASSESSMENT)).not.toBe(key);
+  });
+});
+
+describe('calendar_sync (M035 S05)', () => {
+  const job = (over: Payload = {}): Payload => ({ kind: 'calendar_sync', op: 'invite', booking_id: BOOKING, ...over });
+
+  it('has four ops and ten attempts, fixed by 0143', () => {
+    expect([...R1_MEET_CALENDAR_OPS]).toEqual(['invite', 'move', 'cancel', 'purge']);
+    expect(Object.isFrozen(R1_MEET_CALENDAR_OPS)).toBe(true);
+    expect(R1_MEET_JOB_MAX_ATTEMPTS.calendar_sync).toBe(10);
+    expect(R1_MEET_MAX_MOVE_COUNT).toBe(10);
+    expect(sql0143).toContain('check (move_count between 0 and 10)');
+    // Right after S09's kind (contracts section 5: S11's `ashby_booked_tag` follows it).
+    expect(R1_MEET_JOB_KINDS.indexOf('calendar_sync')).toBe(R1_MEET_JOB_KINDS.indexOf('scorecard_feedback') + 1);
+  });
+
+  it('parses each op strictly: the id lower-cased, frozen, nothing else read', () => {
+    for (const op of R1_MEET_CALENDAR_OPS) {
+      const parsed = parseCalendarSyncJob(job({ op, booking_id: BOOKING.toUpperCase() }));
+      expect(parsed).toStrictEqual({ kind: 'calendar_sync', op, bookingId: BOOKING });
+      expect(Object.isFrozen(parsed)).toBe(true);
+      expect(Object.keys(parsed!)).toEqual(['kind', 'op', 'bookingId']);
+    }
+    // A move count, a receipt or anything else in the payload is never read.
+    expect(parseCalendarSyncJob(job({ op: 'move', move_count: 'x', receipt_id: 'nope', email: 'ignored' }))).toStrictEqual({
+      kind: 'calendar_sync',
+      op: 'move',
+      bookingId: BOOKING,
+    });
+    expect(R1_MEET_JOB_PARSERS.calendar_sync).toBe(parseCalendarSyncJob);
+  });
+
+  it('refuses a bad op, a bad id, another kind, and is no job of any other kind', () => {
+    for (const op of ['Invite', 'INVITE', 'delete', 'move ', ' move', '', 'remove', 'add', 1, null, true, ['invite'], {}]) {
+      expect(parseCalendarSyncJob(job({ op })), JSON.stringify(op)).toBeNull();
+    }
+    expect(parseCalendarSyncJob(without(job(), 'op'))).toBeNull();
+    expect(parseCalendarSyncJob(without(job(), 'booking_id'))).toBeNull();
+    for (const value of NOT_UUIDS) expect(parseCalendarSyncJob(job({ booking_id: value })), JSON.stringify(value)).toBeNull();
+    for (const kind of ['calendar-sync', 'Calendar_sync', 'calendar_sync ', 'ashby_booked_tag', null]) {
+      expect(parseCalendarSyncJob(job({ kind })), String(kind)).toBeNull();
+    }
+    for (const other of R1_MEET_JOB_KINDS) {
+      if (other === 'calendar_sync') continue;
+      expect((R1_MEET_JOB_PARSERS[other] as (payload: unknown) => unknown)(job()), other).toBeNull();
+    }
+  });
+
+  it('builds the 0143 payload (kind, op, booking_id) and refuses a wrong move count', () => {
+    const spec = r1MeetJobs.calendarSync('invite', BOOKING.toUpperCase());
+    expect(Object.keys(spec.payload)).toEqual(['kind', 'op', 'booking_id']);
+    expect(parseCalendarSyncJob(JSON.parse(JSON.stringify(spec.payload)))).toStrictEqual({
+      kind: 'calendar_sync',
+      op: 'invite',
+      bookingId: BOOKING,
+    });
+    expect(spec.dedupKey).toBe(`r1-meet:calendar:${BOOKING}:invite`);
+    expect(spec.maxAttempts).toBe(10);
+    expect(Object.isFrozen(spec) && Object.isFrozen(spec.payload)).toBe(true);
+    for (const n of [1, 10]) expect(r1MeetJobs.calendarSync('move', BOOKING, n).dedupKey).toBe(`r1-meet:calendar:${BOOKING}:move:${n}`);
+    for (const n of [undefined, 0, -1, 11, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '2' as unknown as number]) {
+      expect(() => r1MeetJobs.calendarSync('move', BOOKING, n), String(n)).toThrow(new TypeError('r1_meet_calendar_move_count'));
+    }
+    for (const op of ['invite', 'cancel', 'purge'] as const) {
+      expect(() => r1MeetJobs.calendarSync(op, BOOKING, 1), op).toThrow(new TypeError('r1_meet_calendar_move_count'));
+    }
+  });
+
+  it('agrees with the four 0143 producers on the payload, the key and the attempts (the producer pin)', () => {
+    const producer = new RegExp(
+      String.raw`jsonb_build_object\('kind', 'calendar_sync', 'op', '([a-z]+)', 'booking_id', (\w+)\.id\), `
+        + String.raw`'r1-meet:calendar:' \|\| \2\.id::text \|\| ':([a-z:]+)'( \|\| \2\.move_count::text)?, (\d+)\)`,
+      'g',
+    );
+    const found = [...sql0143.matchAll(producer)].map((match) => ({
+      op: match[1]!,
+      row: match[2]!,
+      suffix: match[3]!,
+      counted: match[4] !== undefined,
+      attempts: Number(match[5]),
+    }));
+    // create (v_booking, invite), move (v_booking, move), the terminal trigger (new, cancel), the delete trigger (old, purge).
+    expect(found.map(({ op, row }) => `${row}:${op}`).sort()).toEqual(
+      ['new:cancel', 'old:purge', 'v_booking:invite', 'v_booking:move'],
+    );
+    // Every calendar_sync job 0143 writes is one of these four: no other producer exists.
+    expect(sql0143.split("jsonb_build_object('kind', 'calendar_sync'").length - 1).toBe(4);
+    for (const { op, suffix, counted, attempts } of found) {
+      const moveCount = op === 'move' ? 4 : undefined;
+      // The key 0143 prints for a sample row, next to the one this build prints.
+      const printed = `r1-meet:calendar:${BOOKING}:${suffix}${counted ? String(moveCount) : ''}`;
+      const spec = r1MeetJobs.calendarSync(op as (typeof R1_MEET_CALENDAR_OPS)[number], BOOKING, moveCount);
+      expect(spec.dedupKey, op).toBe(printed);
+      expect(counted, op).toBe(op === 'move');
+      expect(suffix, op).toBe(op === 'move' ? 'move:' : op);
+      expect(attempts, op).toBe(spec.maxAttempts);
+      expect(Object.keys(spec.payload), op).toEqual(['kind', 'op', 'booking_id']);
+      expect(R1_MEET_CALENDAR_OPS).toContain(op);
+    }
   });
 });
 

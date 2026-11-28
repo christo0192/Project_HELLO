@@ -41,6 +41,7 @@ import type { RecallClient, RecallClientLogger } from '../../../integrations/rec
 import { isRecallError, type RecallErrorCategory } from '../../../integrations/recall/errors.js';
 import type { RecallBot } from '../../../integrations/recall/types.js';
 import { createLogger } from '../../logger.js';
+import type { R1MeetCalendarDeps } from './calendar-sync.js';
 import type { R1MeetMultiHumanPolicy } from './config.js';
 import type { R1MeetFeedbackDeps } from './feedback.js';
 import {
@@ -121,6 +122,13 @@ export interface R1MeetFlowDeps {
    * harnesses compile unchanged; absent, a `scorecard_feedback` job throws `r1_meet_feedback_unwired`.
    */
   readonly feedback?: R1MeetFeedbackDeps;
+  /**
+   * The ports of Lexy's calendar for public-page bookings (M035 S05, `calendar-sync.ts`): the calendar
+   * store, the Google client (per call, null without Lexy's Google settings), an Ashby read port and
+   * the public configuration. Optional so the M034 flows and harnesses compile unchanged; absent, a
+   * `calendar_sync` job throws `r1_meet_calendar_unwired`.
+   */
+  readonly calendar?: R1MeetCalendarDeps;
 }
 
 /**
