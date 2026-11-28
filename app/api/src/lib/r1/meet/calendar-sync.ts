@@ -47,7 +47,33 @@
  *      `invited_state_conflict` / `invited_booking_gone` when the row moved meanwhile (as for step 5).
  *  13  calendar mode only (D-S05-12): the event's Meet link must still be the booking's; a different
  *      or missing one alerts `r1_meet_public_meet_link_changed` (`invite`) and changes nothing else.
- * `move`, `cancel` and `purge` arrive in the next task (they throw `r1_meet_calendar_op_unbuilt`).
+ *
+ * THE MOVE (D-S05-4), always converging on the CURRENT booking row (a late `move:1` job after a
+ * second move sends the newest slot, and the `move:2` job then finds it done):
+ *   booking_gone | ashby_booking | booking_terminal | slot_over (the slot has ended) | calendar_<state>
+ *   (the event is cancelled or purged): ignored, no Google call. No Google settings: as the invite.
+ *   One GET. Gone: as the invite's step 4 for an undispatched booking (`failed/invite_undeliverable`,
+ *   alert `event_gone`); a dispatched one is never cut, the job just ends `processed('event_gone')`.
+ *   The event already has the booking's start and end (compared in milliseconds): `already_moved`,
+ *   no token and no write. Else the manage key and the name as the invite, a fresh token whose digest
+ *   is stored first, then ONE send of the new start, end and description (with the new link),
+ *   `sendUpdates=all`, and NEVER the attendees (Google keeps them). Then the calendar-mode Meet link
+ *   check (`move`) and `processed('moved')`. Both ends repair a `created` state to `invited` when the
+ *   event lists an attendee (an invite whose answer was lost).
+ *
+ * THE CANCEL (D-S05-6), shared with the drain (`cancelR1MeetPublicCalendarEvent`): only a TERMINAL
+ * public booking whose event still exists (`created` or `invited`) and whose slot has not started.
+ * A live booking's event is never deleted (`booking_live`); after the start there is no Google call
+ * (`after_start`: the retention purge removes the event later). The delete sends `sendUpdates=all`
+ * for `created` AND `invited` (a deliberate deviation from contracts section 5, recorded in section
+ * 9: with no attendee Google mails nobody, and an attendee whose invite answer was lost still hears
+ * of the cancel), then `created|invited -> cancelled`. A 404/410 counts as deleted (`cancelled_gone`).
+ *
+ * THE PURGE (D-S05-7): the event id is derived from the job's booking id (the row may be gone after a
+ * delete). A row that is still there: Ashby, live or already `purged` is ignored; a terminal one whose
+ * slot is still ahead is deleted with `sendUpdates=all` (the candidate hears of it), anything else
+ * with `none`; then `created|invited|cancelled -> purged`. No row: one delete with `none` and no
+ * database write (a re-run repeats it, answered 404/410: nothing is left to remember it).
  *
  * GOOGLE FAILURES (D-S05-8), one alert per run at most: `quota`, `unavailable`, `timeout` and
  * `malformed_response` defer `google_quota` / `google_unavailable` for the hint (5..300 s, 30 s with
@@ -69,7 +95,11 @@
 
 import type { AshbyClient } from '../../../integrations/ashby/client.js';
 import { extractApplicationInfo } from '../../../integrations/ashby/extractors.js';
-import type { GoogleCalendarClient, GoogleCalendarEvent } from '../../../integrations/google/calendar.js';
+import type {
+  GoogleCalendarClient,
+  GoogleCalendarEvent,
+  GoogleCalendarSendUpdates,
+} from '../../../integrations/google/calendar.js';
 import { isGoogleError, type GoogleOperation } from '../../../integrations/google/errors.js';
 import type { GoogleClientLogger } from '../../../integrations/google/http.js';
 import { normalizeGoogleMeetUrl } from '../../../integrations/google-meet/url.js';
@@ -77,6 +107,7 @@ import type { R1MeetBookingStatus } from './bookings-read.js';
 import type { R1MeetPublicConfig } from './config.js';
 import {
   R1MeetJobError,
+  R1_MEET_MALFORMED_PAYLOAD,
   R1_MEET_RPC_UNEXPECTED,
   canDeferR1MeetJob,
   parseCalendarSyncJob,
@@ -105,6 +136,7 @@ import {
   type R1MeetLog,
   type R1MeetLogMeta,
 } from './recall-actions.js';
+import { R1_MEET_TERMINAL_STATUSES } from './runtime-store.js';
 import { r1MeetDerivedKey } from './ticket.js';
 
 // ── Vocabulary ──────────────────────────────────────────────────────────────
@@ -168,8 +200,11 @@ export interface R1MeetCalendarDeps {
 const UNDISPATCHED_LIVE: ReadonlySet<R1MeetBookingStatus> = new Set<R1MeetBookingStatus>(['pending', 'blocked', 'bot_scheduled']);
 /** The calendar states in which the event still exists on Lexy's calendar. */
 const EVENT_EXISTS: readonly R1MeetCalendarState[] = Object.freeze(['created', 'invited']);
+/** The ends of a booking: its event is never moved, and only these have their event cancelled. */
+const TERMINAL: ReadonlySet<R1MeetBookingStatus> = new Set<R1MeetBookingStatus>(R1_MEET_TERMINAL_STATUSES);
+/** The calendar states a purge may leave (`v_allowed` of `r1_meet_public_set_calendar_state`, 0143). */
+const PURGEABLE: readonly R1MeetCalendarState[] = Object.freeze(['created', 'invited', 'cancelled']);
 
-const OP_UNBUILT = 'r1_meet_calendar_op_unbuilt';
 const ASHBY_UNAVAILABLE = 'r1_meet_calendar_ashby_unavailable';
 const MANAGE_KEY_MISSING = 'r1_meet_calendar_manage_key_missing';
 const PROFILE_UNKNOWN = 'r1_meet_calendar_profile_unknown';
@@ -409,6 +444,77 @@ export function r1MeetGoogleClientLogger(log: R1MeetLog): GoogleClientLogger {
   });
 }
 
+// ── The manage link and the words (the invite and the move) ─────────────────
+
+/** No manage key (the worker secret): never a send without a stored digest. The setup alert, an hour's wait. */
+function manageKeyMissing(deps: R1MeetFlowDeps, meta: R1MeetJobMeta): R1MeetJobResult | null {
+  if (r1MeetDerivedKey(R1_MEET_MANAGE_DOMAIN, deps.ticketSource) !== null) return null;
+  alert(deps.log, R1_MEET_PUBLIC_CALENDAR_ALERTS.setupError, 'manage_key_missing');
+  return deferOrThrow(meta, deps.now(), 'manage_key_missing', R1_MEET_CALENDAR_SYNC.setupDeferSec, MANAGE_KEY_MISSING);
+}
+
+/** Who the invite says the interviewer is: the booking's objective profile. Unknown: an alert and a throw. */
+function interviewerName(deps: R1MeetFlowDeps, booking: R1MeetCalendarBooking): string {
+  const profile = getR1MeetProfile(booking.objectiveProfile);
+  if (profile === null) {
+    deps.log.error({ error_category: R1_MEET_ALERTS.profileUnknown });
+    throw new R1MeetJobError(PROFILE_UNKNOWN);
+  }
+  return profile.botDisplayName;
+}
+
+/** The description to send, or the end of the job when the row refused the new digest. */
+type FreshManageLink =
+  | { readonly kind: 'ready'; readonly description: string }
+  | { readonly kind: 'refused'; readonly result: R1MeetJobResult };
+
+/**
+ * A fresh manage token (32 random bytes) and the description with its link, built in memory; then ONLY
+ * the token's digest is stored (`r1_meet_public_set_manage_digest`), BEFORE any send. The token leaves
+ * this function inside the description only: never a log line, a row, a job or an error. A refusal
+ * (`booking_terminal`, `not_found`, `not_public`) ends the job ignored, with no send.
+ */
+async function storeFreshManageLink(
+  deps: R1MeetFlowDeps,
+  store: R1MeetCalendarStore,
+  booking: R1MeetCalendarBooking,
+  name: string,
+): Promise<FreshManageLink> {
+  const minted = mintR1MeetManageToken({
+    ...(deps.random === undefined ? {} : { random: deps.random }),
+    ...(deps.ticketSource === undefined ? {} : { source: deps.ticketSource }),
+  });
+  if (minted === null) throw new R1MeetJobError(MINT_FAILED);
+  const manageLink = r1MeetPublicManageLink(deps.config.bridgePageUrl, minted.token);
+  const description = manageLink === null ? null : buildR1MeetPublicInviteDescription({ interviewerName: name, manageLink });
+  if (description === null) throw new R1MeetJobError(COPY_INVALID);
+  const stored = await store.setManageDigest({ bookingId: booking.id, digest: minted.digest, nowIso: toIso(deps.now()) });
+  switch (stored) {
+    case 'ok':
+      return { kind: 'ready', description };
+    case 'booking_terminal':
+      return { kind: 'refused', result: r1MeetIgnored('booking_terminal') };
+    case 'not_found':
+      return { kind: 'refused', result: r1MeetIgnored('booking_gone') };
+    default:
+      return { kind: 'refused', result: r1MeetIgnored('not_public') };
+  }
+}
+
+/** Calendar mode only (D-S05-12): the sent event's Meet link must still be the booking's. Alerts only. */
+function checkMeetLink(
+  log: R1MeetLog,
+  google: R1MeetCalendarGoogle,
+  sent: GoogleCalendarEvent,
+  booking: R1MeetCalendarBooking,
+  op: 'invite' | 'move',
+): void {
+  // In space mode the event carries no Meet link of its own (`location` holds the space's).
+  if (google.meetMode === 'calendar' && normalizeGoogleMeetUrl(sent.hangoutLink) !== booking.meetUrl) {
+    alert(log, R1_MEET_PUBLIC_CALENDAR_ALERTS.meetLinkChanged, op);
+  }
+}
+
 // ── The invite ──────────────────────────────────────────────────────────────
 
 /** Ends an invite whose booking became undeliverable: the code of the job either way. */
@@ -484,17 +590,11 @@ async function runInvite(
   }
 
   // 7. The manage key: never a send without a stored digest.
-  if (r1MeetDerivedKey(R1_MEET_MANAGE_DOMAIN, deps.ticketSource) === null) {
-    alert(deps.log, R1_MEET_PUBLIC_CALENDAR_ALERTS.setupError, 'manage_key_missing');
-    return deferOrThrow(meta, deps.now(), 'manage_key_missing', R1_MEET_CALENDAR_SYNC.setupDeferSec, MANAGE_KEY_MISSING);
-  }
+  const keyMissing = manageKeyMissing(deps, meta);
+  if (keyMissing !== null) return keyMissing;
 
   // 8. Who the invite says the interviewer is.
-  const profile = getR1MeetProfile(booking.objectiveProfile);
-  if (profile === null) {
-    deps.log.error({ error_category: R1_MEET_ALERTS.profileUnknown });
-    throw new R1MeetJobError(PROFILE_UNKNOWN);
-  }
+  const name = interviewerName(deps, booking);
 
   // 9. The on-file email.
   const onFile = await resolveOnFileEmail(deps, calendar, booking, meta);
@@ -502,24 +602,13 @@ async function runInvite(
   if (onFile.kind === 'none') return undeliverable(deps, booking, 'no_email');
 
   // 10. A fresh manage token and the words, in memory; then its digest, BEFORE the send.
-  const minted = mintR1MeetManageToken({
-    ...(deps.random === undefined ? {} : { random: deps.random }),
-    ...(deps.ticketSource === undefined ? {} : { source: deps.ticketSource }),
-  });
-  if (minted === null) throw new R1MeetJobError(MINT_FAILED);
-  const manageLink = r1MeetPublicManageLink(deps.config.bridgePageUrl, minted.token);
-  const description =
-    manageLink === null ? null : buildR1MeetPublicInviteDescription({ interviewerName: profile.botDisplayName, manageLink });
-  if (description === null) throw new R1MeetJobError(COPY_INVALID);
-  const stored = await store.setManageDigest({ bookingId: booking.id, digest: minted.digest, nowIso: toIso(deps.now()) });
-  if (stored === 'booking_terminal') return r1MeetIgnored('booking_terminal');
-  if (stored === 'not_found') return r1MeetIgnored('booking_gone');
-  if (stored !== 'ok') return r1MeetIgnored('not_public');
+  const link = await storeFreshManageLink(deps, store, booking, name);
+  if (link.kind === 'refused') return link.result;
 
   // 11. The send: exactly the on-file attendee and the description; Google mails the invite.
   let sent: GoogleCalendarEvent;
   try {
-    sent = await google.calendar.patchEvent(eventId, { attendeeEmail: onFile.email, description }, 'all');
+    sent = await google.calendar.patchEvent(eventId, { attendeeEmail: onFile.email, description: link.description }, 'all');
   } catch (error) {
     if (isGoogleError(error) && error.code === 'not_found') return undeliverable(deps, booking, 'event_gone');
     return googleFailure(error, { meta, nowMs: deps.now(), log: deps.log, call: 'calendar.patch' });
@@ -527,11 +616,243 @@ async function runInvite(
 
   // 12. The state.
   const moved = await store.setCalendarState({ bookingId: booking.id, from: EVENT_EXISTS, to: 'invited', nowIso: toIso(deps.now()) });
-  // 13. The Meet link, in calendar mode (in space mode the event carries none of its own).
-  if (google.meetMode === 'calendar' && normalizeGoogleMeetUrl(sent.hangoutLink) !== booking.meetUrl) {
-    alert(deps.log, R1_MEET_PUBLIC_CALENDAR_ALERTS.meetLinkChanged, 'invite');
-  }
+  // 13. The Meet link, in calendar mode.
+  checkMeetLink(deps.log, google, sent, booking, 'invite');
   return invitedState(moved, 'invited');
+}
+
+// ── The move ────────────────────────────────────────────────────────────────
+
+/** The event already holds the booking's slot: compared in milliseconds (Google may answer in IST). */
+function sameSlot(event: GoogleCalendarEvent, booking: R1MeetCalendarBooking): boolean {
+  return (
+    event.startAt !== null &&
+    event.endAt !== null &&
+    Date.parse(event.startAt) === Date.parse(booking.startAt) &&
+    Date.parse(event.endAt) === Date.parse(booking.endAt)
+  );
+}
+
+/**
+ * A `created` state whose event lists an attendee (an invite whose answer was lost; this job is the
+ * only writer of attendees) -> `invited`. A row that moved meanwhile is left as it is.
+ */
+async function repairInvited(
+  deps: R1MeetFlowDeps,
+  store: R1MeetCalendarStore,
+  booking: R1MeetCalendarBooking,
+  event: GoogleCalendarEvent,
+): Promise<void> {
+  if (booking.calendarState !== 'created' || event.attendeeEmails.length === 0) return;
+  const answer = await store.setCalendarState({ bookingId: booking.id, from: EVENT_EXISTS, to: 'invited', nowIso: toIso(deps.now()) });
+  // A row never changes its source: the store or the database is not what this build expects.
+  if (answer.status === 'not_public') throw new R1MeetJobError(R1_MEET_RPC_UNEXPECTED);
+}
+
+/**
+ * The event of a move is gone from Lexy's calendar (D-S05-5): an undispatched booking can no longer be
+ * reached (`failed/invite_undeliverable`, alert `event_gone`, a held bot queued for release); a
+ * dispatched one is never cut. Never a retry: the job is done either way.
+ */
+async function moveEventGone(deps: R1MeetFlowDeps, booking: R1MeetCalendarBooking): Promise<R1MeetJobResult> {
+  if (UNDISPATCHED_LIVE.has(booking.status)) await failR1MeetPublicInvite(deps, booking, 'event_gone');
+  return r1MeetProcessed('event_gone');
+}
+
+async function runMove(
+  deps: R1MeetFlowDeps,
+  calendar: R1MeetCalendarDeps,
+  bookingId: string,
+  meta: R1MeetJobMeta,
+): Promise<R1MeetJobResult> {
+  const store = calendar.store;
+
+  // The CURRENT row: a stale job converges on the newest slot.
+  const booking = await store.getBooking(bookingId);
+  if (booking === null) return r1MeetIgnored('booking_gone');
+  if (booking.source !== 'public_page') return r1MeetIgnored('ashby_booking');
+  if (TERMINAL.has(booking.status)) return r1MeetIgnored('booking_terminal');
+  if (deps.now() >= Date.parse(booking.endAt)) return r1MeetIgnored('slot_over');
+  const state = booking.calendarState;
+  if (state === null || !EVENT_EXISTS.includes(state)) return r1MeetIgnored(`calendar_${state ?? 'none'}`);
+
+  const google = googleOf(calendar);
+  if (google === null) return googleUnconfigured(deps, meta);
+  const eventId = r1MeetCalendarEventId(booking.id);
+
+  let event: GoogleCalendarEvent | null;
+  try {
+    event = await google.calendar.getEvent(eventId);
+  } catch (error) {
+    return googleFailure(error, { meta, nowMs: deps.now(), log: deps.log, call: 'calendar.get' });
+  }
+  if (event === null || eventGone(event)) return moveEventGone(deps, booking);
+
+  // Already on Google (a lost answer, or an earlier job of a later move): no token, no write.
+  if (sameSlot(event, booking)) {
+    await repairInvited(deps, store, booking, event);
+    return r1MeetProcessed('already_moved');
+  }
+
+  const keyMissing = manageKeyMissing(deps, meta);
+  if (keyMissing !== null) return keyMissing;
+  const name = interviewerName(deps, booking);
+  const link = await storeFreshManageLink(deps, store, booking, name);
+  if (link.kind === 'refused') return link.result;
+
+  // The send: the new slot and the description with the new link. NEVER the attendees: Google keeps them.
+  let sent: GoogleCalendarEvent;
+  try {
+    sent = await google.calendar.patchEvent(
+      eventId,
+      { startAt: booking.startAt, endAt: booking.endAt, description: link.description },
+      'all',
+    );
+  } catch (error) {
+    if (isGoogleError(error) && error.code === 'not_found') return moveEventGone(deps, booking);
+    return googleFailure(error, { meta, nowMs: deps.now(), log: deps.log, call: 'calendar.patch' });
+  }
+  checkMeetLink(deps.log, google, sent, booking, 'move');
+  await repairInvited(deps, store, booking, sent);
+  return r1MeetProcessed('moved');
+}
+
+// ── The cancel (shared with the drain) ──────────────────────────────────────
+
+/** What one cancel of a booking's event did (`cancelled`, `cancelled_gone`) or why it did nothing. */
+export type R1MeetCalendarCancelOutcome =
+  | 'cancelled'
+  | 'cancelled_gone'
+  | 'after_start'
+  | 'booking_live'
+  | 'not_public'
+  | 'not_owed'
+  | 'booking_gone'
+  | 'state_conflict';
+
+/**
+ * The cancel rule (D-S05-6), in this order: the booking (gone: `booking_gone`), public (else
+ * `not_public`), terminal (else `booking_live`: a live booking's event is never deleted), its event
+ * still there (`created`/`invited`, else `not_owed`), its slot still ahead (else `after_start`, with
+ * no Google call). Only then are Lexy's Google settings asked for (none: `google_unconfigured`), the
+ * event deleted with `sendUpdates=all` (a 404/410 counts as deleted) and the state set `cancelled`.
+ * Throws a `GoogleError` (the delete) or an `R1MeetJobError` (the database).
+ */
+async function cancelEvent(
+  store: R1MeetCalendarStore,
+  google: () => R1MeetCalendarGoogle | null,
+  bookingId: string,
+  nowMs: number,
+): Promise<R1MeetCalendarCancelOutcome | 'google_unconfigured'> {
+  const booking = await store.getBooking(bookingId);
+  if (booking === null) return 'booking_gone';
+  if (booking.source !== 'public_page') return 'not_public';
+  if (!TERMINAL.has(booking.status)) return 'booking_live';
+  const state = booking.calendarState;
+  if (state === null || !EVENT_EXISTS.includes(state)) return 'not_owed';
+  if (nowMs >= Date.parse(booking.startAt)) return 'after_start';
+
+  const settings = google();
+  if (settings === null) return 'google_unconfigured';
+  // `all` for `created` too: with no attendee Google mails nobody; with one whose invite answer was
+  // lost, the candidate still hears of the cancel.
+  const deleted = await settings.calendar.deleteEvent(r1MeetCalendarEventId(booking.id), 'all');
+  const answer = await store.setCalendarState({ bookingId: booking.id, from: EVENT_EXISTS, to: 'cancelled', nowIso: toIso(nowMs) });
+  switch (answer.status) {
+    case 'ok':
+      return deleted === 'deleted' ? 'cancelled' : 'cancelled_gone';
+    case 'state_conflict':
+      return 'state_conflict';
+    case 'not_found':
+      return 'booking_gone';
+    default:
+      // A row never changes its source: the store or the database is not what this build expects.
+      throw new R1MeetJobError(R1_MEET_RPC_UNEXPECTED);
+  }
+}
+
+/**
+ * Cancel one public booking's event on Lexy's calendar under the cancel rule (D-S05-6; see
+ * `cancelEvent`). The `calendar_sync` cancel op and the drain's inline cancel share it. Throws a
+ * `GoogleError` when the delete fails and an `R1MeetJobError` when the database does: the caller
+ * decides (the job defers or throws a closed code; the drain alerts and leaves it to `pub_drift`).
+ */
+export async function cancelR1MeetPublicCalendarEvent(
+  calendar: Pick<R1MeetCalendarDeps, 'store'>,
+  google: R1MeetCalendarGoogle,
+  bookingId: string,
+  nowMs: number,
+): Promise<R1MeetCalendarCancelOutcome> {
+  const outcome = await cancelEvent(calendar.store, () => google ?? null, bookingId, nowMs);
+  // Only reachable when a caller hands in no settings at all.
+  if (outcome === 'google_unconfigured') throw new R1MeetJobError(GOOGLE_UNCONFIGURED);
+  return outcome;
+}
+
+/**
+ * The cancel op: the shared rule, with Lexy's Google settings asked for only once a delete is owed (a
+ * job that owes nothing ends ignored even without them).
+ */
+async function runCancel(
+  deps: R1MeetFlowDeps,
+  calendar: R1MeetCalendarDeps,
+  bookingId: string,
+  meta: R1MeetJobMeta,
+): Promise<R1MeetJobResult> {
+  let outcome: R1MeetCalendarCancelOutcome | 'google_unconfigured';
+  try {
+    outcome = await cancelEvent(calendar.store, () => googleOf(calendar), bookingId, deps.now());
+  } catch (error) {
+    return googleFailure(error, { meta, nowMs: deps.now(), log: deps.log, call: 'calendar.delete' });
+  }
+  if (outcome === 'google_unconfigured') return googleUnconfigured(deps, meta);
+  return outcome === 'cancelled' || outcome === 'cancelled_gone' ? r1MeetProcessed(outcome) : r1MeetIgnored(outcome);
+}
+
+// ── The purge ───────────────────────────────────────────────────────────────
+
+async function runPurge(
+  deps: R1MeetFlowDeps,
+  calendar: R1MeetCalendarDeps,
+  bookingId: string,
+  meta: R1MeetJobMeta,
+): Promise<R1MeetJobResult> {
+  const store = calendar.store;
+  // Derived, never read: after a delete there is no row to read it from.
+  const eventId = r1MeetCalendarEventId(bookingId);
+
+  const booking = await store.getBooking(bookingId);
+  let sendUpdates: GoogleCalendarSendUpdates = 'none';
+  if (booking !== null) {
+    if (booking.source !== 'public_page') return r1MeetIgnored('ashby_booking');
+    if (!TERMINAL.has(booking.status)) return r1MeetIgnored('booking_live');
+    if (booking.calendarState === 'purged') return r1MeetIgnored('already_purged');
+    // A terminal booking whose slot is still ahead: the candidate is told.
+    if (deps.now() < Date.parse(booking.startAt)) sendUpdates = 'all';
+  }
+
+  const google = googleOf(calendar);
+  if (google === null) return googleUnconfigured(deps, meta);
+  try {
+    // `deleted` and `gone` (404/410) are both done.
+    await google.calendar.deleteEvent(eventId, sendUpdates);
+  } catch (error) {
+    return googleFailure(error, { meta, nowMs: deps.now(), log: deps.log, call: 'calendar.delete' });
+  }
+  if (booking === null) return r1MeetProcessed('purged_no_row');
+
+  const answer = await store.setCalendarState({ bookingId: booking.id, from: PURGEABLE, to: 'purged', nowIso: toIso(deps.now()) });
+  switch (answer.status) {
+    case 'ok':
+      return r1MeetProcessed('purged');
+    case 'state_conflict':
+      return r1MeetProcessed('purged_state_conflict');
+    case 'not_found':
+      return r1MeetProcessed('purged_no_row');
+    default:
+      // A row never changes its source: the store or the database is not what this build expects.
+      throw new R1MeetJobError(R1_MEET_RPC_UNEXPECTED);
+  }
 }
 
 // ── The job ─────────────────────────────────────────────────────────────────
@@ -547,8 +868,15 @@ export async function runR1MeetCalendarSync(
   switch (job.op) {
     case 'invite':
       return runInvite(deps, calendar, job.bookingId, meta);
+    case 'move':
+      return runMove(deps, calendar, job.bookingId, meta);
+    case 'cancel':
+      return runCancel(deps, calendar, job.bookingId, meta);
+    case 'purge':
+      return runPurge(deps, calendar, job.bookingId, meta);
     default:
-      throw new R1MeetJobError(OP_UNBUILT);
+      // The parser admits the four ops only.
+      throw new R1MeetJobError(R1_MEET_MALFORMED_PAYLOAD);
   }
 }
 
