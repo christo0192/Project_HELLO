@@ -72,6 +72,7 @@ const CANDIDATE_SCOPE_SOURCES = [
   'src/pages/R1MeetBookingsPage.tsx',
   'src/components/r1/MeetBookingsFilters.tsx',
   'src/components/r1/MeetBookingsTable.tsx',
+  'src/components/r1/MeetBookingsPublicLink.tsx',
   'src/pages/AshbyScopedReviewPage.tsx',
   'src/components/talent/CandidateShell.tsx',
   'src/components/talent/ResumeReviewBadge.tsx',

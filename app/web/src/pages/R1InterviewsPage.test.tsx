@@ -483,7 +483,7 @@ describe('a round held over Google Meet', () => {
   it.each<[string, Partial<R1QueueRound>]>([
     ['a browser round', { channel: 'browser' }],
     ['a null channel', { channel: null }],
-    ['no channel at all (every API today)', {}],
+    ['no channel at all (an older API)', {}],
     ['a channel this page does not know', { channel: 'zoom' as unknown as R1QueueRound['channel'] }],
   ])('is not marked for %s', async (_name, over) => {
     const row = await rowOf(over);

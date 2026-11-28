@@ -144,6 +144,7 @@ describe('candidate-page booking refusals (P9)', () => {
     ['appointment_not_found', /no longer exists for this candidate/i, 404, true],
     ['slot_not_yet_eligible', /next eligible time/i, 409, false],
     ['daily_attempt_exists', /maximum number of calls on that day/i, 409, false],
+    ['not_phone_screened', /public R1 booking link and is not phone-screened/, 409, false],
   ] as const)('maps %s to specific operator copy', (code, pattern, status, refresh) => {
     const err = new ApiError(code, status);
     const msg = phoneErrorMessage(err);
@@ -232,6 +233,44 @@ describe('every booking RPC status has specific copy', () => {
 
   it('the generic fallback still applies to an unmapped code', () => {
     expect(phoneErrorMessage(new ApiError('not_a_real_status', 409))).toMatch(GENERIC_RE);
+  });
+});
+
+/**
+ * Cross-package guard (M035 S12 fix round F4, 0144): the candidate routes
+ * refuse a phone request and a slot booking for a public R1 booking import
+ * with a 409 whose code is the API's own `NOT_PHONE_SCREENED` constant. The
+ * code is read from the API source, so a rename there turns this red instead
+ * of reaching staff as the generic sentence or the raw code.
+ */
+describe('the public booking import refusal has specific copy', () => {
+  const CANDIDATES_ROUTE_PATH = resolve(
+    __dirname,
+    '../../../../../api/src/routes/candidates.ts',
+  );
+
+  function extractNotPhoneScreened(src: string): string {
+    const match = /export const NOT_PHONE_SCREENED = '([a-z_]+)';/.exec(src);
+    if (!match) throw new Error('NOT_PHONE_SCREENED not found in routes/candidates.ts');
+    return match[1];
+  }
+
+  const code = extractNotPhoneScreened(readFileSync(CANDIDATES_ROUTE_PATH, 'utf8'));
+
+  it('extracts the real code (non-vacuous)', () => {
+    expect(code).toBe('not_phone_screened');
+    expect(() => extractNotPhoneScreened("export const OTHER = 'x';")).toThrow(/not found/);
+  });
+
+  it('says why in words, never the code, and asks for no refresh', () => {
+    const err = new ApiError(code, 409);
+    const msg = phoneErrorMessage(err);
+    expect(msg).not.toMatch(GENERIC_RE);
+    expect(msg).not.toContain(code);
+    expect(msg).toBe(
+      'This candidate came in through the public R1 booking link and is not phone-screened, so no phone call was booked or requested.',
+    );
+    expect(phoneErrorRequiresRefresh(err)).toBe(false);
   });
 });
 

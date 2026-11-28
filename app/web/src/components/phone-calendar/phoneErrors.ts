@@ -98,6 +98,12 @@ const CODE_MESSAGES: Record<string, string> = {
   // appointment is gone or no longer belongs to this candidate's engagement.
   appointment_not_found:
     'This appointment no longer exists for this candidate, so nothing was changed. Refresh the page to see the current booking.',
+  // 0144 (M035 S12 fix round F4): both the candidate-page phone request and
+  // the slot booking refuse an import shell the public R1 booking page made,
+  // permanently. NOT in REFRESH_REQUIRED: nothing on screen is stale, and a
+  // re-read changes nothing.
+  not_phone_screened:
+    'This candidate came in through the public R1 booking link and is not phone-screened, so no phone call was booked or requested.',
 
   // ── Server-side failures ──
   phone_read_error:

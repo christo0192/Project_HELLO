@@ -20,17 +20,20 @@ import {
   isMeetFilterDate,
   meetBookingReasonText,
   meetBookingSlot,
+  meetBookingSourceText,
   meetBookingStamp,
   meetBookingTerm,
   meetBookingsQuery,
   meetDateError,
   meetFiltersAreDefault,
   meetFiltersFrom,
+  meetPublicBookingUrl,
   mergeMeetBookings,
   r1MeetBookingsPath,
   readR1MeetBookings,
 } from './r1-meet-bookings';
-import type { R1MeetBooking, R1MeetBookingReason, R1MeetBookingStatus } from './r1-meet-bookings';
+import type { R1MeetBooking, R1MeetBookingReason, R1MeetBookingSource, R1MeetBookingStatus } from './r1-meet-bookings';
+import { R1_BOOK_PATH } from './r1/r1-book-link';
 
 const TODAY = '2026-11-24';
 
@@ -111,9 +114,14 @@ const REASON_WORDS: Record<R1MeetBookingReason, string | null> = {
   multiple_humans: 'More than one person was in the meeting.',
   attempt_settled: 'The interview has ended.',
   flag_off: 'Google Meet interviews were turned off.',
-  candidate_cancelled: 'The candidate cancelled with the link in their invite.',
-  invite_undeliverable: 'Lexy’s calendar invite could not be sent.',
+  candidate_cancelled: 'The candidate cancelled it with the link in their calendar invite.',
+  invite_undeliverable: 'Lexy’s calendar invite could not be sent to the candidate.',
 };
+
+/** A public booking was never in Ashby: the one reason whose words differ by source (M035 S08). */
+const PUBLIC_CANCELLED = 'Cancelled because the Ashby application is no longer active.';
+
+const SOURCES: readonly R1MeetBookingSource[] = ['ashby', 'public_page'];
 
 describe('the status words', () => {
   it.each(Object.entries(STATUS_WORDS))('%s reads as its word, in its family', (status, [label, tone]) => {
@@ -160,22 +168,37 @@ describe('the status words', () => {
 });
 
 describe('the reason words', () => {
-  it.each(Object.entries(REASON_WORDS))('%s reads as its sentence', (reason, text) => {
-    expect(meetBookingReasonText(reason)).toBe(text);
+  it.each(Object.entries(REASON_WORDS))('%s reads as its sentence, for either source', (reason, text) => {
+    expect(meetBookingReasonText(reason, 'ashby')).toBe(text);
+    expect(meetBookingReasonText(reason, 'public_page')).toBe(reason === 'cancelled' ? PUBLIC_CANCELLED : text);
   });
 
   it('leaves no reason out of the table above', () => {
     expect(Object.keys(REASON_WORDS).sort()).toEqual([...R1_MEET_BOOKING_REASONS].sort());
   });
 
-  it('has nothing to say about an eligible booking, and only about that one', () => {
-    expect(R1_MEET_BOOKING_REASONS.filter((reason) => meetBookingReasonText(reason) === null)).toEqual(['eligible']);
+  it('says why a public booking was cancelled, which was never in Ashby', () => {
+    expect(meetBookingReasonText('cancelled', 'ashby')).toBe('Cancelled in Ashby.');
+    expect(meetBookingReasonText('cancelled', 'public_page')).toBe(PUBLIC_CANCELLED);
+    // Cancelled is the one reason whose words depend on where the booking came from.
+    const differs = R1_MEET_BOOKING_REASONS.filter(
+      (reason) => meetBookingReasonText(reason, 'ashby') !== meetBookingReasonText(reason, 'public_page'),
+    );
+    expect(differs).toEqual(['cancelled']);
   });
 
-  it.each(['a_later_reason', '', 'constructor', 'toString', '__proto__', 'NO_SHOW'])(
-    'never prints a reason it does not know (%j)',
+  it.each(SOURCES)('has nothing to say about an eligible booking, and only about that one (%s)', (source) => {
+    expect(R1_MEET_BOOKING_REASONS.filter((reason) => meetBookingReasonText(reason, source) === null)).toEqual([
+      'eligible',
+    ]);
+  });
+
+  it.each(['a_later_reason', '', 'constructor', 'toString', '__proto__', 'NO_SHOW', 'hasOwnProperty'])(
+    'never prints a reason it does not know (%j), for either source',
     (reason) => {
-      expect(meetBookingReasonText(reason)).toBe('This page does not know the reason.');
+      for (const source of SOURCES) {
+        expect(meetBookingReasonText(reason, source), source).toBe('This page does not know the reason.');
+      }
     },
   );
 
@@ -183,9 +206,60 @@ describe('the reason words', () => {
     const words = [
       ...R1_MEET_STATUS_OPTIONS.map((option) => option.label),
       ...R1_MEET_BOOKING_STATUSES.map((status) => meetBookingTerm(status).label),
-      ...R1_MEET_BOOKING_REASONS.map((reason) => meetBookingReasonText(reason) ?? ''),
+      ...SOURCES.flatMap((source) => R1_MEET_BOOKING_REASONS.map((reason) => meetBookingReasonText(reason, source) ?? '')),
+      ...R1_MEET_BOOKING_SOURCES.map((source) => meetBookingSourceText(source)),
+      PUBLIC_CANCELLED,
     ];
+    // Not vacuous: the public words and both source words are in the list.
+    expect(words).toEqual(expect.arrayContaining([PUBLIC_CANCELLED, 'Ashby', 'Public link']));
     for (const word of words) expect(word).not.toMatch(/_/);
+  });
+});
+
+const SOURCE_WORDS: Record<R1MeetBookingSource, string> = {
+  ashby: 'Ashby',
+  public_page: 'Public link',
+};
+
+describe('the source words', () => {
+  it.each(Object.entries(SOURCE_WORDS))('%s reads as %j', (source, text) => {
+    expect(meetBookingSourceText(source as R1MeetBookingSource)).toBe(text);
+  });
+
+  it('leaves no source out of the table above', () => {
+    expect(Object.keys(SOURCE_WORDS)).toEqual([...R1_MEET_BOOKING_SOURCES]);
+  });
+
+  it('says each source in its own plain words', () => {
+    const words = R1_MEET_BOOKING_SOURCES.map((source) => meetBookingSourceText(source));
+    expect(new Set(words).size).toBe(R1_MEET_BOOKING_SOURCES.length);
+    for (const word of words) {
+      expect(word).not.toMatch(/_/);
+      expect(word).not.toBe('Not recognised');
+    }
+  });
+
+  it.each(['csv', '', 'ASHBY', 'public-page', '__proto__', 'constructor', 'toString', 'hasOwnProperty'])(
+    'never prints a source it does not know (%j)',
+    (source) => {
+      expect(meetBookingSourceText(source as R1MeetBookingSource)).toBe('Not recognised');
+    },
+  );
+});
+
+describe('the public booking link', () => {
+  it('is the page\'s own origin and the one public booking path', () => {
+    expect(R1_BOOK_PATH).toBe('/book');
+    expect(meetPublicBookingUrl('https://hello.example.test')).toBe('https://hello.example.test/book');
+    expect(meetPublicBookingUrl('https://hello.example.test')).toBe(`https://hello.example.test${R1_BOOK_PATH}`);
+    expect(meetPublicBookingUrl('http://localhost:5173')).toBe('http://localhost:5173/book');
+  });
+
+  it('never names a manage path, a fragment or a query', () => {
+    const url = meetPublicBookingUrl('https://hello.example.test');
+    expect(url).not.toContain('manage');
+    expect(url).not.toContain('#');
+    expect(url).not.toContain('?');
   });
 });
 
@@ -689,7 +763,9 @@ describe('the vocabularies agree with the API document', () => {
     const api = apiVocabulary(openapi);
     for (const status of api.status) expect(meetBookingTerm(status).label, status).not.toBe('Not recognised');
     for (const reason of api.reason) {
-      expect(meetBookingReasonText(reason), reason).not.toBe('This page does not know the reason.');
+      for (const source of SOURCES) {
+        expect(meetBookingReasonText(reason, source), `${reason} (${source})`).not.toBe('This page does not know the reason.');
+      }
     }
   });
 

@@ -73,6 +73,7 @@ import {
   PhoneSlotDialog,
   appointmentStatusTerm,
   engagementStateTerm,
+  phoneErrorMessage,
 } from "../components/phone-calendar";
 import { istToday } from "../lib/ist-datetime";
 import type { IstDate } from "../lib/ist-datetime";
@@ -1033,6 +1034,12 @@ function PhoneCycleCard({
         setConfirming(false);
         setMessage(duplicateHoldErrorMessage(e.message));
         load();
+      } else if (e instanceof ApiError && e.message === "not_phone_screened") {
+        // A public R1 booking import is never phone-screened, so the refusal
+        // is permanent: close the confirmation and say why. No re-read, as
+        // nothing on the card changed.
+        setConfirming(false);
+        setMessage(phoneErrorMessage(e));
       } else {
         setMessage(e instanceof ApiError ? e.message : "The phone screening could not be requested.");
       }
@@ -1106,6 +1113,15 @@ function PhoneCycleCard({
       setSlotDialogOpen(false);
       load();
     } catch (e) {
+      if (e instanceof ApiError && e.message === "not_phone_screened") {
+        // The same permanent refusal as the phone request: no slot can ever
+        // be booked for a public R1 booking import, so the grid is no use.
+        // Close it, or the words land behind the modal; nothing to re-read.
+        setSelectedSlot(null);
+        setSlotDialogOpen(false);
+        setMessage(phoneErrorMessage(e));
+        return;
+      }
       setMessage(e instanceof ApiError
         ? duplicateHoldErrorMessage(e.message) ?? e.message
         : "The appointment could not be saved.");

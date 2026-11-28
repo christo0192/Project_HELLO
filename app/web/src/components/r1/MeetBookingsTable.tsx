@@ -1,14 +1,22 @@
 /**
- * The Meet bookings list: when, whom, where it is and why, and when it was made and last changed.
+ * The Meet bookings list: when, whom, where it is and why, where it came from (the public booking link
+ * or Ashby), and when it was made and last changed.
  *
  * The read carries no name, so a row offers the way to the candidate and not who they are. It prints
- * words only: a status or a reason by its code, an id and a version never reach the page. Every time is
+ * words only: a status, a reason or a source by its code, an id and a version never reach the page. The
+ * source is plain text with no colour: colour carries the four state families only. Every time is
  * India time and says so.
  */
 import { Link } from 'react-router-dom';
 import { TBody, THead, Table, Td, Th, Tr } from '../design';
 import { Tag } from '../design/candidate';
-import { meetBookingReasonText, meetBookingSlot, meetBookingStamp, meetBookingTerm } from '../../lib/r1-meet-bookings';
+import {
+  meetBookingReasonText,
+  meetBookingSlot,
+  meetBookingSourceText,
+  meetBookingStamp,
+  meetBookingTerm,
+} from '../../lib/r1-meet-bookings';
 import type { R1MeetBooking } from '../../lib/r1-meet-bookings';
 
 const ROW_LINK =
@@ -32,14 +40,16 @@ function BookingRow({ booking }: { booking: R1MeetBooking }) {
   const { candidate_id: candidateId, round_id: roundId } = booking;
   const slot = meetBookingSlot(booking.start_at, booking.end_at);
   const term = meetBookingTerm(booking.status, booking.reason);
-  const reason = meetBookingReasonText(booking.reason);
+  const reason = meetBookingReasonText(booking.reason, booking.source);
+  const source = meetBookingSourceText(booking.source);
   return (
     <Tr>
       <Td className="py-2.5">
         <p className="font-medium md:whitespace-nowrap">{slot.day}</p>
         <p className="text-label text-ink-secondary md:whitespace-nowrap">{slot.time}</p>
-        {/* The column this width has no room for. */}
+        {/* The columns this width has no room for. */}
         <div className="mt-0.5 text-meta text-ink-tertiary md:hidden">
+          <p>Source: {source}</p>
           <Stamps booking={booking} />
         </div>
       </Td>
@@ -64,6 +74,7 @@ function BookingRow({ booking }: { booking: R1MeetBooking }) {
         <Tag tone={term.tone} srPrefix="Status:">{term.label}</Tag>
         {reason !== null && <p className="mt-1 max-w-xs text-meta text-ink-secondary">{reason}</p>}
       </Td>
+      <Td className={`${WIDE} whitespace-nowrap py-2.5 text-label text-ink-secondary`}>{source}</Td>
       <Td className={`${WIDE} whitespace-nowrap py-2.5 text-label text-ink-secondary`}>
         <Stamps booking={booking} />
       </Td>
@@ -79,6 +90,7 @@ export function MeetBookingsTable({ bookings }: { bookings: readonly R1MeetBooki
           <Th>Slot (IST)</Th>
           <Th>Candidate</Th>
           <Th>Status</Th>
+          <Th className={WIDE}>Source</Th>
           <Th className={WIDE}>Created and updated</Th>
         </tr>
       </THead>
